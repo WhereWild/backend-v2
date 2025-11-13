@@ -1,0 +1,12 @@
+services:
+  gdal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wherewild-gdal
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    init: true
+    stdin_open: true
+    tty: true # Keep interactive sessions stable.

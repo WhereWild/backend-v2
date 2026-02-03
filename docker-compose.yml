@@ -5,8 +5,12 @@ services:
       dockerfile: Dockerfile
     image: wherewild-gdal
     working_dir: /workspace
+    user: "${DOCKER_UID}:${DOCKER_GID}"
     volumes:
       - .:/workspace
+    ports:
+      - "8000:8000"
+      - "9101:9101"
     init: true
     stdin_open: true
-    tty: true # Keep interactive sessions stable.
+    tty: true

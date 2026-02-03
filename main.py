@@ -1,181 +1,627 @@
-import json
-import logging
-import os
+from __future__ import annotations
+
+import math
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, List, Optional
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
-from wherewild.stats_repository import (
-    SpeciesStatsNotFoundError,
-    VariableNotFoundError,
-    get_species_stats,
-    get_variable_leaderboard,
+from util.config import load_config
+from util import gis_lookup, indexing, summary_stats, taxa_navigation
+
+CONFIG = load_config("global")
+
+api_title = "WhereWild API"
+
+api_version = "0.2.0"
+
+category_sample_limit = 500
+
+cors_allow_headers = ("*",)
+
+cors_allow_methods = ("GET",)
+
+cors_allow_origins = ("*",)
+
+density_points = 128
+
+forced_categorical_variables = frozenset({"landcover"})
+
+default_species_limit = 12
+
+max_species_limit = 100
+
+
+
+app = FastAPI(title=api_title, version=api_version)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(cors_allow_origins),
+    allow_methods=list(cors_allow_methods),
+    allow_headers=list(cors_allow_headers),
 )
-
-app = FastAPI(title="WhereWild API", version="0.1.0")
 
 
 @app.get("/health", summary="Simple liveness probe")
 def health_check() -> dict[str, str]:
-    return {"status": "ok"}
+    """Returns a simple liveness payload.
+    
+    Returns:
+        A status string and UTC timestamp.
+    """
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-@app.get(
-    "/species/{species_id}/environment/{variable}",
-    summary="Retrieve precomputed environmental stats for a species/variable pair",
-)
-def species_environment_stats(species_id: int, variable: str) -> dict:
-    variable_id = variable.strip()
-    try:
-        return get_species_stats(species_id=species_id, variable_id=variable_id)
-    except VariableNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Variable '{variable_id}' is not available.",
-        ) from None
-    except SpeciesStatsNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No stats found for species {
-                species_id} and variable '{variable_id}'.",
-        ) from None
-
-
-@app.get(
-    "/variables/{variable}/leaderboard",
-    summary="Retrieve the leaderboard for a GIS variable",
-)
-def variable_leaderboard(variable: str) -> dict:
-    variable_id = variable.strip()
-    try:
-        return get_variable_leaderboard(variable_id=variable_id)
-    except VariableNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Variable '{variable_id}' is not available.",
-        ) from None
-    except SpeciesStatsNotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No leaderboard found for variable '{variable_id}'.",
-        ) from None
-
-
-logging.basicConfig(level=logging.INFO)
-PROJECT_ROOT = Path(__file__).resolve().parent
-SPECIES_DIR = Path(os.environ.get(
-    "SPECIES_DIR", PROJECT_ROOT / "processed" / "species")).resolve()
-CATALOG_PATH = SPECIES_DIR / "species_catalog.json"
-
-if not CATALOG_PATH.exists():
-    logging.error("species_catalog.json not found at %s", CATALOG_PATH)
-    raise SystemExit(f"Missing species_catalog.json at {CATALOG_PATH}")
-
-CATALOG = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
-if isinstance(CATALOG, dict):
-    CATALOG = [CATALOG]
-
-
-def normalize_taxon_id(value: int | str | None) -> int | None:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        candidate = value.strip()
-        if not candidate:
-            return None
-        if candidate.isdigit():
-            return int(candidate)
-    return None
-
-
-def build_taxon_index(entries: list[dict]) -> dict[int, dict]:
-    index: dict[int, dict] = {}
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        taxon_id = normalize_taxon_id(entry.get("taxon_id"))
-        if taxon_id is None:
-            continue
-        if taxon_id in index:
-            first = index[taxon_id].get("scientific_name") or index[taxon_id].get(
-                "common_name") or "unknown"
-            duplicate = entry.get("scientific_name") or entry.get(
-                "common_name") or "unknown"
-            raise ValueError(
-                f"Duplicate taxon_id {taxon_id} detected between '{
-                    first}' and '{duplicate}'."
-            )
-        index[taxon_id] = entry
-    return index
-
-
-TAXON_ID_INDEX = build_taxon_index(CATALOG)
-
-logging.info("Running file: %s", Path(__file__).resolve())
-logging.info("SPECIES_DIR = %s", SPECIES_DIR)
-logging.info("catalog_path = %s", CATALOG_PATH)
-logging.info("loaded %d species; sample common_names: %s", len(
-    CATALOG), [s.get("common_name") for s in CATALOG[:8]])
-
-app.add_middleware(CORSMiddleware, allow_origins=[
-                   "*"], allow_methods=["GET"], allow_headers=["*"])
-
-if (SPECIES_DIR / "images").exists():
-    app.mount("/static/species_images",
-              StaticFiles(directory=str(SPECIES_DIR / "images")), name="species_images")
-
-
-def image_url(request: Request, fname: str):
-    if not fname:
-        return None
-    base = str(request.base_url).rstrip("/")
-    filename = fname.replace("images/", "")
-    return f"{base}/static/species_images/{filename}"
-
-
-def serialize_species_brief(species: dict, request: Request) -> dict:
-    """Return the subset of species fields used by the list endpoint."""
-    fields = ("taxon_id", "slug", "common_name", "scientific_name")
-    payload = {field: species.get(field) for field in fields}
-    payload["image_url"] = image_url(request, species.get("image_file"))
-    return payload
+@app.get("/variables")
+def list_environment_variables() -> List[dict[str, Any]]:
+    """Lists available environmental variables.
+    
+    Returns:
+        A list of variable metadata entries.
+    """
+    return gis_lookup.load_variable_metadata()[0]
 
 
 @app.get("/api/species")
-def list_species(request: Request, q: str | None = None, limit: int | None = None):
-    items = CATALOG
-    if q:
-        ql = q.lower()
-        items = [i for i in items if ql in (i.get("common_name", "").lower(
-        ) + i.get("scientific_name", "").lower() + i.get("slug", ""))]
-    if limit:
-        items = items[:limit]
-    response: list[dict] = []
-    for species in items:
-        response.append(serialize_species_brief(species, request))
-    return response
+def list_species(
+    q: str = Query(..., min_length=1, description="Search term (scientific name or common name)"),
+    limit: int = Query(default_species_limit, ge=1, le=max_species_limit),
+) -> List[dict[str, Any]]:
+    """Searches taxa by name and returns serialized results.
+    
+    Args:
+        q: Search term for scientific or common names.
+        limit: Maximum number of matches to return.
+    
+    Returns:
+        A list of serialized taxon payloads.
+    """
+    records = [taxon for taxon, _score in taxa_navigation.search_taxa_by_name(q, limit=limit)]
+    payloads: list[dict[str, Any]] = []
+    for record in records:
+        payload = taxa_navigation.serialize_taxon(record)
+        if payload:
+            payloads.append(payload)
+    return payloads
 
 
 @app.get("/api/species/{taxon_id}")
-def get_species(taxon_id: int, request: Request):
-    it = TAXON_ID_INDEX.get(taxon_id)
-    if not it:
-        raise HTTPException(status_code=404, detail=f"Species with taxon_id {
-                            taxon_id} not found")
-    out = dict(it)
-    out["image_url"] = image_url(request, it.get("image_file"))
-    return out
+def get_species_detail(taxon_id: int) -> dict[str, Any]:
+    """Loads a single taxon record by id.
+    
+    Args:
+        taxon_id: Taxon id to look up.
+    
+    Returns:
+        A serialized taxon payload.
+    """
+    taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+    payload = taxa_navigation.serialize_taxon(taxon) if taxon else None
+    if not payload:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Species with taxon_id {taxon_id} not found",
+        )
+    return payload
 
 
-@app.get("/_debug/species_info")
-def debug_species_info():
+@app.get("/locations/search")
+def search_locations_endpoint(
+    q: str = Query(..., min_length=1, description="Location name or partial match"),
+    limit: int = Query(10, ge=1, le=50),
+) -> dict[str, Any]:
+    """Searches locations by name substring.
+    
+    Args:
+        q: Search term for location names.
+        limit: Maximum number of matches to return.
+    
+    Returns:
+        A dict containing location match results.
+    """
+    matches = gis_lookup.search_locations(q, limit)
+    return {"results": matches}
+
+
+@app.get("/species/{taxon_id}/occurrences")
+def species_occurrences(
+    taxon_id: int,
+    location: Optional[str] = Query(None, description="Filter observations by location gid"),
+) -> dict[str, Any]:
+    """Returns occurrence points for a taxon, optionally filtered by location.
+    
+    Args:
+        taxon_id: Taxon id to query.
+        location: Optional location GID to filter observations.
+    
+    Returns:
+        A dict with occurrence count and point records.
+    """
+    taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+    if taxon is None:
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    if not Path(taxon["path"]).exists():
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    rows = taxa_navigation.load_occurrence_points(
+        taxon_id,
+        location.strip() if location else None,
+    )
     return {
-        "SPECIES_DIR": str(SPECIES_DIR),
-        "catalog_path": str(CATALOG_PATH),
-        "count": len(CATALOG),
-        "sample_common_names": [s.get("common_name") for s in CATALOG[:10]]
+        "speciesId": taxon_id,
+        "count": len(rows),
+        "occurrences": rows,
+    }
+
+
+@app.get("/species/{taxon_id}/environment/{variable_id}")
+def species_environment_stats(
+    taxon_id: int,
+    variable_id: str,
+    location: Optional[str] = Query(
+        None, description="Optional location gid (GADM or GBIF region) to filter observations."
+    ),
+) -> dict[str, Any]:
+    """Returns environment stats for a taxon and variable.
+    
+    Args:
+        taxon_id: Taxon id to query.
+        variable_id: Environmental variable id.
+        location: Optional location GID to filter observations.
+    
+    Returns:
+        A dict containing summary stats, distributions, and rankings.
+    """
+    variable_id = variable_id.strip()
+    variable_entry = gis_lookup.load_variable_metadata()[1].get(variable_id)
+    if not variable_entry:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Variable '{variable_id}' is not available.",
+        )
+    taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+    if taxon is None:
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    taxon_dir = Path(taxon["path"])
+    if not taxon_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    location_gid = location.strip() if location else None
+    value_type = str(variable_entry.get("value_type") or "").lower() or "numeric"
+    forced_categorical = variable_id.lower() in forced_categorical_variables
+    categorical_payload = None
+    category_samples: list[dict[str, Any]] = []
+    if forced_categorical or value_type == "categorical":
+        if location_gid:
+            categorical_payload = summary_stats.build_categorical_stats_for_location(
+                taxon_id,
+                variable_id,
+                location_gid,
+                sample_limit=category_sample_limit,
+            )
+            if categorical_payload is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"No samples available for taxon {taxon_id}, "
+                        f"variable '{variable_id}' and location '{location_gid}'."
+                    ),
+                )
+            if categorical_payload:
+                category_samples = categorical_payload.get("samples", [])
+            value_type = "categorical"
+        else:
+            categorical_payload = summary_stats.load_categorical_distribution(taxon_dir, variable_id)
+            if categorical_payload is None and forced_categorical:
+                value_type = "categorical"
+            elif categorical_payload is not None:
+                value_type = "categorical"
+                category_samples = summary_stats.build_categorical_samples(
+                    taxon_dir, variable_id, categorical_payload.get("distribution", [])
+                )
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    baseline_numeric_summary = None
+    baseline_categorical_distribution: list[dict[str, Any]] = []
+    baseline_categorical_totals: dict[str, Any] = {}
+
+    if categorical_payload:
+        if location_gid:
+            baseline_stats = summary_stats.load_categorical_distribution(taxon_dir, variable_id)
+            if baseline_stats:
+                baseline_categorical_distribution = baseline_stats.get("distribution", [])
+                baseline_categorical_totals = baseline_stats.get("totals", {})
+        totals = categorical_payload.get("totals", {})
+        total_samples = totals.get("total_samples") or 0
+        summary = {
+            "count": int(total_samples),
+            "min": None,
+            "mean": None,
+            "max": None,
+            "stddev": None,
+            "q01": None,
+            "q10": None,
+            "q90": None,
+            "q99": None,
+        }
+        ranks = indexing.load_relative_ranks(taxon_dir, variable_id, location_gid=location_gid)
+        if not location_gid:
+            category_samples = summary_stats.build_categorical_samples(
+                taxon_dir, variable_id, categorical_payload.get("distribution", [])
+            )
+        response = {
+            "speciesId": taxon_id,
+            "species_id": taxon_id,
+            "variable": variable_id,
+            "variableName": variable_entry.get("name"),
+            "variable_metadata": {
+                "name": variable_entry.get("name"),
+                "units": variable_entry.get("units"),
+                "value_type": "categorical",
+            },
+            "units": variable_entry.get("units"),
+            "variableType": "categorical",
+            "generatedAt": generated_at,
+            "generated_at": generated_at,
+            "summary": summary,
+            "histogram": None,
+            "densityCurve": None,
+            "binSamples": [],
+            "bin_samples": [],
+            "density_curve": None,
+            "categoricalDistribution": categorical_payload.get("distribution", []),
+            "categorical_distribution": categorical_payload.get("distribution", []),
+            "dominantCategories": categorical_payload.get("dominant", []),
+            "dominant_categories": categorical_payload.get("dominant", []),
+            "categoricalSamples": category_samples,
+            "categorical_samples": category_samples,
+            "baselineCategoricalDistribution": baseline_categorical_distribution,
+            "baseline_categorical_distribution": baseline_categorical_distribution,
+            "baselineCategoricalTotals": baseline_categorical_totals,
+            "baseline_categorical_totals": baseline_categorical_totals,
+            "baselineSummary": baseline_numeric_summary,
+            "baseline_summary": baseline_numeric_summary,
+            "relativeRanks": ranks,
+            "relative_ranks": ranks,
+        }
+        return response
+
+    samples = summary_stats.gather_numeric_records(
+        taxon_id,
+        taxon_dir,
+        variable_id,
+        location_gid=location_gid,
+    )
+    values = [sample["value"] for sample in samples]
+    if not values:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}'.",
+        )
+    if location_gid:
+        baseline_samples = summary_stats.gather_numeric_records(
+            taxon_id,
+            taxon_dir,
+            variable_id,
+            location_gid=None,
+        )
+        baseline_values = [sample["value"] for sample in baseline_samples]
+        if baseline_values:
+            baseline_numeric_summary = summary_stats.summarize_values(baseline_values)
+    summary = summary_stats.summarize_values(values)
+    density_curve = indexing.build_density_curve(values, point_count=density_points)
+    ranks = indexing.load_relative_ranks(taxon_dir, variable_id, location_gid=location_gid)
+    response = {
+        "speciesId": taxon_id,
+        "species_id": taxon_id,
+        "variable": variable_id,
+        "variableName": variable_entry.get("name"),
+        "variable_metadata": {
+            "name": variable_entry.get("name"),
+            "units": variable_entry.get("units"),
+            "value_type": value_type or "numeric",
+        },
+        "units": variable_entry.get("units"),
+        "variableType": value_type or "numeric",
+        "generatedAt": generated_at,
+        "generated_at": generated_at,
+        "summary": summary,
+        "histogram": None,
+        "densityCurve": density_curve,
+        "binSamples": [],
+        "bin_samples": [],
+        "density_curve": density_curve,
+        "baselineSummary": baseline_numeric_summary,
+        "baseline_summary": baseline_numeric_summary,
+        "baselineCategoricalDistribution": [],
+        "baseline_categorical_distribution": [],
+        "baselineCategoricalTotals": {},
+        "baseline_categorical_totals": {},
+        "categoricalDistribution": [],
+        "categorical_distribution": [],
+        "dominantCategories": [],
+        "dominant_categories": [],
+        "categoricalSamples": [],
+        "categorical_samples": [],
+        "relativeRanks": ranks,
+        "relative_ranks": ranks,
+    }
+    return response
+
+
+@app.get("/species/{taxon_id}/environment/{variable_id}/class/{class_value}/samples")
+def species_environment_class_samples(
+    taxon_id: int,
+    variable_id: str,
+    class_value: str,
+    limit: int | None = Query(None, ge=1, le=10000),
+    location: Optional[str] = Query(
+        None, description="Optional location gid (GADM or GBIF region) to filter observations."
+    ),
+) -> dict[str, Any]:
+    """Returns categorical class samples for a taxon and variable.
+    
+    Args:
+        taxon_id: Taxon id to query.
+        variable_id: Categorical variable id.
+        class_value: Class value to match.
+        limit: Maximum number of samples to return.
+        location: Optional location GID to filter observations.
+    
+    Returns:
+        A dict containing matching observation samples.
+    """
+    taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+    if taxon is None:
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    taxon_dir = Path(taxon["path"])
+    if not taxon_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    try:
+        parsed_value: float | int | str
+        parsed_value = float(class_value)
+        if parsed_value.is_integer():
+            parsed_value = int(parsed_value)
+    except ValueError:
+        parsed_value = class_value
+    location_gid = location.strip() if location else None
+    observations: list[dict[str, Any]] = []
+    if location_gid:
+        observations = summary_stats.categorical_class_samples_for_location(
+            taxon_id,
+            variable_id,
+            parsed_value,
+            location_gid=location_gid,
+            limit=limit,
+        )
+    else:
+        index_path = taxon_dir / "occurrence_index.parquet"
+        if not index_path.exists():
+            raise HTTPException(
+                status_code=503,
+                detail="GIS lookup utilities are unavailable on this server.",
+            )
+        try:
+            rows = summary_stats.get_layer_records_for_class(index_path, variable_id, parsed_value)
+        except Exception as exc:  # pragma: no cover - passthrough
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if limit is not None and limit > 0:
+            rows = rows[:limit]
+        observations = [
+            {
+                "catalogNumber": row[0],
+                "latitude": row[1],
+                "longitude": row[2],
+                "value": row[3],
+            }
+            for row in rows
+        ]
+    return {
+        "speciesId": taxon_id,
+        "variable": variable_id,
+        "classValue": parsed_value,
+        "observations": observations,
+        "count": len(observations),
+    }
+
+
+@app.get("/species/{taxon_id}/environment/{variable_id}/slice")
+def species_environment_slice(
+    taxon_id: int,
+    variable_id: str,
+    min_value: float = Query(..., alias="min"),
+    max_value: float = Query(..., alias="max"),
+    limit: int | None = Query(None, ge=1, le=10000),
+    location: Optional[str] = Query(
+        None, description="Optional location gid (GADM or GBIF region) to filter observations."
+    ),
+) -> dict[str, Any]:
+    """Returns numeric samples within a value range for a taxon/variable.
+    
+    Args:
+        taxon_id: Taxon id to query.
+        variable_id: Numeric variable id.
+        min_value: Minimum value to include.
+        max_value: Maximum value to include.
+        limit: Maximum number of samples to return.
+        location: Optional location GID to filter observations.
+    
+    Returns:
+        A dict containing range parameters and matching observations.
+    """
+    if not math.isfinite(min_value) or not math.isfinite(max_value):
+        raise HTTPException(status_code=400, detail="min and max must be finite numbers")
+    if max_value < min_value:
+        min_value, max_value = max_value, min_value
+    variable_entry = gis_lookup.load_variable_metadata()[1].get(variable_id)
+    if not variable_entry:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Variable '{variable_id}' is not available.",
+        )
+    value_type = str(variable_entry.get("value_type") or "").lower() or "numeric"
+    if value_type == "categorical" or variable_id.lower() in forced_categorical_variables:
+        raise HTTPException(
+            status_code=400,
+            detail="Categorical layers must be queried via the class samples endpoint.",
+        )
+    taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+    if taxon is None:
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    taxon_dir = Path(taxon["path"])
+    if not taxon_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    index_path = taxon_dir / "occurrence_index.parquet"
+    if not index_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Index parquet missing for taxon {taxon_id}",
+        )
+    location_gid = location.strip() if location else None
+    rows: list[tuple[str, float | None, float | None, float | None]] = []
+    if location_gid:
+        rows = summary_stats.numeric_range_samples_for_location(
+            taxon_id,
+            variable_id,
+            min_value,
+            max_value,
+            location_gid=location_gid,
+            limit=limit,
+        )
+    else:
+        try:
+            rows = summary_stats.get_sorted_layer_records_in_value_range(
+                index_path,
+                variable_id,
+                value_min=min_value,
+                value_max=max_value,
+                limit=limit,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    observations: list[dict[str, Any]] = []
+    for catalog, lat, lon, value in rows:
+        observations.append(
+            {
+                "catalogNumber": catalog,
+                "value": float(value) if isinstance(value, (int, float)) else value,
+                "latitude": lat,
+                "longitude": lon,
+            }
+        )
+    return {
+        "speciesId": taxon_id,
+        "variable": variable_id,
+        "range": {"min": min_value, "max": max_value},
+        "limit": limit,
+        "count": len(observations),
+        "observations": observations,
+    }
+
+
+@app.get("/relative-rankings/{taxon_id}")
+def get_relative_rankings(
+    taxon_id: int,
+    rank: str = Query(..., description="Descendant rank to include (e.g., SPECIES)"),
+    variable: str = Query(..., description="Environmental variable / layer id"),
+    metric: str = Query(..., description="Metric to rank by (min, mean, max, std, 1-99 range)"),
+    limit: int = Query(50, ge=1, le=200),
+    order: str = Query("asc", description="Sort order: asc or desc"),
+    min_samples: int = Query(0, ge=0, description="Minimum samples required to appear"),
+    include_species_like: bool = Query(
+        False, description="When rank=SPECIES, include subspecies/varieties/forms"
+    ),
+    include_distribution: bool = Query(
+        False,
+        description=(
+            "Include the kernel density distribution for all eligible descendants. "
+            "This can be expensive for large taxa."
+        ),
+    ),
+    location: Optional[str] = Query(
+        None,
+        description="Optional location GID (GADM) or GBIF region to filter descendants by",
+    ),
+) -> dict[str, Any]:
+    """Returns descendant rankings for a taxon by variable/metric.
+    
+    Args:
+        taxon_id: Ancestor taxon id to rank descendants under.
+        rank: Descendant rank to include.
+        variable: Environmental variable id to rank by.
+        metric: Metric name to rank by.
+        limit: Maximum number of results to return.
+        order: Sort order ("asc" or "desc").
+        min_samples: Minimum sample count required to appear.
+        include_species_like: Whether to include subspecies-like ranks for species.
+        include_distribution: Whether to return raw values for density curves.
+        location: Optional location GID to filter descendants by occurrence membership.
+    
+    Returns:
+        A dict containing ranking entries and optional distribution data.
+    """
+    location_gid = location.strip() if location else None
+    try:
+        entries, distribution_values = indexing.child_relative_rankings(
+            str(taxon_id),
+            rank,
+            variable,
+            metric,
+            limit=limit,
+            order=order,
+            min_samples=min_samples,
+            include_species_like=include_species_like,
+            return_distribution=include_distribution,
+            location_gid=location_gid,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    total = entries[0]["count"] if entries else 0
+    distribution_curve = None
+    if include_distribution and distribution_values:
+        distribution_curve = indexing.build_density_curve(
+            distribution_values,
+            point_count=density_points,
+        )
+    return {
+        "ancestor_taxon_id": taxon_id,
+        "rank": rank.upper(),
+        "variable": variable,
+        "metric": metric,
+        "total": total,
+        "limit": limit,
+        "order": order.lower(),
+        "min_samples": min_samples,
+        "include_species_like": include_species_like,
+        "entries": entries,
+        "distribution": distribution_curve,
+    }
+
+
+@app.get("/relative-rankings/{taxon_id}/options")
+def list_relative_ranking_options(
+    taxon_id: int,
+    rank: str = Query(..., description="Descendant rank to inspect (e.g., SPECIES)"),
+) -> dict[str, Any]:
+    """Lists available ranking metrics for an ancestor/rank.
+    
+    Args:
+        taxon_id: Ancestor taxon id to inspect.
+        rank: Descendant rank to inspect.
+    
+    Returns:
+        A dict containing available variable/metric options.
+    """
+    try:
+        options = indexing.list_rank_metric_options(str(taxon_id), rank)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ancestor_taxon_id": taxon_id,
+        "rank": rank.upper(),
+        "options": options,
     }
 
 

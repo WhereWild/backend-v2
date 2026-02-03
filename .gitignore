@@ -30,4 +30,8 @@ htmlcov/
 .uv/
 
 # Logs
+logs/
 *.log*
+
+# Local secrets
+docker/rclone.conf

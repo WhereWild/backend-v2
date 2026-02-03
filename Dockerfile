@@ -17,4 +17,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /tmp/requirements.txt
 
+COPY docker/aliases.sh /etc/wherewild_aliases.sh
+RUN echo '\n# WhereWild dev aliases\n[ -f /etc/wherewild_aliases.sh ] && . /etc/wherewild_aliases.sh' >> /etc/bash.bashrc
+
 CMD ["tail", "-f", "/dev/null"]

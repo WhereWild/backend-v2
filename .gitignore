@@ -3,6 +3,9 @@
 data/
 processed/
 
+# Ignore macOS Finder metadata
+.DS_Store
+
 # Python cache and bytecode
 __pycache__/
 *.py[cod]

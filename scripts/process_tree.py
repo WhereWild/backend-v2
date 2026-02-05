@@ -23,6 +23,9 @@ from util.config import load_config
 
 CONFIG = load_config("global")
 
+process_tree_ranks_only = False
+
+
 index_workers = 4
 
 pending_task_multiplier = 4
@@ -186,7 +189,7 @@ def process_tree(
     """Entry point when enrichment has populated occurrence.parquet files."""
     pending_multiplier = max(1, pending_multiplier)
 
-    if CONFIG.process_tree_ranks_only:
+    if process_tree_ranks_only:
         compute_relative_ranks(root_taxon_id)
         return
 

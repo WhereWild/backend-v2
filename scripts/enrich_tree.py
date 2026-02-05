@@ -20,6 +20,9 @@ from util.config import load_config
 
 CONFIG = load_config("global")
 
+enrich_tree_row_limit = 10_000_000
+
+
 # We require these columns when writing
 
 
@@ -267,7 +270,7 @@ def main():
     for batch in _iter_worklist_batches(
         layer_ids,
         CONFIG.root_taxon_id,
-        row_limit=CONFIG.enrich_tree_row_limit,
+        row_limit=enrich_tree_row_limit,
     ):
         if batch is None or batch.num_rows == 0:
             continue

@@ -78,11 +78,17 @@ def list_species(
     Returns:
         A list of serialized taxon payloads.
     """
-    records = [taxon for taxon, _score in taxa_navigation.search_taxa_by_name(q, limit=limit)]
+    records = taxa_navigation.search_taxa_by_name(q, limit=limit)
     payloads: list[dict[str, Any]] = []
-    for record in records:
+    for record, _score, matched_name in records:
         payload = taxa_navigation.serialize_taxon(record)
         if payload:
+            common_names = payload.get("common_names") or []
+            matched_common_name = taxa_navigation.resolve_matched_common_name(
+                common_names,
+                matched_name,
+            )
+            payload["matched_common_name"] = matched_common_name
             payloads.append(payload)
     return payloads
 

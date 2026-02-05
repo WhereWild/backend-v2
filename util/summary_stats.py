@@ -25,6 +25,9 @@ from util.config import load_config
 # ---- Path bootstrap ----
 CONFIG = load_config("global")
 
+significant_category_threshold = 0.05
+
+
 excluded_numeric_columns = frozenset(
             {
                 "decimalLatitude",
@@ -812,7 +815,7 @@ def build_categorical_stats_for_location(
     distribution.sort(key=lambda row: row.get("fraction", 0), reverse=True)
     dominant = distribution[: min(5, len(distribution))]
     significant = [
-        entry for entry in distribution if entry.get("fraction", 0) >= CONFIG.significant_category_threshold
+        entry for entry in distribution if entry.get("fraction", 0) >= significant_category_threshold
     ]
     totals = {
         "total_samples": total,
@@ -1500,7 +1503,7 @@ def _collect_categorical_stats(df: pd.DataFrame, categorical_cols: Sequence[str]
         significant = 0
         if total > 0:
             for count in counts:
-                if (count / total) >= CONFIG.significant_category_threshold:
+                if (count / total) >= significant_category_threshold:
                     significant += 1
         entries.append(
             {
@@ -1543,7 +1546,7 @@ def _collect_categorical_stats_from_counts(
         entries.append({"variable": column, "metric": "unique_classes", "value": int(len(counts))})
         significant = 0
         for count in counts.values():
-            if (count / total) >= CONFIG.significant_category_threshold:
+            if (count / total) >= significant_category_threshold:
                 significant += 1
         entries.append(
             {

@@ -804,13 +804,6 @@ def load_relative_ranks(
     contexts = _ancestor_contexts(Path(taxon["path"]))
     if not contexts:
         return []
-    species_context_key: str | None = None
-    if storage_rank == "SUBSPECIES":
-        for ancestor in contexts:
-            if taxa_navigation.canonical_rank(ancestor["rank"]) == "SPECIES":
-                species_context_key = ancestor["taxon_key"]
-                break
-
     allowed_taxa: Optional[frozenset[int]] = None
     normalized_location = location_gid.strip() if location_gid else None
     if normalized_location:
@@ -830,23 +823,12 @@ def load_relative_ranks(
             else "SPECIES"
         )
         lookup_key = taxon_key
-        if column_rank == "SPECIES" and storage_rank == "SUBSPECIES":
-            if not species_context_key:
-                continue
-            lookup_key = species_context_key
         index_path = Path(ancestor["path"]) / f"{column_rank.lower()}_index.parquet"
         if not index_path.exists():
             continue
         column_lengths = _load_column_lengths(index_path)
         if not column_lengths:
             continue
-        lookup_taxon = taxa_navigation.get_taxon_by_id(str(lookup_key))
-        if lookup_taxon is None:
-            continue
-        stats = _load_summary_stats(str(lookup_taxon["path"])) or {}
-        categorical_stats = _load_categorical_stats(str(lookup_taxon["path"])) or {}
-        metrics = dict(stats.get(variable_id, {}))
-        metrics.update(categorical_stats.get(variable_id, {}))
         for metric_name in relative_rank_metrics:
             try:
                 column_name = _resolve_column_name(
@@ -857,6 +839,17 @@ def load_relative_ranks(
             column_length = column_lengths.get(column_name)
             if not column_length:
                 continue
+            column = _load_struct_column(index_path, column_name, column_length)
+            taxon_keys = column.field("taxonKey").to_pylist()
+            values = column.field("value").to_pylist()
+            samples = column.field("sampleCount").to_pylist()
+            lookup_taxon = taxa_navigation.get_taxon_by_id(str(lookup_key))
+            if lookup_taxon is None:
+                continue
+            stats = _load_summary_stats(str(lookup_taxon["path"])) or {}
+            categorical_stats = _load_categorical_stats(str(lookup_taxon["path"])) or {}
+            metrics = dict(stats.get(variable_id, {}))
+            metrics.update(categorical_stats.get(variable_id, {}))
             raw_value = metrics.get(metric_name)
             if raw_value is None:
                 continue
@@ -866,10 +859,6 @@ def load_relative_ranks(
                 continue
             if not math.isfinite(target_value):
                 continue
-            column = _load_struct_column(index_path, column_name, column_length)
-            taxon_keys = column.field("taxonKey").to_pylist()
-            values = column.field("value").to_pylist()
-            samples = column.field("sampleCount").to_pylist()
             left = bisect.bisect_left(values, target_value)
             right = bisect.bisect_right(values, target_value)
             if left == right:
@@ -1105,6 +1094,8 @@ def child_relative_rankings(
     metric_values = column.field("value").to_pylist()
     sample_counts = column.field("sampleCount").to_pylist()
 
+    media_index = taxa_navigation.load_taxon_media()
+
     min_samples = max(0, int(min_samples or 0))
 
     eligible: list[tuple[int, Any, float, int, Optional[int]]] = []
@@ -1150,12 +1141,19 @@ def child_relative_rankings(
         else:
             rank_index = output_idx
         percentile = rank_index / denominator if filtered_total > 1 else 0.0
+        common_names = taxa_navigation.extract_common_names_for_language(
+            taxon,
+            language=CONFIG.common_name_language,
+        )
+        common_name = common_names[0] if common_names else None
+        media_record = media_index.get(taxon["taxon_key"])
         record = {
             "taxonId": taxon_id if taxon_id is not None else taxon["taxon_key"],
             "taxon_id": taxon_id if taxon_id is not None else taxon["taxon_key"],
             "taxon_key": taxon["taxon_key"],
             "scientificName": taxon["scientific_name"],
-            "commonName": taxon["common_name"] or None,
+            "commonName": common_name,
+            "common_names": common_names,
             "rank": canonical_taxon_rank,
             "value": numeric_value,
             "sampleCount": sample_count,
@@ -1165,6 +1163,12 @@ def child_relative_rankings(
             "metric": metric,
             "variable": layer,
         }
+        if media_record:
+            record["image_url"] = media_record.get("url")
+            record["image_license"] = media_record.get("license")
+            record["image_creator"] = media_record.get("creator")
+            record["image_rights_holder"] = media_record.get("rightsHolder")
+            record["image_references"] = media_record.get("references")
         results.append(record)
 
     return results, distribution_values

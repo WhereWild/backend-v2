@@ -58,6 +58,14 @@ _SKIP_DIRS = {
 }
 
 
+def _property_fields() -> set[str]:
+    return {
+        name
+        for name, value in inspect.getmembers(GlobalConfig)
+        if not name.startswith("_") and isinstance(value, property)
+    }
+
+
 def _iter_python_files(root: Path) -> Iterable[Path]:
     for path in root.rglob("*.py"):
         if path.name == "config.py":
@@ -289,9 +297,22 @@ def main() -> None:
 
     root = Path(__file__).resolve().parents[1]
     counts, unknown = audit_config_usage(root)
+    internal_refs = _collect_internal_refs(root / "util" / "config.py")
+    for name in internal_refs:
+        if name in counts and counts[name] < 2:
+            counts[name] = 2
+    property_fields = _property_fields()
 
-    unused = [name for name, count in counts.items() if count == 0]
-    single_use = [name for name, count in counts.items() if count == 1]
+    unused = [
+        name
+        for name, count in counts.items()
+        if count == 0 and name not in property_fields
+    ]
+    single_use = [
+        name
+        for name, count in counts.items()
+        if count == 1 and name not in property_fields
+    ]
 
     print("Config usage counts (excluding config.py):")
     for name, count in sorted(counts.items(), key=lambda item: (item[1], item[0])):

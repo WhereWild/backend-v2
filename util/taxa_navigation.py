@@ -42,6 +42,18 @@ class TaxonRecord(TypedDict):
     rank: str
 
 
+def _normalize_taxon_path(value: Any) -> Path:
+    raw = value if isinstance(value, Path) else Path(str(value))
+    if raw.is_absolute():
+        parts = raw.parts
+        if "taxonomy" in parts:
+            idx = parts.index("taxonomy")
+            rel = Path(*parts[idx + 1 :])
+            return CONFIG.taxonomy_root / rel
+        return raw
+    return CONFIG.taxonomy_root / raw
+
+
 @lru_cache(maxsize=1)
 def _load_payload() -> dict:
     """Loads the taxon catalog payload pickle.
@@ -67,7 +79,13 @@ def load_catalog() -> Dict[str, TaxonRecord]:
         A dict mapping taxon ids to taxon records.
     """
     payload = _load_payload()
-    return payload["catalog"]
+    catalog = payload["catalog"]
+    normalized: Dict[str, TaxonRecord] = {}
+    for key, record in catalog.items():
+        updated = dict(record)
+        updated["path"] = _normalize_taxon_path(updated["path"])
+        normalized[key] = updated
+    return normalized
 
 
 @lru_cache(maxsize=1)

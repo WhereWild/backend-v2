@@ -11,6 +11,14 @@ services:
     ports:
       - "8000:8000"
       - "9101:9101"
+    environment:
+      - RCLONE_CONFIG=/workspace/docker/rclone.conf
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
     init: true
     stdin_open: true
     tty: true

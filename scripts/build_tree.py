@@ -91,12 +91,13 @@ with open(CONFIG.taxa_csv_path, newline="", encoding="utf-8") as f:
                 cleaned_name = clean_name(name, level.upper())
                 path_parts.append(f"{cleaned_name}_{key}")
                 path = CONFIG.taxonomy_root / Path(*path_parts)
+                rel_path = path.relative_to(CONFIG.taxonomy_root).as_posix()
 
                 # Keep catalog entries light for fast serialization/deserialization
                 if key not in catalog:
                     catalog[str(key)] = {
                         "taxon_key": str(key),
-                        "path": path,
+                        "path": rel_path,
                         "scientific_name": cleaned_name,
                         "common_name": "",
                         "rank": level.upper(),
@@ -124,7 +125,7 @@ with open(CONFIG.taxa_csv_path, newline="", encoding="utf-8") as f:
         common_name = row.get("commonName", "")
         catalog[str(taxon_key_to_write)] = {
             "taxon_key": str(taxon_key_to_write),
-            "path": path,
+            "path": rel_path,
             "scientific_name": cleaned_name,
             "common_name": common_name,
             "rank": row["taxonRank"],

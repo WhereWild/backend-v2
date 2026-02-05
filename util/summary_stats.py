@@ -12,6 +12,7 @@ import math
 import re
 from contextlib import contextmanager
 from contextvars import ContextVar
+from fastdigest import TDigest as _FastTDigest
 
 import numpy as np
 import pandas as pd
@@ -23,8 +24,6 @@ from util.config import load_config
 
 # ---- Path bootstrap ----
 CONFIG = load_config("global")
-
-from fastdigest import TDigest as _FastTDigest
 
 excluded_numeric_columns = frozenset(
             {

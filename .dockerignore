@@ -1,0 +1,28 @@
+# Data (never bake into image)
+data/
+*.zip
+*.parquet
+
+# Python cache / virtualenvs
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Git / CI
+.git/
+.gitignore
+.gitlab/
+.github/
+
+# Editor / OS junk
+.vscode/
+.DS_Store
+
+# Tests & coverage (optional)
+coverage/
+__tests__/
+
+# Node / frontend junk if repo is mixed
+node_modules/

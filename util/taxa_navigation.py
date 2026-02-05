@@ -38,7 +38,7 @@ class TaxonRecord(TypedDict):
     taxon_key: str
     path: Path
     scientific_name: str
-    common_name: str
+    common_name: object
     rank: str
 
 
@@ -52,6 +52,203 @@ def _normalize_taxon_path(value: Any) -> Path:
             return CONFIG.taxonomy_root / rel
         return raw
     return CONFIG.taxonomy_root / raw
+
+
+def normalize_name(value: str) -> str:
+    """Normalizes a taxon name to match name index keys."""
+    if not value:
+        return ""
+    return " ".join(value.replace("_", " ").lower().split())
+
+
+def get_parent_taxon(taxon: TaxonRecord) -> TaxonRecord | None:
+    """Returns the parent taxon record when available."""
+    raw_path = taxon.get("path")
+    if not raw_path:
+        return None
+    path = _normalize_taxon_path(raw_path)
+    if path == CONFIG.taxonomy_root:
+        return None
+    parent = path.parent
+    if parent == CONFIG.taxonomy_root:
+        return None
+    parent_key = taxon_key_from_path(parent)
+    return get_taxon_by_id(parent_key)
+
+
+def _common_name_score(language: str, lexicon: str, source: str) -> int:
+    lang = (language or "").strip().lower()
+    lex = (lexicon or "").strip().lower()
+    src = (source or "").strip().lower()
+    score = 0
+    if lang == "en":
+        score += 100
+    if "english" in lex:
+        score += 50
+    if "american" in lex or "united states" in lex or "u.s." in lex or "usa" in lex:
+        score += 10
+    if src == "inat":
+        score += 25
+    return score
+
+
+def _matches_language(language: str, lexicon: str, target_language: str) -> bool:
+    lang = (language or "").strip().lower()
+    lex = (lexicon or "").strip().lower()
+    target = (target_language or "").strip().lower()
+    if not target:
+        return True
+    if lang == target:
+        return True
+    if target == "en" and "english" in lex:
+        return True
+    return False
+
+
+def _format_common_name(value: str) -> str:
+    """Title-case common names while preserving short acronyms."""
+    if not value:
+        return ""
+    words = []
+    for word in value.split(" "):
+        if len(word) <= 4 and word.isupper():
+            words.append(word)
+        else:
+            lower = word.lower()
+            if "'" in lower:
+                parts = lower.split("'", 1)
+                if parts[0]:
+                    first = parts[0][0].upper() + parts[0][1:]
+                else:
+                    first = ""
+                second = parts[1]
+                words.append(f"{first}'{second}" if second else first)
+            else:
+                words.append(lower[:1].upper() + lower[1:])
+    return " ".join(words).strip()
+
+
+def _extract_common_names(taxon: TaxonRecord, language: str | None) -> list[str]:
+    raw_common_name = taxon.get("common_name")
+    preferred_name = ""
+    if language and str(language).lower().startswith("en"):
+        preferred_name = str(taxon.get("inat_preferred_common_name") or "").strip()
+    if isinstance(raw_common_name, list):
+        if raw_common_name and isinstance(raw_common_name[0], dict):
+            scored: dict[str, int] = {}
+            for entry in raw_common_name:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if not name:
+                    continue
+                entry_language = str(entry.get("language") or "")
+                lexicon = str(entry.get("lexicon") or "")
+                source = str(entry.get("source") or "")
+                if language and not _matches_language(entry_language, lexicon, language):
+                    continue
+                score = _common_name_score(entry_language, lexicon, source)
+                if name not in scored or score > scored[name]:
+                    scored[name] = score
+            ordered = sorted(scored.items(), key=lambda item: (-item[1], item[0].lower()))
+            names = [_format_common_name(name) for name, _score in ordered if name]
+            if preferred_name:
+                preferred_formatted = _format_common_name(preferred_name)
+                if preferred_formatted not in names:
+                    names.insert(0, preferred_formatted)
+                else:
+                    names = [preferred_formatted] + [n for n in names if n != preferred_formatted]
+            return names
+        names = [name.strip() for name in raw_common_name if isinstance(name, str)]
+        names = [_format_common_name(name) for name in names if name]
+        if preferred_name:
+            preferred_formatted = _format_common_name(preferred_name)
+            if preferred_formatted not in names:
+                names.insert(0, preferred_formatted)
+            else:
+                names = [preferred_formatted] + [n for n in names if n != preferred_formatted]
+        return names
+    if isinstance(raw_common_name, str) and raw_common_name.strip():
+        names = [name.strip() for name in raw_common_name.split(",")]
+        names = [_format_common_name(name) for name in names if name]
+        if preferred_name:
+            preferred_formatted = _format_common_name(preferred_name)
+            if preferred_formatted not in names:
+                names.insert(0, preferred_formatted)
+            else:
+                names = [preferred_formatted] + [n for n in names if n != preferred_formatted]
+        return names
+    return []
+
+
+def extract_common_names(taxon: TaxonRecord) -> list[str]:
+    """Returns all common names from a taxon record (strings or {name, language, lexicon})."""
+    return _extract_common_names(taxon, language=None)
+
+
+def extract_common_names_for_language(taxon: TaxonRecord, language: str = "en") -> list[str]:
+    """Returns common names for a specific language, ordered by source/lexicon preference."""
+    names = _extract_common_names(taxon, language=language)
+    if names:
+        return names
+    rank = (taxon.get("rank") or "").strip().upper()
+    if rank in CONFIG.subspecies_equivalents:
+        parent = get_parent_taxon(taxon)
+        if parent:
+            return _extract_common_names(parent, language=language)
+    return []
+
+
+def resolve_matched_common_name(common_names: list[str], matched_key: str | None) -> str | None:
+    """Matches a normalized name-index key to a cased common name."""
+    if not matched_key:
+        return None
+    for name in common_names:
+        if normalize_name(name) == matched_key:
+            return name
+    return None
+
+
+def iter_descendants_dfs(taxon: TaxonRecord) -> Iterable[TaxonRecord]:
+    """Iterates descendants in depth-first order."""
+    stack: list[TaxonRecord] = list(get_children(taxon["taxon_key"]))
+    while stack:
+        current = stack.pop()
+        yield current
+        children = get_children(current["taxon_key"])
+        if children:
+            stack.extend(children)
+
+
+@lru_cache(maxsize=4096)
+def resolve_taxon_media(taxon_key: str) -> dict | None:
+    """Resolve media for a taxon, falling back to descendants then siblings."""
+    taxon = get_taxon_by_id(taxon_key)
+    if not taxon:
+        return None
+    media_index = load_taxon_media()
+    direct = media_index.get(taxon_key)
+    if direct:
+        return direct
+
+    for descendant in iter_descendants_dfs(taxon):
+        record = media_index.get(descendant["taxon_key"])
+        if record:
+            return record
+
+    parent = get_parent_taxon(taxon)
+    if parent:
+        siblings = [sib for sib in get_children(parent["taxon_key"]) if sib["taxon_key"] != taxon_key]
+        for sibling in siblings:
+            record = media_index.get(sibling["taxon_key"])
+            if record:
+                return record
+            for descendant in iter_descendants_dfs(sibling):
+                record = media_index.get(descendant["taxon_key"])
+                if record:
+                    return record
+
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -90,16 +287,53 @@ def load_catalog() -> Dict[str, TaxonRecord]:
 
 @lru_cache(maxsize=1)
 def load_name_index() -> dict:
-    """Loads the combined name index from the payload.
-    
+    """Load name index and expand it to include all comma-separated common names.
+
     Args:
         None.
-    
+
     Returns:
-        A dict mapping normalized names to lists of taxon ids.
+        Dictionary mapping normalized names to lists of taxon keys.
     """
     payload = _load_payload()
-    return payload["combined_name_index"]
+    name_index = payload["combined_name_index"]
+    catalog = payload["catalog"]
+
+    # Enhance index with all common names
+    for taxon_key, taxon in catalog.items():
+        names = extract_common_names(taxon)
+
+        for name in names:
+            if name:  # skip empty strings
+                normalized = name.lower()
+                if normalized not in name_index:
+                    name_index[normalized] = []
+                if taxon_key not in name_index[normalized]:
+                    name_index[normalized].append(taxon_key)
+
+        scientific_name = taxon.get("scientific_name")
+        if isinstance(scientific_name, str) and scientific_name.strip():
+            normalized_scientific = normalize_name(scientific_name)
+            if normalized_scientific:
+                if normalized_scientific not in name_index:
+                    name_index[normalized_scientific] = []
+                if taxon_key not in name_index[normalized_scientific]:
+                    name_index[normalized_scientific].append(taxon_key)
+
+    return name_index
+
+
+@lru_cache(maxsize=1)
+def load_taxon_media() -> dict[str, dict]:
+    """Load taxon_key -> media mapping from taxon_media.pkl.
+
+    Returns:
+        Dictionary mapping taxon_key to media record with url, license, creator, rightsHolder.
+    """
+    if not CONFIG.taxon_media_path.exists():
+        return {}
+    with open(CONFIG.taxon_media_path, "rb") as f:
+        return pickle.load(f)
 
 # ---- Public API ----
 def get_taxon_by_id(taxon_id: str) -> TaxonRecord | None:
@@ -152,7 +386,7 @@ def taxon_key_from_path(path: Path) -> str:
         return name.split("_")[-1]
     return name
 
-def search_taxa_by_name(name_query: str, limit: int = 10) -> list[Tuple[TaxonRecord, float]]:
+def search_taxa_by_name(name_query: str, limit: int = 10) -> list[Tuple[TaxonRecord, float, str]]:
     """Performs fuzzy search to get a list of taxa with a name that matches the query.
     
     Args:
@@ -167,21 +401,55 @@ def search_taxa_by_name(name_query: str, limit: int = 10) -> list[Tuple[TaxonRec
     name_index = load_name_index()
     if not name_index:
         return []
+    normalized_query = normalize_name(name_query)
+    tokens = normalized_query.split()
+    if not tokens:
+        return []
+
     matches = process.extract(
-        name_query.lower(),
+        normalized_query,
         name_index.keys(),
-        scorer=fuzz.WRatio,
-        limit=limit
+        scorer=fuzz.token_set_ratio,
+        limit=max(limit * 25, 100),
     )
 
-    results = []
+    min_score = 60 if len(tokens) > 1 else 70
+    best_by_taxon: dict[str, Tuple[TaxonRecord, float, str]] = {}
     for name, score, _ in matches:
+        name_tokens = name.split()
+        if len(tokens) > 1:
+            token_matches = all(
+                any(nt.startswith(token) for nt in name_tokens)
+                for token in tokens
+            )
+            if not token_matches:
+                continue
+        else:
+            token = tokens[0]
+            if not any(nt.startswith(token) for nt in name_tokens):
+                continue
+
+        adjusted_score = score
+        if name == normalized_query:
+            adjusted_score += 20
+        token_penalty = max(0, len(name_tokens) - len(tokens)) * 2
+        adjusted_score -= token_penalty
+
+        if adjusted_score < min_score:
+            continue
+
         keys = name_index.get(name, [])
         for key in keys:
             taxon = catalog.get(key)
-            if taxon:
-                results.append((taxon, score))
-    return results
+            if not taxon:
+                continue
+            existing = best_by_taxon.get(key)
+            if existing is None or adjusted_score > existing[1]:
+                best_by_taxon[key] = (taxon, adjusted_score, name)
+
+    results = list(best_by_taxon.values())
+    results.sort(key=lambda entry: entry[1], reverse=True)
+    return results[:limit]
 
 
 def canonical_rank(value: str | None) -> str:
@@ -295,10 +563,10 @@ def count_taxon_rows(taxon: TaxonRecord) -> int | None:
 
 def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
     """Returns a serialized version of taxon metadata for the API.
-    
+
     Args:
         taxon: The taxon record in question.
-    
+
     Returns:
         A serialized version of the taxon containing its id, scientific and common names, description, image, slug, rank, and number of occurrences.
     """
@@ -306,7 +574,10 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
     if taxon_id is None:
         return None
     scientific_name = (taxon.get("scientific_name") or "").replace("_", " ").strip()
-    common_name = taxon.get("common_name") or scientific_name
+
+    common_names = extract_common_names_for_language(taxon, language=CONFIG.common_name_language)
+    common_name = common_names[0] if common_names else scientific_name
+
     rank = (taxon.get("rank") or "").upper()
     slug = "-".join(part for part in scientific_name.lower().split() if part)
     data_path = Path(taxon["path"]) / CONFIG.occurrence_parquet_filename
@@ -315,16 +586,32 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
         f"{scientific_name} has {occurrences:,} research-grade observations in this dataset."
         f" Rank: {rank.title()}."
     )
-    return {
+
+    # Load media data
+    taxon_key = taxon.get("taxon_key")
+    media_record = resolve_taxon_media(taxon_key) if taxon_key else None
+
+    result = {
         "taxon_id": taxon_id,
         "scientific_name": scientific_name,
         "common_name": common_name,
+        "common_names": common_names,
         "description": description,
         "image_url": None,
         "slug": slug,
         "rank": rank,
         "occurrences": occurrences,
     }
+
+    # Add image and attribution if available
+    if media_record:
+        result["image_url"] = media_record.get("url")
+        result["image_license"] = media_record.get("license")
+        result["image_creator"] = media_record.get("creator")
+        result["image_rights_holder"] = media_record.get("rightsHolder")
+        result["image_references"] = media_record.get("references")
+
+    return result
 
 
 def base_observation_mask(table: pa.Table) -> pa.Array:

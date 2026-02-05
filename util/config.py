@@ -55,6 +55,13 @@ class GlobalConfig:
     gbif_regions_filename: str = "gbif_regions.csv"
     location_catalog_filename: str = "location_taxa.parquet"
 
+    # GBIF occurrence download files (for media extraction)
+    gbif_occurrence_txt: str = "occurrence.txt"
+    gbif_multimedia_txt: str = "multimedia.txt"
+    gbif_taxon_lookup_filename: str = "gbif_taxon_lookup.txt"
+    taxon_media_filename: str = "taxon_media.pkl"
+    # Set to None for full dataset, or a number to limit rows (for testing/sampling)
+
     # Base root
     project_root: Path = field(default_factory=_project_root)
 
@@ -103,10 +110,8 @@ class GlobalConfig:
     occurrence_list_columns: tuple[str, ...] = ("dp", "rcs", "gall")
 
     # API + aggregation behavior
-    significant_category_threshold: float = 0.02
 
     # Enrichment
-    enrich_tree_row_limit: int = 10_000_000
 
     # GIS + locations
     gbif_regions: tuple[str, ...] = (
@@ -124,6 +129,27 @@ class GlobalConfig:
             0: "level0Gid",
             1: "level1Gid",
             2: "level2Gid",
+        }
+    )
+
+    # Temporal weather enrichment
+    temporal_cache_dirname: str = "temporal_cache"
+    inat_mapping_offline_filename: str = "inat_gbif_mapping.csv"
+    inat_mapping_api_filename: str = "inat_gbif_mapping_api.csv"
+    inat_mapping_obs_filename: str = "inat_gbif_mapping_obs.csv"
+    inat_preferred_common_name_locale: str = "en"
+    inat_preferred_common_name_batch_size: int = 200
+    inat_preferred_common_name_request_limit: int = 0
+    inat_preferred_common_name_progress_every: int = 50
+    inat_preferred_common_name_overwrite: bool = False
+    inat_preferred_common_name_rate_limit_per_second: float = 1.0
+    inat_preferred_common_name_max_requests: int = 10_000
+    common_name_language: str = "en"
+    location_scope_by_level: dict[int, str] = field(
+        default_factory=lambda: {
+            0: "gadm_level0",
+            1: "gadm_level1",
+            2: "gadm_level2",
         }
     )
 
@@ -189,6 +215,34 @@ class GlobalConfig:
     @property
     def occurrence_path(self) -> Path:
         return self.species_dir / self.occurrence_filename
+
+    @property
+    def gbif_occurrence_path(self) -> Path:
+        return self.species_dir / self.gbif_occurrence_txt
+
+    @property
+    def gbif_multimedia_path(self) -> Path:
+        return self.species_dir / self.gbif_multimedia_txt
+
+    @property
+    def gbif_taxon_lookup_path(self) -> Path:
+        return self.taxonomy_root / self.gbif_taxon_lookup_filename
+
+    @property
+    def taxon_media_path(self) -> Path:
+        return self.taxonomy_root / self.taxon_media_filename
+
+    @property
+    def inat_mapping_offline_path(self) -> Path:
+        return self.taxonomy_root / self.inat_mapping_offline_filename
+
+    @property
+    def inat_mapping_api_path(self) -> Path:
+        return self.taxonomy_root / self.inat_mapping_api_filename
+
+    @property
+    def inat_mapping_obs_path(self) -> Path:
+        return self.taxonomy_root / self.inat_mapping_obs_filename
 
     @property
     def location_hierarchy_path(self) -> Path:

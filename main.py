@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from util.config import load_config
-from util import gis_lookup, indexing, summary_stats, taxa_navigation
+from util import gis_lookup, indexing, summary_stats, taxa_navigation, units
 
 CONFIG = load_config("global")
 
@@ -55,13 +55,20 @@ def health_check() -> dict[str, str]:
 
 
 @app.get("/variables")
-def list_environment_variables() -> List[dict[str, Any]]:
+def list_environment_variables(
+    unit_system: Optional[str] = Query(
+        None, description="Unit system for response values (metric or imperial)"
+    ),
+) -> List[dict[str, Any]]:
     """Lists available environmental variables.
     
     Returns:
         A list of variable metadata entries.
     """
-    return gis_lookup.load_variable_metadata()[0]
+    return units.apply_unit_system_to_variables(
+        gis_lookup.load_variable_metadata()[0],
+        unit_system,
+    )
 
 
 @app.get("/api/species")
@@ -168,6 +175,9 @@ def species_environment_stats(
     location: Optional[str] = Query(
         None, description="Optional location gid (GADM or GBIF region) to filter observations."
     ),
+    unit_system: Optional[str] = Query(
+        None, description="Unit system for response values (metric or imperial)"
+    ),
 ) -> dict[str, Any]:
     """Returns environment stats for a taxon and variable.
     
@@ -186,6 +196,7 @@ def species_environment_stats(
             status_code=404,
             detail=f"Variable '{variable_id}' is not available.",
         )
+    raw_units = variable_entry.get("units")
     taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
     if taxon is None:
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
@@ -262,10 +273,10 @@ def species_environment_stats(
             "variableName": variable_entry.get("name"),
             "variable_metadata": {
                 "name": variable_entry.get("name"),
-                "units": variable_entry.get("units"),
+                "units": raw_units,
                 "value_type": "categorical",
             },
-            "units": variable_entry.get("units"),
+            "units": raw_units,
             "variableType": "categorical",
             "generatedAt": generated_at,
             "generated_at": generated_at,
@@ -324,10 +335,10 @@ def species_environment_stats(
         "variableName": variable_entry.get("name"),
         "variable_metadata": {
             "name": variable_entry.get("name"),
-            "units": variable_entry.get("units"),
+            "units": raw_units,
             "value_type": value_type or "numeric",
         },
-        "units": variable_entry.get("units"),
+        "units": raw_units,
         "variableType": value_type or "numeric",
         "generatedAt": generated_at,
         "generated_at": generated_at,
@@ -352,7 +363,7 @@ def species_environment_stats(
         "relativeRanks": ranks,
         "relative_ranks": ranks,
     }
-    return response
+    return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/class/{class_value}/samples")
@@ -441,6 +452,9 @@ def species_environment_slice(
     location: Optional[str] = Query(
         None, description="Optional location gid (GADM or GBIF region) to filter observations."
     ),
+    unit_system: Optional[str] = Query(
+        None, description="Unit system for response values (metric or imperial)"
+    ),
 ) -> dict[str, Any]:
     """Returns numeric samples within a value range for a taxon/variable.
     
@@ -466,6 +480,11 @@ def species_environment_slice(
             detail=f"Variable '{variable_id}' is not available.",
         )
     value_type = str(variable_entry.get("value_type") or "").lower() or "numeric"
+    raw_units = variable_entry.get("units")
+    resolved_unit_system = units.normalize_unit_system(unit_system)
+    if resolved_unit_system and raw_units:
+        min_value = units.convert_value_from_system(min_value, raw_units, resolved_unit_system)
+        max_value = units.convert_value_from_system(max_value, raw_units, resolved_unit_system)
     if value_type == "categorical" or variable_id.lower() in forced_categorical_variables:
         raise HTTPException(
             status_code=400,
@@ -517,14 +536,16 @@ def species_environment_slice(
                 "longitude": lon,
             }
         )
-    return {
+    response = {
         "speciesId": taxon_id,
         "variable": variable_id,
         "range": {"min": min_value, "max": max_value},
+        "units": raw_units,
         "limit": limit,
         "count": len(observations),
         "observations": observations,
     }
+    return units.apply_unit_system_to_slice_response(response, unit_system, raw_units)
 
 
 @app.get("/relative-rankings/{taxon_id}")
@@ -549,6 +570,9 @@ def get_relative_rankings(
     location: Optional[str] = Query(
         None,
         description="Optional location GID (GADM) or GBIF region to filter descendants by",
+    ),
+    unit_system: Optional[str] = Query(
+        None, description="Unit system for response values (metric or imperial)"
     ),
 ) -> dict[str, Any]:
     """Returns descendant rankings for a taxon by variable/metric.
@@ -591,11 +615,16 @@ def get_relative_rankings(
             distribution_values,
             point_count=density_points,
         )
-    return {
+    raw_units = None
+    variable_entry = gis_lookup.load_variable_metadata()[1].get(variable)
+    if variable_entry:
+        raw_units = variable_entry.get("units")
+    response = {
         "ancestor_taxon_id": taxon_id,
         "rank": rank.upper(),
         "variable": variable,
         "metric": metric,
+        "units": raw_units,
         "total": total,
         "limit": limit,
         "order": order.lower(),
@@ -604,6 +633,7 @@ def get_relative_rankings(
         "entries": entries,
         "distribution": distribution_curve,
     }
+    return units.apply_unit_system_to_rankings_response(response, unit_system, raw_units)
 
 
 @app.get("/relative-rankings/{taxon_id}/options")

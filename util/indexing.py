@@ -44,6 +44,21 @@ relative_rank_metrics = (
     )
 
 
+def _harmonize_numeric_arrays(arrays: list[pa.Array]) -> list[pa.Array]:
+    if not arrays:
+        return arrays
+    types = {arr.type for arr in arrays}
+    if len(types) <= 1:
+        return arrays
+    if all(pa.types.is_integer(t) or pa.types.is_floating(t) for t in types):
+        target = pa.float64() if any(pa.types.is_floating(t) for t in types) else pa.int64()
+        return [pc.cast(arr, target) if arr.type != target else arr for arr in arrays]
+    if all(pa.types.is_string(t) or pa.types.is_large_string(t) for t in types):
+        target = pa.string()
+        return [pc.cast(arr, target) if arr.type != target else arr for arr in arrays]
+    return arrays
+
+
 def build_index_parquet(node_path: Path) -> None:
     """Builds/overwrites an occurrence_index.parquet for a given node in the tree.
         The index is a sorted list of tuples `(catalogNumber, originId, value)` for each GIS variable.
@@ -116,11 +131,14 @@ def build_index_parquet(node_path: Path) -> None:
                     tmp_path.unlink(missing_ok=True)
 
     # Collect datasets for the index. Each dataset is a parquet. We might need multiple if the node is a species node (has its own parquet) but also has subspecies children (also have their own parquet)
+    parent_catalog_numbers = table[catalog_number_col].combine_chunks()
+    if not (pa.types.is_string(parent_catalog_numbers.type) or pa.types.is_large_string(parent_catalog_numbers.type)):
+        parent_catalog_numbers = pc.cast(parent_catalog_numbers, pa.string())
     datasets = [
         {
             "origin_id": 0,
             "table": table,
-            "catalog_numbers": table[catalog_number_col].combine_chunks(),
+            "catalog_numbers": parent_catalog_numbers,
             "relative_path": ".",
             "path": parent_dir,
             "taxon_key": taxa_navigation.taxon_key_from_path(parent_dir),
@@ -149,11 +167,14 @@ def build_index_parquet(node_path: Path) -> None:
         if catalog_number_col not in child_table.schema.names:
             continue
 
+        child_catalog_numbers = child_table[catalog_number_col].combine_chunks()
+        if not (pa.types.is_string(child_catalog_numbers.type) or pa.types.is_large_string(child_catalog_numbers.type)):
+            child_catalog_numbers = pc.cast(child_catalog_numbers, pa.string())
         datasets.append(
             {
                 "origin_id": origin_id_counter,
                 "table": child_table,
-                "catalog_numbers": child_table[catalog_number_col].combine_chunks(),
+                "catalog_numbers": child_catalog_numbers,
                 "relative_path": child_dir.name,
                 "path": child_dir,
                 "taxon_key": child_taxon["taxon_key"],
@@ -169,11 +190,85 @@ def build_index_parquet(node_path: Path) -> None:
         origin_id_counter += 1
 
     # ---- Build index columns ----
+    existing_table: pa.Table | None = None
+    existing_columns: set[str] = set()
+    existing_column_lengths: dict[str, int] = {}
+    existing_category_offsets: dict[str, dict[str, dict[str, int | float]]] = {}
+    existing_origin_map: list[dict[str, Any]] | None = None
+    existing_catalog_column: str | None = None
+
+    if index_parquet.exists():
+        try:
+            existing_schema = pq.read_schema(index_parquet)
+            existing_columns = set(existing_schema.names)
+            metadata = dict(existing_schema.metadata or {})
+            raw_lengths = metadata.get(b"column_lengths")
+            if raw_lengths:
+                existing_column_lengths = json.loads(raw_lengths.decode("utf-8"))
+            raw_offsets = metadata.get(b"category_offsets")
+            if raw_offsets:
+                existing_category_offsets = json.loads(raw_offsets.decode("utf-8"))
+            raw_origin_map = metadata.get(b"origin_map")
+            if raw_origin_map:
+                existing_origin_map = json.loads(raw_origin_map.decode("utf-8"))
+            raw_catalog = metadata.get(b"catalog_column")
+            if raw_catalog:
+                existing_catalog_column = raw_catalog.decode("utf-8")
+        except Exception:
+            existing_columns = set()
+            existing_column_lengths = {}
+            existing_category_offsets = {}
+            existing_origin_map = None
+            existing_catalog_column = None
+
+    if existing_origin_map:
+        datasets = []
+        for entry in existing_origin_map:
+            rel_path = entry.get("relative_path") or "."
+            origin_id = int(entry.get("id", 0))
+            data_dir = parent_dir if rel_path == "." else parent_dir / rel_path
+            data_file = data_dir / data_parquet.name
+            if not data_file.exists():
+                continue
+            try:
+                entry_table = pq.read_table(data_file)
+            except Exception:
+                continue
+            if catalog_number_col not in entry_table.schema.names:
+                continue
+            entry_catalog_numbers = entry_table[catalog_number_col].combine_chunks()
+            if not (
+                pa.types.is_string(entry_catalog_numbers.type)
+                or pa.types.is_large_string(entry_catalog_numbers.type)
+            ):
+                entry_catalog_numbers = pc.cast(entry_catalog_numbers, pa.string())
+            datasets.append(
+                {
+                    "origin_id": origin_id,
+                    "table": entry_table,
+                    "catalog_numbers": entry_catalog_numbers,
+                    "relative_path": rel_path,
+                    "path": data_dir,
+                    "taxon_key": entry.get("taxon_key"),
+                }
+            )
+        origin_map = existing_origin_map
+
+    layer_ids = [
+        layer_id
+        for layer_id in layer_catalog.keys()
+        if layer_id and layer_id not in existing_columns
+    ]
+
+    if not layer_ids and existing_columns:
+        print(f"skip indexing {str(parent_dir).split('/')[-1]} (already built)")
+        return
+
     index_columns: dict[str, pa.Array] = {}
     column_lengths: dict[str, int] = {}
     max_len = 0
 
-    for layer_id, layer in layer_catalog.items():
+    for layer_id in layer_ids:
         if not layer_id:
             continue
 
@@ -233,6 +328,9 @@ def build_index_parquet(node_path: Path) -> None:
         if not combined_values:
             continue
 
+        combined_values = _harmonize_numeric_arrays(combined_values)
+        combined_catalogs = _harmonize_numeric_arrays(combined_catalogs)
+
         values = pa.concat_arrays(combined_values)
         catalogs = pa.concat_arrays(combined_catalogs)
         origins = pa.concat_arrays(combined_origins)
@@ -285,21 +383,60 @@ def build_index_parquet(node_path: Path) -> None:
             if offsets:
                 category_offsets[layer_id] = offsets
 
-    # pad rows with nulls at the end
-    for key, arr in list(index_columns.items()):
-        if len(arr) < max_len:
-            pad = pa.nulls(max_len - len(arr), type=arr.type)
-            index_columns[key] = pa.concat_arrays([arr, pad])
+    if not index_columns and existing_columns:
+        print(f"skip indexing {str(parent_dir).split('/')[-1]} (no new layers)")
+        return
 
-    index_table = pa.table(index_columns)
+    if existing_columns:
+        existing_table = pq.read_table(index_parquet)
+        existing_arrays: dict[str, pa.Array] = {}
+        for name in existing_table.schema.names:
+            existing_arrays[name] = existing_table[name].combine_chunks()
+            if name not in existing_column_lengths:
+                nulls = int(pc.sum(pc.is_null(existing_arrays[name])).as_py())
+                existing_column_lengths[name] = len(existing_arrays[name]) - nulls
 
-    # enrich the metadata with computed stuffs
-    metadata = dict(index_table.schema.metadata or {})
-    metadata[b"origin_map"] = json.dumps(origin_map).encode("utf-8")
-    metadata[b"column_lengths"] = json.dumps(column_lengths).encode("utf-8")
-    metadata[b"catalog_column"] = catalog_number_col.encode("utf-8")
-    metadata[b"category_offsets"] = json.dumps(category_offsets).encode("utf-8")
-    index_table = index_table.replace_schema_metadata(metadata)
+        existing_max_len = existing_table.num_rows
+        max_len = max(max_len, existing_max_len)
+
+        for key, arr in list(existing_arrays.items()):
+            if len(arr) < max_len:
+                pad = pa.nulls(max_len - len(arr), type=arr.type)
+                existing_arrays[key] = pa.concat_arrays([arr, pad])
+
+        for key, arr in list(index_columns.items()):
+            if len(arr) < max_len:
+                pad = pa.nulls(max_len - len(arr), type=arr.type)
+                index_columns[key] = pa.concat_arrays([arr, pad])
+
+        merged_arrays = {**existing_arrays, **index_columns}
+        index_table = pa.table(merged_arrays)
+        metadata = dict(index_table.schema.metadata or {})
+        merged_column_lengths = {**existing_column_lengths, **column_lengths}
+        merged_category_offsets = {**existing_category_offsets, **category_offsets}
+        metadata[b"origin_map"] = json.dumps(existing_origin_map or origin_map).encode("utf-8")
+        metadata[b"column_lengths"] = json.dumps(merged_column_lengths).encode("utf-8")
+        metadata[b"catalog_column"] = (
+            (existing_catalog_column or catalog_number_col).encode("utf-8")
+        )
+        metadata[b"category_offsets"] = json.dumps(merged_category_offsets).encode("utf-8")
+        index_table = index_table.replace_schema_metadata(metadata)
+    else:
+        # pad rows with nulls at the end
+        for key, arr in list(index_columns.items()):
+            if len(arr) < max_len:
+                pad = pa.nulls(max_len - len(arr), type=arr.type)
+                index_columns[key] = pa.concat_arrays([arr, pad])
+
+        index_table = pa.table(index_columns)
+
+        # enrich the metadata with computed stuffs
+        metadata = dict(index_table.schema.metadata or {})
+        metadata[b"origin_map"] = json.dumps(origin_map).encode("utf-8")
+        metadata[b"column_lengths"] = json.dumps(column_lengths).encode("utf-8")
+        metadata[b"catalog_column"] = catalog_number_col.encode("utf-8")
+        metadata[b"category_offsets"] = json.dumps(category_offsets).encode("utf-8")
+        index_table = index_table.replace_schema_metadata(metadata)
 
     # ---- Atomic write occurrence_index.parquet ----
     index_parquet = index_parquet.resolve()
@@ -482,6 +619,8 @@ def build_descendant_catalogs_for_ancestor(ancestor_taxon_id: str) -> None:
 def _collect_metric_entries_for_taxon(
     taxon,
     fallback_samples: int,
+    *,
+    exclude_columns: Optional[set[str]] = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Collects ranking entries from summary stats for a single taxon.
     
@@ -528,6 +667,8 @@ def _collect_metric_entries_for_taxon(
             if math.isnan(numeric_value):
                 continue
             column_key = f"{variable}::{metric_name}"
+            if exclude_columns and column_key in exclude_columns:
+                continue
             bucket = entries.setdefault(column_key, [])
             bucket.append(
                 {
@@ -539,27 +680,11 @@ def _collect_metric_entries_for_taxon(
     return entries
 
 
-def _write_rank_index(
-    index_path: Path,
+def _build_rank_index_arrays(
     column_entries: dict[str, list[dict[str, Any]]],
-) -> dict[str, list[dict[str, Any]]]:
-    """Writes a rank index parquet from metric entry lists.
-    
-    Args:
-        index_path: Output path for the rank index parquet.
-        column_entries: Mapping of "variable::metric" to entry dicts with taxon_key, value, and sample_count.
-    
-    Returns:
-        A positions payload mapping "variable::metric" to taxon_key/position/sample_count entries.
-    
-    Example:
-        Output file name: "<ancestor_path>/<rank>_index.parquet" (e.g. "genus_index.parquet").
-        Output columns are struct arrays keyed by "variable::metric", for example.
-    """
+) -> tuple[dict[str, pa.Array], dict[str, int], set[str], int]:
     if not column_entries:
-        index_path.unlink(missing_ok=True)
-        return {}
-
+        return {}, {}, set(), 0
     struct_fields = [
         pa.field("taxonKey", pa.string()),
         pa.field("value", pa.float64()),
@@ -569,7 +694,6 @@ def _write_rank_index(
     column_lengths: dict[str, int] = {}
     arrays: dict[str, pa.Array] = {}
     metric_names: set[str] = set()
-    position_payload: dict[str, list[dict[str, Any]]] = {}
 
     for column_name, entries in column_entries.items():
         if not entries:
@@ -596,25 +720,39 @@ def _write_rank_index(
         )
         arrays[column_name] = struct_array
         max_len = max(max_len, len(struct_array))
-        column_positions: list[dict[str, Any]] = []
-        for idx, entry in enumerate(sorted_entries):
-            column_positions.append(
-                {
-                    "taxon_key": str(entry["taxon_key"]),
-                    "position": idx,
-                    "sample_count": entry["sample_count"],
-                }
-            )
-        position_payload[column_name] = column_positions
 
     if not arrays:
-        index_path.unlink(missing_ok=True)
-        return {}
+        return {}, {}, set(), 0
 
     for column_name, arr in list(arrays.items()):
         if len(arr) < max_len:
             pad = pa.nulls(max_len - len(arr), type=arr.type)
             arrays[column_name] = pa.concat_arrays([arr, pad])
+
+    return arrays, column_lengths, metric_names, max_len
+
+
+def _write_rank_index(
+    index_path: Path,
+    column_entries: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Writes a rank index parquet from metric entry lists.
+    
+    Args:
+        index_path: Output path for the rank index parquet.
+        column_entries: Mapping of "variable::metric" to entry dicts with taxon_key, value, and sample_count.
+    
+    Returns:
+        A positions payload mapping "variable::metric" to taxon_key/position/sample_count entries.
+    
+    Example:
+        Output file name: "<ancestor_path>/<rank>_index.parquet" (e.g. "genus_index.parquet").
+        Output columns are struct arrays keyed by "variable::metric", for example.
+    """
+    arrays, column_lengths, metric_names, max_len = _build_rank_index_arrays(column_entries)
+    if not arrays:
+        index_path.unlink(missing_ok=True)
+        return
 
     table = pa.table(arrays)
     metadata = dict(table.schema.metadata or {})
@@ -637,8 +775,7 @@ def _write_rank_index(
     finally:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
-
-    return position_payload
+    return None
 
 
 def _build_rank_index_parquet(ancestor, canonical_rank: str) -> None:
@@ -669,6 +806,27 @@ def _build_rank_index_parquet(ancestor, canonical_rank: str) -> None:
         index_path.unlink(missing_ok=True)
         return
 
+    existing_columns: set[str] = set()
+    existing_table: pa.Table | None = None
+    existing_column_lengths: dict[str, int] = {}
+    existing_metrics: set[str] = set()
+    if index_path.exists():
+        try:
+            existing_table = pq.read_table(index_path)
+            existing_columns = set(existing_table.schema.names)
+            metadata = dict(existing_table.schema.metadata or {})
+            raw_lengths = metadata.get(b"column_lengths")
+            if raw_lengths:
+                existing_column_lengths = json.loads(raw_lengths.decode("utf-8"))
+            raw_metrics = metadata.get(b"metrics")
+            if raw_metrics:
+                existing_metrics = set(json.loads(raw_metrics.decode("utf-8")))
+        except Exception:
+            existing_table = None
+            existing_columns = set()
+            existing_column_lengths = {}
+            existing_metrics = set()
+
     column_entries: dict[str, list[dict[str, Any]]] = {}
     for record in frame.itertuples(index=False):
         taxon_key = getattr(record, "taxon_key", None)
@@ -678,7 +836,11 @@ def _build_rank_index_parquet(ancestor, canonical_rank: str) -> None:
         if taxon is None:
             continue
         fallback_samples = int(getattr(record, "sample_count", None))
-        metric_entries = _collect_metric_entries_for_taxon(taxon, fallback_samples)
+        metric_entries = _collect_metric_entries_for_taxon(
+            taxon,
+            fallback_samples,
+            exclude_columns=existing_columns if existing_columns else None,
+        )
         if not metric_entries:
             continue
         for column_name, entries in metric_entries.items():
@@ -686,11 +848,67 @@ def _build_rank_index_parquet(ancestor, canonical_rank: str) -> None:
             bucket.extend(entries)
 
     if not column_entries:
+        if existing_columns:
+            print(f"[rank-index] skip {ancestor_path} {canonical_rank} (already built)")
+            return
         print(f"[rank-index] no stats entries for {ancestor_path} {canonical_rank}")
         index_path.unlink(missing_ok=True)
         return
 
-    _write_rank_index(index_path, column_entries)
+    if existing_table is None or not existing_columns:
+        _write_rank_index(index_path, column_entries)
+        return
+
+    new_arrays, new_lengths, new_metrics, new_max_len = _build_rank_index_arrays(column_entries)
+    if not new_arrays:
+        print(f"[rank-index] skip {ancestor_path} {canonical_rank} (no new columns)")
+        return
+
+    existing_arrays: dict[str, pa.Array] = {}
+    for name in existing_table.schema.names:
+        col = existing_table[name]
+        existing_arrays[name] = col.combine_chunks()
+        if name not in existing_column_lengths:
+            nulls = int(pc.sum(pc.is_null(existing_arrays[name])).as_py())
+            existing_column_lengths[name] = len(existing_arrays[name]) - nulls
+
+    existing_max_len = existing_table.num_rows
+    max_len = max(existing_max_len, new_max_len)
+
+    for name, arr in list(existing_arrays.items()):
+        if len(arr) < max_len:
+            pad = pa.nulls(max_len - len(arr), type=arr.type)
+            existing_arrays[name] = pa.concat_arrays([arr, pad])
+
+    for name, arr in list(new_arrays.items()):
+        if len(arr) < max_len:
+            pad = pa.nulls(max_len - len(arr), type=arr.type)
+            new_arrays[name] = pa.concat_arrays([arr, pad])
+
+    merged_arrays = {**existing_arrays, **new_arrays}
+    table = pa.table(merged_arrays)
+    metadata = dict(table.schema.metadata or {})
+    merged_lengths = {**existing_column_lengths, **new_lengths}
+    merged_metrics = set(existing_metrics) | set(new_metrics)
+    metadata[b"column_lengths"] = json.dumps(merged_lengths).encode("utf-8")
+    metadata[b"metrics"] = json.dumps(sorted(merged_metrics)).encode("utf-8")
+    table = table.replace_schema_metadata(metadata)
+
+    index_path = index_path.resolve()
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=index_path.parent,
+        suffix=".parquet",
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        pq.write_table(table, tmp_path)
+        os.replace(tmp_path, index_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
 
 
 def build_rank_indexes_for_ancestor(ancestor_taxon_id: str) -> None:

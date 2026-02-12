@@ -1341,12 +1341,29 @@ def numeric_column_stats(*, streaming: bool = True) -> Dict[str, Dict[str, float
             "numeric_column_stats() must be called inside stats_context()."
         )
     parquet_path = Path(node_path) / CONFIG.occurrence_parquet_filename
+    existing_stats = _load_summary_stats(str(parquet_path.parent)) or {}
+    existing_categorical = _load_categorical_stats(str(parquet_path.parent)) or {}
+    existing_numeric_vars = set(existing_stats.keys())
+    existing_categorical_vars = set(existing_categorical.keys())
     if streaming:
-        return _numeric_column_stats_streaming(parquet_path)
-    return _numeric_column_stats_exact(parquet_path)
+        return _numeric_column_stats_streaming(
+            parquet_path,
+            existing_numeric=existing_numeric_vars,
+            existing_categorical=existing_categorical_vars,
+        )
+    return _numeric_column_stats_exact(
+        parquet_path,
+        existing_numeric=existing_numeric_vars,
+        existing_categorical=existing_categorical_vars,
+    )
 
 
-def _numeric_column_stats_exact(parquet_path: Path) -> Dict[str, Dict[str, float]]:
+def _numeric_column_stats_exact(
+    parquet_path: Path,
+    *,
+    existing_numeric: set[str] | None = None,
+    existing_categorical: set[str] | None = None,
+) -> Dict[str, Dict[str, float]]:
     tables = list(_iter_descendant_tables(parquet_path))
     if not tables:
         return {}
@@ -1365,14 +1382,22 @@ def _numeric_column_stats_exact(parquet_path: Path) -> Dict[str, Dict[str, float
     categorical_cols = [
         col for col in df.columns if _layer_value_type(col) == "categorical"
     ]
+    if existing_categorical:
+        categorical_cols = [col for col in categorical_cols if col not in existing_categorical]
     categorical_entries = _collect_categorical_stats(df, categorical_cols)
-    _write_categorical_stats(parquet_path.parent, categorical_entries)
+    _write_categorical_stats(
+        parquet_path.parent,
+        categorical_entries,
+        merge_existing=True,
+    )
 
     numeric_cols = [
         col
         for col in df.select_dtypes(include=["number"]).columns
         if col not in excluded_numeric_columns and _layer_value_type(col) != "categorical"
     ]
+    if existing_numeric:
+        numeric_cols = [col for col in numeric_cols if col not in existing_numeric]
     if not numeric_cols:
         return {}
 
@@ -1400,11 +1425,16 @@ def _numeric_column_stats_exact(parquet_path: Path) -> Dict[str, Dict[str, float
             "range": float(desc.at["max", col] - desc.at["min", col]),
         }
 
-    _write_summary_stats(parquet_path.parent, stats)
+    _write_summary_stats(parquet_path.parent, stats, merge_existing=True)
     return stats
 
 
-def _numeric_column_stats_streaming(parquet_path: Path) -> Dict[str, Dict[str, float]]:
+def _numeric_column_stats_streaming(
+    parquet_path: Path,
+    *,
+    existing_numeric: set[str] | None = None,
+    existing_categorical: set[str] | None = None,
+) -> Dict[str, Dict[str, float]]:
     categorical_counts: Dict[str, Counter] = defaultdict(Counter)
     categorical_totals: Dict[str, int] = defaultdict(int)
     numeric_stats: Dict[str, Dict[str, Any]] = {}
@@ -1422,6 +1452,10 @@ def _numeric_column_stats_streaming(parquet_path: Path) -> Dict[str, Dict[str, f
         categorical_cols = [
             col for col in df.columns if _layer_value_type(col) == "categorical"
         ]
+        if existing_categorical:
+            categorical_cols = [
+                col for col in categorical_cols if col not in existing_categorical
+            ]
         for column in categorical_cols:
             if column not in df.columns:
                 continue
@@ -1438,6 +1472,8 @@ def _numeric_column_stats_streaming(parquet_path: Path) -> Dict[str, Dict[str, f
             for col in df.select_dtypes(include=["number"]).columns
             if col not in excluded_numeric_columns and _layer_value_type(col) != "categorical"
         ]
+        if existing_numeric:
+            numeric_cols = [col for col in numeric_cols if col not in existing_numeric]
         for column in numeric_cols:
             stats_entry = numeric_stats.get(column)
             if stats_entry is None:
@@ -1451,7 +1487,11 @@ def _numeric_column_stats_streaming(parquet_path: Path) -> Dict[str, Dict[str, f
     categorical_entries = _collect_categorical_stats_from_counts(
         categorical_counts, categorical_totals
     )
-    _write_categorical_stats(parquet_path.parent, categorical_entries)
+    _write_categorical_stats(
+        parquet_path.parent,
+        categorical_entries,
+        merge_existing=True,
+    )
 
     if not numeric_stats:
         return {}
@@ -1483,7 +1523,7 @@ def _numeric_column_stats_streaming(parquet_path: Path) -> Dict[str, Dict[str, f
             "range": float(max_value - min_value),
         }
 
-    _write_summary_stats(parquet_path.parent, stats)
+    _write_summary_stats(parquet_path.parent, stats, merge_existing=True)
     return stats
 
 
@@ -1585,7 +1625,12 @@ def _collect_categorical_stats_from_counts(
             )
     return entries
 
-def _write_summary_stats(directory: Path, stats: Dict[str, Dict[str, Any]]) -> None:
+def _write_summary_stats(
+    directory: Path,
+    stats: Dict[str, Dict[str, Any]],
+    *,
+    merge_existing: bool = False,
+) -> None:
     """Writes numeric summary stats to summary_stats.parquet.
     
     Args:
@@ -1600,12 +1645,24 @@ def _write_summary_stats(directory: Path, stats: Dict[str, Dict[str, Any]]) -> N
     serialized = frame.reset_index().rename(columns={"index": "variable"}) # simply reset and rename the index to the variable column
     stats_path = directory / "summary_stats.parquet"
     try:
+        if merge_existing and stats_path.exists():
+            existing = pd.read_parquet(stats_path)
+            if not existing.empty:
+                combined = pd.concat([existing, serialized], ignore_index=True)
+                combined = combined.drop_duplicates(subset=["variable"], keep="last")
+                serialized = combined
         serialized.to_parquet(stats_path, index=False)
+        _load_summary_stats.cache_clear()
     except Exception:
         pass
 
 
-def _write_categorical_stats(directory: Path, entries: List[Dict[str, Any]]) -> None:
+def _write_categorical_stats(
+    directory: Path,
+    entries: List[Dict[str, Any]],
+    *,
+    merge_existing: bool = False,
+) -> None:
     """Writes categorical stats to categorical_stats.parquet.
     
     Args:
@@ -1614,14 +1671,28 @@ def _write_categorical_stats(directory: Path, entries: List[Dict[str, Any]]) -> 
     """
     stats_path = directory / "categorical_stats.parquet"
     if not entries:
+        if merge_existing:
+            return
         stats_path.unlink(missing_ok=True)
         return
     frame = pd.DataFrame(entries)
     if frame.empty:
+        if merge_existing:
+            return
         stats_path.unlink(missing_ok=True)
         return
     try:
+        if merge_existing and stats_path.exists():
+            existing = pd.read_parquet(stats_path)
+            if not existing.empty:
+                combined = pd.concat([existing, frame], ignore_index=True)
+                combined = combined.drop_duplicates(
+                    subset=["variable", "metric"],
+                    keep="last",
+                )
+                frame = combined
         frame.to_parquet(stats_path, index=False)
+        _load_categorical_stats.cache_clear()
     except Exception:
         pass
 

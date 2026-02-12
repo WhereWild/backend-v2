@@ -46,6 +46,7 @@ class GlobalConfig:
 
     # Filenames and templates
     taxa_csv_filename: str = "taxa.csv"
+    vernacular_filename: str = "VernacularName.tsv"
     occurrence_filename: str = "occurrence.txt"
     occurrence_parquet_filename: str = "occurrence.parquet"
     taxon_catalog_filename: str = "taxon_catalog.pkl"
@@ -211,6 +212,9 @@ class GlobalConfig:
     @property
     def taxa_csv_path(self) -> Path:
         return self.species_dir / self.taxa_csv_filename
+    @property
+    def vernacular_tsv_path(self) -> Path:
+        return self.data_root / self.vernacular_filename
 
     @property
     def occurrence_path(self) -> Path:

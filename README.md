@@ -61,14 +61,29 @@ You can test run the exported image with
 ```sh
 docker run --rm -it \
   -e WHEREWILD_MODE=api \
+  -e RCLONE_CONFIG=/workspace/docker/rclone.conf \
   -p 8000:8000 \
-  -v <CHANGE ME>:/data \
+  -v <HOST_DATA_DIR>:/workspace/data \
+  -v <HOST_RCLONE_CONF_FILE>:/workspace/docker/rclone.conf:ro \
   wherewild-backend:latest
 ```
 
-**This image expects a mounted `/data` folder**. For using B2, I think `entrypoint.sh` might need modifitcation.
+- This image expects a mounted `/workspace/data` folder. You will need to mount a **host directory**. It works like this: `-v /absolute/host/path:/container/path` mounts the absolute directory path on your machine (the host) to the directory path within the container. Remove the angle brackets and replace them with your actual host paths.
+- If you want the container to use a different local data directory than `/workspace/data`, set `WHEREWILD_LOCAL_DATA_ROOT`.
+- When `WHEREWILD_MODE=api` **and** the image includes `/etc/wherewild_aliases.sh` **and** `ww_data_root` resolves to the local data root, the entrypoint runs `b2-pull-all` in the background on startup when serving from local data. If those conditions are not met (for example, aliases are not baked into the image), `b2-pull-all` will **not** be invoked automatically, and you must run it (or other `b2-pull` commands) manually inside the container if you want data to sync from B2. For any of these uses to work, you must provide an rclone config file and point `RCLONE_CONFIG` at it (as shown above). The second `-v` flag in the example is a **file-to-file bind mount**: the left-hand side must be the path to a single rclone config file on the host (for example `/home/me/.config/rclone/rclone.conf`), and the right-hand side is the file path `/workspace/docker/rclone.conf` inside the container. Do not mount a directory there, or rclone will not read the config.
 
-You may need to change the mount. It works like this: `-v a: b` mounts absolute directory path `a` on your machine (the host) to `b` within the container. Remove the angle brackets.
+Example minimal `rclone.conf` for B2:
+
+```conf
+[wherewild-localdev-reader]
+type = b2
+account = <B2 keyId>
+key = <B2 applicationKey>
+```
+
+#### Image Hosting
+
+Currently, the image is hosted on Docker Hub at `kellynyanbinary/wherewild-backend`.
 
 ### Removing Containers
 

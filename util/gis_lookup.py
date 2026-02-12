@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from util.config import load_config
+import unicodedata
 
 CONFIG = load_config("global")
 
@@ -283,6 +284,13 @@ def resolve_location_context(
     context.reverse()
     return context
 
+"Helper method to strip diacritics"
+def strip_diacritics(text: str) -> str:
+    if not text:
+        return ''
+    normalized = unicodedata.normalize('NFD', str(text))
+    stripped = ''.join(ch for ch in normalized if unicodedata.category(ch)!= 'Mn')
+    return stripped.lower().strip()
 
 def search_locations(query: str, limit: int) -> List[dict[str, Any]]:
     """Searches location records by name substring.
@@ -297,10 +305,12 @@ def search_locations(query: str, limit: int) -> List[dict[str, Any]]:
     search_term = query.lower().strip()
     if not search_term:
         return []
+    search_norm = strip_diacritics(search_term)
     entries, mapping = load_location_catalog()
     results: List[dict[str, Any]] = []
     for record in entries:
-        if search_term not in record.name.lower():
+        name_norm = strip_diacritics(record.name or '')
+        if search_norm not in name_norm:
             continue
         context = resolve_location_context(record, mapping)
         results.append(
@@ -313,6 +323,63 @@ def search_locations(query: str, limit: int) -> List[dict[str, Any]]:
         )
         if len(results) >= limit:
             break
+    return results
+
+def list_children(parent_token: str, level: Optional[int] = None, limit: int = 500) -> List[dict[str, Any]]:
+    """
+    Return child locations of `parent_token` (gid or name). If level is provided, filter by level.
+    """
+    entries, by_gid = load_location_catalog()
+    parent_token = (parent_token or "").strip()
+    if not parent_token:
+        return []
+
+    results: List[dict[str, Any]] = []
+
+    # 1) try treat parent_token as gid and return records whose gid starts with parent + '.'
+    if '.' in parent_token or parent_token.upper() in by_gid:
+        # If the token is exactly a gid key in by_gid, use its gid as parent
+        parent_gid = parent_token if parent_token in by_gid else None
+        if parent_gid is None:
+            # maybe uppercase region codes
+            if parent_token.upper() in by_gid:
+                parent_gid = parent_token.upper()
+        if parent_gid:
+            pre = f"{parent_gid}."
+            for rec in entries:
+                if level is not None and rec.level != level:
+                    continue
+                if str(rec.gid).startswith(pre):
+                    results.append({"gid": rec.gid, "name": rec.name, "level": rec.level, "hierarchy": resolve_location_context(rec, by_gid)})
+                    if len(results) >= limit:
+                        return results
+            # if found some, return
+            if results:
+                return results
+
+    # 2) fallback: match by name in hierarchy / parent_gid field
+    lower = parent_token.lower()
+    for rec in entries:
+        if level is not None and rec.level != level:
+            continue
+        # check if parent_gid equals a gid whose name matches
+        parent_gid = rec.parent_gid
+        if parent_gid and parent_gid in by_gid and by_gid[parent_gid].name.lower() == lower:
+            results.append({"gid": rec.gid, "name": rec.name, "level": rec.level, "hierarchy": resolve_location_context(rec, by_gid)})
+            if len(results) >= limit:
+                return results
+
+    # 3) super-fallback: check if parent_token appears in record.hierarchy names
+    if not results:
+        for rec in entries:
+            if level is not None and rec.level != level:
+                continue
+            ctx = resolve_location_context(rec, by_gid)
+            if any(p.lower() == lower for p in ctx):
+                results.append({"gid": rec.gid, "name": rec.name, "level": rec.level, "hierarchy": ctx})
+                if len(results) >= limit:
+                    return results
+
     return results
 
 def _region_origin(value: float) -> float:

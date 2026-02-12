@@ -8,12 +8,14 @@ rather than opening and closing COGs for each lookup request which has lots of o
 from __future__ import annotations
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 import tempfile
+import json
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import rasterio
+from rasterio.windows import Window
 import util.gis_lookup as gis_lookup
 import util.taxa_navigation as taxa_navigation
 from util.config import load_config
@@ -22,14 +24,31 @@ CONFIG = load_config("global")
 
 enrich_tree_row_limit = 10_000_000
 
+DEM_FILENAME = "dem.tif"
+DEM_REGION_ROOT = CONFIG.gis_regions_root
+DERIVED_DEM_LAYER_METRICS = {
+    "slope": "slope",
+    "aspect": "aspect",
+    "aspect_deg": "aspect_deg",
+}
+
 
 # We require these columns when writing
 
 
 def _load_layer_ids() -> List[str]:
-    ids = gis_lookup.list_layer_ids()
+    with open(CONFIG.gis_catalog_path, "r") as f:
+        catalog = json.load(f)
+    ids: List[str] = []
+    for category in catalog.get("categories", []):
+        if category.get("name") == "temporal":
+            continue
+        for layer in category.get("layers", []):
+            layer_id = layer.get("id")
+            if layer_id:
+                ids.append(str(layer_id))
     if not ids:
-        raise RuntimeError("No GIS layers defined in the catalog.")
+        raise RuntimeError("No non-temporal GIS layers defined in the catalog.")
     return ids
 
 # TODO: does this belong in a library? do we want a separate library for parquet manipulation?
@@ -57,6 +76,7 @@ def _missing_rows_for_taxon(taxon, layer_ids: List[str]) -> pa.Table | None:
     df = table.to_pandas()
     if df.empty:
         return None
+    _cleanup_stale_gis_columns(df, layer_ids, data_path)
     required_columns = list(CONFIG.occurrence_base_columns[:4])
     if any(column not in df.columns for column in required_columns):
         return None
@@ -88,6 +108,25 @@ def _missing_rows_for_taxon(taxon, layer_ids: List[str]) -> pa.Table | None:
             "dataPath": pa.array(subset["dataPath"].to_numpy(), type=pa.large_string()),
         }
     )
+
+def _cleanup_stale_gis_columns(df, layer_ids: List[str], data_path: Path) -> None:
+    if "gall" not in df.columns:
+        return
+    try:
+        gall_idx = list(df.columns).index("gall")
+    except ValueError:
+        return
+    allowed = set(layer_ids)
+    columns = list(df.columns)
+    drop_cols: list[str] = []
+    for col in columns[gall_idx + 1 :]:
+        if col not in allowed:
+            drop_cols.append(col)
+    if not drop_cols:
+        return
+    df.drop(columns=drop_cols, inplace=True)
+    updated = pa.Table.from_pandas(df, preserve_index=False)
+    _atomic_write(Path(data_path), updated)
 
 
 def _iter_worklist_batches(
@@ -132,10 +171,24 @@ def _sample_layer_values(
     layer_id: str,
     lats: np.ndarray,
     lons: np.ndarray,
+    tile_id: str,
 ) -> List[float | None]:
     '''Samples a list of lats and lons for a certain layer and returns the values in a list.'''
     if lats.size == 0:
         return []
+    layer_meta = gis_lookup.load_layer_metadata().get(layer_id)
+    if layer_meta is not None and "region_root" not in layer_meta:
+        return [None] * len(lats)
+    if layer_id == "elevation":
+        return _sample_dem_values(lats=lats, lons=lons, tile_id=tile_id)
+    derived_metric = DERIVED_DEM_LAYER_METRICS.get(layer_id)
+    if derived_metric is not None:
+        return _sample_dem_derived_values(
+            lats=lats,
+            lons=lons,
+            tile_id=tile_id,
+            metrics=(derived_metric,),
+        )[derived_metric]
     ref_lat = float(lats[0])
     ref_lon = float(lons[0])
     cog_path = gis_lookup.get_cog_path(layer_id, ref_lat, ref_lon)
@@ -153,6 +206,149 @@ def _sample_layer_values(
                 results.append(float(value))
     return results
 
+
+def _meters_per_degree(lat_deg: float) -> Tuple[float, float]:
+    lat_rad = np.deg2rad(lat_deg)
+    m_per_deg_lat = (
+        111132.92
+        - 559.82 * np.cos(2 * lat_rad)
+        + 1.175 * np.cos(4 * lat_rad)
+        - 0.0023 * np.cos(6 * lat_rad)
+    )
+    m_per_deg_lon = (
+        111412.84 * np.cos(lat_rad)
+        - 93.5 * np.cos(3 * lat_rad)
+        + 0.118 * np.cos(5 * lat_rad)
+    )
+    return float(m_per_deg_lat), float(m_per_deg_lon)
+
+
+def _compute_slope_aspect(
+    window: np.ndarray,
+    dx_m: float,
+    dy_m: float,
+) -> Tuple[float, float]:
+    z1, z2, z3 = window[0, 0], window[0, 1], window[0, 2]
+    z4, _, z6 = window[1, 0], window[1, 1], window[1, 2]
+    z7, z8, z9 = window[2, 0], window[2, 1], window[2, 2]
+
+    dzdx = ((z3 + 2 * z6 + z9) - (z1 + 2 * z4 + z7)) / (8.0 * dx_m)
+    dzdy = ((z7 + 2 * z8 + z9) - (z1 + 2 * z2 + z3)) / (8.0 * dy_m)
+
+    slope_rad = np.arctan(np.sqrt(dzdx * dzdx + dzdy * dzdy))
+    slope_deg = float(np.degrees(slope_rad))
+
+    if dzdx == 0 and dzdy == 0:
+        aspect_deg = 0.0
+    else:
+        aspect = np.degrees(np.arctan2(dzdy, -dzdx))
+        aspect_deg = float(90.0 - aspect)
+        if aspect_deg < 0:
+            aspect_deg += 360.0
+
+    return slope_deg, aspect_deg
+
+
+def _aspect_bin(aspect_deg: float) -> int:
+    # 8-bin compass rose. N centered at 0/360.
+    if aspect_deg < 0:
+        aspect_deg = (aspect_deg % 360.0)
+    aspect_deg = aspect_deg % 360.0
+    if aspect_deg < 22.5 or aspect_deg >= 337.5:
+        return 1  # N
+    if aspect_deg < 67.5:
+        return 2  # NE
+    if aspect_deg < 112.5:
+        return 3  # E
+    if aspect_deg < 157.5:
+        return 4  # SE
+    if aspect_deg < 202.5:
+        return 5  # S
+    if aspect_deg < 247.5:
+        return 6  # SW
+    if aspect_deg < 292.5:
+        return 7  # W
+    return 8  # NW
+
+
+def _sample_dem_derived_values(
+    *,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    tile_id: str,
+    metrics: Tuple[str, ...],
+) -> Dict[str, List[float | None]]:
+    results: Dict[str, List[float | None]] = {
+        metric: [None] * len(lats) for metric in metrics
+    }
+    dem_path = DEM_REGION_ROOT / tile_id / DEM_FILENAME
+    if not dem_path.exists():
+        return results
+
+    with rasterio.open(dem_path) as ds:
+        nodata = ds.nodata
+        pixel_width_deg = float(ds.transform.a)
+        pixel_height_deg = abs(float(ds.transform.e))
+        for idx, (lat, lon) in enumerate(zip(lats.tolist(), lons.tolist())):
+            row, col = ds.index(lon, lat)
+            window_size = 3
+            radius = window_size // 2
+            if (
+                row - radius < 0
+                or col - radius < 0
+                or row + radius >= ds.height
+                or col + radius >= ds.width
+            ):
+                continue
+            window = ds.read(
+                1,
+                window=Window(col - radius, row - radius, window_size, window_size),
+                boundless=False,
+            )
+            if window.shape != (window_size, window_size):
+                continue
+            if nodata is not None and np.any(window == nodata):
+                continue
+            if np.any(np.isnan(window)):
+                continue
+            m_per_deg_lat, m_per_deg_lon = _meters_per_degree(lat)
+            dx_m = pixel_width_deg * m_per_deg_lon
+            dy_m = pixel_height_deg * m_per_deg_lat
+            if dx_m == 0 or dy_m == 0:
+                continue
+            center = window_size // 2
+            local3 = window[center - 1 : center + 2, center - 1 : center + 2]
+            slope_deg, aspect_deg = _compute_slope_aspect(local3, dx_m, dy_m)
+            for metric in metrics:
+                if metric == "slope":
+                    results[metric][idx] = slope_deg
+                elif metric == "aspect":
+                    results[metric][idx] = float(_aspect_bin(aspect_deg))
+                elif metric == "aspect_deg":
+                    results[metric][idx] = aspect_deg
+    return results
+
+
+def _sample_dem_values(
+    *,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    tile_id: str,
+) -> List[float | None]:
+    results: List[float | None] = [None] * len(lats)
+    dem_path = DEM_REGION_ROOT / tile_id / DEM_FILENAME
+    if not dem_path.exists():
+        return results
+    coords = list(zip(lons.tolist(), lats.tolist()))
+    with rasterio.open(dem_path) as ds:
+        nodata = ds.nodata
+        sampler = ds.sample(coords)
+        for idx, point in enumerate(sampler):
+            value = point[0]
+            if nodata is not None and value == nodata:
+                continue
+            results[idx] = float(value)
+    return results
 
 def _flush_taxon_updates(
     taxon_key: str,
@@ -239,13 +435,49 @@ def _process_tiles(worklist: pa.Table) -> None:
                 continue
             for layer_id in missing_layers:
                 layer_rows[layer_id].append(row_idx)
+        derived_layers = {
+            layer_id: DERIVED_DEM_LAYER_METRICS.get(layer_id)
+            for layer_id in layer_rows.keys()
+            if DERIVED_DEM_LAYER_METRICS.get(layer_id) is not None
+        }
+        if derived_layers:
+            union_indices = sorted(
+                {idx for rows in layer_rows.values() for idx in rows}
+            )
+            union_lats = lats[np.array(union_indices, dtype=int)]
+            union_lons = lons[np.array(union_indices, dtype=int)]
+            metrics = tuple(sorted(set(derived_layers.values())))
+            derived_values = _sample_dem_derived_values(
+                lats=union_lats,
+                lons=union_lons,
+                tile_id=tile_id,
+                metrics=metrics,
+            )
+            for layer_id, metric in derived_layers.items():
+                row_indices = layer_rows[layer_id]
+                if not row_indices:
+                    continue
+                index_map = {idx: pos for pos, idx in enumerate(union_indices)}
+                for row_idx in row_indices:
+                    pos = index_map.get(row_idx)
+                    if pos is None:
+                        continue
+                    value = derived_values[metric][pos]
+                    if value is None:
+                        continue
+                    taxon_key = taxa[row_idx]
+                    catalog = catalogs[row_idx]
+                    pending[taxon_key][layer_id].append((catalog, value))
+
         for layer_id, row_indices in layer_rows.items():
+            if layer_id in derived_layers:
+                continue
             if not row_indices:
                 continue
             row_indices_arr = np.array(row_indices, dtype=int)
             layer_lats = lats[row_indices_arr]
             layer_lons = lons[row_indices_arr]
-            values = _sample_layer_values(layer_id, layer_lats, layer_lons)
+            values = _sample_layer_values(layer_id, layer_lats, layer_lons, tile_id)
             for offset, value in zip(row_indices_arr, values):
                 if value is None:
                     continue

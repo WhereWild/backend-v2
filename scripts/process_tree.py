@@ -16,9 +16,12 @@ from typing import Callable, Iterable
 import time
 
 import util.indexing as indexing
+import util.gis_lookup as gis_lookup
 import util.summary_stats as summary_stats
 import util.taxa_navigation as taxa_navigation
 from util.config import load_config
+import pyarrow.parquet as pq
+import pandas as pd
 
 
 CONFIG = load_config("global")
@@ -33,6 +36,86 @@ pending_task_multiplier = 4
 stats_workers = 4
 
 memory_high_watermark = 0.8
+
+skip_existing_indexes = True
+
+skip_existing_stats = True
+
+_layer_catalog = gis_lookup.load_layer_metadata()
+_layer_ids = set(_layer_catalog.keys())
+_categorical_layer_ids = {
+    layer_id
+    for layer_id, layer in _layer_catalog.items()
+    if (layer.get("value_type") or "").lower() == "categorical"
+}
+
+
+def _schema_layer_ids(schema) -> set[str]:
+    return {name for name in schema.names if name in _layer_ids}
+
+
+def _index_is_current(node_path: Path) -> bool:
+    index_path = node_path / "occurrence_index.parquet"
+    if not index_path.exists():
+        return False
+    data_path = node_path / CONFIG.occurrence_parquet_filename
+    if not data_path.exists():
+        return True
+    try:
+        data_schema = pq.read_schema(data_path)
+    except Exception:
+        return True
+    expected_layers = _schema_layer_ids(data_schema)
+    if not expected_layers:
+        return True
+    try:
+        index_schema = pq.read_schema(index_path)
+    except Exception:
+        return False
+    return expected_layers.issubset(set(index_schema.names))
+
+
+def _stats_are_current(node_path: Path) -> bool:
+    stats_path = node_path / "summary_stats.parquet"
+    if not stats_path.exists():
+        return False
+    data_path = node_path / CONFIG.occurrence_parquet_filename
+    if not data_path.exists():
+        return True
+    try:
+        data_schema = pq.read_schema(data_path)
+    except Exception:
+        return True
+    expected_layers = _schema_layer_ids(data_schema)
+    expected_categorical = expected_layers & _categorical_layer_ids
+    expected_numeric = expected_layers - expected_categorical
+
+    existing_numeric: set[str] = set()
+    try:
+        frame = pd.read_parquet(stats_path, columns=["variable"])
+        if not frame.empty:
+            existing_numeric = set(frame["variable"].dropna().astype(str).tolist())
+    except Exception:
+        return False
+    if not expected_numeric.issubset(existing_numeric):
+        return False
+
+    existing_categorical: set[str] = set()
+    cat_path = node_path / "categorical_stats.parquet"
+    if expected_categorical:
+        if not cat_path.exists():
+            return False
+        try:
+            cat_frame = pd.read_parquet(cat_path, columns=["variable"])
+            if not cat_frame.empty:
+                existing_categorical = set(
+                    cat_frame["variable"].dropna().astype(str).tolist()
+                )
+        except Exception:
+            return False
+        if not expected_categorical.issubset(existing_categorical):
+            return False
+    return True
 
 def _memory_usage_ratio() -> float:
     """Returns memory usage ratio based on /proc/meminfo when available."""
@@ -111,6 +194,9 @@ def _build_index_for_node(node: taxa_navigation.TaxonRecord) -> None:
         return
 
     path = Path(node["path"])
+    if skip_existing_indexes and _index_is_current(path):
+        print(f"skip indexing {str(path).split('/')[-1]} (already built)")
+        return
     try:
         indexing.build_index_parquet(path)
         print(f"indexed {str(path).split("/")[-1]}")
@@ -120,6 +206,9 @@ def _build_index_for_node(node: taxa_navigation.TaxonRecord) -> None:
 
 def _compute_stats_for_node(node: taxa_navigation.TaxonRecord) -> None:
     taxon_path = Path(node["path"])
+    if skip_existing_stats and _stats_are_current(taxon_path):
+        print(f"skip stats {str(taxon_path).split('/')[-1]} (already built)")
+        return
     canonical_rank = taxa_navigation.canonical_rank(node["rank"] or "")
     streaming = canonical_rank not in CONFIG.leaf_rank_set
     with summary_stats.stats_context(taxon_path):

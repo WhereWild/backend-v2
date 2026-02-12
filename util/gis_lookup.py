@@ -582,6 +582,8 @@ def get_cog_path(layer_id: str, latitude: float, longitude: float) -> Optional[P
     if layer is None:
         return None
 
+    if "region_root" not in layer:
+        raise KeyError(f"Layer {layer_id} missing region_root in catalog.")
     region_root = layer["region_root"]
     filename = layer["filename_template"].format(id=layer_id)
 

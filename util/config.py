@@ -67,7 +67,7 @@ class GlobalConfig:
     project_root: Path = field(default_factory=_project_root)
 
     # Pipeline tuning
-    root_taxon_id: str = "1"
+    root_taxon_id: str = "6"
     process_tree_ranks_only: bool = False
     do_write_dirs: bool = False
 
@@ -135,6 +135,93 @@ class GlobalConfig:
 
     # Temporal weather enrichment
     temporal_cache_dirname: str = "temporal_cache"
+    temporal_models_by_variable: dict[str, tuple[str, ...]] = field(
+        default_factory=lambda: {
+            "cloud_cover": ("copernicus_era5", "copernicus_era5_ensemble"),
+            "dew_point_2m": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "precipitation": ("copernicus_era5", "copernicus_era5_ensemble"),
+            "snow_depth": ("copernicus_era5_land",),
+            "snowfall_water_equivalent": ("copernicus_era5", "copernicus_era5_ensemble"),
+            "soil_moisture_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "soil_moisture_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "soil_temperature_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "soil_temperature_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "temperature_2m": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "vapor_pressure_deficit": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+            "weather_code_simple": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
+        }
+    )
+    temporal_model_preference: tuple[str, ...] = (
+        "copernicus_era5_land",
+        "copernicus_era5",
+        "copernicus_era5_ensemble",
+    )
+    temporal_window_hours_default: tuple[int, ...] = (1, 8, 24, 72, 168, 720, 2160)
+    temporal_window_hours_by_variable: dict[str, tuple[int, ...]] = field(
+        default_factory=lambda: {
+            "cloud_cover": (1, 8, 24, 72, 168, 720, 2160),
+            "dew_point_2m": (1, 8, 24, 72, 168, 720, 2160),
+            "precipitation": (1, 8, 24, 72, 168, 720, 2160),
+            "snowfall_water_equivalent": (1, 8, 24, 72, 168, 720, 2160),
+            "soil_moisture_0_to_7cm": (1, 8, 24, 72, 168, 720, 2160),
+            "soil_moisture_7_to_28cm": (1, 8, 24, 72, 168, 720, 2160),
+            "soil_temperature_0_to_7cm": (1, 8, 24, 72, 168, 720, 2160),
+            "soil_temperature_7_to_28cm": (1, 8, 24, 72, 168, 720, 2160),
+            "temperature_2m": (1, 8, 24, 72, 168, 720, 2160),
+            # Snapshots
+            "snow_depth": (1,),
+            "weather_code_simple": (1,),
+        }
+    )
+    # Columns that may contain target elevation in occurrence parquets (first found is used).
+    temporal_elevation_columns: tuple[str, ...] = (
+        "elevation",
+        "elevationMeters",
+        "elevation_m",
+        "elevation_meters",
+        "dem_elevation",
+        "dem_elevation_m",
+    )
+    # Variables eligible for elevation lapse-rate correction.
+    temporal_elevation_correctable_vars: tuple[str, ...] = (
+        "temperature_2m",
+        "dew_point_2m",
+        "soil_temperature_0_to_7cm",
+        "soil_temperature_7_to_28cm",
+    )
+    temporal_agg_by_variable: dict[str, str] = field(
+        default_factory=lambda: {
+            "precipitation": "sum",
+            "snowfall_water_equivalent": "sum",
+            # Everything else is averaged
+            "cloud_cover": "avg",
+            "dew_point_2m": "avg",
+            "snow_depth": "avg",
+            "soil_moisture_0_to_7cm": "avg",
+            "soil_moisture_7_to_28cm": "avg",
+            "soil_temperature_0_to_7cm": "avg",
+            "soil_temperature_7_to_28cm": "avg",
+            "temperature_2m": "avg",
+        }
+    )
+    # Override grid mode per model for temporal OM files.
+    # Valid modes: lat_asc_lon_pm180, lat_asc_lon_360, lat_desc_lon_pm180, lat_desc_lon_360
+    temporal_grid_mode_by_model: dict[str, str] = field(
+        default_factory=lambda: {
+            "copernicus_era5": "lat_asc_lon_pm180",
+            "copernicus_era5_land": "lat_asc_lon_pm180",
+            "copernicus_era5_ensemble": "lat_asc_lon_pm180",
+        }
+    )
+    # Cap the number of occurrence rows per worklist batch to bound memory.
+    # Set to 0 to disable batching (process all rows at once).
+    temporal_worklist_batch_rows: int = 1_500_000
+    # Log a one-time model elevation summary per model to validate HSURF access.
+    temporal_debug_model_elevation: bool = True
+    # Include RSS memory in progress logs.
+    temporal_log_memory: bool = False
+    # If set to None, overwrite all temporal columns every run.
+    temporal_overwrite_columns: tuple[str, ...] | None = ()
     inat_mapping_offline_filename: str = "inat_gbif_mapping.csv"
     inat_mapping_api_filename: str = "inat_gbif_mapping_api.csv"
     inat_mapping_obs_filename: str = "inat_gbif_mapping_obs.csv"

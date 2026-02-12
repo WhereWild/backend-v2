@@ -75,12 +75,81 @@ def load_layer_metadata() -> Dict[str, Dict[str, Any]]:
     catalog = _load_gis_catalog()
     layers: Dict[str, Dict[str, Any]] = {}
     for category in catalog.get("categories", []):
+        if category.get("name") == "temporal":
+            for layer in _expand_temporal_layers(category):
+                layer_id = layer.get("id")
+                if not layer_id:
+                    continue
+                layers[str(layer_id)] = layer
+            continue
         for layer in category.get("layers", []):
             layer_id = layer.get("id")
             if not layer_id:
                 continue
             layers[str(layer_id)] = layer
     return layers
+
+
+@lru_cache(maxsize=1)
+def load_temporal_registry() -> dict[str, Any]:
+    """Load temporal registry from the GIS catalog.
+
+    Returns a dict with keys:
+      - windows: default windows list
+      - layers: list of base temporal layer dicts (id, agg, windows override, etc.)
+    """
+    catalog = _load_gis_catalog()
+    for category in catalog.get("categories", []):
+        if category.get("name") == "temporal":
+            return {
+                "windows": category.get("windows", []),
+                "layers": category.get("layers", []),
+            }
+    return {"windows": [], "layers": []}
+
+
+def _expand_temporal_layers(category: dict[str, Any]) -> list[dict[str, Any]]:
+    windows = category.get("windows", []) or []
+    base_layers = category.get("layers", []) or []
+    expanded: list[dict[str, Any]] = []
+    for layer in base_layers:
+        base_id = layer.get("id")
+        if not base_id:
+            continue
+        agg = layer.get("agg") or "avg"
+        layer_windows = layer.get("windows") or windows
+        display_name = layer.get("display_name") or base_id
+        units = layer.get("units")
+        value_type = layer.get("value_type") or "numeric"
+        code = layer.get("code") or str(base_id).upper()
+        if agg == "snapshot":
+            expanded.append(
+                {
+                    "id": base_id,
+                    "code": code,
+                    "display_name": display_name,
+                    "units": units,
+                    "value_type": value_type,
+                    "region_root": "regions",
+                    "region_size": 10,
+                    "filename_template": "{id}.tif",
+                }
+            )
+            continue
+        for hours in layer_windows:
+            expanded.append(
+                {
+                    "id": f"{base_id}_{agg}_{hours}h",
+                    "code": f"{code}_{agg.upper()}_{hours}H",
+                    "display_name": f"{display_name} ({agg.capitalize()}, {hours}h)",
+                    "units": units,
+                    "value_type": value_type,
+                    "region_root": "regions",
+                    "region_size": 10,
+                    "filename_template": "{id}.tif",
+                }
+            )
+    return expanded
 
 
 @lru_cache(maxsize=1)
@@ -99,6 +168,22 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
     mapping: dict[str, dict[str, Any]] = {}
     for category in catalog.get("categories", []):
         category_name = category.get("display_name") or category.get("name")
+        if category.get("name") == "temporal":
+            for layer in _expand_temporal_layers(category):
+                layer_id = layer.get("id")
+                if not layer_id:
+                    continue
+                entry = {
+                    "id": layer_id,
+                    "name": layer.get("display_name") or layer.get("name") or layer_id,
+                    "units": layer.get("units"),
+                    "description": layer.get("description"),
+                    "value_type": layer.get("value_type"),
+                    "category": category_name,
+                }
+                entries.append(entry)
+                mapping[layer_id] = entry
+            continue
         for layer in category.get("layers", []):
             layer_id = layer.get("id")
             if not layer_id:
@@ -468,11 +553,19 @@ def list_layer_ids() -> List[str]:
         A list of layer ids in catalog order.
     """
     catalog = _load_gis_catalog()
-    return [
-        layer["id"]
-        for category in catalog["categories"]
-        for layer in category["layers"]
-    ]
+    ids: list[str] = []
+    for category in catalog.get("categories", []):
+        if category.get("name") == "temporal":
+            for layer in _expand_temporal_layers(category):
+                layer_id = layer.get("id")
+                if layer_id:
+                    ids.append(str(layer_id))
+            continue
+        for layer in category.get("layers", []):
+            layer_id = layer.get("id")
+            if layer_id:
+                ids.append(str(layer_id))
+    return ids
 
 def get_cog_path(layer_id: str, latitude: float, longitude: float) -> Optional[Path]:
     """Gets the path to the COG of a given layer at a given coordinate.

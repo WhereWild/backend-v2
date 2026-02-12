@@ -526,6 +526,10 @@ pd() {
   python -m "$module" "$@"
 }
 
+pt() {
+  pytest -q "$@"
+}
+
 pdb() {
   local module="$1"
   shift

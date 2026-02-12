@@ -10,6 +10,7 @@ RUN apt-get update \
     python3-venv \
     python3-dev \
     build-essential \
+        bash-completion \
     fuse \
     psmisc \
     rclone \
@@ -25,7 +26,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY . /app
 
 COPY docker/aliases.sh /etc/wherewild_aliases.sh
-RUN echo '\n# WhereWild dev aliases\n[ -f /etc/wherewild_aliases.sh ] && . /etc/wherewild_aliases.sh' >> /etc/bash.bashrc
+RUN echo '\n# WhereWild dev aliases\n[ -f /etc/wherewild_aliases.sh ] && . /etc/wherewild_aliases.sh' >> /etc/bash.bashrc \
+    && echo '\n# Enable bash completion\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr/share/bash-completion/bash_completion\nfi' >> /etc/bash.bashrc
 
 COPY docker/entrypoint.sh /usr/local/bin/wherewild-entrypoint
 RUN chmod +x /usr/local/bin/wherewild-entrypoint

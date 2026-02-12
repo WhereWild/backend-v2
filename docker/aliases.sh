@@ -106,7 +106,7 @@ b2-pull-all() {
   local remote="${WW_B2_READER_REMOTE:-wherewild-localdev-reader}"
   local bucket="${WW_B2_BUCKET:-wherewild-data}"
   local prefix="${WW_B2_PREFIX:-data}"
-  local data_root="${WW_DATA_ROOT:-/workspace/data}"
+  local data_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
   local transfers="${WW_RCLONE_TRANSFERS:-16}"
   local checkers="${WW_RCLONE_CHECKERS:-32}"
   local mt_streams="${WW_RCLONE_MULTI_THREAD_STREAMS:-4}"
@@ -156,7 +156,7 @@ b2-push-all() {
   local remote="${WW_B2_WRITER_REMOTE:-wherewild-localdev-writer}"
   local bucket="${WW_B2_BUCKET:-wherewild-data}"
   local prefix="${WW_B2_PREFIX:-data}"
-  local data_root="${WW_DATA_ROOT:-/workspace/data}"
+  local data_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
   local transfers="${WW_RCLONE_TRANSFERS:-16}"
   local stats_interval="${WW_RCLONE_STATS_INTERVAL:-1m}"
   local log_dir="/workspace/logs/rclone"
@@ -221,7 +221,7 @@ b2-overwrite-remote() {
   local remote="${WW_B2_WRITER_REMOTE:-wherewild-localdev-writer}"
   local bucket="${WW_B2_BUCKET:-wherewild-data}"
   local prefix="${WW_B2_PREFIX:-data}"
-  local data_root="${WW_DATA_ROOT:-/workspace/data}"
+  local data_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
   local transfers="${WW_RCLONE_TRANSFERS:-16}"
   local stats_interval="${WW_RCLONE_STATS_INTERVAL:-1m}"
   local log_dir="/workspace/logs/rclone"
@@ -366,7 +366,7 @@ EOF
 ww_data_root() {
   local mode="${1:-}"
   local mount_point="${WW_B2_MOUNT:-/workspace/.b2-mount}"
-  local local_root="${WW_DATA_ROOT:-/workspace/data}"
+  local local_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
 
   if [[ "$mode" == "--local" ]]; then
     echo "$local_root"
@@ -389,7 +389,7 @@ b2-pull() {
   local remote="${WW_B2_READER_REMOTE:-wherewild-localdev-reader}"
   local bucket="${WW_B2_BUCKET:-wherewild-data}"
   local prefix="${WW_B2_PREFIX:-data}"
-  local local_root="${WW_DATA_ROOT:-/workspace/data}"
+  local local_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
   local get_root="${WW_B2_GET_ROOT:-/workspace/data}"
   local force=0
   local dry_run=0
@@ -446,7 +446,7 @@ b2-push() {
   local remote="${WW_B2_WRITER_REMOTE:-wherewild-localdev-writer}"
   local bucket="${WW_B2_BUCKET:-wherewild-data}"
   local prefix="${WW_B2_PREFIX:-data}"
-  local local_root="${WW_DATA_ROOT:-/workspace/data}"
+  local local_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
   local force=0
   local dry_run=0
   local local_path=""

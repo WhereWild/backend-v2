@@ -1,0 +1,156 @@
+{
+  "layer_id": "landcover",
+  "source": "GLC_FCS30 2020",
+  "classes": [
+    {
+      "id": 10,
+      "name": "Rainfed cropland",
+      "description": "Cropland under rainfed agricultural management."
+    },
+    {
+      "id": 11,
+      "name": "Herbaceous cover cropland",
+      "description": "Rainfed cropland dominated by herbaceous cover."
+    },
+    {
+      "id": 12,
+      "name": "Tree or shrub cover cropland (orchard)",
+      "description": "Orchards and croplands dominated by tree or shrub cover."
+    },
+    {
+      "id": 20,
+      "name": "Irrigated cropland",
+      "description": "Cropland supported primarily by irrigation."
+    },
+    {
+      "id": 51,
+      "name": "Open evergreen broadleaved forest",
+      "description": "Evergreen broadleaved forest with relatively open canopy."
+    },
+    {
+      "id": 52,
+      "name": "Closed evergreen broadleaved forest",
+      "description": "Evergreen broadleaved forest with closed canopy."
+    },
+    {
+      "id": 61,
+      "name": "Open deciduous broadleaved forest",
+      "description": "Deciduous broadleaved forest with fractional cover between 0.15 and 0.4."
+    },
+    {
+      "id": 62,
+      "name": "Closed deciduous broadleaved forest",
+      "description": "Deciduous broadleaved forest with fractional cover above 0.4."
+    },
+    {
+      "id": 71,
+      "name": "Open evergreen needle-leaved forest",
+      "description": "Evergreen needle-leaved forest with fractional cover between 0.15 and 0.4."
+    },
+    {
+      "id": 72,
+      "name": "Closed evergreen needle-leaved forest",
+      "description": "Evergreen needle-leaved forest with fractional cover above 0.4."
+    },
+    {
+      "id": 81,
+      "name": "Open deciduous needle-leaved forest",
+      "description": "Deciduous needle-leaved forest with fractional cover between 0.15 and 0.4."
+    },
+    {
+      "id": 82,
+      "name": "Closed deciduous needle-leaved forest",
+      "description": "Deciduous needle-leaved forest with fractional cover above 0.4."
+    },
+    {
+      "id": 91,
+      "name": "Open mixed leaf forest",
+      "description": "Mixed broadleaved and needle-leaved forest with open canopy."
+    },
+    {
+      "id": 92,
+      "name": "Closed mixed leaf forest",
+      "description": "Mixed broadleaved and needle-leaved forest with closed canopy."
+    },
+    {
+      "id": 120,
+      "name": "Shrubland",
+      "description": "Shrub-dominated vegetation."
+    },
+    {
+      "id": 121,
+      "name": "Evergreen shrubland",
+      "description": "Shrubland dominated by evergreen species."
+    },
+    {
+      "id": 122,
+      "name": "Deciduous shrubland",
+      "description": "Shrubland dominated by deciduous species."
+    },
+    {
+      "id": 130,
+      "name": "Grassland",
+      "description": "Areas dominated by grasses and herbaceous plants."
+    },
+    {
+      "id": 140,
+      "name": "Lichens and mosses",
+      "description": "Areas dominated by lichen and moss cover."
+    },
+    {
+      "id": 150,
+      "name": "Sparse vegetation",
+      "description": "Vegetation with fractional cover less than 0.15."
+    },
+    {
+      "id": 152,
+      "name": "Sparse shrubland",
+      "description": "Shrubland with fractional cover less than 0.15."
+    },
+    {
+      "id": 153,
+      "name": "Sparse herbaceous",
+      "description": "Herbaceous vegetation with fractional cover less than 0.15."
+    },
+    {
+      "id": 180,
+      "name": "Wetlands",
+      "description": "Marshes, swamps, peatlands, or other wetlands."
+    },
+    {
+      "id": 190,
+      "name": "Impervious surfaces",
+      "description": "Built-up or impervious urban surfaces."
+    },
+    {
+      "id": 200,
+      "name": "Bare areas",
+      "description": "General bare ground with minimal vegetation."
+    },
+    {
+      "id": 201,
+      "name": "Consolidated bare areas",
+      "description": "Bare areas with consolidated surfaces such as rock or pavement."
+    },
+    {
+      "id": 202,
+      "name": "Unconsolidated bare areas",
+      "description": "Bare areas composed of unconsolidated materials like sand."
+    },
+    {
+      "id": 210,
+      "name": "Water body",
+      "description": "Lakes, reservoirs, rivers, or other surface water."
+    },
+    {
+      "id": 220,
+      "name": "Permanent ice and snow",
+      "description": "Glaciers or perennial snow and ice."
+    },
+    {
+      "id": 250,
+      "name": "Filled value",
+      "description": "Landcover data not present."
+    }
+  ]
+}

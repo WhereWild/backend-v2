@@ -662,6 +662,17 @@ def _format_category_label(metric: str) -> str:
     return cleaned.title() if cleaned else metric
 
 
+def _legend_key(value: object) -> str:
+    """Normalize legend lookup keys so numeric codes match string ids."""
+    if isinstance(value, (int,)):
+        return str(value)
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return str(int(value))
+        return str(value)
+    return str(value).strip()
+
+
 def load_categorical_distribution(
     data_dir: Path,
     variable_id: str,
@@ -797,8 +808,9 @@ def build_categorical_stats_for_location(
     distribution: list[dict[str, Any]] = []
     for key, count in counts.items():
         normalized_value = value_lookup.get(key, key)
-        entry = legend_lookup.get(str(normalized_value)) or legend_lookup.get(
-            re.sub(r"[^a-z0-9]+", " ", str(normalized_value).lower()).strip()
+        normalized_key = _legend_key(normalized_value)
+        entry = legend_lookup.get(normalized_key) or legend_lookup.get(
+            re.sub(r"[^a-z0-9]+", " ", normalized_key.lower()).strip()
         )
         value_field = entry["id"] if entry and "id" in entry else normalized_value
         class_name = entry["name"] if entry else str(normalized_value)

@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from collections import Counter
 
 from util.config import load_config
 from util import gis_lookup, indexing, summary_stats, taxa_navigation, units
@@ -167,6 +168,290 @@ def species_occurrences(
         "occurrences": rows,
     }
 
+@app.get("/species/{taxon_id}/locations")
+def species_locations(
+    taxon_id: int,
+    level: Optional[str] = Query(None, description="continent|country|state|county"),
+    parent: Optional[str] = Query(None, description="Parent location GID (optional)"),
+    limit: int = Query(500, ge=1, le=5000),
+) -> List[dict[str, Any]]:
+    """
+    Returns location GIDs for a species based on occurrence data.
+    """
+    print(f"[DEBUG] species_locations called with taxon_id={taxon_id}, level={level}")
+    
+    try:
+        taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+        print(f"[DEBUG] Taxon retrieved: {taxon}")
+    except Exception as e:
+        print(f"[ERROR] Failed to get taxon: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get taxon: {str(e)}")
+    
+    if taxon is None:
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    
+    taxon_dir = Path(taxon["path"])
+    if not taxon_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+
+    # Load all occurrence points - match the working occurrences endpoint
+    print(f"[DEBUG] Loading occurrence points for taxon_id={taxon_id}")
+    try:
+        rows = taxa_navigation.load_occurrence_points(
+            taxon_id,  # Try with int first
+            None,      # location parameter
+        )
+        print(f"[DEBUG] Loaded {len(rows) if rows else 0} occurrence rows")
+    except Exception as e:
+        print(f"[ERROR] Failed to load occurrences with int, trying string: {e}")
+        try:
+            # Try with string version like the working endpoint does
+            rows = taxa_navigation.load_occurrence_points(
+                str(taxon_id),
+                None,
+            )
+            print(f"[DEBUG] Loaded {len(rows) if rows else 0} occurrence rows with string")
+        except Exception as e2:
+            print(f"[ERROR] Failed to load occurrences: {e2}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to load occurrences: {str(e2)}"
+            )
+    
+    if not rows:
+        print("[DEBUG] No occurrence rows found, returning empty list")
+        return []
+
+    # Rest of the function stays the same...
+    gid_candidate_fields = [
+        "location_gid", "loc_gid", "location", "gid", "gadm_gid",
+        "admin_gid", "country_gid", "country", "admin0_gid", 
+        "admin1_gid", "admin2_gid",
+    ]
+
+    gids: list[str] = []
+    for r in rows:
+        found = None
+        for key in gid_candidate_fields:
+            if key in r and r.get(key):
+                found = r.get(key)
+                break
+        if found:
+            try:
+                gids.append(str(found))
+            except Exception:
+                continue
+
+    print(f"[DEBUG] Found {len(gids)} location gids")
+    
+    if not gids:
+        return []
+
+    counts = Counter(gids)
+    results: list[dict[str, Any]] = []
+    processed_gids = set()
+    
+    for gid, cnt in counts.most_common(limit * 3):
+        if gid in processed_gids:
+            continue
+        processed_gids.add(gid)
+        
+        loc_info = None
+        try:
+            if hasattr(gis_lookup, "get_location_by_gid"):
+                loc_info = gis_lookup.get_location_by_gid(gid)
+            elif hasattr(gis_lookup, "search_locations"):
+                matches = gis_lookup.search_locations(gid, 1)
+                if matches:
+                    loc_info = matches[0]
+        except Exception:
+            pass
+        
+        if not loc_info:
+            continue
+        
+        loc_level = loc_info.get("level", -999)
+        
+        if level:
+            level_map = {
+                "continent": -1,
+                "country": 0,
+                "state": 1,
+                "county": 2,
+            }
+            expected_level = level_map.get(level.lower())
+            if expected_level is not None and loc_level != expected_level:
+                continue
+        
+        results.append({
+            "gid": gid,
+            "name": loc_info.get("name") or str(gid),
+            "level": loc_level,
+            "hierarchy": loc_info.get("hierarchy") or [],
+            "count": int(cnt),
+        })
+        
+        if len(results) >= limit:
+            break
+
+    print(f"[DEBUG] Returning {len(results)} location results")
+    return results
+
+@app.get("/locations/search_hierarchy")
+def search_locations_by_hierarchy(
+    q: str = Query("", description="Location name or partial match (optional if parent provided)"),
+    level: Optional[str] = Query(None, description="continent|country|state|county or numeric level code"),
+    parent: Optional[str] = Query(None, description="Parent name or gid. For counties pass 'United States|Utah' or a gid."),
+    limit: int = Query(50, ge=1, le=1000),
+) -> dict[str, Any]:
+
+    q = (q or "").strip()
+
+    level_map = {"continent": -1, "country": 0, "state": 1, "county": 2}
+
+    expected_level = None
+    if level is not None:
+        try:
+            expected_level = int(level)
+        except Exception:
+            expected_level = level_map.get(level.lower())
+
+    parents_raw = (parent or "").strip()
+    parent_tokens = [p.strip() for p in parents_raw.split("|") if p.strip()]
+
+    resolved_parent_names: list[str] = []
+    resolved_parent_gids: list[str] = []
+    for tok in parent_tokens:
+        resolved_name = tok
+        resolved_gid = tok
+        try:
+            if hasattr(gis_lookup, "get_location_by_gid"):
+                maybe = gis_lookup.get_location_by_gid(tok)
+                if maybe:
+                    resolved_name = maybe.get("name", tok)
+                    resolved_gid = maybe.get("gid", tok)
+        except Exception:
+            pass
+        resolved_parent_names.append(str(resolved_name).lower())
+        resolved_parent_gids.append(str(resolved_gid).lower())
+
+    if not q and not parent_tokens and expected_level is None:
+        return {"results": []}
+
+    candidates: list[dict[str, Any]] = []
+    seen_gids = set()
+
+    def matches_parent(cand: dict[str, Any]) -> bool:
+        # if no parent requested, everything matches
+        if not resolved_parent_names:
+            return True
+        cand_hierarchy = [str(x).lower() for x in (cand.get("hierarchy") or []) if x is not None]
+        cand_name = str(cand.get("name") or "").lower()
+        cand_gid = str(cand.get("gid") or "").lower()
+        for pname, pgid in zip(resolved_parent_names, resolved_parent_gids):
+            if pname in cand_hierarchy or pname == cand_name or pgid == cand_gid or pgid in cand_hierarchy:
+                continue
+            return False
+        return True
+
+    def push_candidate_if_valid(cand: dict[str, Any]):
+        gid = str(cand.get("gid") or "")
+        if not gid or gid in seen_gids:
+            return
+        # enforce parent matching here (critical fix)
+        if not matches_parent(cand):
+            return
+        seen_gids.add(gid)
+        candidates.append(cand)
+
+    try:
+        if q:
+            raw = gis_lookup.search_locations(q, limit)
+            for cand in raw:
+                push_candidate_if_valid(cand)
+
+        else:
+            # 1) catalog-based enumeration (fast)
+            if expected_level is not None and hasattr(gis_lookup, "load_location_catalog"):
+                try:
+                    entries, mapping = gis_lookup.load_location_catalog()
+                    for rec in entries:
+                        if getattr(rec, "level", None) != expected_level:
+                            continue
+
+                        # build hierarchy names
+                        hierarchy = []
+                        parent_gid = getattr(rec, "parent_gid", None)
+                        while parent_gid:
+                            parent_rec = mapping.get(parent_gid)
+                            if not parent_rec:
+                                break
+                            hierarchy.append(parent_rec.name)
+                            parent_gid = parent_rec.parent_gid
+
+                        cand = {
+                            "gid": rec.gid,
+                            "name": rec.name,
+                            "level": rec.level,
+                            "hierarchy": list(reversed(hierarchy)),
+                        }
+                        push_candidate_if_valid(cand)
+                        if len(candidates) >= limit:
+                            break
+                except Exception:
+                    pass
+
+            # 2) list_children if available
+            if not candidates and hasattr(gis_lookup, "list_children"):
+                for parent_tok in parent_tokens or []:
+                    try:
+                        parent_gid = None
+                        if hasattr(gis_lookup, "get_location_by_gid"):
+                            maybe = gis_lookup.get_location_by_gid(parent_tok)
+                            if maybe:
+                                parent_gid = maybe.get("gid")
+                        raw = gis_lookup.list_children(parent_gid or parent_tok, level=expected_level, limit=limit * 3)
+                        for cand in raw:
+                            push_candidate_if_valid(cand)
+                        if len(candidates) >= limit:
+                            break
+                    except Exception:
+                        continue
+
+            # 3) letter-scan fallback — keep scanning letters until we have enough valid matches
+            if not candidates:
+                letters = "abcdefghijklmnopqrstuvwxyz"
+                per_letter_limit = max(50, min(200, limit))
+                for ch in letters:
+                    if len(candidates) >= limit:
+                        break
+                    try:
+                        partial = gis_lookup.search_locations(ch, per_letter_limit)
+                    except Exception:
+                        continue
+                    for cand in partial:
+                        push_candidate_if_valid(cand)
+                        if len(candidates) >= limit:
+                            break
+
+    except Exception:
+        return {"results": []}
+
+    # final strict filter by level (redundant but safe)
+    results: list[dict[str, Any]] = []
+    for cand in candidates:
+        if expected_level is not None and cand.get("level") != expected_level:
+            continue
+        results.append({
+            "gid": str(cand.get("gid") or ""),
+            "name": cand.get("name") or "",
+            "level": cand.get("level", -999),
+            "hierarchy": cand.get("hierarchy") or [],
+        })
+        if len(results) >= limit:
+            break
+
+    return {"results": results}
 
 @app.get("/species/{taxon_id}/environment/{variable_id}")
 def species_environment_stats(

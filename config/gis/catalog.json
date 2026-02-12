@@ -1,0 +1,76 @@
+{
+  "categories": [
+    {
+      "name": "bioclimate",
+      "display_name": "Bioclimatic",
+      "description": "Bioclimatic variables derived from monthly temperature and precipitation to capture annual trends, seasonality, and extremes for ecological modeling.",
+      "source": "WorldClim 2.1 (https://www.worldclim.org/)",
+      "license": "Creative Commons Attribution 4.0",
+      "layers": [
+        { "id": "bio_1", "code": "BIO1", "display_name": "Annual Mean Temperature", "units": "°C", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_2", "code": "BIO2", "display_name": "Mean Diurnal Range", "units": "°C", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_3", "code": "BIO3", "display_name": "Isothermality", "units": "ratio ×100", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_4", "code": "BIO4", "display_name": "Temperature Seasonality", "units": "standard deviation ×100", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_5", "code": "BIO5", "display_name": "Max Temperature of Warmest Month", "units": "°C", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_6", "code": "BIO6", "display_name": "Min Temperature of Coldest Month", "units": "°C", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_7", "code": "BIO7", "display_name": "Temperature Annual Range (BIO5-BIO6)", "units": "°C", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_8", "code": "BIO8", "display_name": "Mean Temperature of Wettest Quarter", "units": "°C", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_9", "code": "BIO9", "display_name": "Mean Temperature of Driest Quarter", "units": "°C", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_10", "code": "BIO10", "display_name": "Mean Temperature of Warmest Quarter", "units": "°C", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_11", "code": "BIO11", "display_name": "Mean Temperature of Coldest Quarter", "units": "°C", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_12", "code": "BIO12", "display_name": "Annual Precipitation", "units": "mm", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_13", "code": "BIO13", "display_name": "Precipitation of Wettest Month", "units": "mm", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_14", "code": "BIO14", "display_name": "Precipitation of Driest Month", "units": "mm", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_15", "code": "BIO15", "display_name": "Precipitation Seasonality (Coefficient of Variation)", "units": "coefficient", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_16", "code": "BIO16", "display_name": "Precipitation of Wettest Quarter", "units": "mm", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_17", "code": "BIO17", "display_name": "Precipitation of Driest Quarter", "units": "mm", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_18", "code": "BIO18", "display_name": "Precipitation of Warmest Quarter", "units": "mm", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "bio_19", "code": "BIO19", "display_name": "Precipitation of Coldest Quarter", "units": "mm", "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
+        { "id": "koppen_geiger", "code": "KOPPEN_GEIGER", "display_name": "Köppen-Geiger Classes", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "koppen_geiger.tif", "value_type": "categorical" }
+      ]
+    },
+    {
+      "name": "landclass",
+      "display_name": "Earth Surface",
+      "description": "Global 30m land cover classification derived from the GLC_FCS30 2020 release.",
+      "source": "GLC_FCS30 2020 (https://www.globallandcover.com/)",
+      "license": "Creative Commons Attribution 4.0",
+      "layers": [
+        { "id": "landcover", "code": "GLC_FCS30_2020", "display_name": "Land Cover Classes", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "landcover.tif", "value_type": "categorical" }
+      ]
+    },
+    {
+      "name": "terrain",
+      "display_name": "Terrain",
+      "description": "Derived terrain metrics computed from FABDEM V1-2 elevation tiles.",
+      "source": "FABDEM V1-2 (https://data.bris.ac.uk/data/dataset/s5hqmjcdj8yo2ibzi9b4ew3sn)",
+      "license": "CC BY-NC-SA 4.0",
+      "layers": [
+        { "id": "elevation", "code": "ELEVATION", "display_name": "Elevation", "units": "m", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif", "value_type": "numeric" },
+        { "id": "slope", "code": "SLOPE", "display_name": "Slope", "units": "degrees", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif", "value_type": "numeric", "derived": true },
+        { "id": "aspect", "code": "ASPECT", "display_name": "Aspect (Binned)", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif", "value_type": "categorical", "derived": true },
+        { "id": "aspect_deg", "code": "ASPECT_DEG", "display_name": "Aspect (Degrees)", "units": "degrees", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif", "value_type": "numeric", "derived": true }
+      ]
+    },
+    {
+      "name": "temporal",
+      "display_name": "Recent Weather",
+      "description": "Time-window aggregate variables for weather and soil conditions.",
+      "source": "Temporal aggregates",
+      "license": "Same as source dataset",
+      "windows": [1, 8, 24, 72, 168, 720, 2160],
+      "layers": [
+        { "id": "cloud_cover", "code": "CLOUD_COVER", "display_name": "Cloud Cover", "units": "%", "value_type": "numeric", "agg": "avg" },
+        { "id": "snowfall_water_equivalent", "code": "SNOWFALL_WATER_EQUIV", "display_name": "Snowfall Water Equivalent", "units": "mm", "value_type": "numeric", "agg": "sum" },
+        { "id": "precipitation", "code": "PRECIPITATION", "display_name": "Precipitation", "units": "mm", "value_type": "numeric", "agg": "sum" },
+        { "id": "dew_point_2m", "code": "DEW_POINT_2M", "display_name": "Dew Point (2m)", "units": "°C", "value_type": "numeric", "agg": "avg" },
+        { "id": "vapor_pressure_deficit", "code": "VPD", "display_name": "Vapor Pressure Deficit", "units": "kPa", "value_type": "numeric", "agg": "avg", "derived": true },
+        { "id": "soil_moisture_0_to_7cm", "code": "SOIL_MOISTURE_0_7CM", "display_name": "Soil Moisture (0–7cm)", "units": "m³/m³", "value_type": "numeric", "agg": "avg" },
+        { "id": "soil_temperature_0_to_7cm", "code": "SOIL_TEMPERATURE_0_7CM", "display_name": "Soil Temperature (0–7cm)", "units": "°C", "value_type": "numeric", "agg": "avg" },
+        { "id": "temperature_2m", "code": "TEMPERATURE_2M", "display_name": "Air Temperature (2m)", "units": "°C", "value_type": "numeric", "agg": "avg" },
+        { "id": "snow_depth", "code": "SNOW_DEPTH", "display_name": "Snow Depth", "units": "m", "value_type": "numeric", "agg": "avg", "windows": [1] },
+        { "id": "weather_code_simple", "code": "WEATHER_CODE_SIMPLE", "display_name": "Weather Code (Simple)", "units": "class id", "value_type": "categorical", "agg": "snapshot", "windows": [1] }
+      ]
+    }
+  ]
+}

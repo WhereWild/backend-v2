@@ -176,15 +176,28 @@ class GlobalConfig:
         return self.data_root / "gis"
 
     @property
+    def gis_config_root(self) -> Path:
+        return self.project_root / "config" / "gis"
+
+    @property
     def gis_catalog_path(self) -> Path:
-        return _resolve_env_path(
-            "GIS_CATALOG_PATH",
-            self.gis_root / self.catalog_json_filename,
-        )
+        env_path = os.environ.get("GIS_CATALOG_PATH")
+        if env_path:
+            return Path(env_path).expanduser().resolve()
+        config_path = self.gis_config_root / self.catalog_json_filename
+        if config_path.exists():
+            return config_path.resolve()
+        return (self.gis_root / self.catalog_json_filename).resolve()
 
     @property
     def gis_legends_root(self) -> Path:
-        return self.gis_root / "legends"
+        env_path = os.environ.get("GIS_LEGENDS_ROOT")
+        if env_path:
+            return Path(env_path).expanduser().resolve()
+        config_path = self.gis_config_root / "legends"
+        if config_path.exists():
+            return config_path.resolve()
+        return (self.gis_root / "legends").resolve()
 
     @property
     def gis_locations_root(self) -> Path:

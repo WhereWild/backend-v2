@@ -324,7 +324,7 @@ b2-stop() {
   local pid_dir="/workspace/logs/pids"
   local stopped=0
 
-  for name in rclone-mount rclone-copy rclone-sync; do
+  for name in rclone-mount rclone-clone rclone-pull-sync rclone-copy rclone-sync; do
     local pid_file="${pid_dir}/${name}.pid"
     if [[ -f "$pid_file" ]]; then
       local pid
@@ -366,6 +366,9 @@ B2 helpers (inside gt):
 - b2-pull-all
   Copy the entire remote data tree into /workspace/data (background, logs to /workspace/logs/rclone/clone.log).
 
+- b2-pull-sync [--force|--dry-run]
+  Sync remote data to /workspace/data; makes local EXACTLY match remote and deletes local extras.
+
 - b2-pull <path> [dest] [--dry-run] [--force]
   Download a single file from B2. Default dest: /workspace/data/<path>.
   Example: b2-pull gis/catalog.json
@@ -386,6 +389,88 @@ B2 helpers (inside gt):
 - b2-env
   Print WHEREWILD_DATA_ROOT for the mount path.
 EOF
+}
+
+b2-pull-sync() {
+  local remote="${WW_B2_READER_REMOTE:-wherewild-localdev-reader}"
+  local bucket="${WW_B2_BUCKET:-wherewild-data}"
+  local prefix="${WW_B2_PREFIX:-data}"
+  local data_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
+  local transfers="${WW_RCLONE_TRANSFERS:-16}"
+  local checkers="${WW_RCLONE_CHECKERS:-32}"
+  local mt_streams="${WW_RCLONE_MULTI_THREAD_STREAMS:-4}"
+  local buffer_size="${WW_RCLONE_BUFFER_SIZE:-64M}"
+  local stats_interval="${WW_RCLONE_STATS_INTERVAL:-1m}"
+  local log_dir="/workspace/logs/rclone"
+  local log_file="${log_dir}/pull-sync.log"
+  local pid_dir="/workspace/logs/pids"
+  local pid_file="${pid_dir}/rclone-pull-sync.pid"
+  local remote_path="$bucket"
+  local force=0
+  local dry_run=0
+  local args=()
+  local arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      --dry-run) dry_run=1 ;;
+      --*) args+=("$arg") ;;
+      *) args+=("$arg") ;;
+    esac
+  done
+
+  if [[ "${#args[@]}" -ne 0 ]]; then
+    echo "b2-pull-sync: unexpected arguments: ${args[*]}"
+    return 1
+  fi
+
+  if [[ "$force" -ne 1 && "$dry_run" -ne 1 ]]; then
+    echo "b2-pull-sync: refuses to delete local files without --force (use --dry-run to preview)"
+    return 1
+  fi
+
+  if [[ -n "$prefix" ]]; then
+    remote_path="${bucket}/${prefix}"
+  fi
+
+  if [[ "$dry_run" -ne 1 ]]; then
+    echo "b2-pull-sync WARNING:"
+    echo "This will make local data EXACTLY match the remote data tree."
+    echo "Local files not present on remote will be deleted."
+    echo "Type 'destroy' to proceed:"
+    local confirm
+    read -r confirm
+    if [[ "$confirm" != "destroy" ]]; then
+      echo "b2-pull-sync: aborted"
+      return 1
+    fi
+  fi
+
+  mkdir -p "$data_root"
+  mkdir -p "$log_dir"
+  mkdir -p "$pid_dir"
+
+  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    echo "b2-pull-sync: already running (pid $(cat "$pid_file"))"
+    return 0
+  fi
+
+  : > "$log_file"
+  rclone sync "${remote}:${remote_path}" "$data_root" \
+    --fast-list \
+    --transfers "$transfers" \
+    --checkers "$checkers" \
+    --multi-thread-streams "$mt_streams" \
+    --buffer-size "$buffer_size" \
+    --stats "$stats_interval" \
+    --stats-log-level INFO \
+    --log-file "$log_file" \
+    --log-level INFO \
+    ${dry_run:+--dry-run} > /dev/null 2>&1 &
+  local pid="$!"
+  echo "$pid" > "$pid_file"
+  echo "b2-pull-sync started (pid ${pid}); log: ${log_file}"
 }
 
 ww_data_root() {

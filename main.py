@@ -7,10 +7,10 @@ from typing import Any, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from collections import Counter
 
 from util.config import load_config
 from util import gis_lookup, indexing, summary_stats, taxa_navigation, units
+from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
 
@@ -43,6 +43,23 @@ app.add_middleware(
     allow_methods=list(cors_allow_methods),
     allow_headers=list(cors_allow_headers),
 )
+
+
+@app.on_event("startup")
+def _preload_gis_legends() -> None:
+    try:
+        gis_lookup.preload_layer_legends()
+    except FileNotFoundError:
+        # Allow API to start even if GIS catalog/legends are not present yet.
+        pass
+    except OSError:
+        # Remote/object storage might be unavailable at startup; defer to first request.
+        pass
+def _path_exists(path: Path) -> bool:
+    storage = get_parquet_storage(CONFIG.data_root, CONFIG.project_root)
+    if storage.is_remote:
+        return storage.exists(path)
+    return path.exists()
 
 
 @app.get("/health", summary="Simple liveness probe")
@@ -87,6 +104,7 @@ def list_species(
         A list of serialized taxon payloads.
     """
     records = taxa_navigation.search_taxa_by_name(q, limit=limit)
+
     payloads: list[dict[str, Any]] = []
     for record, _score, matched_name in records:
         payload = taxa_navigation.serialize_taxon(record)
@@ -156,11 +174,18 @@ def species_occurrences(
     taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
     if taxon is None:
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
-    if not Path(taxon["path"]).exists():
+    if not _path_exists(Path(taxon["path"])):
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
+    normalized_location = location.strip() if location else None
+    if normalized_location and not gis_lookup.is_valid_location_gid(normalized_location):
+        return {
+            "speciesId": taxon_id,
+            "count": 0,
+            "occurrences": [],
+        }
     rows = taxa_navigation.load_occurrence_points(
         taxon_id,
-        location.strip() if location else None,
+        normalized_location,
     )
     return {
         "speciesId": taxon_id,
@@ -175,126 +200,146 @@ def species_locations(
     parent: Optional[str] = Query(None, description="Parent location GID (optional)"),
     limit: int = Query(500, ge=1, le=5000),
 ) -> List[dict[str, Any]]:
-    """
-    Returns location GIDs for a species based on occurrence data.
-    """
-    print(f"[DEBUG] species_locations called with taxon_id={taxon_id}, level={level}")
-    
-    try:
-        taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
-        print(f"[DEBUG] Taxon retrieved: {taxon}")
-    except Exception as e:
-        print(f"[ERROR] Failed to get taxon: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get taxon: {str(e)}")
-    
+    """Returns locations where the species is present using precomputed membership."""
+    taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
     if taxon is None:
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
-    
-    taxon_dir = Path(taxon["path"])
-    if not taxon_dir.exists():
+    if not _path_exists(Path(taxon["path"])):
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
-
-    # Load all occurrence points - match the working occurrences endpoint
-    print(f"[DEBUG] Loading occurrence points for taxon_id={taxon_id}")
-    try:
-        rows = taxa_navigation.load_occurrence_points(
-            taxon_id,  # Try with int first
-            None,      # location parameter
-        )
-        print(f"[DEBUG] Loaded {len(rows) if rows else 0} occurrence rows")
-    except Exception as e:
-        print(f"[ERROR] Failed to load occurrences with int, trying string: {e}")
-        try:
-            # Try with string version like the working endpoint does
-            rows = taxa_navigation.load_occurrence_points(
-                str(taxon_id),
-                None,
-            )
-            print(f"[DEBUG] Loaded {len(rows) if rows else 0} occurrence rows with string")
-        except Exception as e2:
-            print(f"[ERROR] Failed to load occurrences: {e2}")
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Failed to load occurrences: {str(e2)}"
-            )
-    
-    if not rows:
-        print("[DEBUG] No occurrence rows found, returning empty list")
+    target_taxon_id = taxa_navigation.taxon_id_as_int(str(taxon["taxon_key"]))
+    if target_taxon_id is None:
         return []
 
-    # Rest of the function stays the same...
-    gid_candidate_fields = [
-        "location_gid", "loc_gid", "location", "gid", "gadm_gid",
-        "admin_gid", "country_gid", "country", "admin0_gid", 
-        "admin1_gid", "admin2_gid",
-    ]
+    level_map = {"continent": -1, "country": 0, "state": 1, "county": 2}
+    expected_level: int | None = None
+    if level is not None:
+        try:
+            expected_level = int(level)
+        except (TypeError, ValueError):
+            expected_level = level_map.get(str(level).lower())
 
-    gids: list[str] = []
-    for r in rows:
-        found = None
-        for key in gid_candidate_fields:
-            if key in r and r.get(key):
-                found = r.get(key)
+    entries, by_gid = gis_lookup.load_location_catalog()
+    if not entries:
+        return []
+
+    level_by_scope = {
+        str(scope): int(level_idx)
+        for level_idx, scope in CONFIG.location_scope_by_level.items()
+    }
+    level_by_scope["gbif_region"] = -1
+
+    parent_tokens = [token.strip() for token in (parent or "").split("|") if token.strip()]
+    records_by_lower_name: dict[str, list[gis_lookup.LocationRecord]] = {}
+    for record in entries:
+        records_by_lower_name.setdefault(record.name.lower(), []).append(record)
+
+    parent_matchers: list[tuple[set[str], set[str]]] = []
+    for token in parent_tokens:
+        name_options = {token.lower()}
+        gid_options = {token.lower()}
+        by_gid_record = by_gid.get(token) or by_gid.get(token.upper())
+        if by_gid_record is not None:
+            name_options.add(by_gid_record.name.lower())
+            gid_options.add(by_gid_record.gid.lower())
+        for named_record in records_by_lower_name.get(token.lower(), []):
+            name_options.add(named_record.name.lower())
+            gid_options.add(named_record.gid.lower())
+        parent_matchers.append((name_options, gid_options))
+
+    ancestor_gid_cache: dict[str, set[str]] = {}
+
+    def ancestor_gids_for(record: gis_lookup.LocationRecord) -> set[str]:
+        cached = ancestor_gid_cache.get(record.gid)
+        if cached is not None:
+            return cached
+        chain: set[str] = set()
+        seen: set[str] = set()
+        current = record.parent_gid
+        while current:
+            current_key = str(current)
+            if current_key in seen:
                 break
-        if found:
-            try:
-                gids.append(str(found))
-            except Exception:
-                continue
+            seen.add(current_key)
+            chain.add(current_key.lower())
+            parent_record = by_gid.get(current_key)
+            if parent_record is None:
+                break
+            current = parent_record.parent_gid
+        ancestor_gid_cache[record.gid] = chain
+        return chain
 
-    print(f"[DEBUG] Found {len(gids)} location gids")
-    
-    if not gids:
+    def matches_parent(
+        gid: str,
+        name: str,
+        hierarchy_names: list[str],
+        hierarchy_gids: set[str],
+    ) -> bool:
+        if not parent_matchers:
+            return True
+        cand_gid = gid.lower()
+        cand_name = name.lower()
+        hierarchy_name_set = {item.lower() for item in hierarchy_names}
+        for name_options, gid_options in parent_matchers:
+            name_match = (
+                bool(name_options & hierarchy_name_set)
+                or cand_name in name_options
+            )
+            gid_match = cand_gid in gid_options or bool(gid_options & hierarchy_gids)
+            if not (name_match or gid_match):
+                return False
+        return True
+
+    location_counts = gis_lookup.location_counts_for_taxon(target_taxon_id)
+    if not location_counts:
         return []
 
-    counts = Counter(gids)
     results: list[dict[str, Any]] = []
-    processed_gids = set()
-    
-    for gid, cnt in counts.most_common(limit * 3):
-        if gid in processed_gids:
+    seen_gids: set[str] = set()
+    for (scope, gid), count in location_counts.items():
+        location_level = level_by_scope.get(str(scope))
+        if location_level is None:
             continue
-        processed_gids.add(gid)
-        
-        loc_info = None
-        try:
-            if hasattr(gis_lookup, "get_location_by_gid"):
-                loc_info = gis_lookup.get_location_by_gid(gid)
-            elif hasattr(gis_lookup, "search_locations"):
-                matches = gis_lookup.search_locations(gid, 1)
-                if matches:
-                    loc_info = matches[0]
-        except Exception:
-            pass
-        
-        if not loc_info:
+        if expected_level is not None and location_level != expected_level:
             continue
-        
-        loc_level = loc_info.get("level", -999)
-        
-        if level:
-            level_map = {
-                "continent": -1,
-                "country": 0,
-                "state": 1,
-                "county": 2,
-            }
-            expected_level = level_map.get(level.lower())
-            if expected_level is not None and loc_level != expected_level:
-                continue
-        
-        results.append({
-            "gid": gid,
-            "name": loc_info.get("name") or str(gid),
-            "level": loc_level,
-            "hierarchy": loc_info.get("hierarchy") or [],
-            "count": int(cnt),
-        })
-        
-        if len(results) >= limit:
-            break
+        gid_key = str(gid)
+        if not gis_lookup.is_valid_location_gid(gid_key):
+            continue
+        if gid_key in seen_gids:
+            continue
+        seen_gids.add(gid_key)
 
-    print(f"[DEBUG] Returning {len(results)} location results")
+        record = by_gid.get(gid_key)
+        if record is not None:
+            location_name = record.name
+            hierarchy = gis_lookup.resolve_location_context(record, by_gid)
+            hierarchy_gids = ancestor_gids_for(record)
+        else:
+            location_name = gid_key
+            hierarchy = []
+            hierarchy_gids = set()
+
+        if not matches_parent(gid_key, location_name, hierarchy, hierarchy_gids):
+            continue
+
+        results.append(
+            {
+                "gid": gid_key,
+                "name": location_name,
+                "level": location_level,
+                "hierarchy": hierarchy,
+                "count": int(count),
+            }
+        )
+
+    results.sort(
+        key=lambda item: (
+            -int(item.get("count", 0)),
+            str(item.get("name", "")).lower(),
+            str(item.get("gid", "")),
+        )
+    )
+    if limit and len(results) > limit:
+        return results[:limit]
     return results
 
 @app.get("/locations/search_hierarchy")
@@ -486,13 +531,12 @@ def species_environment_stats(
     if taxon is None:
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
     taxon_dir = Path(taxon["path"])
-    if not taxon_dir.exists():
+    if not _path_exists(taxon_dir):
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
     location_gid = location.strip() if location else None
     value_type = str(variable_entry.get("value_type") or "").lower() or "numeric"
     forced_categorical = variable_id.lower() in forced_categorical_variables
     categorical_payload = None
-    category_samples: list[dict[str, Any]] = []
     if forced_categorical or value_type == "categorical":
         if location_gid:
             categorical_payload = summary_stats.build_categorical_stats_for_location(
@@ -509,8 +553,6 @@ def species_environment_stats(
                         f"variable '{variable_id}' and location '{location_gid}'."
                     ),
                 )
-            if categorical_payload:
-                category_samples = categorical_payload.get("samples", [])
             value_type = "categorical"
         else:
             categorical_payload = summary_stats.load_categorical_distribution(taxon_dir, variable_id)
@@ -518,9 +560,6 @@ def species_environment_stats(
                 value_type = "categorical"
             elif categorical_payload is not None:
                 value_type = "categorical"
-                category_samples = summary_stats.build_categorical_samples(
-                    taxon_dir, variable_id, categorical_payload.get("distribution", [])
-                )
     generated_at = datetime.now(timezone.utc).isoformat()
 
     baseline_numeric_summary = None
@@ -547,10 +586,6 @@ def species_environment_stats(
             "q99": None,
         }
         ranks = indexing.load_relative_ranks(taxon_dir, variable_id, location_gid=location_gid)
-        if not location_gid:
-            category_samples = summary_stats.build_categorical_samples(
-                taxon_dir, variable_id, categorical_payload.get("distribution", [])
-            )
         response = {
             "speciesId": taxon_id,
             "species_id": taxon_id,
@@ -575,14 +610,61 @@ def species_environment_stats(
             "categorical_distribution": categorical_payload.get("distribution", []),
             "dominantCategories": categorical_payload.get("dominant", []),
             "dominant_categories": categorical_payload.get("dominant", []),
-            "categoricalSamples": category_samples,
-            "categorical_samples": category_samples,
             "baselineCategoricalDistribution": baseline_categorical_distribution,
             "baseline_categorical_distribution": baseline_categorical_distribution,
             "baselineCategoricalTotals": baseline_categorical_totals,
             "baseline_categorical_totals": baseline_categorical_totals,
             "baselineSummary": baseline_numeric_summary,
             "baseline_summary": baseline_numeric_summary,
+            "relativeRanks": ranks,
+            "relative_ranks": ranks,
+        }
+        return response
+
+    if not location_gid:
+        summary = summary_stats.load_numeric_summary(str(taxon_dir), variable_id)
+        density_curve = summary_stats.load_density_graph(str(taxon_dir), variable_id)
+        if not summary or not density_curve:
+            raise HTTPException(
+                status_code=503,
+                # We COULD compute on-demand here but I think it's better to fail loudly as the data *should* be here for performance reasons.
+                detail=(
+                    f"Precomputed summary stats or KDE missing (summary={bool(summary)} "
+                    f"density={bool(density_curve)}). "
+                    "Rebuild summary_stats.parquet and density_graph.parquet."
+                ),
+            )
+        ranks = indexing.load_relative_ranks(taxon_dir, variable_id, location_gid=location_gid)
+        response = {
+            "speciesId": taxon_id,
+            "species_id": taxon_id,
+            "variable": variable_id,
+            "variableName": variable_entry.get("name"),
+            "variable_metadata": {
+                "name": variable_entry.get("name"),
+                "units": variable_entry.get("units"),
+                "value_type": value_type or "numeric",
+            },
+            "units": variable_entry.get("units"),
+            "variableType": value_type or "numeric",
+            "generatedAt": generated_at,
+            "generated_at": generated_at,
+            "summary": summary,
+            "histogram": None,
+            "densityCurve": density_curve,
+            "binSamples": [],
+            "bin_samples": [],
+            "density_curve": density_curve,
+            "baselineSummary": baseline_numeric_summary,
+            "baseline_summary": baseline_numeric_summary,
+            "baselineCategoricalDistribution": [],
+            "baseline_categorical_distribution": [],
+            "baselineCategoricalTotals": {},
+            "baseline_categorical_totals": {},
+            "categoricalDistribution": [],
+            "categorical_distribution": [],
+            "dominantCategories": [],
+            "dominant_categories": [],
             "relativeRanks": ranks,
             "relative_ranks": ranks,
         }
@@ -643,8 +725,6 @@ def species_environment_stats(
         "categorical_distribution": [],
         "dominantCategories": [],
         "dominant_categories": [],
-        "categoricalSamples": [],
-        "categorical_samples": [],
         "relativeRanks": ranks,
         "relative_ranks": ranks,
     }
@@ -677,7 +757,7 @@ def species_environment_class_samples(
     if taxon is None:
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
     taxon_dir = Path(taxon["path"])
-    if not taxon_dir.exists():
+    if not _path_exists(taxon_dir):
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
     try:
         parsed_value: float | int | str
@@ -698,7 +778,7 @@ def species_environment_class_samples(
         )
     else:
         index_path = taxon_dir / "occurrence_index.parquet"
-        if not index_path.exists():
+        if not _path_exists(index_path):
             raise HTTPException(
                 status_code=503,
                 detail="GIS lookup utilities are unavailable on this server.",
@@ -779,10 +859,10 @@ def species_environment_slice(
     if taxon is None:
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
     taxon_dir = Path(taxon["path"])
-    if not taxon_dir.exists():
+    if not _path_exists(taxon_dir):
         raise HTTPException(status_code=404, detail=f"Unknown taxon {taxon_id}")
     index_path = taxon_dir / "occurrence_index.parquet"
-    if not index_path.exists():
+    if not _path_exists(index_path):
         raise HTTPException(
             status_code=404,
             detail=f"Index parquet missing for taxon {taxon_id}",

@@ -168,7 +168,10 @@ def _iter_taxa_with_occurrences() -> Iterable[tuple[int, Path]]:
         taxon_id = taxa_navigation.taxon_id_as_int(taxon["taxon_key"])
         if taxon_id is None:
             continue
-        parquet_path = Path(taxon["path"]) / CONFIG.occurrence_parquet_filename
+        parquet_path = (
+            taxa_navigation.normalize_taxon_path(taxon["path"])
+            / CONFIG.occurrence_parquet_filename
+        )
         if parquet_path.exists():
             yield taxon_id, parquet_path
 

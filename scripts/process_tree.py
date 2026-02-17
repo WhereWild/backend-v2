@@ -21,12 +21,12 @@ import util.summary_stats as summary_stats
 import util.taxa_navigation as taxa_navigation
 from util.config import load_config
 import pyarrow.parquet as pq
-import pandas as pd
 
 
 CONFIG = load_config("global")
 
-process_tree_ranks_only = False
+process_tree_ranks_only = CONFIG.process_tree_ranks_only
+process_tree_indexes_only = CONFIG.process_tree_indexes_only
 
 
 index_workers = 4
@@ -35,23 +35,23 @@ pending_task_multiplier = 4
 
 stats_workers = 4
 
+rank_workers = 4
+
 memory_high_watermark = 0.8
 
 skip_existing_indexes = True
 
-skip_existing_stats = True
-
 _layer_catalog = gis_lookup.load_layer_metadata()
-_layer_ids = set(_layer_catalog.keys())
-_categorical_layer_ids = {
-    layer_id
-    for layer_id, layer in _layer_catalog.items()
-    if (layer.get("value_type") or "").lower() == "categorical"
-}
 
 
-def _schema_layer_ids(schema) -> set[str]:
-    return {name for name in schema.names if name in _layer_ids}
+def _expected_layer_targets(schema) -> dict[str, str]:
+    """Resolve catalog-aware target columns expected in index/stats artifacts."""
+    return dict(
+        indexing.index_targets_for_columns(
+            set(schema.names),
+            layer_catalog=_layer_catalog,
+        )
+    )
 
 
 def _index_is_current(node_path: Path) -> bool:
@@ -65,7 +65,7 @@ def _index_is_current(node_path: Path) -> bool:
         data_schema = pq.read_schema(data_path)
     except Exception:
         return True
-    expected_layers = _schema_layer_ids(data_schema)
+    expected_layers = set(_expected_layer_targets(data_schema).keys())
     if not expected_layers:
         return True
     try:
@@ -74,48 +74,6 @@ def _index_is_current(node_path: Path) -> bool:
         return False
     return expected_layers.issubset(set(index_schema.names))
 
-
-def _stats_are_current(node_path: Path) -> bool:
-    stats_path = node_path / "summary_stats.parquet"
-    if not stats_path.exists():
-        return False
-    data_path = node_path / CONFIG.occurrence_parquet_filename
-    if not data_path.exists():
-        return True
-    try:
-        data_schema = pq.read_schema(data_path)
-    except Exception:
-        return True
-    expected_layers = _schema_layer_ids(data_schema)
-    expected_categorical = expected_layers & _categorical_layer_ids
-    expected_numeric = expected_layers - expected_categorical
-
-    existing_numeric: set[str] = set()
-    try:
-        frame = pd.read_parquet(stats_path, columns=["variable"])
-        if not frame.empty:
-            existing_numeric = set(frame["variable"].dropna().astype(str).tolist())
-    except Exception:
-        return False
-    if not expected_numeric.issubset(existing_numeric):
-        return False
-
-    existing_categorical: set[str] = set()
-    cat_path = node_path / "categorical_stats.parquet"
-    if expected_categorical:
-        if not cat_path.exists():
-            return False
-        try:
-            cat_frame = pd.read_parquet(cat_path, columns=["variable"])
-            if not cat_frame.empty:
-                existing_categorical = set(
-                    cat_frame["variable"].dropna().astype(str).tolist()
-                )
-        except Exception:
-            return False
-        if not expected_categorical.issubset(existing_categorical):
-            return False
-    return True
 
 def _memory_usage_ratio() -> float:
     """Returns memory usage ratio based on /proc/meminfo when available."""
@@ -206,13 +164,11 @@ def _build_index_for_node(node: taxa_navigation.TaxonRecord) -> None:
 
 def _compute_stats_for_node(node: taxa_navigation.TaxonRecord) -> None:
     taxon_path = Path(node["path"])
-    if skip_existing_stats and _stats_are_current(taxon_path):
-        print(f"skip stats {str(taxon_path).split('/')[-1]} (already built)")
-        return
     canonical_rank = taxa_navigation.canonical_rank(node["rank"] or "")
     streaming = canonical_rank not in CONFIG.leaf_rank_set
     with summary_stats.stats_context(taxon_path):
         summary_stats.numeric_column_stats(streaming=streaming)
+        summary_stats.write_density_graph(taxon_path)
     print(f"built summary stats for {str(taxon_path).split("/")[-1]}")
 
 
@@ -246,26 +202,66 @@ def compute_stats_for_tree(
     )
 
 
-def compute_relative_ranks(root_taxon_id: str) -> None:
-    """Sequential DFS pass that builds catalogs + rank indexes."""
-    root = taxa_navigation.get_taxon_by_id(root_taxon_id)
-    if root is None:
-        raise ValueError(f"Unknown taxon id {root_taxon_id}")
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        try:
+def _build_rank_artifacts_for_node(
+    node: taxa_navigation.TaxonRecord,
+    *,
+    has_descendants: bool,
+) -> None:
+    try:
+        if has_descendants:
             indexing.build_descendant_catalogs_for_ancestor(node["taxon_key"])
             indexing.build_rank_indexes_for_ancestor(node["taxon_key"])
             print(
                 "built descendant catalogs and rank indexes for "
                 f"{node['scientific_name']}"
             )
-        except Exception as exc:
-            print(f"failed building catalogs for {node['taxon_key']}: {exc}")
-        children = taxa_navigation.get_children(node["taxon_key"])
-        if children:
-            stack.extend(children)
+    except Exception as exc:
+        print(f"failed building catalogs for {node['taxon_key']}: {exc}")
+
+
+def compute_relative_ranks(
+    root_taxon_id: str,
+    *,
+    max_workers: int = rank_workers,
+) -> None:
+    """Level-order pass that builds catalogs + rank indexes."""
+    indexing.reset_rank_build_caches()
+    root = taxa_navigation.get_taxon_by_id(root_taxon_id)
+    if root is None:
+        raise ValueError(f"Unknown taxon id {root_taxon_id}")
+    worker_count = max(1, max_workers)
+    current_level: list[taxa_navigation.TaxonRecord] = [root]
+    while current_level:
+        level_children = {
+            node["taxon_key"]: taxa_navigation.get_children(node["taxon_key"])
+            for node in current_level
+        }
+        if worker_count == 1 or len(current_level) == 1:
+            for node in current_level:
+                _build_rank_artifacts_for_node(
+                    node,
+                    has_descendants=bool(level_children.get(node["taxon_key"])),
+                )
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(worker_count, len(current_level))
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        _build_rank_artifacts_for_node,
+                        node,
+                        has_descendants=bool(level_children.get(node["taxon_key"])),
+                    )
+                    for node in current_level
+                ]
+                for future in futures:
+                    future.result()
+        next_level: list[taxa_navigation.TaxonRecord] = []
+        for node in current_level:
+            children = level_children.get(node["taxon_key"])
+            if children:
+                next_level.extend(children)
+        current_level = next_level
 
 
 def process_tree(
@@ -278,8 +274,25 @@ def process_tree(
     """Entry point when enrichment has populated occurrence.parquet files."""
     pending_multiplier = max(1, pending_multiplier)
 
+    if process_tree_indexes_only and process_tree_ranks_only:
+        raise ValueError(
+            "Config conflict: both process_tree_indexes_only and "
+            "process_tree_ranks_only are enabled."
+        )
+
+    if process_tree_indexes_only:
+        compute_indexes_for_tree(
+            root_taxon_id,
+            max_workers=max(1, index_workers),
+            pending_multiplier=pending_multiplier,
+        )
+        return
+
     if process_tree_ranks_only:
-        compute_relative_ranks(root_taxon_id)
+        compute_relative_ranks(
+            root_taxon_id,
+            max_workers=max(1, rank_workers),
+        )
         return
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -299,7 +312,10 @@ def process_tree(
         # Stats must complete before relative rankings begin.
         stats_future.result()
         print("Stats finished; starting relative ranking catalogs/indexes…")
-        compute_relative_ranks(root_taxon_id)
+        compute_relative_ranks(
+            root_taxon_id,
+            max_workers=max(1, rank_workers),
+        )
         indexes_future.result()
 
 

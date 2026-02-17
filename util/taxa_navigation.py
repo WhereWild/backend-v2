@@ -10,13 +10,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, TypedDict
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 from rapidfuzz import fuzz, process
 
 from util.config import load_config
+from util.storage import ParquetStorageProxy
 from util import gis_lookup
 
 CONFIG = load_config("global")
+PARQUET = ParquetStorageProxy(CONFIG.data_root, CONFIG.project_root)
 
 base_occurrence_columns = frozenset(
             {
@@ -36,7 +37,7 @@ combined_parquet_filename = "combined.parquet"
 
 class TaxonRecord(TypedDict):
     taxon_key: str
-    path: Path
+    path: Path | str
     scientific_name: str
     common_name: object
     rank: str
@@ -52,6 +53,11 @@ def _normalize_taxon_path(value: Any) -> Path:
             return CONFIG.taxonomy_root / rel
         return raw
     return CONFIG.taxonomy_root / raw
+
+
+def normalize_taxon_path(value: Any) -> Path:
+    """Normalize a serialized taxon path to an absolute taxonomy path."""
+    return _normalize_taxon_path(value)
 
 
 def normalize_name(value: str) -> str:
@@ -261,55 +267,40 @@ def _load_payload() -> dict:
     Returns:
         A dict containing the catalog and lookup indices.
     """
-    with open(CONFIG.taxon_catalog_path, "rb") as f:
-        return pickle.load(f)
+    with PARQUET.open_input_file(CONFIG.taxon_catalog_path) as handle:
+        return pickle.load(handle)
 
 
 @lru_cache(maxsize=1)
 def load_catalog() -> Dict[str, TaxonRecord]:
-    """Loads the catalog of taxon records keyed by taxon id.
-    
-    Args:
-        None.
-    
-    Returns:
-        A dict mapping taxon ids to taxon records.
+    """Loads the raw catalog keyed by taxon id.
+
+    Paths are stored as serialized in the payload and normalized lazily on
+    per-record access, which keeps cold-start load time low.
     """
     payload = _load_payload()
-    catalog = payload["catalog"]
-    normalized: Dict[str, TaxonRecord] = {}
-    for key, record in catalog.items():
-        updated = dict(record)
-        updated["path"] = _normalize_taxon_path(updated["path"])
-        normalized[key] = updated
-    return normalized
+    return payload["catalog"]
 
 
 @lru_cache(maxsize=1)
 def load_name_index() -> dict:
-    """Load name index and expand it to include all comma-separated common names.
-
-    Args:
-        None.
-
-    Returns:
-        Dictionary mapping normalized names to lists of taxon keys.
-    """
+    """Load name index and expand it to include all comma-separated common names."""
     payload = _load_payload()
     name_index = payload["combined_name_index"]
     catalog = payload["catalog"]
 
-    # Enhance index with all common names
+    # Enhance index with all common names and updated scientific names.
     for taxon_key, taxon in catalog.items():
         names = extract_common_names(taxon)
 
         for name in names:
-            if name:  # skip empty strings
-                normalized = name.lower()
-                if normalized not in name_index:
-                    name_index[normalized] = []
-                if taxon_key not in name_index[normalized]:
-                    name_index[normalized].append(taxon_key)
+            if not name:
+                continue
+            normalized = name.lower()
+            if normalized not in name_index:
+                name_index[normalized] = []
+            if taxon_key not in name_index[normalized]:
+                name_index[normalized].append(taxon_key)
 
         scientific_name = taxon.get("scientific_name")
         if isinstance(scientific_name, str) and scientific_name.strip():
@@ -323,6 +314,18 @@ def load_name_index() -> dict:
     return name_index
 
 
+@lru_cache(maxsize=65536)
+def _normalized_taxon_record(lookup_key: Any) -> TaxonRecord | None:
+    """Returns a single normalized taxon record for the requested catalog key."""
+    catalog = load_catalog()
+    record = catalog.get(lookup_key)
+    if record is None:
+        return None
+    updated = dict(record)
+    updated["path"] = _normalize_taxon_path(updated["path"])
+    return updated
+
+
 @lru_cache(maxsize=1)
 def load_taxon_media() -> dict[str, dict]:
     """Load taxon_key -> media mapping from taxon_media.pkl.
@@ -330,10 +333,10 @@ def load_taxon_media() -> dict[str, dict]:
     Returns:
         Dictionary mapping taxon_key to media record with url, license, creator, rightsHolder.
     """
-    if not CONFIG.taxon_media_path.exists():
+    if not PARQUET.exists(CONFIG.taxon_media_path):
         return {}
-    with open(CONFIG.taxon_media_path, "rb") as f:
-        return pickle.load(f)
+    with PARQUET.open_input_file(CONFIG.taxon_media_path) as handle:
+        return pickle.load(handle)
 
 # ---- Public API ----
 def get_taxon_by_id(taxon_id: str) -> TaxonRecord | None:
@@ -345,8 +348,21 @@ def get_taxon_by_id(taxon_id: str) -> TaxonRecord | None:
     Returns:
         The taxon record for the corresponding id.
     """
-    catalog = load_catalog()
-    return catalog.get(taxon_id)
+    record = _normalized_taxon_record(taxon_id)
+    if record is not None:
+        return record
+    # Fallbacks for catalogs keyed by int/str inconsistently.
+    try:
+        numeric_id = int(taxon_id)
+    except (TypeError, ValueError):
+        numeric_id = None
+    if numeric_id is not None:
+        record = _normalized_taxon_record(numeric_id)
+        if record is not None:
+            return record
+    if isinstance(taxon_id, int):
+        return _normalized_taxon_record(str(taxon_id))
+    return None
 
 def get_children(taxon_id: str) -> List[TaxonRecord]:
     """Returns a list of taxon records for all direct children of the taxon defined by the passed taxon id.
@@ -358,10 +374,25 @@ def get_children(taxon_id: str) -> List[TaxonRecord]:
         A list of taxon records for all direct children of the argument taxon.
     """
     parent = get_taxon_by_id(taxon_id)
-    if parent is None or not parent["path"].exists():
+    if parent is None:
         return []
 
-    children = []
+    cached_children = _child_index().get(str(taxon_id))
+    if cached_children is not None:
+        resolved: list[TaxonRecord] = []
+        for child_key in cached_children:
+            child_taxon = get_taxon_by_id(child_key)
+            if child_taxon is not None:
+                resolved.append(child_taxon)
+        return resolved
+
+    if PARQUET.is_remote:
+        return []
+
+    if not parent["path"].exists():
+        return []
+
+    children: list[TaxonRecord] = []
     for child_dir in parent["path"].iterdir():
         if child_dir.is_dir():
             # match child by taxonKey suffix in folder name
@@ -396,8 +427,6 @@ def search_taxa_by_name(name_query: str, limit: int = 10) -> list[Tuple[TaxonRec
     Returns:
         A list of tuples of (TaxonRecord, float) where the float denotes how strong the match was.
     """
-
-    catalog = load_catalog()
     name_index = load_name_index()
     if not name_index:
         return []
@@ -440,12 +469,13 @@ def search_taxa_by_name(name_query: str, limit: int = 10) -> list[Tuple[TaxonRec
 
         keys = name_index.get(name, [])
         for key in keys:
-            taxon = catalog.get(key)
+            taxon_key = str(key)
+            taxon = get_taxon_by_id(taxon_key)
             if not taxon:
                 continue
-            existing = best_by_taxon.get(key)
+            existing = best_by_taxon.get(taxon_key)
             if existing is None or adjusted_score > existing[1]:
-                best_by_taxon[key] = (taxon, adjusted_score, name)
+                best_by_taxon[taxon_key] = (taxon, adjusted_score, name)
 
     results = list(best_by_taxon.values())
     results.sort(key=lambda entry: entry[1], reverse=True)
@@ -556,9 +586,9 @@ def count_taxon_rows(taxon: TaxonRecord) -> int | None:
         The number of rows within the taxon's occurrence parquet.
     """
     data_path = Path(taxon["path"]) / CONFIG.occurrence_parquet_filename
-    if not data_path.exists():
+    if not PARQUET.exists(data_path):
         return None
-    return pq.read_metadata(data_path).num_rows
+    return PARQUET.read_metadata(data_path).num_rows
 
 
 def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
@@ -568,7 +598,7 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
         taxon: The taxon record in question.
 
     Returns:
-        A serialized version of the taxon containing its id, scientific and common names, description, image, slug, rank, and number of occurrences.
+        A serialized version of the taxon containing its id, scientific and common names, description, image, and rank metadata.
     """
     taxon_id = taxon_id_as_int(taxon.get("taxon_key"))
     if taxon_id is None:
@@ -580,12 +610,9 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
 
     rank = (taxon.get("rank") or "").upper()
     slug = "-".join(part for part in scientific_name.lower().split() if part)
-    data_path = Path(taxon["path"]) / CONFIG.occurrence_parquet_filename
-    occurrences = count_taxon_rows(taxon) if data_path.exists() else 0
-    description = (
-        f"{scientific_name} has {occurrences:,} research-grade observations in this dataset."
-        f" Rank: {rank.title()}."
-    )
+    # Avoid per-result metadata reads during search serialization.
+    occurrences: int | None = None
+    description = f"{scientific_name}. Rank: {rank.title()}."
 
     # Load media data
     taxon_key = taxon.get("taxon_key")
@@ -658,17 +685,17 @@ def iter_filtered_occurrence_tables(
     taxa = iter_descendants(taxon, include_self=True)
     for taxon_record in taxa:
         taxon_dir = Path(taxon_record["path"])
-        if not taxon_dir.exists():
+        if not PARQUET.is_remote and not taxon_dir.exists():
             continue
         for candidate in (
             CONFIG.occurrence_parquet_filename,
             combined_parquet_filename,
         ):
             path = taxon_dir / candidate
-            if not path.exists():
+            if not PARQUET.exists(path):
                 continue
             try:
-                table = pq.read_table(path, columns=column_list).combine_chunks()
+                table = PARQUET.read_table(path, columns=column_list).combine_chunks()
             except Exception:
                 continue
             mask = base_observation_mask(table)
@@ -716,3 +743,23 @@ def load_occurrence_points(
                 }
             )
     return points
+
+
+@lru_cache(maxsize=1)
+def _child_index() -> dict[str, list[str]]:
+    """Builds a parent taxon key -> child taxon keys index."""
+    catalog = load_catalog()
+    mapping: dict[str, list[str]] = {}
+    for record in catalog.values():
+        raw_path = record.get("path")
+        if not raw_path:
+            continue
+        path = Path(str(raw_path))
+        parent_path = path.parent
+        parent_key = taxon_key_from_path(parent_path)
+        child_key = str(record.get("taxon_key") or "")
+        if child_key:
+            mapping.setdefault(parent_key, []).append(child_key)
+    for children in mapping.values():
+        children.sort()
+    return mapping

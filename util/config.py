@@ -68,7 +68,9 @@ class GlobalConfig:
 
     # Pipeline tuning
     root_taxon_id: str = "6"
+    process_tree_indexes_only: bool = False
     process_tree_ranks_only: bool = False
+    process_positions_flush_rows: int = 10_000_000
     do_write_dirs: bool = False
 
     # Taxonomy

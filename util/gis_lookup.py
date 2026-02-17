@@ -3,6 +3,7 @@ This file functions as a library, providing functions that perform standard oper
 '''
 
 from pathlib import Path
+import io
 from functools import lru_cache
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
@@ -14,13 +15,15 @@ import re
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 from util.config import load_config
+from util.storage import ParquetStorageProxy
 import unicodedata
 
 CONFIG = load_config("global")
+PARQUET = ParquetStorageProxy(CONFIG.data_root, CONFIG.project_root)
 
 _LAYER_CACHE: dict[str, dict[str, Any]] = {}
+_INVALID_LOCATION_GID_TOKENS = frozenset({"nan", "none", "null", "na", "n/a", "undefined"})
 
 
 @dataclass(frozen=True)
@@ -40,8 +43,8 @@ def _load_gis_catalog() -> Dict[str, Any]:
     Returns:
         The parsed GIS catalog dictionary with categories and layers.
     """
-    with open(CONFIG.gis_catalog_path, "r") as f:
-        return json.load(f)
+    with PARQUET.open_input_file(CONFIG.gis_catalog_path) as handle:
+        return json.loads(handle.read())
 
 
 @lru_cache(maxsize=256)
@@ -214,7 +217,8 @@ def load_layer_legend(layer_id: str) -> dict[str, dict[str, Any]]:
     """
     path = CONFIG.gis_legends_root / f"{layer_id}_legend.json"
     try:
-        payload = json.loads(path.read_text())
+        with PARQUET.open_input_file(path) as handle:
+            payload = json.loads(handle.read())
     except (OSError, json.JSONDecodeError):
         return {}
     mapping: dict[str, dict[str, Any]] = {}
@@ -236,6 +240,24 @@ def load_layer_legend(layer_id: str) -> dict[str, dict[str, Any]]:
 
 
 @lru_cache(maxsize=1)
+def preload_layer_legends() -> int:
+    """Loads all categorical layer legends into memory.
+    
+    Returns:
+        Count of legends loaded.
+    """
+    layers = load_layer_metadata()
+    loaded = 0
+    for layer_id, meta in layers.items():
+        value_type = str(meta.get("value_type") or "").lower()
+        if value_type != "categorical":
+            continue
+        load_layer_legend(layer_id)
+        loaded += 1
+    return loaded
+
+
+@lru_cache(maxsize=1)
 def load_location_catalog() -> tuple[List[LocationRecord], dict[str, LocationRecord]]:
     """Loads the location catalog into a tuple of a list of all locations (for search) and a dict of location ids to location records.
     
@@ -247,28 +269,39 @@ def load_location_catalog() -> tuple[List[LocationRecord], dict[str, LocationRec
     """
     entries: List[LocationRecord] = []
     by_gid: dict[str, LocationRecord] = {}
-    if CONFIG.location_hierarchy_path.exists():
-        with CONFIG.location_hierarchy_path.open(encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                try:
-                    level = int(row.get("level", 0))
-                except (TypeError, ValueError):
-                    continue
-                gid = row.get("gid") or ""
-                name = row.get("name") or ""
-                parent_gid = row.get("parent_gid") or None
-                if not gid or not name:
-                    continue
-                record = LocationRecord(gid=gid, name=name, level=level, parent_gid=parent_gid)
-                entries.append(record)
-                by_gid[record.gid] = record
+    if PARQUET.exists(CONFIG.location_hierarchy_path):
+        with PARQUET.open_input_file(CONFIG.location_hierarchy_path) as raw:
+            with io.TextIOWrapper(raw, encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    try:
+                        level = int(row.get("level", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    gid = row.get("gid") or ""
+                    name = row.get("name") or ""
+                    parent_gid = row.get("parent_gid") or None
+                    if not gid or not name:
+                        continue
+                    record = LocationRecord(gid=gid, name=name, level=level, parent_gid=parent_gid)
+                    entries.append(record)
+                    by_gid[record.gid] = record
     for region in sorted(CONFIG.gbif_region_set):
         name = region.replace("_", " ").title()
         record = LocationRecord(gid=region, name=name, level=-1, parent_gid=None)
         entries.append(record)
         by_gid[record.gid] = record
     return entries, by_gid
+
+
+def is_valid_location_gid(gid: Any) -> bool:
+    """Returns True when a location token is usable as a GID filter."""
+    if gid is None:
+        return False
+    text = str(gid).strip()
+    if not text:
+        return False
+    return text.lower() not in _INVALID_LOCATION_GID_TOKENS
 
 
 def location_lookup_for_gid(gid: str) -> tuple[str, str, str]:
@@ -280,7 +313,9 @@ def location_lookup_for_gid(gid: str) -> tuple[str, str, str]:
     Returns:
         A tuple of (column_name, scope_label, normalized_gid).
     """
-    normalized = gid.strip()
+    normalized = str(gid).strip()
+    if not is_valid_location_gid(normalized):
+        raise ValueError(f"Invalid location gid '{gid}'")
     upper = normalized.upper()
     if upper in CONFIG.gbif_region_set:
         return "gbifRegion", "gbif_region", upper
@@ -302,7 +337,10 @@ def build_location_mask(table: pa.Table, location_gid: str) -> Optional[pa.Array
     Returns:
         A mask for the parquet that filters for only rows within the gid in question.
     """
-    column_name, _scope, target = location_lookup_for_gid(location_gid)
+    try:
+        column_name, _scope, target = location_lookup_for_gid(location_gid)
+    except ValueError:
+        return None
     if column_name not in table.column_names:
         return None
     column = table[column_name]
@@ -322,20 +360,14 @@ def location_taxa_membership() -> Dict[tuple[str, str], frozenset[int]]:
         A dict mapping gids at certain scopes to a set of taxon ids that occur within the region.
     """
     mapping: dict[tuple[str, str], set[int]] = defaultdict(set)
-    if not CONFIG.location_catalog_path.exists():
-        return {}
-    try:
-        table = pq.read_table(
-            CONFIG.location_catalog_path,
-            columns=["scope", "gid", "taxon_id"],
-        ).combine_chunks()
-    except Exception:
+    table = _load_location_taxa_table()
+    if table is None:
         return {}
     scopes = table.column("scope").to_pylist()
     gids = table.column("gid").to_pylist()
     taxon_ids = table.column("taxon_id").to_pylist()
     for scope, gid, taxon_id in zip(scopes, gids, taxon_ids):
-        if not scope or not gid:
+        if not scope or not is_valid_location_gid(gid):
             continue
         try:
             numeric_id = int(taxon_id)
@@ -343,6 +375,62 @@ def location_taxa_membership() -> Dict[tuple[str, str], frozenset[int]]:
             continue
         mapping[(str(scope), str(gid))].add(numeric_id)
     return {key: frozenset(value) for key, value in mapping.items()}
+
+
+@lru_cache(maxsize=1)
+def _load_location_taxa_table() -> pa.Table | None:
+    if not PARQUET.exists(CONFIG.location_catalog_path):
+        return None
+    try:
+        return PARQUET.read_table(
+            CONFIG.location_catalog_path,
+            columns=["scope", "gid", "taxon_id", "count"],
+        ).combine_chunks()
+    except Exception:
+        try:
+            return PARQUET.read_table(
+                CONFIG.location_catalog_path,
+                columns=["scope", "gid", "taxon_id"],
+            ).combine_chunks()
+        except Exception:
+            return None
+
+
+def location_counts_for_taxon(taxon_id: int) -> Dict[tuple[str, str], int]:
+    """Returns per-location observation counts for a specific taxon."""
+    try:
+        normalized_taxon_id = int(taxon_id)
+    except (TypeError, ValueError):
+        return {}
+    table = _load_location_taxa_table()
+    if table is None or not table.num_rows:
+        return {}
+    try:
+        taxon_col = table["taxon_id"]
+        scalar = pa.scalar(normalized_taxon_id, type=taxon_col.type)
+        filtered = table.filter(
+            pc.equal(taxon_col, scalar)
+        ).combine_chunks()
+    except Exception:
+        return {}
+    if not filtered.num_rows:
+        return {}
+    has_count_column = "count" in filtered.column_names
+    scopes = filtered.column("scope").to_pylist()
+    gids = filtered.column("gid").to_pylist()
+    counts = filtered.column("count").to_pylist() if has_count_column else [1] * len(scopes)
+    mapping: dict[tuple[str, str], int] = defaultdict(int)
+    for scope, gid, count in zip(scopes, gids, counts):
+        if not scope or not is_valid_location_gid(gid):
+            continue
+        try:
+            numeric_count = int(count)
+        except (TypeError, ValueError):
+            numeric_count = 1
+        if numeric_count <= 0:
+            continue
+        mapping[(str(scope), str(gid))] += numeric_count
+    return dict(mapping)
 
 
 def resolve_location_context(

@@ -3,10 +3,19 @@ api() {
   local log_dir="/workspace/logs"
   local pid_dir="/workspace/logs/pids"
   local pid_file="${pid_dir}/api.pid"
+  local storage_mode="${WHEREWILD_PARQUET_STORAGE:-b2}"
+  ww_load_b2_env
   data_root="$(ww_data_root "$@")"
   if [[ "${1:-}" == "--local" || "${1:-}" == "--remote" ]]; then
+    if [[ "${1:-}" == "--local" ]]; then
+      storage_mode="local"
+    else
+      storage_mode="local"
+    # we have two local storage modes as a stub for if/when we eventually add s3 mode, for now both force local mounting since it's faster for parquets. When we do ML and have to read COGs we might want this back if all the data is not on the VM running it.
+    fi
     shift
   fi
+  export WHEREWILD_PARQUET_STORAGE="$storage_mode"
   mkdir -p "$log_dir" "$pid_dir"
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
     echo "api: already running (pid $(cat "$pid_file"))"
@@ -22,10 +31,18 @@ api() {
 
 api-fg() {
   local data_root
+  local storage_mode="${WHEREWILD_PARQUET_STORAGE:-b2}"
+  ww_load_b2_env
   data_root="$(ww_data_root "$@")"
   if [[ "${1:-}" == "--local" || "${1:-}" == "--remote" ]]; then
+    if [[ "${1:-}" == "--local" ]]; then
+      storage_mode="local"
+    else
+      storage_mode="local"
+    fi
     shift
   fi
+  export WHEREWILD_PARQUET_STORAGE="$storage_mode"
   WHEREWILD_DATA_ROOT="$data_root" \
     uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
     --reload --reload-dir /workspace/main.py --reload-dir /workspace/util
@@ -82,7 +99,7 @@ b2-mount() {
   fi
 
   : > "$log_file"
-  rclone mount "${remote}:${remote_path}" "$mount_point" \
+  LD_PRELOAD= rclone mount "${remote}:${remote_path}" "$mount_point" \
     --read-only \
     --fast-list \
     --vfs-cache-mode=full \
@@ -192,6 +209,10 @@ b2-push-all() {
     return 0
   fi
 
+  local dry_flag="--dry-run=false"
+  if [[ "$dry_run" -eq 1 ]]; then
+    dry_flag="--dry-run"
+  fi
   : > "$log_file"
   rclone copy "$data_root" "${remote}:${bucket}/${prefix}" \
     --exclude "species/occurrence.txt" \
@@ -211,7 +232,7 @@ b2-push-all() {
     --stats-log-level INFO \
     --log-file "$log_file" \
     --log-level INFO \
-    ${dry_run:+--dry-run} > /dev/null 2>&1 &
+    "$dry_flag" > /dev/null 2>&1 &
   local pid="$!"
   echo "$pid" > "$pid_file"
   echo "b2-copy started (pid ${pid}); log: ${log_file}"
@@ -269,6 +290,10 @@ b2-overwrite-remote() {
     return 0
   fi
 
+  local dry_flag="--dry-run=false"
+  if [[ "$dry_run" -eq 1 ]]; then
+    dry_flag="--dry-run"
+  fi
   : > "$log_file"
   rclone sync "$data_root" "${remote}:${bucket}/${prefix}" \
     --exclude "species/occurrence.txt" \
@@ -288,7 +313,7 @@ b2-overwrite-remote() {
     --stats-log-level INFO \
     --log-file "$log_file" \
     --log-level INFO \
-    ${dry_run:+--dry-run} > /dev/null 2>&1 &
+    "$dry_flag" > /dev/null 2>&1 &
   local pid="$!"
   echo "$pid" > "$pid_file"
   echo "b2-overwrite-remote started (pid ${pid}); log: ${log_file}"
@@ -382,6 +407,53 @@ ww_data_root() {
     echo "$mount_point"
   else
     echo "$local_root"
+  fi
+}
+
+ww_load_b2_env() {
+  local config="${RCLONE_CONFIG:-/workspace/docker/rclone.conf}"
+  local remote="${WW_B2_READER_REMOTE:-wherewild-localdev-reader}"
+  local account key endpoint fallback_endpoint
+
+  if [[ ! -f "$config" ]]; then
+    return 0
+  fi
+
+  account="$(
+    awk -v r="[$remote]" -F'=' '
+      $0==r {in_section=1; next}
+      /^\[/ {in_section=0}
+      in_section && $1 ~ /account/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}
+    ' "$config"
+  )"
+  key="$(
+    awk -v r="[$remote]" -F'=' '
+      $0==r {in_section=1; next}
+      /^\[/ {in_section=0}
+      in_section && $1 ~ /^key/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}
+    ' "$config"
+  )"
+  endpoint="$(
+    awk -v r="[$remote]" -F'=' '
+      $0==r {in_section=1; next}
+      /^\[/ {in_section=0}
+      in_section && $1 ~ /endpoint/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}
+    ' "$config"
+  )"
+
+  if [[ -z "$endpoint" ]]; then
+    fallback_endpoint="${WW_B2_S3_ENDPOINT_DEFAULT:-https://s3.us-west-004.backblazeb2.com}"
+    endpoint="$fallback_endpoint"
+  fi
+
+  if [[ -z "${WW_B2_KEY_ID:-}" && -n "$account" ]]; then
+    export WW_B2_KEY_ID="$account"
+  fi
+  if [[ -z "${WW_B2_APP_KEY:-}" && -n "$key" ]]; then
+    export WW_B2_APP_KEY="$key"
+  fi
+  if [[ -z "${WW_B2_S3_ENDPOINT:-}" && -n "$endpoint" ]]; then
+    export WW_B2_S3_ENDPOINT="$endpoint"
   fi
 }
 
@@ -496,10 +568,18 @@ b2-push() {
     return 1
   fi
 
+  local dry_flag="--dry-run=false"
+  if [[ "$dry_run" -eq 1 ]]; then
+    dry_flag="--dry-run"
+  fi
+  local rclone_bin="/usr/bin/rclone"
+  if [[ ! -x "$rclone_bin" ]]; then
+    rclone_bin="$(command -v rclone)"
+  fi
   if [[ -n "$prefix" ]]; then
-    rclone copyto "$source_path" "${remote}:${bucket}/${prefix}/${remote_path}" ${dry_run:+--dry-run}
+    "$rclone_bin" copyto "$source_path" "${remote}:${bucket}/${prefix}/${remote_path}" "$dry_flag"
   else
-    rclone copyto "$source_path" "${remote}:${bucket}/${remote_path}" ${dry_run:+--dry-run}
+    "$rclone_bin" copyto "$source_path" "${remote}:${bucket}/${remote_path}" "$dry_flag"
   fi
 }
 
@@ -523,6 +603,7 @@ pd() {
     module="${module//\//.}"
   fi
 
+  export WHEREWILD_PARQUET_STORAGE="${WHEREWILD_PARQUET_STORAGE:-local}"
   python -m "$module" "$@"
 }
 
@@ -564,6 +645,7 @@ pdb() {
     return 1
   fi
 
+  export WHEREWILD_PARQUET_STORAGE="${WHEREWILD_PARQUET_STORAGE:-local}"
   PYTHONUNBUFFERED=1 setsid python -u -m "$module" "$@" > "$log_file" 2>&1 &
   echo "$!" > "$pid_file"
   echo "pdb started: $log_file"

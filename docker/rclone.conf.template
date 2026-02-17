@@ -2,8 +2,10 @@
 type = b2
 account = REPLACE_WITH_READER_KEY_ID
 key = REPLACE_WITH_READER_APP_KEY
+endpoint = https://s3.us-west-004.backblazeb2.com
 
 [wherewild-localdev-writer]
 type = b2
 account = REPLACE_WITH_WRITER_KEY_ID
 key = REPLACE_WITH_WRITER_APP_KEY
+endpoint = https://s3.us-west-004.backblazeb2.com

@@ -136,6 +136,7 @@ In the gdal terminal, you also have:
 - `b2-mount` to mount the B2 data at `/workspace/.b2-mount` (background, logs to `logs/rclone/mount.log`). `gt` auto-mounts on shell start, so you usually do not need to call this manually.
 - `b2-umount` to unmount the B2 mount.
 - `b2-pull-all` to copy the entire remote data tree into `/workspace/data` (background, logs to `logs/rclone/clone.log`).
+- `b2-pull-sync [--force|--dry-run]` to sync remote data into `/workspace/data` and delete local extras not present remotely (logs to `logs/rclone/pull-sync.log`).
 - `b2-push-all [--force|--dry-run]` to copy local data to B2 without deletions (logs to `logs/rclone/copy.log`). Requires `--force` for real writes.
 - `b2-overwrite-remote [--force|--dry-run]` to sync local data to B2 (makes remote EXACTLY match local and deletes remote extras, logs to `logs/rclone/sync.log`). Requires `--force` for real writes.
 - `b2-stop` to stop any running `b2-*` jobs using pid files.
@@ -155,6 +156,30 @@ We use Backblaze B2 for shared data. The container creates `/workspace/docker/rc
    - Only give them access to the `wherewild-data` bucket.
 3. Inside gdal, run `rclone config`. Edit the relevant existing remotes to use keys for application keys you need to create on B2. The `keyID` on B2 is the first field rclone asks for, the second field should be the other one it gives you, which is only available right after creation. *Of course, keep this secret!*
 4. Use `b2-mount` for read-only access and (again, only if you created a read/write key that you only need if you are going to be uploading data!) `b2-push-all`/`b2-overwrite-remote` for uploads. Use `b2-pull-all` or `b2-pull` to download data into `/workspace/data`.
+
+### Increase IOPS for `b2-pull-all`
+
+`b2-pull-all` exposes rclone concurrency knobs through environment variables:
+
+- `WW_RCLONE_CHECKERS` (metadata/object-operation concurrency)
+- `WW_RCLONE_TRANSFERS` (file transfer concurrency)
+- `WW_RCLONE_MULTI_THREAD_STREAMS` (parallel streams per large file)
+- `WW_RCLONE_BUFFER_SIZE` (memory buffer per transfer)
+
+A good high-IOPS starting profile (especially for many small files) is:
+
+```sh
+export WW_RCLONE_CHECKERS=128
+export WW_RCLONE_TRANSFERS=64
+export WW_RCLONE_MULTI_THREAD_STREAMS=1
+export WW_RCLONE_BUFFER_SIZE=16M
+b2-stop && b2-pull-all
+```
+
+Then tail `logs/rclone/clone.log` and tune:
+
+- If you see throttling/retries (for example HTTP `429`), back off to `CHECKERS=64` and `TRANSFERS=32`.
+- If there is no throttling and your disk/network still has headroom, increase gradually (`CHECKERS` by `+16`, `TRANSFERS` by `+8`).
 
 Finally, it's a great idea to install the [parquet viewer](https://marketplace.visualstudio.com/items?itemName=dvirtz.parquet-viewer) extension on VSCode which allows the viewing of parquet files as simple csvs which really helps quick manual inspection. It will likely require you install pyarrow or fastparquet OUTSIDE of Docker or something similar so it can convert the parquets to CSVs. [Rainbow CSV](https://marketplace.visualstudio.com/items?itemName=mechatroner.rainbow-csv) is also a great addition with this that makes it easy to tell which values are part of which columns.
 

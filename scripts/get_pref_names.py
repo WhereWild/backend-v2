@@ -1,7 +1,13 @@
 """
-Fetch iNaturalist preferred_common_name for taxa with inat_id and store in the catalog.
+Fetch iNaturalist preferred metadata for taxa with inat_id and store in the catalog.
 
-Uses the iNat API /v1/taxa endpoint with batched ids.
+Currently stores:
+- inat_preferred_common_name
+- inat_preferred_image (URL from default_photo)
+- inat_preferred_image_license
+- inat_preferred_image_creator
+- inat_preferred_image_attribution
+- inat_preferred_image_references
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from util.config import load_config
 CONFIG = load_config("global")
 
 INAT_TAXA_ENDPOINT = "https://api.inaturalist.org/v1/taxa"
+INAT_PHOTO_BASE_URL = "https://www.inaturalist.org/photos"
 
 
 def fetch_taxa_batch(ids: list[str], locale: str, timeout: int) -> list[dict[str, Any]]:
@@ -31,6 +38,37 @@ def fetch_taxa_batch(ids: list[str], locale: str, timeout: int) -> list[dict[str
         payload = json.loads(response.read().decode("utf-8"))
     results = payload.get("results") or []
     return results if isinstance(results, list) else []
+
+
+def _clean_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in {"none", "null"}:
+        return ""
+    return text
+
+
+def extract_preferred_image_metadata(taxon_payload: dict[str, Any]) -> dict[str, str]:
+    """Extract best-available image metadata from iNat taxon payload."""
+    default_photo = taxon_payload.get("default_photo")
+    if not isinstance(default_photo, dict):
+        return {}
+    image_url = ""
+    for field in ("original_url", "large_url", "medium_url", "url", "square_url"):
+        value = _clean_text(default_photo.get(field))
+        if value:
+            image_url = value
+            break
+    if not image_url:
+        return {}
+    photo_id = _clean_text(default_photo.get("id"))
+    references = f"{INAT_PHOTO_BASE_URL}/{photo_id}" if photo_id else ""
+    return {
+        "inat_preferred_image": image_url,
+        "inat_preferred_image_license": _clean_text(default_photo.get("license_code")),
+        "inat_preferred_image_creator": _clean_text(default_photo.get("attribution_name")),
+        "inat_preferred_image_attribution": _clean_text(default_photo.get("attribution")),
+        "inat_preferred_image_references": references,
+    }
 
 
 def main() -> None:
@@ -56,13 +94,28 @@ def main() -> None:
         inat_id = str(taxon.get("inat_id") or "").strip()
         if not inat_id:
             continue
-        if not overwrite and taxon.get("inat_preferred_common_name"):
+        has_preferred_name = bool(str(taxon.get("inat_preferred_common_name") or "").strip())
+        has_preferred_image = bool(str(taxon.get("inat_preferred_image") or "").strip())
+        has_image_license = bool(str(taxon.get("inat_preferred_image_license") or "").strip())
+        has_image_creator = bool(
+            str(taxon.get("inat_preferred_image_creator") or "").strip()
+            or str(taxon.get("inat_preferred_image_attribution") or "").strip()
+        )
+        has_image_reference = bool(str(taxon.get("inat_preferred_image_references") or "").strip())
+        if (
+            not overwrite
+            and has_preferred_name
+            and has_preferred_image
+            and has_image_license
+            and has_image_creator
+            and has_image_reference
+        ):
             continue
         targets.append((taxon_key, inat_id))
         if request_limit and len(targets) >= request_limit:
             break
 
-    print(f"  Taxa needing preferred common names: {len(targets):,}")
+    print(f"  Taxa needing preferred iNat metadata: {len(targets):,}")
     if not targets:
         print("Nothing to do.")
         return
@@ -72,7 +125,9 @@ def main() -> None:
         inat_to_taxa.setdefault(inat_id, []).append(taxon_key)
     inat_ids = list(inat_to_taxa.keys())
 
-    updated = 0
+    names_updated = 0
+    images_updated = 0
+    image_metadata_updated = 0
     errors = 0
     requests = 0
 
@@ -91,28 +146,54 @@ def main() -> None:
         requests += 1
         for taxon in results:
             inat_id = str(taxon.get("id") or "").strip()
-            preferred = taxon.get("preferred_common_name")
-            if not inat_id or not preferred:
+            preferred_name = str(taxon.get("preferred_common_name") or "").strip()
+            image_metadata = extract_preferred_image_metadata(taxon)
+            if not inat_id:
                 continue
             for taxon_key in inat_to_taxa.get(inat_id, []):
                 catalog_taxon = catalog.get(taxon_key)
                 if not catalog_taxon:
                     continue
-                if not overwrite and catalog_taxon.get("inat_preferred_common_name"):
-                    continue
-                catalog_taxon["inat_preferred_common_name"] = preferred
-                updated += 1
+                if preferred_name and (
+                    overwrite
+                    or not str(catalog_taxon.get("inat_preferred_common_name") or "").strip()
+                ):
+                    catalog_taxon["inat_preferred_common_name"] = preferred_name
+                    names_updated += 1
+                if image_metadata:
+                    if overwrite or not str(catalog_taxon.get("inat_preferred_image") or "").strip():
+                        catalog_taxon["inat_preferred_image"] = image_metadata["inat_preferred_image"]
+                        images_updated += 1
+                    metadata_changed = False
+                    for field in (
+                        "inat_preferred_image_license",
+                        "inat_preferred_image_creator",
+                        "inat_preferred_image_attribution",
+                        "inat_preferred_image_references",
+                    ):
+                        value = image_metadata.get(field, "")
+                        if not value:
+                            continue
+                        if overwrite or not str(catalog_taxon.get(field) or "").strip():
+                            catalog_taxon[field] = value
+                            metadata_changed = True
+                    if metadata_changed:
+                        image_metadata_updated += 1
 
         if requests % progress_every == 0:
             print(
-                f"  requests={requests:,} updated={updated:,} "
+                f"  requests={requests:,} names_updated={names_updated:,} "
+                f"images_updated={images_updated:,} "
+                f"image_metadata_updated={image_metadata_updated:,} "
                 f"errors={errors:,} remaining={max(len(inat_ids) - idx - batch_size, 0):,}",
                 flush=True,
             )
 
         time.sleep(1.0 / rate_limit)
 
-    print(f"\nUpdated {updated:,} taxa with inat_preferred_common_name")
+    print(f"\nUpdated preferred common names: {names_updated:,}")
+    print(f"Updated preferred images: {images_updated:,}")
+    print(f"Updated preferred image metadata: {image_metadata_updated:,}")
     if errors:
         print(f"Errors: {errors:,}")
 

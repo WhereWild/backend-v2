@@ -228,19 +228,31 @@ def iter_descendants_dfs(taxon: TaxonRecord) -> Iterable[TaxonRecord]:
 
 @lru_cache(maxsize=4096)
 def resolve_taxon_media(taxon_key: str) -> dict | None:
-    """Resolve media for a taxon, falling back to descendants then siblings."""
+    """Resolve media for a taxon, preferring descendant species for higher ranks."""
     taxon = get_taxon_by_id(taxon_key)
     if not taxon:
         return None
     media_index = load_taxon_media()
+    rank = canonical_rank(taxon.get("rank"))
+    is_species_or_lower = rank == "SPECIES" or rank in CONFIG.subspecies_equivalents
     direct = media_index.get(taxon_key)
-    if direct:
-        return direct
 
+    first_descendant_media = None
     for descendant in iter_descendants_dfs(taxon):
         record = media_index.get(descendant["taxon_key"])
-        if record:
+        if not record:
+            continue
+        if first_descendant_media is None:
+            first_descendant_media = record
+        if canonical_rank(descendant.get("rank")) == "SPECIES":
             return record
+
+    if is_species_or_lower and direct:
+        return direct
+    if first_descendant_media:
+        return first_descendant_media
+    if direct:
+        return direct
 
     parent = get_parent_taxon(taxon)
     if parent:
@@ -576,6 +588,64 @@ def taxon_id_as_int(taxon_key: str | None) -> int | None:
         return None
 
 
+def preferred_image_url(taxon: TaxonRecord | None) -> str | None:
+    """Returns catalog-stored preferred image URL when available."""
+    if not taxon:
+        return None
+    value = str(taxon.get("inat_preferred_image") or "").strip()
+    return value or None
+
+
+@lru_cache(maxsize=4096)
+def resolve_preferred_image_taxon_key(taxon_key: str) -> str | None:
+    """Resolve taxon key whose preferred image metadata should be used."""
+    taxon = get_taxon_by_id(taxon_key)
+    if not taxon:
+        return None
+
+    # If this taxon already has a preferred image, never traverse descendants.
+    if preferred_image_url(taxon):
+        return taxon_key
+
+    for descendant in iter_descendants_dfs(taxon):
+        image = preferred_image_url(descendant)
+        if not image:
+            continue
+        return descendant["taxon_key"]
+    return None
+
+
+def preferred_image_payload(taxon: TaxonRecord | None) -> dict[str, str]:
+    """Returns API image fields derived from catalog-stored preferred image metadata."""
+    if not taxon:
+        return {}
+    source_taxon_key = resolve_preferred_image_taxon_key(str(taxon.get("taxon_key") or ""))
+    source_taxon = get_taxon_by_id(source_taxon_key) if source_taxon_key else None
+    image_url = preferred_image_url(source_taxon)
+    if not image_url:
+        return {}
+    payload = {"image_url": image_url}
+    image_license = str((source_taxon or {}).get("inat_preferred_image_license") or "").strip()
+    image_creator = str((source_taxon or {}).get("inat_preferred_image_creator") or "").strip()
+    image_attribution = str((source_taxon or {}).get("inat_preferred_image_attribution") or "").strip()
+    image_references = str((source_taxon or {}).get("inat_preferred_image_references") or "").strip()
+    if image_license:
+        payload["image_license"] = image_license
+    if image_creator:
+        payload["image_rights_holder"] = image_creator
+    elif image_attribution:
+        payload["image_rights_holder"] = image_attribution
+    if image_creator:
+        payload["image_creator"] = image_creator
+    elif image_attribution:
+        payload["image_creator"] = image_attribution
+    if image_attribution:
+        payload["image_attribution"] = image_attribution
+    if image_references:
+        payload["image_references"] = image_references
+    return payload
+
+
 def count_taxon_rows(taxon: TaxonRecord) -> int | None:
     """Returns the numnber of rows within the occurrence parquet of a taxon.
     
@@ -614,9 +684,12 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
     occurrences: int | None = None
     description = f"{scientific_name}. Rank: {rank.title()}."
 
-    # Load media data
+    # Prefer catalog-stored preferred image metadata when available.
     taxon_key = taxon.get("taxon_key")
-    media_record = resolve_taxon_media(taxon_key) if taxon_key else None
+    preferred_image = preferred_image_payload(taxon)
+    media_record = None
+    if not preferred_image and taxon_key:
+        media_record = resolve_taxon_media(taxon_key)
 
     result = {
         "taxon_id": taxon_id,
@@ -624,14 +697,16 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
         "common_name": common_name,
         "common_names": common_names,
         "description": description,
-        "image_url": None,
+        "image_url": preferred_image.get("image_url"),
         "slug": slug,
         "rank": rank,
         "occurrences": occurrences,
     }
 
     # Add image and attribution if available
-    if media_record:
+    if preferred_image:
+        result.update(preferred_image)
+    elif media_record:
         result["image_url"] = media_record.get("url")
         result["image_license"] = media_record.get("license")
         result["image_creator"] = media_record.get("creator")

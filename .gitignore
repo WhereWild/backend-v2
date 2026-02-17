@@ -1,4 +1,5 @@
 .venv/
+.env.local
 .python-version
 data/
 processed/

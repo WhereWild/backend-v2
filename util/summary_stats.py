@@ -10,6 +10,9 @@ import sys
 import json
 import math
 import re
+import random
+import os
+import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from fastdigest import TDigest as _FastTDigest
@@ -21,11 +24,17 @@ import pyarrow.parquet as pq
 import pyarrow.compute as pc
 from util import gis_lookup, taxa_navigation
 from util.config import load_config
+from util.storage import ParquetStorageProxy
 
 # ---- Path bootstrap ----
 CONFIG = load_config("global")
+PARQUET = ParquetStorageProxy(CONFIG.data_root, CONFIG.project_root)
 
 significant_category_threshold = 0.05
+
+density_graph_filename = "density_graph.parquet"
+
+density_max_samples = 20000
 
 
 excluded_numeric_columns = frozenset(
@@ -111,10 +120,10 @@ def _prepare_index_column(index_parquet: Path, layer_id: str):
     Returns:
         A dict with the struct column plus origin and category offset metadata.
     """
-    if not index_parquet.exists():
+    if not PARQUET.exists(index_parquet):
         raise FileNotFoundError(index_parquet)
 
-    table = pq.read_table(index_parquet, columns=[layer_id])
+    table = PARQUET.read_table(index_parquet, columns=[layer_id])
     if table.num_columns == 0:
         return None
 
@@ -178,7 +187,7 @@ def _make_dataset_loader(
             return None
         rel_path = info["relative_path"]
         data_path = (index_dir / rel_path / data_filename).resolve()
-        if not data_path.exists():
+        if not PARQUET.exists(data_path):
             return None
         table_cols = [
             catalog_column,
@@ -188,7 +197,7 @@ def _make_dataset_loader(
             "obscured",
             "coordinateUncertaintyInMeters",
         ]
-        parquet_table = pq.read_table(data_path, columns=table_cols).combine_chunks()
+        parquet_table = PARQUET.read_table(data_path, columns=table_cols).combine_chunks()
 
         mask = pc.equal(parquet_table["obscured"], "No")
         coord_col = parquet_table["coordinateUncertaintyInMeters"]
@@ -509,6 +518,7 @@ def get_layer_records_for_class(
     Returns:
         A list of (catalog, latitude, longitude, value) rows for the class.
     """
+    class_value = resolve_categorical_class_value(layer_id, class_value)
     prepared = _prepare_index_column(index_parquet, layer_id)
     if prepared is None:
         return []
@@ -546,7 +556,7 @@ def get_schema(parquet_path: Path):
     Returns:
         The pyarrow schema for the parquet file.
     """
-    return pq.read_schema(parquet_path)
+    return PARQUET.read_schema(parquet_path)
 
 
 def get_num_rows(parquet_path: Path) -> int:
@@ -558,7 +568,7 @@ def get_num_rows(parquet_path: Path) -> int:
     Returns:
         The number of rows in the parquet file.
     """
-    meta = pq.read_metadata(parquet_path)
+    meta = PARQUET.read_metadata(parquet_path)
     return meta.num_rows
 
 
@@ -596,8 +606,8 @@ def code_to_name(variable_code: str) -> str:
     Returns:
         The display name if found, otherwise None.
     """
-    with open(CONFIG.gis_catalog_path) as f:
-        d = json.load(f)
+    with PARQUET.open_input_file(CONFIG.gis_catalog_path) as handle:
+        d = json.loads(handle.read())
         for category in d["categories"]:
             for layer in category["layers"]:
                 if layer["id"] == variable_code:
@@ -614,7 +624,7 @@ def column_null_counts(parquet_path: Path) -> Dict[str, int]:
     Returns:
         A mapping of column name to null count.
     """
-    table = pq.read_table(parquet_path)
+    table = PARQUET.read_table(parquet_path)
     return {
         col: pc.sum(pc.is_null(table[col])).as_py()
         for col in table.column_names
@@ -687,10 +697,13 @@ def load_categorical_distribution(
         A dict with distribution, dominant classes, and totals, or None.
     """
     stats_path = data_dir / "categorical_stats.parquet"
-    if not stats_path.exists():
+    if not PARQUET.exists(stats_path):
         return None
     try:
-        table = pq.read_table(stats_path, columns=["variable", "metric", "value"]).combine_chunks()
+        table = PARQUET.read_table(
+            stats_path,
+            columns=["variable", "metric", "value"],
+        ).combine_chunks()
     except Exception:
         return None
     try:
@@ -732,6 +745,9 @@ def load_categorical_distribution(
                     class_id = int(lowered.split("_", 1)[1])
                 except (ValueError, IndexError):
                     class_id = None
+        # If metric keys were stored as fallback class_<id>, resolve legend by id now.
+        if legend_entry is None and class_id is not None:
+            legend_entry = legend_lookup.get(str(class_id))
         class_name = legend_entry.get("name") if legend_entry else _format_category_label(key)
         description = legend_entry.get("description") if legend_entry else None
         distribution.append(
@@ -759,6 +775,45 @@ def load_categorical_distribution(
         "dominant": dominant,
         "totals": totals,
     }
+
+
+def resolve_categorical_class_value(layer_id: str, class_value: Any) -> Any:
+    """Resolves a categorical class value from a slug/label to its stored id.
+    
+    Args:
+        layer_id: GIS layer id.
+        class_value: Raw class value from the API.
+    
+    Returns:
+        The resolved class id when possible, otherwise the input value.
+    """
+    try:
+        parsed_value = float(class_value)
+        if math.isfinite(parsed_value):
+            return int(parsed_value) if parsed_value.is_integer() else parsed_value
+    except (TypeError, ValueError):
+        pass
+    if isinstance(class_value, str):
+        text = class_value.strip()
+        lowered = text.lower()
+        if lowered.startswith("class_"):
+            tail = text.split("_", 1)[1]
+            try:
+                parsed_value = float(tail)
+                if math.isfinite(parsed_value):
+                    return int(parsed_value) if parsed_value.is_integer() else parsed_value
+            except (TypeError, ValueError):
+                return tail
+        legend_lookup = gis_lookup.load_layer_legend(layer_id)
+        entry = legend_lookup.get(text)
+        if entry is None:
+            slug = re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+            entry = legend_lookup.get(slug)
+        if entry and isinstance(entry, dict):
+            resolved = entry.get("id")
+            if resolved is not None:
+                return resolved
+    return class_value
 
 
 def build_categorical_stats_for_location(
@@ -863,7 +918,7 @@ def build_categorical_samples(
         A list of sample dicts with class value and observationIds.
     """
     index_path = data_dir / "occurrence_index.parquet"
-    if not index_path.exists():
+    if not PARQUET.exists(index_path):
         return []
     samples: list[dict[str, Any]] = []
     for entry in categories:
@@ -964,7 +1019,7 @@ def gather_numeric_records(
     if location_gid:
         return gather_numeric_records_from_tables(taxon_id, variable_id, location_gid)
     index_path = data_dir / "occurrence_index.parquet"
-    if index_path.exists():
+    if PARQUET.exists(index_path):
         try:
             rows = get_sorted_layer_records(index_path, variable_id)
         except Exception:
@@ -993,7 +1048,7 @@ def gather_numeric_records(
         taxa_navigation.combined_parquet_filename,
     ):
         path = data_dir / candidate
-        if not path.exists():
+        if not PARQUET.exists(path):
             continue
         try:
             samples = read_numeric_from_parquet(path, variable_id)
@@ -1017,7 +1072,7 @@ def read_numeric_from_parquet(
     Returns:
         A list of numeric observation samples with catalog id and coordinates.
     """
-    table = pq.read_table(
+    table = PARQUET.read_table(
         parquet_path,
         columns=[
             "catalogNumber",
@@ -1125,7 +1180,8 @@ def categorical_class_samples_for_location(
     Returns:
         A list of observation dicts with catalogNumber/lat/lon/value.
     """
-    target_key, _ = categorical_value_key(class_value)
+    resolved_value = resolve_categorical_class_value(variable_id, class_value)
+    target_key, _ = categorical_value_key(resolved_value)
     observations: list[dict[str, Any]] = []
     for table in taxa_navigation.iter_filtered_occurrence_tables(
         taxon_id,
@@ -1251,22 +1307,14 @@ def _iter_descendant_tables(parquet_path: Path) -> Iterable[pa.Table]:
     """
     taxon_dir = parquet_path.parent
     filename = parquet_path.name
-
-    stack = [taxon_dir]
-    visited: set[Path] = set()
-    while stack:
-        current = stack.pop()
-        if current in visited:
-            continue
-        visited.add(current)
-
-        data_file = current / filename
-        if data_file.exists():
-            yield pq.read_table(data_file)
-
-        for child in current.iterdir():
-            if child.is_dir():
-                stack.append(child)
+    taxon_key = taxa_navigation.taxon_key_from_path(taxon_dir)
+    taxon = taxa_navigation.get_taxon_by_id(taxon_key)
+    if taxon is None:
+        return
+    for record in taxa_navigation.iter_descendants(taxon, include_self=True):
+        data_file = Path(record["path"]) / filename
+        if PARQUET.exists(data_file):
+            yield PARQUET.read_table(data_file)
 
 
 def _digest_quantile(digest: Any, q: float) -> float | None:
@@ -1657,6 +1705,129 @@ def _write_summary_stats(
         pass
 
 
+def _density_point_count(count: int) -> int:
+    if count <= 0:
+        return 0
+    if count <= 32:
+        return max(8, count)
+    if count <= 200:
+        return 64
+    return 128
+
+
+def _build_density_curve(values: Sequence[float], point_count: int) -> Optional[dict[str, Any]]:
+    if not values or point_count <= 0:
+        return None
+    array = np.asarray(values, dtype=float)
+    array = array[np.isfinite(array)]
+    if array.size == 0:
+        return None
+    count = len(array)
+    min_val = float(array.min())
+    max_val = float(array.max())
+    if math.isclose(min_val, max_val):
+        span = 1.0 if math.isclose(min_val, 0.0) else abs(min_val) * 0.1 or 1.0
+        min_val -= span
+        max_val += span
+    std = float(array.std()) or 1.0
+    bandwidth = 1.06 * std * (count ** (-0.2))
+    if not math.isfinite(bandwidth) or bandwidth <= 0:
+        bandwidth = (max_val - min_val) / 20 or 1.0
+    xs = np.linspace(min_val, max_val, point_count)
+    diffs = (xs[:, None] - array[None, :]) / bandwidth
+    kernel = np.exp(-0.5 * diffs ** 2)
+    factor = 1.0 / (count * bandwidth * math.sqrt(2 * math.pi))
+    densities = kernel.sum(axis=1) * factor
+    return {
+        "points": [float(value) for value in xs.tolist()],
+        "density": [float(value) for value in densities.tolist()],
+        "min": min_val,
+        "max": max_val,
+        "bandwidth": bandwidth,
+    }
+
+
+def write_density_graph(directory: Path) -> None:
+    """Precompute density curves for numeric columns and write density_graph.parquet."""
+    parquet_path = Path(directory) / CONFIG.occurrence_parquet_filename
+    rows: list[dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+    samples: Dict[str, list[float]] = {}
+
+    for table in _iter_descendant_tables(parquet_path):
+        df = table.to_pandas()
+
+        if "obscured" in df.columns:
+            df = df[df["obscured"] == "No"]
+        if "coordinateUncertaintyInMeters" in df.columns:
+            df = df[df["coordinateUncertaintyInMeters"] <= 500]
+
+        numeric_cols = [
+            col
+            for col in df.select_dtypes(include=["number"]).columns
+            if col not in excluded_numeric_columns and _layer_value_type(col) != "categorical"
+        ]
+        for column in numeric_cols:
+            series = pd.to_numeric(df[column], errors="coerce").dropna()
+            if series.empty:
+                continue
+            values = series.astype(float).tolist()
+            if not values:
+                continue
+            sample_bucket = samples.setdefault(column, [])
+            seen = counts.get(column, 0)
+            for value in values:
+                seen += 1
+                if len(sample_bucket) < density_max_samples:
+                    sample_bucket.append(float(value))
+                else:
+                    j = random.randrange(seen)
+                    if j < density_max_samples:
+                        sample_bucket[j] = float(value)
+            counts[column] = seen
+
+    for column, sample_values in samples.items():
+        count = counts.get(column, 0)
+        if count <= 0 or not sample_values:
+            continue
+        point_count = _density_point_count(count)
+        curve = _build_density_curve(sample_values, point_count)
+        if not curve:
+            continue
+        rows.append(
+            {
+                "variable": column,
+                "count": int(count),
+                "sampleCount": int(len(sample_values)),
+                "pointCount": int(point_count),
+                "points": curve["points"],
+                "density": curve["density"],
+                "min": curve["min"],
+                "max": curve["max"],
+                "bandwidth": curve["bandwidth"],
+            }
+        )
+
+    out_path = Path(directory) / density_graph_filename
+    if not rows:
+        out_path.unlink(missing_ok=True)
+        return
+    table = pa.Table.from_pylist(rows)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=out_path.parent,
+        suffix=".parquet",
+        delete=False,
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        pq.write_table(table, tmp_path)
+        os.replace(tmp_path, out_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
 def _write_categorical_stats(
     directory: Path,
     entries: List[Dict[str, Any]],
@@ -1707,14 +1878,86 @@ def _load_summary_stats(path_str: str) -> Dict[str, Any] | None:
         A mapping of variable id to metric dicts, or None if missing.
     """
     stats_path = Path(path_str) / "summary_stats.parquet"
-    if not stats_path.exists():
+    if not PARQUET.exists(stats_path):
         return None
     try:
-        frame = pd.read_parquet(stats_path)
+        frame = PARQUET.read_table(stats_path).to_pandas()
         stats = _dataframe_to_stats(frame)
         return stats
     except (OSError, ValueError):
         return None
+
+
+def load_density_graph(path_str: str, variable_id: str) -> Dict[str, Any] | None:
+    """Loads a precomputed density graph for a variable if available."""
+    density_path = Path(path_str) / density_graph_filename
+    local_exists = density_path.exists()
+    if not PARQUET.exists(density_path) and not local_exists:
+        try:
+            density_path.stat()
+            stat_msg = "stat-ok"
+        except Exception as exc:
+            stat_msg = f"stat-fail:{exc}"
+        print(f"[density] missing file {density_path} ({stat_msg})")
+        return None
+    try:
+        columns = [
+            "variable",
+            "points",
+            "density",
+            "min",
+            "max",
+            "bandwidth",
+            "count",
+            "sampleCount",
+            "pointCount",
+        ]
+        if PARQUET.is_remote and local_exists:
+            table = pq.read_table(density_path, columns=columns)
+        else:
+            table = PARQUET.read_table(density_path, columns=columns)
+    except (OSError, ValueError) as exc:
+        print(f"[density] read failed {density_path}: {exc}")
+        return None
+    if not table.num_rows:
+        print(f"[density] empty file {density_path}")
+        return None
+    try:
+        variable_col = pc.cast(table["variable"], pa.string())
+    except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError):
+        variable_col = table["variable"]
+    mask = pc.equal(variable_col, variable_id)
+    filtered = table.filter(mask).combine_chunks()
+    if not filtered.num_rows:
+        preview = table.column("variable").to_pylist()[:10]
+        print(
+            f"[density] missing var={variable_id} in {density_path} "
+            f"(first={preview})"
+        )
+        return None
+    row = filtered.to_pylist()[0]
+    return {
+        "points": row.get("points") or [],
+        "density": row.get("density") or [],
+        "min": row.get("min"),
+        "max": row.get("max"),
+        "bandwidth": row.get("bandwidth"),
+        "count": row.get("count"),
+        "sampleCount": row.get("sampleCount"),
+        "pointCount": row.get("pointCount"),
+    }
+
+
+def load_numeric_summary(path_str: str, variable_id: str) -> Dict[str, Any] | None:
+    stats = _load_summary_stats(path_str)
+    if not stats:
+        stats_path = Path(path_str) / "summary_stats.parquet"
+        if PARQUET.exists(stats_path):
+            _load_summary_stats.cache_clear()
+            stats = _load_summary_stats(path_str)
+        if not stats:
+            return None
+    return stats.get(variable_id)
 
 
 @lru_cache(maxsize=4096)
@@ -1728,10 +1971,10 @@ def _load_categorical_stats(path_str: str) -> Dict[str, Dict[str, Any]]:
         A mapping of variable id to metric dicts.
     """
     stats_path = Path(path_str) / "categorical_stats.parquet"
-    if not stats_path.exists():
+    if not PARQUET.exists(stats_path):
         return {}
     try:
-        frame = pd.read_parquet(stats_path)
+        frame = PARQUET.read_table(stats_path).to_pandas()
     except (OSError, ValueError):
         return {}
     return _tall_dataframe_to_stats(frame)

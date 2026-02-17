@@ -1780,8 +1780,6 @@ def child_relative_rankings(
     metric_values = column.field("value").to_pylist()
     sample_counts = column.field("sampleCount").to_pylist()
 
-    media_index = taxa_navigation.load_taxon_media()
-
     min_samples = max(0, int(min_samples or 0))
 
     eligible: list[tuple[int, Any, float, int, Optional[int]]] = []
@@ -1832,7 +1830,8 @@ def child_relative_rankings(
             language=CONFIG.common_name_language,
         )
         common_name = common_names[0] if common_names else None
-        media_record = media_index.get(taxon["taxon_key"])
+        media_record = taxa_navigation.resolve_taxon_media(taxon["taxon_key"])
+        preferred_image = taxa_navigation.preferred_image_payload(taxon)
         record = {
             "taxonId": taxon_id if taxon_id is not None else taxon["taxon_key"],
             "taxon_id": taxon_id if taxon_id is not None else taxon["taxon_key"],
@@ -1849,7 +1848,9 @@ def child_relative_rankings(
             "metric": metric,
             "variable": layer,
         }
-        if media_record:
+        if preferred_image:
+            record.update(preferred_image)
+        elif media_record:
             record["image_url"] = media_record.get("url")
             record["image_license"] = media_record.get("license")
             record["image_creator"] = media_record.get("creator")

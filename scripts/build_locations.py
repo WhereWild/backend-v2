@@ -3,9 +3,11 @@
 The script inspects the gadm.gpkg GeoPackage for feature layers that contain
 `GID_*`/`NAME_*` columns, then writes per-level CSV files along with a
 hierarchy table and GBIF region list. Afterwards it scans the taxa catalog to
-build a Parquet file mapping each location GID to the taxa that have
-occurrence data there. Downstream code can rely on a single script instead of
-coordinating separate steps.
+build a Parquet file mapping each location GID to taxa occurrence counts.
+The final table includes a taxonomy rollup pass so ancestors accumulate counts
+from all descendants (e.g., family/order rows include species observations).
+Downstream code can rely on a single script instead of coordinating separate
+steps.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import csv
 import sqlite3
 from pathlib import Path
 from typing import Iterable
+from functools import lru_cache
 import pyarrow as pa
 import pyarrow.parquet as pq
 import util.taxa_navigation as taxa_navigation
@@ -176,13 +179,13 @@ def _iter_taxa_with_occurrences() -> Iterable[tuple[int, Path]]:
             yield taxon_id, parquet_path
 
 
-def _collect_gids(parquet_path: Path) -> dict[str, set[str]]:
+def _collect_gid_counts(parquet_path: Path) -> dict[str, dict[str, int]]:
     location_columns = list(CONFIG.location_columns)
     gbif_column = (gbif_column_name, gbif_scope_name)
-    per_scope: dict[str, set[str]] = {
-        scope: set() for _, scope in location_columns
+    per_scope_counts: dict[str, dict[str, int]] = {
+        scope: defaultdict(int) for _, scope in location_columns
     }
-    per_scope[gbif_column[1]] = set()
+    per_scope_counts[gbif_column[1]] = defaultdict(int)
     column_defs = location_columns + [gbif_column]
     column_names = [name for name, _ in column_defs]
     pf = pq.ParquetFile(parquet_path)
@@ -195,49 +198,84 @@ def _collect_gids(parquet_path: Path) -> dict[str, set[str]]:
                 continue
             for value in column.to_pylist():
                 if value and isinstance(value, str):
-                    per_scope[scope].add(value)
-    return per_scope
+                    per_scope_counts[scope][value] += 1
+    return {
+        scope: dict(gid_counts)
+        for scope, gid_counts in per_scope_counts.items()
+    }
+
+
+@lru_cache(maxsize=250_000)
+def _ancestor_taxon_ids(taxon_id: int) -> tuple[int, ...]:
+    taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+    if taxon is None:
+        return ()
+    ancestors: list[int] = []
+    current = taxa_navigation.get_parent_taxon(taxon)
+    while current is not None:
+        ancestor_id = taxa_navigation.taxon_id_as_int(str(current.get("taxon_key") or ""))
+        if ancestor_id is not None:
+            ancestors.append(ancestor_id)
+        current = taxa_navigation.get_parent_taxon(current)
+    return tuple(ancestors)
 
 
 def _build_location_catalog() -> None:
     output_path = CONFIG.location_catalog_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    location_membership: dict[tuple[str, str], set[int]] = defaultdict(set)
+    counts_by_triplet: dict[tuple[str, str, int], int] = defaultdict(int)
 
     for idx, (taxon_id, parquet_path) in enumerate(
         _iter_taxa_with_occurrences(), start=1
     ):
-        per_scope = _collect_gids(parquet_path)
-        for scope, gids in per_scope.items():
-            for gid in gids:
-                location_membership[(scope, gid)].add(taxon_id)
+        per_scope_counts = _collect_gid_counts(parquet_path)
+        for scope, gid_counts in per_scope_counts.items():
+            for gid, count in gid_counts.items():
+                if count <= 0:
+                    continue
+                counts_by_triplet[(scope, gid, taxon_id)] += int(count)
         if idx % location_progress_interval == 0:
             print(f"Processed {idx} taxa…")
 
-    if not location_membership:
+    if not counts_by_triplet:
         print("No location mappings created (no occurrence data found).")
         return
+
+    # Roll up direct counts to all ancestors so ancestor taxa include descendant
+    # observations for the same location.
+    direct_items = list(counts_by_triplet.items())
+    for idx, ((scope, gid, taxon_id), count) in enumerate(direct_items, start=1):
+        for ancestor_id in _ancestor_taxon_ids(taxon_id):
+            counts_by_triplet[(scope, gid, ancestor_id)] += int(count)
+        if idx % (location_progress_interval * 10) == 0:
+            print(f"Rolled up {idx} location-taxon rows…")
 
     rows_scope: list[str] = []
     rows_gid: list[str] = []
     rows_taxon: list[int] = []
-    for (scope, gid), taxa in location_membership.items():
-        for taxon_id in sorted(taxa):
-            rows_scope.append(scope)
-            rows_gid.append(gid)
-            rows_taxon.append(taxon_id)
+    rows_count: list[int] = []
+    for scope, gid, taxon_id in sorted(counts_by_triplet.keys()):
+        count = int(counts_by_triplet[(scope, gid, taxon_id)])
+        if count <= 0:
+            continue
+        rows_scope.append(scope)
+        rows_gid.append(gid)
+        rows_taxon.append(taxon_id)
+        rows_count.append(count)
 
     table = pa.Table.from_pydict(
         {
             "scope": pa.array(rows_scope, type=pa.string()),
             "gid": pa.array(rows_gid, type=pa.string()),
             "taxon_id": pa.array(rows_taxon, type=pa.int64()),
+            "count": pa.array(rows_count, type=pa.int64()),
         }
     )
     pq.write_table(table, output_path)
     print(
         f"Wrote {len(rows_taxon)} rows linking "
-        f"{len(location_membership)} locations to taxa at "
+        f"{len({(scope, gid) for scope, gid, _ in counts_by_triplet.keys()})} locations "
+        f"to taxa at "
         f"{output_path.relative_to(CONFIG.project_root)}"
     )
 

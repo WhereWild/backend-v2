@@ -619,7 +619,7 @@ def species_environment_stats(
             "relativeRanks": ranks,
             "relative_ranks": ranks,
         }
-        return response
+        return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
     if not location_gid:
         summary = summary_stats.load_numeric_summary(str(taxon_dir), variable_id)
@@ -668,7 +668,7 @@ def species_environment_stats(
             "relativeRanks": ranks,
             "relative_ranks": ranks,
         }
-        return response
+        return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
     samples = summary_stats.gather_numeric_records(
         taxon_id,

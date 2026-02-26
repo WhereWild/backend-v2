@@ -228,14 +228,22 @@ def load_layer_legend(layer_id: str) -> dict[str, dict[str, Any]]:
         if class_id is None or name is None:
             continue
         slug = re.sub(r"[^a-z0-9]+", " ", str(name).lower()).strip()
+        code_match = re.search(r"\(([A-Za-z0-9]{2,4})\)", str(name))
         data = {
             "id": class_id,
             "name": name,
             "description": entry.get("description"),
+            "group": entry.get("group"),
+            "group_label": entry.get("group_label"),
+            "traits": entry.get("traits"),
         }
         mapping[str(class_id)] = data
         if slug:
             mapping[slug] = data
+        if code_match:
+            code = code_match.group(1)
+            mapping[code] = data
+            mapping[code.lower()] = data
     return mapping
 
 
@@ -397,7 +405,11 @@ def _load_location_taxa_table() -> pa.Table | None:
 
 
 def location_counts_for_taxon(taxon_id: int) -> Dict[tuple[str, str], int]:
-    """Returns per-location observation counts for a specific taxon."""
+    """Returns per-location observation counts for a taxon.
+
+    For species taxa, counts include infraspecific descendants
+    (subspecies/variety/form) so species presence reflects child observations.
+    """
     try:
         normalized_taxon_id = int(taxon_id)
     except (TypeError, ValueError):
@@ -405,12 +417,33 @@ def location_counts_for_taxon(taxon_id: int) -> Dict[tuple[str, str], int]:
     table = _load_location_taxa_table()
     if table is None or not table.num_rows:
         return {}
+    target_taxon_ids: set[int] = {normalized_taxon_id}
+    try:
+        from util import taxa_navigation
+
+        target_taxon = taxa_navigation.get_taxon_by_id(str(normalized_taxon_id))
+        if target_taxon is not None:
+            target_rank = taxa_navigation.canonical_rank(target_taxon.get("rank"))
+            if target_rank == "SPECIES":
+                for descendant in taxa_navigation.iter_descendants(target_taxon):
+                    descendant_rank = taxa_navigation.canonical_rank(descendant.get("rank"))
+                    if descendant_rank not in CONFIG.subspecies_equivalents:
+                        continue
+                    descendant_id = taxa_navigation.taxon_id_as_int(descendant.get("taxon_key"))
+                    if descendant_id is not None:
+                        target_taxon_ids.add(int(descendant_id))
+    except Exception:
+        # Fall back to direct-only counts if taxonomy lookups fail.
+        target_taxon_ids = {normalized_taxon_id}
     try:
         taxon_col = table["taxon_id"]
-        scalar = pa.scalar(normalized_taxon_id, type=taxon_col.type)
-        filtered = table.filter(
-            pc.equal(taxon_col, scalar)
-        ).combine_chunks()
+        if len(target_taxon_ids) == 1:
+            scalar = pa.scalar(normalized_taxon_id, type=taxon_col.type)
+            mask = pc.equal(taxon_col, scalar)
+        else:
+            value_set = pa.array(sorted(target_taxon_ids), type=taxon_col.type)
+            mask = pc.is_in(taxon_col, value_set=value_set)
+        filtered = table.filter(mask).combine_chunks()
     except Exception:
         return {}
     if not filtered.num_rows:
@@ -430,6 +463,77 @@ def location_counts_for_taxon(taxon_id: int) -> Dict[tuple[str, str], int]:
         if numeric_count <= 0:
             continue
         mapping[(str(scope), str(gid))] += numeric_count
+    return dict(mapping)
+
+
+@lru_cache(maxsize=1024)
+def location_taxon_counts(
+    scope: str,
+    gid: str,
+    *,
+    include_species_rollup: bool = False,
+) -> Dict[int, int]:
+    """Returns taxon->observation count mapping for a specific location key.
+
+    When include_species_rollup=True, infraspecific counts are also added to
+    their parent species taxon id.
+    """
+    normalized_scope = str(scope or "").strip()
+    normalized_gid = str(gid or "").strip()
+    if not normalized_scope or not is_valid_location_gid(normalized_gid):
+        return {}
+    table = _load_location_taxa_table()
+    if table is None or not table.num_rows:
+        return {}
+    try:
+        scope_mask = pc.equal(table["scope"], pa.scalar(normalized_scope, type=table["scope"].type))
+        gid_mask = pc.equal(table["gid"], pa.scalar(normalized_gid, type=table["gid"].type))
+        filtered = table.filter(pc.and_(scope_mask, gid_mask)).combine_chunks()
+    except Exception:
+        return {}
+    if not filtered.num_rows:
+        return {}
+    has_count_column = "count" in filtered.column_names
+    taxon_ids = filtered.column("taxon_id").to_pylist()
+    counts = filtered.column("count").to_pylist() if has_count_column else [1] * len(taxon_ids)
+    mapping: dict[int, int] = defaultdict(int)
+    for taxon_id, count in zip(taxon_ids, counts):
+        try:
+            numeric_taxon_id = int(taxon_id)
+        except (TypeError, ValueError):
+            continue
+        try:
+            numeric_count = int(count)
+        except (TypeError, ValueError):
+            numeric_count = 1
+        if numeric_count <= 0:
+            continue
+        mapping[numeric_taxon_id] += numeric_count
+    if include_species_rollup and mapping:
+        try:
+            from util import taxa_navigation
+
+            rolled: dict[int, int] = defaultdict(int)
+            for numeric_taxon_id, numeric_count in mapping.items():
+                rolled[numeric_taxon_id] += numeric_count
+                taxon = taxa_navigation.get_taxon_by_id(str(numeric_taxon_id))
+                if taxon is None:
+                    continue
+                rank = taxa_navigation.canonical_rank(taxon.get("rank"))
+                if rank not in CONFIG.subspecies_equivalents:
+                    continue
+                parent = taxa_navigation.get_parent_taxon(taxon)
+                while parent is not None:
+                    parent_rank = taxa_navigation.canonical_rank(parent.get("rank"))
+                    if parent_rank == "SPECIES":
+                        parent_id = taxa_navigation.taxon_id_as_int(parent.get("taxon_key"))
+                        if parent_id is not None:
+                            rolled[int(parent_id)] += numeric_count
+                        break
+                    parent = taxa_navigation.get_parent_taxon(parent)
+            mapping = rolled
+        except Exception:
+            pass
     return dict(mapping)
 
 

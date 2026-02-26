@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
@@ -9,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from util.config import load_config
-from util import gis_lookup, indexing, summary_stats, taxa_navigation, units
+from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -120,11 +121,17 @@ def list_species(
 
 
 @app.get("/api/species/{taxon_id}")
-def get_species_detail(taxon_id: int) -> dict[str, Any]:
+def get_species_detail(
+    taxon_id: int,
+    location: Optional[str] = Query(
+        None, description="Optional location GID to tailor description text."
+    ),
+) -> dict[str, Any]:
     """Loads a single taxon record by id.
     
     Args:
         taxon_id: Taxon id to look up.
+        location: Optional location GID filter for location text context.
     
     Returns:
         A serialized taxon payload.
@@ -136,6 +143,19 @@ def get_species_detail(taxon_id: int) -> dict[str, Any]:
             status_code=404,
             detail=f"Species with taxon_id {taxon_id} not found",
         )
+    location_gid = location.strip() if location else None
+    try:
+        description_profile = descriptions.build_taxon_description(
+            taxon,
+            location_gid=location_gid,
+        )
+        text = description_profile.get("text")
+        if isinstance(text, str) and text.strip():
+            payload["description"] = text
+        payload["description_profile"] = description_profile
+    except Exception as exc:
+        print(f"[description] failed for taxon_id={taxon_id}: {exc}")
+        traceback.print_exc()
     return payload
 
 

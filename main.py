@@ -585,7 +585,14 @@ def species_environment_stats(
             "q90": None,
             "q99": None,
         }
-        ranks = indexing.load_relative_ranks(taxon_dir, variable_id, location_gid=location_gid)
+        if location_gid:
+            ranks = []
+            print(
+                f"[timing][env] taxon_id={taxon_id} variable={variable_id} "
+                f"location={location_gid} step=relative_ranks skipped=1 reason=location_filter"
+            )
+        else:
+            ranks = indexing.load_relative_ranks(taxon_dir, variable_id)
         response = {
             "speciesId": taxon_id,
             "species_id": taxon_id,
@@ -634,7 +641,7 @@ def species_environment_stats(
                     "Rebuild summary_stats.parquet and density_graph.parquet."
                 ),
             )
-        ranks = indexing.load_relative_ranks(taxon_dir, variable_id, location_gid=location_gid)
+        ranks = indexing.load_relative_ranks(taxon_dir, variable_id)
         response = {
             "speciesId": taxon_id,
             "species_id": taxon_id,
@@ -694,7 +701,11 @@ def species_environment_stats(
             baseline_numeric_summary = summary_stats.summarize_values(baseline_values)
     summary = summary_stats.summarize_values(values)
     density_curve = indexing.build_density_curve(values, point_count=density_points)
-    ranks = indexing.load_relative_ranks(taxon_dir, variable_id, location_gid=location_gid)
+    ranks = []
+    print(
+        f"[timing][env] taxon_id={taxon_id} variable={variable_id} "
+        f"location={location_gid} step=relative_ranks skipped=1 reason=location_filter"
+    )
     response = {
         "speciesId": taxon_id,
         "species_id": taxon_id,

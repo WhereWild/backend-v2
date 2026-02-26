@@ -1,36 +1,333 @@
 {
   "layer_id": "koppen_geiger",
-  "source": "Beck et al. 2018 / 2023 Köppen-Geiger maps",
+  "source": "Beck et al. 2018 / 2023 K\u00f6ppen-Geiger maps",
   "classes": [
-    { "id": 1, "name": "(Af) Tropical rainforest climate", "description": "Hot, humid, and rainy year-round—think the Amazon Basin, Congo Basin, or coastal Indonesia where seasons barely change." },
-    { "id": 2, "name": "(Am) Tropical monsoon climate", "description": "Steam-bath humidity with an intense wet season and a short drier break, like Mumbai, coastal Thailand, or Guyana." },
-    { "id": 3, "name": "(Aw) Tropical savannah climate", "description": "Warm year-round with distinct wet and dry periods across East Africa, the Venezuelan Llanos, and northern Australia." },
-    { "id": 4, "name": "(BWh) Hot desert climate", "description": "Scorching days, minimal rain, and clear skies typify the Sahara, Arabian Peninsula, and central Australian deserts." },
-    { "id": 5, "name": "(BWk) Cold desert climate", "description": "Dry like a desert but with chilly winters, as in the Gobi, Patagonian interior, or Colorado Plateau." },
-    { "id": 6, "name": "(BSh) Hot semi-arid climate", "description": "Transitional steppe zones bordering hot deserts such as the Sahel, Sudan, and northern Mexico." },
-    { "id": 7, "name": "(BSk) Cold semi-arid climate", "description": "Wide temperature swings with modest rainfall across Mongolia, Kazakhstan, and the U.S. High Plains." },
-    { "id": 8, "name": "(Csa) Mediterranean with hot summers", "description": "Mild, wet winters and hot, dry summers like coastal California, southern Spain, and central Chile." },
-    { "id": 9, "name": "(Csb) Mediterranean with warm summers", "description": "Gentler summers and rainy winters resembling coastal Portugal or the Pacific Northwest." },
-    { "id": 10, "name": "(Csc) Mediterranean with cool summers", "description": "Rare cool-summer Mediterranean pockets in high elevations of coastal Chile or western Turkey." },
-    { "id": 11, "name": "(Cwa) Temperate with dry winters, hot summers", "description": "Sticky summers and dry winters common in southeastern China, northern India, and inland Brazil." },
-    { "id": 12, "name": "(Cwb) Temperate with dry winters, warm summers", "description": "Balanced warmth with winter dryness across Ethiopian highlands and the Bolivian Yungas." },
-    { "id": 13, "name": "(Cwc) Temperate with dry winters, cool summers", "description": "Mild summers but distinct dry winters in the higher Andes valleys and some Himalayan foothills." },
-    { "id": 14, "name": "(Cfa) Humid subtropical with hot summers", "description": "Soupy summers and no true dry season like the U.S. Southeast, eastern China, and coastal Argentina." },
-    { "id": 15, "name": "(Cfb) Humid subtropical with warm summers", "description": "Gentler four-season climate similar to Paris Basin, southern Brazil, or New Zealand’s North Island." },
-    { "id": 16, "name": "(Cfc) Humid oceanic with cool summers", "description": "Persistent drizzle, cool summers, and mild winters like Scotland, southern Chile, or New Zealand’s South Island." },
-    { "id": 17, "name": "(Dsa) Continental with dry summers, hot summers", "description": "Large seasonal swings with dry summers and hot peaks across interior Turkey and Iran’s uplands." },
-    { "id": 18, "name": "(Dsb) Continental with dry summers, warm summers", "description": "Moderately warm summers yet drying trends, as in the Balkans or interior Pacific Northwest." },
-    { "id": 19, "name": "(Dsc) Continental with dry summers, cool summers", "description": "Short, cool summers and dry seasons in subalpine Mongolia or Siberia." },
-    { "id": 20, "name": "(Dsd) Continental with dry summers, severe winters", "description": "Subarctic-style winters paired with dry summers, typical of northern Siberia or interior Alaska." },
-    { "id": 21, "name": "(Dwa) Continental with dry winters, hot summers", "description": "Bitterly cold winters yet sultry summers across northeastern China, Manchuria, and northern Korea." },
-    { "id": 22, "name": "(Dwb) Continental with dry winters, warm summers", "description": "Similar regime with milder summers throughout highland Nepal, northern Japan, and interior Canada." },
-    { "id": 23, "name": "(Dwc) Continental with dry winters, cool summers", "description": "Short cool summers and frigid, dry winters like central Siberia and northern Mongolia." },
-    { "id": 24, "name": "(Dwd) Continental with dry winters, severe winters", "description": "Among the harshest climates: extremely cold, dry winters near Yakutsk and the Lena River basin." },
-    { "id": 25, "name": "(Dfa) Humid continental with hot summers", "description": "Hot, stormy summers and snowy winters found in the U.S. Midwest, southern Ontario, and Ukraine." },
-    { "id": 26, "name": "(Dfb) Humid continental with warm summers", "description": "Classic four-season climates like New England, southern Scandinavia, and northern Japan." },
-    { "id": 27, "name": "(Dfc) Humid continental with cool summers", "description": "Cool summers and long winters dominating northern Canada, interior Alaska, and central Siberia." },
-    { "id": 28, "name": "(Dfd) Humid continental with severe winters", "description": "Extreme winters with short summers typical of northeastern Siberia and the Taymyr Peninsula." },
-    { "id": 29, "name": "(ET) Polar tundra climate", "description": "Permafrost landscapes with brief chilly summers, as in Arctic Canada and northern Alaska." },
-    { "id": 30, "name": "(EF) Polar frost climate", "description": "Perennial ice and snow with virtually no melt season, like central Antarctica or Greenland’s ice cap." }
+    {
+      "id": 1,
+      "name": "(Af) Tropical rainforest climate",
+      "description": "Hot, humid, and rainy year-round\u2014think the Amazon Basin, Congo Basin, or coastal Indonesia where seasons barely change.",
+      "group": "rainforest",
+      "group_label": "Rainforest",
+      "traits": {
+        "code": "AF"
+      }
+    },
+    {
+      "id": 2,
+      "name": "(Am) Tropical monsoon climate",
+      "description": "Steam-bath humidity with an intense wet season and a short drier break, like Mumbai, coastal Thailand, or Guyana.",
+      "group": "monsoon",
+      "group_label": "Monsoon",
+      "traits": {
+        "code": "AM"
+      }
+    },
+    {
+      "id": 3,
+      "name": "(Aw) Tropical savannah climate",
+      "description": "Warm year-round with distinct wet and dry periods across East Africa, the Venezuelan Llanos, and northern Australia.",
+      "group": "savanna",
+      "group_label": "Savanna",
+      "traits": {
+        "code": "AW"
+      }
+    },
+    {
+      "id": 4,
+      "name": "(BWh) Hot desert climate",
+      "description": "Scorching days, minimal rain, and clear skies typify the Sahara, Arabian Peninsula, and central Australian deserts.",
+      "group": "desert",
+      "group_label": "Desert",
+      "traits": {
+        "thermal": "hot",
+        "code": "BWH"
+      }
+    },
+    {
+      "id": 5,
+      "name": "(BWk) Cold desert climate",
+      "description": "Dry like a desert but with chilly winters, as in the Gobi, Patagonian interior, or Colorado Plateau.",
+      "group": "desert",
+      "group_label": "Desert",
+      "traits": {
+        "thermal": "cold",
+        "code": "BWK"
+      }
+    },
+    {
+      "id": 6,
+      "name": "(BSh) Hot semi-arid climate",
+      "description": "Transitional steppe zones bordering hot deserts such as the Sahel, Sudan, and northern Mexico.",
+      "group": "steppe",
+      "group_label": "Steppe",
+      "traits": {
+        "thermal": "hot",
+        "code": "BSH"
+      }
+    },
+    {
+      "id": 7,
+      "name": "(BSk) Cold semi-arid climate",
+      "description": "Wide temperature swings with modest rainfall across Mongolia, Kazakhstan, and the U.S. High Plains.",
+      "group": "steppe",
+      "group_label": "Steppe",
+      "traits": {
+        "thermal": "cold",
+        "code": "BSK"
+      }
+    },
+    {
+      "id": 8,
+      "name": "(Csa) Mediterranean with hot summers",
+      "description": "Mild, wet winters and hot, dry summers like coastal California, southern Spain, and central Chile.",
+      "group": "mediterranean",
+      "group_label": "Mediterranean",
+      "traits": {
+        "thermal": "hot",
+        "code": "CSA"
+      }
+    },
+    {
+      "id": 9,
+      "name": "(Csb) Mediterranean with warm summers",
+      "description": "Gentler summers and rainy winters resembling coastal Portugal or the Pacific Northwest.",
+      "group": "mediterranean",
+      "group_label": "Mediterranean",
+      "traits": {
+        "thermal": "warm",
+        "code": "CSB"
+      }
+    },
+    {
+      "id": 10,
+      "name": "(Csc) Mediterranean with cool summers",
+      "description": "Rare cool-summer Mediterranean pockets in high elevations of coastal Chile or western Turkey.",
+      "group": "mediterranean",
+      "group_label": "Mediterranean",
+      "traits": {
+        "thermal": "cool",
+        "code": "CSC"
+      }
+    },
+    {
+      "id": 11,
+      "name": "(Cwa) Temperate with dry winters, hot summers",
+      "description": "Sticky summers and dry winters common in southeastern China, northern India, and inland Brazil.",
+      "group": "temperate",
+      "group_label": "Temperate",
+      "traits": {
+        "thermal": "hot",
+        "code": "CWA"
+      }
+    },
+    {
+      "id": 12,
+      "name": "(Cwb) Temperate with dry winters, warm summers",
+      "description": "Balanced warmth with winter dryness across Ethiopian highlands and the Bolivian Yungas.",
+      "group": "highland",
+      "group_label": "Highland",
+      "traits": {
+        "thermal": "warm",
+        "code": "CWB"
+      }
+    },
+    {
+      "id": 13,
+      "name": "(Cwc) Temperate with dry winters, cool summers",
+      "description": "Mild summers but distinct dry winters in the higher Andes valleys and some Himalayan foothills.",
+      "group": "highland",
+      "group_label": "Highland",
+      "traits": {
+        "thermal": "cool",
+        "code": "CWC"
+      }
+    },
+    {
+      "id": 14,
+      "name": "(Cfa) Humid subtropical with hot summers",
+      "description": "Soupy summers and no true dry season like the U.S. Southeast, eastern China, and coastal Argentina.",
+      "group": "temperate",
+      "group_label": "Temperate",
+      "traits": {
+        "thermal": "hot",
+        "code": "CFA"
+      }
+    },
+    {
+      "id": 15,
+      "name": "(Cfb) Humid subtropical with warm summers",
+      "description": "Gentler four-season climate similar to Paris Basin, southern Brazil, or New Zealand\u2019s North Island.",
+      "group": "temperate",
+      "group_label": "Temperate",
+      "traits": {
+        "thermal": "warm",
+        "code": "CFB"
+      }
+    },
+    {
+      "id": 16,
+      "name": "(Cfc) Humid oceanic with cool summers",
+      "description": "Persistent drizzle, cool summers, and mild winters like Scotland, southern Chile, or New Zealand\u2019s South Island.",
+      "group": "temperate",
+      "group_label": "Temperate",
+      "traits": {
+        "thermal": "cool",
+        "code": "CFC"
+      }
+    },
+    {
+      "id": 17,
+      "name": "(Dsa) Continental with dry summers, hot summers",
+      "description": "Large seasonal swings with dry summers and hot peaks across interior Turkey and Iran\u2019s uplands.",
+      "group": "interior",
+      "group_label": "Interior",
+      "traits": {
+        "thermal": "hot",
+        "code": "DSA"
+      }
+    },
+    {
+      "id": 18,
+      "name": "(Dsb) Continental with dry summers, warm summers",
+      "description": "Moderately warm summers yet drying trends, as in the Balkans or interior Pacific Northwest.",
+      "group": "interior",
+      "group_label": "Interior",
+      "traits": {
+        "thermal": "warm",
+        "code": "DSB"
+      }
+    },
+    {
+      "id": 19,
+      "name": "(Dsc) Continental with dry summers, cool summers",
+      "description": "Short, cool summers and dry seasons in subalpine Mongolia or Siberia.",
+      "group": "interior",
+      "group_label": "Interior",
+      "traits": {
+        "thermal": "cool",
+        "code": "DSC"
+      }
+    },
+    {
+      "id": 20,
+      "name": "(Dsd) Continental with dry summers, severe winters",
+      "description": "Subarctic-style winters paired with dry summers, typical of northern Siberia or interior Alaska.",
+      "group": "interior",
+      "group_label": "Interior",
+      "traits": {
+        "thermal": "severe-winter",
+        "code": "DSD"
+      }
+    },
+    {
+      "id": 21,
+      "name": "(Dwa) Continental with dry winters, hot summers",
+      "description": "Bitterly cold winters yet sultry summers across northeastern China, Manchuria, and northern Korea.",
+      "group": "continental",
+      "group_label": "Continental",
+      "traits": {
+        "thermal": "hot",
+        "code": "DWA"
+      }
+    },
+    {
+      "id": 22,
+      "name": "(Dwb) Continental with dry winters, warm summers",
+      "description": "Similar regime with milder summers throughout highland Nepal, northern Japan, and interior Canada.",
+      "group": "continental",
+      "group_label": "Continental",
+      "traits": {
+        "thermal": "warm",
+        "code": "DWB"
+      }
+    },
+    {
+      "id": 23,
+      "name": "(Dwc) Continental with dry winters, cool summers",
+      "description": "Short cool summers and frigid, dry winters like central Siberia and northern Mongolia.",
+      "group": "subpolar",
+      "group_label": "Subpolar",
+      "traits": {
+        "thermal": "cool",
+        "code": "DWC"
+      }
+    },
+    {
+      "id": 24,
+      "name": "(Dwd) Continental with dry winters, severe winters",
+      "description": "Among the harshest climates: extremely cold, dry winters near Yakutsk and the Lena River basin.",
+      "group": "subpolar",
+      "group_label": "Subpolar",
+      "traits": {
+        "thermal": "severe-winter",
+        "code": "DWD"
+      }
+    },
+    {
+      "id": 25,
+      "name": "(Dfa) Humid continental with hot summers",
+      "description": "Hot, stormy summers and snowy winters found in the U.S. Midwest, southern Ontario, and Ukraine.",
+      "group": "continental",
+      "group_label": "Continental",
+      "traits": {
+        "thermal": "hot",
+        "code": "DFA"
+      }
+    },
+    {
+      "id": 26,
+      "name": "(Dfb) Humid continental with warm summers",
+      "description": "Classic four-season climates like New England, southern Scandinavia, and northern Japan.",
+      "group": "continental",
+      "group_label": "Continental",
+      "traits": {
+        "thermal": "warm",
+        "code": "DFB"
+      }
+    },
+    {
+      "id": 27,
+      "name": "(Dfc) Humid continental with cool summers",
+      "description": "Cool summers and long winters dominating northern Canada, interior Alaska, and central Siberia.",
+      "group": "subpolar",
+      "group_label": "Subpolar",
+      "traits": {
+        "thermal": "cool",
+        "code": "DFC"
+      }
+    },
+    {
+      "id": 28,
+      "name": "(Dfd) Humid continental with severe winters",
+      "description": "Extreme winters with short summers typical of northeastern Siberia and the Taymyr Peninsula.",
+      "group": "subpolar",
+      "group_label": "Subpolar",
+      "traits": {
+        "thermal": "severe-winter",
+        "code": "DFD"
+      }
+    },
+    {
+      "id": 29,
+      "name": "(ET) Polar tundra climate",
+      "description": "Permafrost landscapes with brief chilly summers, as in Arctic Canada and northern Alaska.",
+      "group": "polar",
+      "group_label": "Polar",
+      "traits": {
+        "thermal": "cold",
+        "code": "ET"
+      }
+    },
+    {
+      "id": 30,
+      "name": "(EF) Polar frost climate",
+      "description": "Perennial ice and snow with virtually no melt season, like central Antarctica or Greenland\u2019s ice cap.",
+      "group": "polar",
+      "group_label": "Polar",
+      "traits": {
+        "thermal": "severe-winter",
+        "code": "EF"
+      }
+    }
   ]
 }

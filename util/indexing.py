@@ -128,6 +128,7 @@ def _is_temporal_metric_column(column_key: str) -> bool:
 def _load_global_relative_rows(
     taxon_key: str,
     variable_id: str,
+    metric_names: Optional[Sequence[str]] = None,
 ) -> pa.Table | None:
     if PARQUET.is_remote:
         return None
@@ -139,6 +140,17 @@ def _load_global_relative_rows(
     except (OSError, ValueError):
         return None
     try:
+        filter_expr = (
+            (pds.field("taxonKey") == str(taxon_key))
+            & (pds.field("variable") == str(variable_id))
+        )
+        requested_metrics = [
+            str(name).strip()
+            for name in (metric_names or ())
+            if str(name).strip()
+        ]
+        if requested_metrics:
+            filter_expr = filter_expr & pds.field("metric").isin(requested_metrics)
         table = dataset.to_table(
             columns=[
                 "variable",
@@ -149,10 +161,7 @@ def _load_global_relative_rows(
                 "contextTaxonId",
                 "contextLabel",
             ],
-            filter=(
-                (pds.field("taxonKey") == str(taxon_key))
-                & (pds.field("variable") == str(variable_id))
-            ),
+            filter=filter_expr,
         )
     except (OSError, ValueError):
         return None
@@ -1391,9 +1400,145 @@ def _ancestor_contexts(taxon_path: Path) -> List[Any]:
     return contexts
 
 
+def _is_categorical_class_metric(metric_name: str) -> bool:
+    return str(metric_name or "").strip().lower().startswith("class_")
+
+
+def _all_requested_metrics_are_class_metrics(
+    requested_metrics: set[str],
+) -> bool:
+    if not requested_metrics:
+        return False
+    return all(_is_categorical_class_metric(metric_name) for metric_name in requested_metrics)
+
+
+def _context_column_rank(storage_rank: str, ancestor_rank: str) -> str:
+    if storage_rank == "SUBSPECIES" and ancestor_rank != "SPECIES":
+        return "SPECIES"
+    return storage_rank
+
+
+@lru_cache(maxsize=65536)
+def _descendant_catalog_sample_counts(
+    ancestor_taxon_id: str,
+    rank: str,
+) -> dict[int, int]:
+    ancestor = taxa_navigation.get_taxon_by_id(str(ancestor_taxon_id))
+    if ancestor is None:
+        return {}
+    catalog_path = Path(ancestor["path"]) / f"{str(rank).lower()}.parquet"
+    if not PARQUET.exists(catalog_path):
+        return {}
+    try:
+        table = PARQUET.read_table(catalog_path, columns=["taxon_key", "sample_count"]).combine_chunks()
+    except Exception:
+        return {}
+    if not table.num_rows:
+        return {}
+    taxon_keys = table.column("taxon_key").to_pylist()
+    sample_counts = table.column("sample_count").to_pylist()
+    mapping: dict[int, int] = {}
+    for taxon_key, sample_count in zip(taxon_keys, sample_counts):
+        taxon_id = taxa_navigation.taxon_id_as_int(str(taxon_key))
+        if taxon_id is None:
+            continue
+        try:
+            numeric_count = int(sample_count)
+        except (TypeError, ValueError):
+            numeric_count = 0
+        if numeric_count <= 0:
+            continue
+        mapping[int(taxon_id)] = numeric_count
+    return mapping
+
+
+def _eligible_context_taxon_ids(
+    *,
+    ancestor_taxon_id: str,
+    target_rank: str,
+    storage_rank: str,
+    include_species_like: bool,
+    allowed_taxa: Optional[frozenset[int]],
+    min_samples: int = 0,
+    location_counts: Optional[dict[int, int]] = None,
+) -> set[int]:
+    ancestor = taxa_navigation.get_taxon_by_id(str(ancestor_taxon_id))
+    if ancestor is None:
+        return set()
+    ancestor_rank = taxa_navigation.canonical_rank(ancestor.get("rank")) or ""
+    column_rank = _context_column_rank(storage_rank, ancestor_rank)
+    base_counts = _descendant_catalog_sample_counts(str(ancestor_taxon_id), column_rank)
+    if not base_counts:
+        return set()
+    target_rank_canonical = taxa_navigation.canonical_rank(target_rank) or target_rank
+    # Fast-path: for species+species-like comparisons, descendant species catalogs
+    # already represent the universe we compare against.
+    if (
+        allowed_taxa is None
+        and min_samples == 0
+        and location_counts is None
+        and target_rank_canonical == "SPECIES"
+        and include_species_like
+    ):
+        return set(base_counts.keys())
+    species_like_ranks = {CONFIG.species_rank, *CONFIG.subspecies_equivalents}
+    species_like_ranks = {
+        taxa_navigation.canonical_rank(rank)
+        for rank in species_like_ranks
+        if taxa_navigation.canonical_rank(rank)
+    }
+    min_samples = max(0, int(min_samples or 0))
+    eligible: set[int] = set()
+    for taxon_id, base_sample_count in base_counts.items():
+        if allowed_taxa is not None and taxon_id not in allowed_taxa:
+            continue
+        resolved_sample_count = (
+            int(location_counts.get(taxon_id, 0))
+            if location_counts is not None
+            else int(base_sample_count)
+        )
+        if min_samples and resolved_sample_count < min_samples:
+            continue
+        taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+        if taxon is None:
+            continue
+        taxon_rank = taxa_navigation.canonical_rank(taxon.get("rank"))
+        if target_rank_canonical == "SPECIES":
+            if include_species_like:
+                if taxon_rank not in species_like_ranks:
+                    continue
+            elif taxon_rank != "SPECIES":
+                continue
+        elif taxon_rank != target_rank_canonical:
+            continue
+        eligible.add(taxon_id)
+    return eligible
+
+
+@lru_cache(maxsize=65536)
+def _eligible_context_taxon_count_cached(
+    ancestor_taxon_id: str,
+    target_rank: str,
+    storage_rank: str,
+    include_species_like: bool,
+) -> int:
+    return len(
+        _eligible_context_taxon_ids(
+            ancestor_taxon_id=ancestor_taxon_id,
+            target_rank=target_rank,
+            storage_rank=storage_rank,
+            include_species_like=include_species_like,
+            allowed_taxa=None,
+            min_samples=0,
+            location_counts=None,
+        )
+    )
+
+
 def load_relative_ranks(
     taxon_dir: Path,
     variable_id: str,
+    metric_names: Optional[Sequence[str]] = None,
     location_gid: Optional[str] = None,
 ) -> List[dict[str, Any]]:
     """Loads relative rank positions for a taxon across ancestor contexts.
@@ -1401,6 +1546,8 @@ def load_relative_ranks(
     Args:
         taxon_dir: Filesystem path of the taxon directory to rank.
         variable_id: Environmental variable id to rank on.
+        metric_names: Optional metric names to include. If omitted, defaults to
+            canonical relative-rank metrics.
         location_gid: Optional location GID to filter ranks to taxa that occur there.
     
     Returns:
@@ -1415,6 +1562,11 @@ def load_relative_ranks(
     taxon = taxa_navigation.get_taxon_by_id(str(taxon_key))
     if taxon is None:
         return []
+    requested_metrics = {
+        str(name).strip().lower()
+        for name in (metric_names or ())
+        if str(name).strip()
+    }
     target_taxon_id = taxa_navigation.taxon_id_as_int(str(taxon_key))
     target_rank = taxa_navigation.canonical_rank(taxon["rank"]) or "SPECIES"
     storage_rank = (
@@ -1437,12 +1589,22 @@ def load_relative_ranks(
             return []
     results: list[dict[str, Any]] = []
     if allowed_taxa is None:
-        table = _load_global_relative_rows(str(taxon_key), variable_id)
+        skip_global_for_class_metrics = _all_requested_metrics_are_class_metrics(requested_metrics)
+        table = None
+        if not skip_global_for_class_metrics:
+            table = _load_global_relative_rows(
+                str(taxon_key),
+                variable_id,
+                metric_names=tuple(requested_metrics) if requested_metrics else None,
+            )
         if table is None:
             positions_path = taxon_dir / "relative_ranks_positions.parquet"
             local_exists = positions_path.exists()
             if not PARQUET.exists(positions_path) and not local_exists:
                 return []
+            filters = [("variable", "=", variable_id)]
+            if requested_metrics:
+                filters.append(("metric", "in", sorted(requested_metrics)))
             try:
                 columns = [
                     "variable",
@@ -1456,36 +1618,61 @@ def load_relative_ranks(
                 table = PARQUET.read_table(
                     positions_path,
                     columns=columns,
-                    filters=[("variable", "=", variable_id)],
+                    filters=filters,
                 )
             except TypeError:
                 try:
                     if PARQUET.is_remote and local_exists:
-                        table = pq.read_table(positions_path, columns=columns)
+                        table = pq.read_table(
+                            positions_path,
+                            columns=columns,
+                            filters=filters,
+                        )
                     else:
-                        table = PARQUET.read_table(positions_path, columns=columns)
+                        table = PARQUET.read_table(
+                            positions_path,
+                            columns=columns,
+                            filters=filters,
+                        )
                 except (OSError, ValueError):
                     return []
             except (OSError, ValueError):
                 return []
         if not table.num_rows:
             return []
-        try:
-            variable_col = pc.cast(table["variable"], pa.string())
-        except (pa.ArrowInvalid, pa.ArrowTypeError, ValueError):
-            variable_col = table["variable"]
-        variable_mask = pc.equal(variable_col, variable_id)
-        filtered = table.filter(variable_mask).combine_chunks()
+        filtered = table.combine_chunks()
         if not filtered.num_rows:
             return []
         for entry in filtered.to_pylist():
             metric_name = str(entry.get("metric") or "")
-            if metric_name not in relative_rank_metrics:
+            normalized_metric = metric_name.strip().lower()
+            if requested_metrics:
+                if normalized_metric not in requested_metrics:
+                    continue
+            elif metric_name not in relative_rank_metrics:
                 continue
             count = entry.get("count")
             position = entry.get("position")
             if count is None or count <= 0 or position is None:
                 continue
+            try:
+                count = int(count)
+                position = int(position)
+            except (TypeError, ValueError):
+                continue
+            if _is_categorical_class_metric(normalized_metric):
+                ancestor_taxon_id = str(entry.get("contextTaxonId") or "").strip()
+                if ancestor_taxon_id:
+                    adjusted_total = _eligible_context_taxon_count_cached(
+                        ancestor_taxon_id,
+                        target_rank,
+                        storage_rank,
+                        (target_rank == "SPECIES"),
+                    )
+                    if adjusted_total > count:
+                        # Missing class_* rows imply zero share and sort before positive shares.
+                        position += adjusted_total - count
+                        count = adjusted_total
             percentile = position / max(count - 1, 1) if count > 1 else 0.0
             ancestor_label = entry.get("contextLabel")
             ancestor_taxon_id = entry.get("contextTaxonId")
@@ -1526,7 +1713,12 @@ def load_relative_ranks(
         categorical_stats = _load_categorical_stats(str(lookup_taxon["path"])) or {}
         metrics = dict(stats.get(variable_id, {}))
         metrics.update(categorical_stats.get(variable_id, {}))
-        for metric_name in relative_rank_metrics:
+        metric_iterable: Sequence[str]
+        if requested_metrics:
+            metric_iterable = sorted(requested_metrics)
+        else:
+            metric_iterable = relative_rank_metrics
+        for metric_name in metric_iterable:
             try:
                 column_name = _resolve_column_name(
                     index_path, variable_id, metric_name
@@ -1573,6 +1765,22 @@ def load_relative_ranks(
                 continue
             count = filtered_total
             position = filtered_position
+            normalized_metric = str(metric_name).strip().lower()
+            if _is_categorical_class_metric(normalized_metric):
+                ancestor_taxon_id = str(ancestor.get("taxon_key") or "").strip()
+                eligible_ids = _eligible_context_taxon_ids(
+                    ancestor_taxon_id=ancestor_taxon_id,
+                    target_rank=target_rank,
+                    storage_rank=storage_rank,
+                    include_species_like=(target_rank == "SPECIES"),
+                    allowed_taxa=allowed_taxa,
+                    min_samples=0,
+                    location_counts=None,
+                )
+                adjusted_total = len(eligible_ids)
+                if adjusted_total > count:
+                    position += adjusted_total - count
+                    count = adjusted_total
             percentile = (
                 position / max(count - 1, 1) if count > 1 else 0.0
             )
@@ -1683,7 +1891,7 @@ def list_rank_metric_options(
         raise ValueError("descendant_rank is required")
     ancestor_path = Path(ancestor["path"])
     index_path = ancestor_path / f"{canonical_rank.lower()}_index.parquet"
-    if not PARQUET.exists(index_path):
+    if not index_path.exists():
         return []
     try:
         schema = PARQUET.read_schema(index_path)
@@ -1750,7 +1958,7 @@ def child_relative_rankings(
 
     ancestor_path = Path(ancestor["path"])
     index_path = ancestor_path / f"{canonical_rank.lower()}_index.parquet"
-    if not PARQUET.exists(index_path):
+    if not index_path.exists():
         return [], None
 
     try:
@@ -1768,13 +1976,18 @@ def child_relative_rankings(
         return [], None
 
     allowed_taxa: Optional[frozenset[int]] = None
+    location_counts: Optional[dict[int, int]] = None
     normalized_location = location_gid.strip() if location_gid else None
     if normalized_location:
         _column, scope, target = gis_lookup.location_lookup_for_gid(normalized_location)
-        membership = gis_lookup.location_taxa_membership()
-        allowed_taxa = membership.get((scope, target))
-        if not allowed_taxa:
+        location_counts = gis_lookup.location_taxon_counts(
+            scope,
+            target,
+            include_species_rollup=(canonical_rank == "SPECIES"),
+        )
+        if not location_counts:
             return [], None
+        allowed_taxa = frozenset(location_counts.keys())
 
     taxon_values = column.field("taxonKey").to_pylist()
     metric_values = column.field("value").to_pylist()
@@ -1786,8 +1999,6 @@ def child_relative_rankings(
     for idx, (taxon_key, value, sample_count) in enumerate(
         zip(taxon_values, metric_values, sample_counts)
     ):
-        if sample_count is None or (min_samples and sample_count < min_samples):
-            continue
         taxon = taxa_navigation.get_taxon_by_id(str(taxon_key))
         if taxon is None:
             continue
@@ -1795,6 +2006,15 @@ def child_relative_rankings(
         if allowed_taxa is not None:
             if taxon_id_value is None or taxon_id_value not in allowed_taxa:
                 continue
+        resolved_sample_count: Optional[int]
+        if location_counts is not None:
+            if taxon_id_value is None:
+                continue
+            resolved_sample_count = location_counts.get(taxon_id_value)
+        else:
+            resolved_sample_count = int(sample_count) if sample_count is not None else None
+        if resolved_sample_count is None or (min_samples and resolved_sample_count < min_samples):
+            continue
         taxon_rank = taxa_navigation.canonical_rank(taxon["rank"])
         if (
             canonical_rank == "SPECIES"
@@ -1802,11 +2022,28 @@ def child_relative_rankings(
             and taxon_rank != "SPECIES"
         ):
             continue
-        eligible.append((idx, taxon, float(value), int(sample_count), taxon_id_value))
+        eligible.append((idx, taxon, float(value), int(resolved_sample_count), taxon_id_value))
 
     filtered_total = len(eligible)
     if filtered_total == 0:
         return [], None
+
+    metric_is_class = _is_categorical_class_metric(metric)
+    class_zero_prefix = 0
+    if metric_is_class:
+        eligible_ids = _eligible_context_taxon_ids(
+            ancestor_taxon_id=str(ancestor_taxon_id),
+            target_rank=canonical_rank,
+            storage_rank=canonical_rank,
+            include_species_like=include_species_like,
+            allowed_taxa=allowed_taxa,
+            min_samples=min_samples,
+            location_counts=location_counts,
+        )
+        adjusted_total = len(eligible_ids)
+        if adjusted_total > filtered_total:
+            class_zero_prefix = adjusted_total - filtered_total
+            filtered_total = adjusted_total
 
     distribution_values = [entry[2] for entry in eligible] if return_distribution else None
 
@@ -1823,7 +2060,7 @@ def child_relative_rankings(
         if order_normalized == "desc":
             rank_index = filtered_total - 1 - output_idx
         else:
-            rank_index = output_idx
+            rank_index = output_idx + class_zero_prefix
         percentile = rank_index / denominator if filtered_total > 1 else 0.0
         common_names = taxa_navigation.extract_common_names_for_language(
             taxon,

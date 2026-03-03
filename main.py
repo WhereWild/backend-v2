@@ -126,6 +126,9 @@ def get_species_detail(
     location: Optional[str] = Query(
         None, description="Optional location GID to tailor description text."
     ),
+    unit_system: Optional[str] = Query(
+        None, description="Unit system for description values (metric or imperial)"
+    ),
 ) -> dict[str, Any]:
     """Loads a single taxon record by id.
     
@@ -148,6 +151,7 @@ def get_species_detail(
         description_profile = descriptions.build_taxon_description(
             taxon,
             location_gid=location_gid,
+            unit_system=unit_system,
         )
         text = description_profile.get("text")
         if isinstance(text, str) and text.strip():

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Optional
 import math
 
-from util import summary_stats
+from util import summary_stats, units
 from util.config import load_config
 
 _LOCATION_CATEGORY_SAMPLE_LIMIT = 500
@@ -1189,26 +1189,56 @@ def _build_location_text(
 # ---------------------------------------------------------------------------
 
 
-def _format_terrain_value(value: Any) -> Optional[str]:
+def _format_terrain_value(
+    value: Any,
+    *,
+    unit: Optional[str] = None,
+    unit_system: Optional[units.UnitSystem] = None,
+) -> Optional[str]:
     try:
         numeric = float(value)
     except (TypeError, ValueError):
         return None
     if not math.isfinite(numeric):
         return None
+    converted, _display = units.convert_value_for_system(numeric, unit, unit_system)
+    if converted is None:
+        return None
+    numeric = float(converted)
     rounded = int(round(numeric / 100.0) * 100)
     return str(rounded)
 
 
-def _extract_elevation_range_values(elevation: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+def _extract_elevation_range_values(
+    elevation: dict[str, Any],
+    *,
+    unit: Optional[str] = None,
+    unit_system: Optional[units.UnitSystem] = None,
+) -> tuple[Optional[str], Optional[str]]:
     range_value = elevation.get("range")
     if isinstance(range_value, dict):
-        min_value = _format_terrain_value(range_value.get("min"))
-        max_value = _format_terrain_value(range_value.get("max"))
+        min_value = _format_terrain_value(
+            range_value.get("min"),
+            unit=unit,
+            unit_system=unit_system,
+        )
+        max_value = _format_terrain_value(
+            range_value.get("max"),
+            unit=unit,
+            unit_system=unit_system,
+        )
         if min_value and max_value:
             return min_value, max_value
-    min_value = _format_terrain_value(elevation.get("min"))
-    max_value = _format_terrain_value(elevation.get("max"))
+    min_value = _format_terrain_value(
+        elevation.get("min"),
+        unit=unit,
+        unit_system=unit_system,
+    )
+    max_value = _format_terrain_value(
+        elevation.get("max"),
+        unit=unit,
+        unit_system=unit_system,
+    )
     return min_value, max_value
 
 
@@ -2155,6 +2185,22 @@ def _format_scalar_value(value: Any) -> Optional[str]:
     return f"{numeric:.1f}".rstrip("0").rstrip(".")
 
 
+def _format_scalar_value_for_system(
+    value: Any,
+    *,
+    unit: Optional[str] = None,
+    unit_system: Optional[units.UnitSystem] = None,
+) -> Optional[str]:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    converted, _display = units.convert_value_for_system(numeric, unit, unit_system)
+    return _format_scalar_value(converted)
+
+
 def _location_label(location_gid: Optional[str]) -> str:
     if not location_gid:
         return "this location"
@@ -2252,6 +2298,7 @@ def _terrain_status_rows(
     *,
     taxon_id: Optional[int] = None,
     location_gid: Optional[str] = None,
+    unit_system: Optional[units.UnitSystem] = None,
 ) -> list[dict[str, Any]]:
     from util import gis_lookup
 
@@ -2261,7 +2308,10 @@ def _terrain_status_rows(
         variable_id="elevation",
         location_gid=location_gid,
     )
-    min_value, max_value = _extract_elevation_range_values(elevation)
+    raw_units: Optional[str] = None
+    display_units = ""
+    min_value: Optional[str]
+    max_value: Optional[str]
     slope = _numeric_summary_for_context(
         taxon_id=taxon_id,
         taxon_dir=taxon_dir,
@@ -2270,12 +2320,18 @@ def _terrain_status_rows(
     )
     slope_grade = _slope_grade_percent(slope.get("mean"))
     slope_p10_grade = _slope_grade_percent(slope.get("10th percentile"))
-    units = ""
     try:
         _entries, variable_lookup = gis_lookup.load_variable_metadata()
-        units = str((variable_lookup.get("elevation") or {}).get("units") or "").strip()
+        raw_units = str((variable_lookup.get("elevation") or {}).get("units") or "").strip() or None
     except Exception:
-        units = ""
+        raw_units = None
+    target_unit = units.equivalent_unit(raw_units, unit_system) if raw_units else raw_units
+    display_units = str(units.display_unit(target_unit) or "").strip()
+    min_value, max_value = _extract_elevation_range_values(
+        elevation,
+        unit=raw_units,
+        unit_system=unit_system,
+    )
 
     detail_parts: list[str] = []
     elevation_outlier_text = (
@@ -2288,8 +2344,8 @@ def _terrain_status_rows(
         else None
     )
     if min_value and max_value:
-        if units:
-            elevation_text = f"Elevation: {min_value}-{max_value} {units}"
+        if display_units:
+            elevation_text = f"Elevation: {min_value}-{max_value} {display_units}"
         else:
             elevation_text = f"Elevation: {min_value}-{max_value}"
         if elevation_outlier_text:
@@ -2334,6 +2390,7 @@ def _temperature_status_rows(
     *,
     taxon_id: Optional[int] = None,
     location_gid: Optional[str] = None,
+    unit_system: Optional[units.UnitSystem] = None,
 ) -> list[dict[str, Any]]:
     from util import gis_lookup
 
@@ -2371,14 +2428,25 @@ def _temperature_status_rows(
     )
     coldest_winter_raw = bio6.get("min")
     hottest_raw = bio5.get("max")
-    coldest_winter = _format_scalar_value(coldest_winter_raw)
-    hottest = _format_scalar_value(hottest_raw)
-    units = ""
+    raw_units: Optional[str] = None
+    display_units = ""
     try:
         _entries, variable_lookup = gis_lookup.load_variable_metadata()
-        units = str((variable_lookup.get("bio_6") or {}).get("units") or "").strip()
+        raw_units = str((variable_lookup.get("bio_6") or {}).get("units") or "").strip() or None
     except Exception:
-        units = ""
+        raw_units = None
+    target_unit = units.equivalent_unit(raw_units, unit_system) if raw_units else raw_units
+    display_units = str(units.display_unit(target_unit) or "").strip()
+    coldest_winter = _format_scalar_value_for_system(
+        coldest_winter_raw,
+        unit=raw_units,
+        unit_system=unit_system,
+    )
+    hottest = _format_scalar_value_for_system(
+        hottest_raw,
+        unit=raw_units,
+        unit_system=unit_system,
+    )
 
     detail: Optional[str] = None
     detail_parts: list[str] = []
@@ -2395,8 +2463,8 @@ def _temperature_status_rows(
             if not location_gid
             else None
         )
-        if units:
-            line = f"Lowest temperature: {label} ({coldest_winter} {units})"
+        if display_units:
+            line = f"Lowest temperature: {label} ({coldest_winter} {display_units})"
         else:
             line = f"Lowest temperature: {label} ({coldest_winter})"
         if low_outlier_text:
@@ -2415,8 +2483,8 @@ def _temperature_status_rows(
             if not location_gid
             else None
         )
-        if units:
-            line = f"Hottest temperature: {label} ({hottest} {units})"
+        if display_units:
+            line = f"Hottest temperature: {label} ({hottest} {display_units})"
         else:
             line = f"Hottest temperature: {label} ({hottest})"
         if high_outlier_text:
@@ -2430,12 +2498,20 @@ def _temperature_status_rows(
                 global_mean=bio1_global.get("mean"),
                 location_name=location_name,
             )
-            local_mean_value = _format_scalar_value(bio1_local.get("mean"))
-            global_mean_value = _format_scalar_value(bio1_global.get("mean"))
+            local_mean_value = _format_scalar_value_for_system(
+                bio1_local.get("mean"),
+                unit=raw_units,
+                unit_system=unit_system,
+            )
+            global_mean_value = _format_scalar_value_for_system(
+                bio1_global.get("mean"),
+                unit=raw_units,
+                unit_system=unit_system,
+            )
             if comparison and local_mean_value and global_mean_value:
-                if units:
+                if display_units:
                     detail_parts.append(
-                        f"Mean temperature: {comparison} ({local_mean_value} {units} vs {global_mean_value} {units})."
+                        f"Mean temperature: {comparison} ({local_mean_value} {display_units} vs {global_mean_value} {display_units})."
                     )
                 else:
                     detail_parts.append(
@@ -2458,6 +2534,7 @@ def _precipitation_status_rows(
     *,
     taxon_id: Optional[int] = None,
     location_gid: Optional[str] = None,
+    unit_system: Optional[units.UnitSystem] = None,
 ) -> list[dict[str, Any]]:
     from util import gis_lookup
 
@@ -2470,9 +2547,6 @@ def _precipitation_status_rows(
     driest_raw = bio12.get("min")
     wettest_raw = bio12.get("max")
     average_raw = bio12.get("mean")
-    driest = _format_scalar_value(driest_raw)
-    wettest = _format_scalar_value(wettest_raw)
-    average = _format_scalar_value(average_raw)
     bio12_global = (
         _numeric_summary_for_context(
             taxon_id=taxon_id,
@@ -2484,19 +2558,36 @@ def _precipitation_status_rows(
         else {}
     )
 
-    units = ""
+    raw_units: Optional[str] = None
     try:
         _entries, variable_lookup = gis_lookup.load_variable_metadata()
-        units = str((variable_lookup.get("bio_12") or {}).get("units") or "").strip()
+        raw_units = str((variable_lookup.get("bio_12") or {}).get("units") or "").strip() or None
     except Exception:
-        units = ""
+        raw_units = None
+    target_unit = units.equivalent_unit(raw_units, unit_system) if raw_units else raw_units
+    display_units = str(units.display_unit(target_unit) or "").strip()
+    driest = _format_scalar_value_for_system(
+        driest_raw,
+        unit=raw_units,
+        unit_system=unit_system,
+    )
+    wettest = _format_scalar_value_for_system(
+        wettest_raw,
+        unit=raw_units,
+        unit_system=unit_system,
+    )
+    average = _format_scalar_value_for_system(
+        average_raw,
+        unit=raw_units,
+        unit_system=unit_system,
+    )
 
     def _with_units(value: str) -> str:
-        return f"{value} {units}" if units else value
+        return f"{value} {display_units}" if display_units else value
 
     def _range_with_units(low: str, high: str) -> str:
-        if units:
-            return f"{low}-{high} {units}"
+        if display_units:
+            return f"{low}-{high} {display_units}"
         return f"{low}-{high}"
 
     detail: Optional[str] = None
@@ -2526,9 +2617,13 @@ def _precipitation_status_rows(
                 global_mean=bio12_global.get("mean"),
                 location_name=location_name,
             )
-            global_mean_value = _format_scalar_value(bio12_global.get("mean"))
+            global_mean_value = _format_scalar_value_for_system(
+                bio12_global.get("mean"),
+                unit=raw_units,
+                unit_system=unit_system,
+            )
             if comparison and global_mean_value:
-                if units:
+                if display_units:
                     preference_line += (
                         f", {comparison} "
                         f"({_with_units(average)} vs {_with_units(global_mean_value)})"
@@ -2706,6 +2801,7 @@ def build_taxon_description(
     taxon: dict[str, Any],
     *,
     location_gid: Optional[str] = None,
+    unit_system: Optional[str] = None,
 ) -> dict[str, Any]:
     """Builds a structured description and plain text rendering for a taxon."""
     from util import taxa_navigation
@@ -2795,24 +2891,29 @@ def build_taxon_description(
             location_text = None
     location_text = _capitalize_leading_the(location_text)
 
+    resolved_unit_system = units.normalize_unit_system(unit_system)
+
     categories = (
         _terrain_status_rows(
             taxon,
             taxon_dir,
             taxon_id=taxon_id,
             location_gid=location_gid,
+            unit_system=resolved_unit_system,
         )
         + _temperature_status_rows(
             taxon,
             taxon_dir,
             taxon_id=taxon_id,
             location_gid=location_gid,
+            unit_system=resolved_unit_system,
         )
         + _precipitation_status_rows(
             taxon,
             taxon_dir,
             taxon_id=taxon_id,
             location_gid=location_gid,
+            unit_system=resolved_unit_system,
         )
     )
 

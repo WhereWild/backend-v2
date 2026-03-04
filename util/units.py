@@ -214,8 +214,32 @@ def convert_summary(
     if not summary or not target_system or not unit:
         return summary
     converted: dict[str, Any] = dict(summary)
+    convertible_keys = {
+        "min",
+        "max",
+        "mean",
+        "median",
+        "std",
+        "stddev",
+        "q01",
+        "q10",
+        "q25",
+        "q50",
+        "q75",
+        "q90",
+        "q99",
+        "1st percentile",
+        "10th percentile",
+        "25th percentile",
+        "75th percentile",
+        "90th percentile",
+        "99th percentile",
+        "10-90 range",
+        "1-99 range",
+        "range",
+    }
     for key, value in summary.items():
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and str(key).strip().lower() in convertible_keys:
             converted[key], _ = convert_value_for_system(float(value), unit, target_system)
     return converted
 

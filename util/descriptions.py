@@ -398,7 +398,6 @@ _CATEGORICAL_LAYER_RULES: dict[str, dict[str, Any]] = {
     },
 }
 
-
 def _semantic_default_label(variable_id: str, group: str, group_label: str) -> str:
     style = str((_CATEGORICAL_LAYER_RULES.get(variable_id) or {}).get("default_style") or "").strip()
     if style == "group_map":
@@ -715,6 +714,13 @@ def _secondary_frequency_verb(frac: float) -> str:
     return "often"
 
 
+def _upgraded_frequency_verb(base_verb: str, total_frac: float) -> str:
+    upgraded = _frequency_verb(total_frac)
+    if not upgraded:
+        return base_verb
+    return upgraded
+
+
 def _combine_entry_pair_or_single(entries: list[dict[str, Any]]) -> str:
     def _name(entry: dict[str, Any]) -> str:
         return str(entry.get("name") or "").strip()
@@ -856,12 +862,17 @@ def _top_categorical_phrase_from_payload(
         return str(entry.get("name") or "").strip()
 
     top_entry_verb = _frequency_verb(top_frac) or "sometimes"
-
     paired_primary_candidate: Optional[dict[str, Any]] = None
     for candidate in ranked[1:]:
         candidate_name = _name(candidate)
         candidate_frac = float(candidate.get("fraction") or 0.0)
         if not candidate_name or candidate_frac < 0.02:
+            continue
+        # Only merge semantic siblings (e.g., sparse/dense forest) when both land in
+        # the same frequency band; otherwise low-tail classes can incorrectly boost
+        # the headline qualifier (e.g., "often").
+        candidate_verb = _frequency_verb(candidate_frac)
+        if candidate_verb != top_entry_verb:
             continue
         if _combine_semantic_entries(top, candidate):
             paired_primary_candidate = candidate
@@ -919,13 +930,19 @@ def _top_categorical_phrase_from_payload(
                 same_band_candidates = [
                     entry
                     for entry in secondary_entries
-                    if abs(top_frac - float(entry.get("fraction") or 0.0)) <= 0.10
+                    if _secondary_frequency_verb(float(entry.get("fraction") or 0.0)) == second_verb
                 ]
                 combined_name = _combine_entry_pair_or_single(same_band_candidates[:2])
                 if combined_name:
+                    included_entries = selected_primary_candidates + same_band_candidates[:2]
+                    combined_total_frac = sum(
+                        float(entry.get("fraction") or 0.0)
+                        for entry in included_entries
+                    )
+                    combined_verb = _upgraded_frequency_verb(top_verb, combined_total_frac)
                     if combined_name == primary_label_text:
-                        return f"{top_verb} in {primary_label_text}"
-                    return f"{top_verb} in {primary_label_text}, as well as {combined_name}"
+                        return f"{combined_verb} in {primary_label_text}"
+                    return f"{combined_verb} in {primary_label_text}, as well as {combined_name}"
             else:
                 same_secondary_candidates = [
                     entry
@@ -935,11 +952,16 @@ def _top_categorical_phrase_from_payload(
                 secondary_label_text = _combine_entry_pair_or_single(same_secondary_candidates[:2])
                 second_label_final = secondary_label_text or second_name
                 if second_verb == top_verb:
-                    return f"{top_verb} in {primary_label_text}, as well as {second_label_final}"
+                    included_entries = selected_primary_candidates + same_secondary_candidates[:2]
+                    combined_total_frac = sum(
+                        float(entry.get("fraction") or 0.0)
+                        for entry in included_entries
+                    )
+                    combined_verb = _upgraded_frequency_verb(top_verb, combined_total_frac)
+                    return f"{combined_verb} in {primary_label_text}, as well as {second_label_final}"
                 top_text = f"{top_verb} in {primary_label_text}"
                 second_text = f"{second_verb} in {second_label_final}"
                 return f"{top_text}, and {second_text}"
-
     return f"{top_verb} in {primary_label_text}"
 
 
@@ -2464,9 +2486,9 @@ def _temperature_status_rows(
             else None
         )
         if display_units:
-            line = f"Lowest temperature: {label} ({coldest_winter} {display_units})"
+            line = f"Can tolerate {label} winter lows ({coldest_winter} {display_units})"
         else:
-            line = f"Lowest temperature: {label} ({coldest_winter})"
+            line = f"Can tolerate {label} winter lows ({coldest_winter})"
         if low_outlier_text:
             line += f" ({low_outlier_text})"
         detail_parts.append(line)
@@ -2484,9 +2506,9 @@ def _temperature_status_rows(
             else None
         )
         if display_units:
-            line = f"Hottest temperature: {label} ({hottest} {display_units})"
+            line = f"Can tolerate {label} summer highs ({hottest} {display_units})"
         else:
-            line = f"Hottest temperature: {label} ({hottest})"
+            line = f"Can tolerate {label} summer highs ({hottest})"
         if high_outlier_text:
             line += f" ({high_outlier_text})"
         detail_parts.append(line)
@@ -2719,10 +2741,10 @@ def _lines_from_categorical_phrase(
                 for prefix in styled_prefix_starts
             ):
                 prefix_raw, body_raw = clause.split(" in ", 1)
-                prefix_text = _title_case_words(prefix_raw)
+                prefix_text = _sentence_case(str(prefix_raw or "").strip().lower())
                 body_text = body_raw.strip()
                 if prefix_text and body_text:
-                    lines.append({"prefix": f"{prefix_text} in:", "body": body_text})
+                    lines.append({"prefix": f"{prefix_text} in", "body": body_text})
                     continue
             lines.append({"body": clause})
     return lines

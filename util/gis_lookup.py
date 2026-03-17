@@ -2,21 +2,24 @@
 This file functions as a library, providing functions that perform standard operations one might use when querying GIS data from taxa or coordinates.
 '''
 
+from contextlib import contextmanager
 from pathlib import Path
 import io
 from functools import lru_cache
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Iterator
 from collections import defaultdict
 import csv
 import json
 import math
+import os
 import re
 
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.fs as pafs
 from util.config import load_config
-from util.storage import ParquetStorageProxy
+from util.storage import ParquetStorageProxy, get_parquet_storage_with_mode
 import unicodedata
 
 CONFIG = load_config("global")
@@ -24,6 +27,7 @@ PARQUET = ParquetStorageProxy(CONFIG.data_root, CONFIG.project_root)
 
 _LAYER_CACHE: dict[str, dict[str, Any]] = {}
 _INVALID_LOCATION_GID_TOKENS = frozenset({"nan", "none", "null", "na", "n/a", "undefined"})
+_RASTER_STORAGE_ENV = "WHEREWILD_RASTER_STORAGE"
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,93 @@ class LocationRecord:
     name: str
     level: int
     parent_gid: Optional[str]
+
+
+@dataclass(frozen=True)
+class RasterSource:
+    uri: str
+    gdal_env: dict[str, str]
+    is_remote: bool
+
+
+def raster_exists(path: Path) -> bool:
+    """Return True when a raster can be read from local disk or remote B2."""
+    return resolve_raster_source(path) is not None
+
+
+def _raster_storage_mode() -> str:
+    mode = str(os.environ.get(_RASTER_STORAGE_ENV, "auto") or "").strip().lower()
+    if mode in {"local", "b2"}:
+        return mode
+    return "auto"
+
+
+def _raster_storage():
+    mode = _raster_storage_mode()
+    if mode == "auto":
+        return PARQUET.current()
+    try:
+        return get_parquet_storage_with_mode(CONFIG.data_root, CONFIG.project_root, mode)
+    except Exception:
+        return PARQUET.current()
+
+
+def resolve_raster_source(path: Path) -> Optional[RasterSource]:
+    """Resolve a raster to either local path or /vsis3 remote URI."""
+    mode = _raster_storage_mode()
+    storage = _raster_storage()
+
+    def _remote_source() -> Optional[RasterSource]:
+        if not storage.is_remote:
+            return None
+        try:
+            if not storage.exists(path):
+                return None
+            return RasterSource(
+                uri=storage.vsis3_path(path),
+                gdal_env=storage.gdal_env(),
+                is_remote=True,
+            )
+        except Exception:
+            return None
+
+    # In explicit b2 mode, prefer /vsis3 over mounted/local files.
+    if mode == "b2":
+        remote = _remote_source()
+        if remote is not None:
+            return remote
+        if path.exists():
+            return RasterSource(uri=str(path), gdal_env={}, is_remote=False)
+        return None
+
+    # local or auto: prefer filesystem path first.
+    if path.exists():
+        return RasterSource(uri=str(path), gdal_env={}, is_remote=False)
+    return _remote_source()
+
+
+@contextmanager
+def open_raster(source: RasterSource) -> Iterator[Any]:
+    """Open a raster source with any required GDAL environment settings."""
+    import rasterio
+
+    if source.gdal_env:
+        with rasterio.Env(**source.gdal_env):
+            with rasterio.open(source.uri) as ds:
+                yield ds
+        return
+    with rasterio.open(source.uri) as ds:
+        yield ds
+
+
+@contextmanager
+def open_raster_path(path: Path) -> Iterator[Any]:
+    """Open a raster from local storage or B2-backed /vsis3 fallback."""
+    source = resolve_raster_source(path)
+    if source is None:
+        raise FileNotFoundError(path)
+    with open_raster(source) as ds:
+        yield ds
 
 @lru_cache(maxsize=1)
 def _load_gis_catalog() -> Dict[str, Any]:
@@ -696,26 +787,45 @@ def get_layer_tile_info(layer_id: str) -> dict:
     Returns:
         A dict containing the span of the region, the pixel size, and the block size and shape in terms of lat/lon. Values are currently always be the same for lat/lon.
     """
-    import rasterio
-
     layer = _get_layer(layer_id) # this is the JSON object for the layer
     if layer is None:
         raise ValueError(f"Layer {layer_id} not found in catalog")
 
-    # Get the region folder and sample a region from that folder
+    # Get the region folder and sample a region from that folder.
     region_root = CONFIG.gis_root / layer["region_root"]
-    sample_dir = next((p for p in sorted(region_root.iterdir()) if p.is_dir()), None)
-    if sample_dir is None:
+    filename = layer["filename_template"].format(id=layer_id)
+    sample_source: Optional[RasterSource] = None
+
+    if region_root.exists():
+        sample_dir = next((p for p in sorted(region_root.iterdir()) if p.is_dir()), None)
+        if sample_dir is not None:
+            sample_path = sample_dir / filename
+            sample_source = resolve_raster_source(sample_path)
+
+    if sample_source is None:
+        storage = _raster_storage()
+        if storage.is_remote and storage.filesystem is not None:
+            try:
+                selector = pafs.FileSelector(storage.resolve(region_root), recursive=True)
+                for info in storage.filesystem.get_file_info(selector):
+                    if info.type != pafs.FileType.File:
+                        continue
+                    if not str(info.path).endswith(f"/{filename}"):
+                        continue
+                    sample_source = RasterSource(
+                        uri=f"/vsis3/{info.path}",
+                        gdal_env=storage.gdal_env(),
+                        is_remote=True,
+                    )
+                    break
+            except Exception:
+                sample_source = None
+
+    if sample_source is None:
         raise FileNotFoundError(f"No regions found for layer {layer_id} in {region_root}")
 
-    # Look for a tif file for the layer inside the sampled folder
-    filename = layer["filename_template"].format(id=layer_id)
-    sample_path = sample_dir / filename
-    if not sample_path.exists():
-        raise FileNotFoundError(f"Sample region {sample_path} missing for layer {layer_id}")
-
     # Get the bounds and relevant data of COGs of that layer
-    with rasterio.open(sample_path) as ds:
+    with open_raster(sample_source) as ds:
         bounds = ds.bounds
         span_lat = abs(bounds.top - bounds.bottom)
         span_lon = abs(bounds.right - bounds.left)
@@ -782,3 +892,11 @@ def get_cog_path(layer_id: str, latitude: float, longitude: float) -> Optional[P
     tile_id = get_region_name(latitude, longitude)
 
     return CONFIG.gis_root / region_root / tile_id / filename
+
+
+def get_cog_source(layer_id: str, latitude: float, longitude: float) -> Optional[RasterSource]:
+    """Resolve a layer COG to local path or B2-backed /vsis3 source."""
+    cog_path = get_cog_path(layer_id, latitude, longitude)
+    if cog_path is None:
+        return None
+    return resolve_raster_source(cog_path)

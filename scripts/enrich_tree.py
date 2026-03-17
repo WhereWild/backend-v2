@@ -14,7 +14,6 @@ import json
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-import rasterio
 from rasterio.windows import Window
 import util.gis_lookup as gis_lookup
 import util.taxa_navigation as taxa_navigation
@@ -191,12 +190,12 @@ def _sample_layer_values(
         )[derived_metric]
     ref_lat = float(lats[0])
     ref_lon = float(lons[0])
-    cog_path = gis_lookup.get_cog_path(layer_id, ref_lat, ref_lon)
-    if cog_path is None or not cog_path.exists():
+    cog_source = gis_lookup.get_cog_source(layer_id, ref_lat, ref_lon)
+    if cog_source is None:
         return [None] * len(lats)
     coords = list(zip(lons.tolist(), lats.tolist()))
     results: list[float | None] = []
-    with rasterio.open(cog_path) as ds:
+    with gis_lookup.open_raster(cog_source) as ds:
         sampler = ds.sample(coords)
         for point in sampler:
             value = point[0]
@@ -282,10 +281,11 @@ def _sample_dem_derived_values(
         metric: [None] * len(lats) for metric in metrics
     }
     dem_path = DEM_REGION_ROOT / tile_id / DEM_FILENAME
-    if not dem_path.exists():
+    dem_source = gis_lookup.resolve_raster_source(dem_path)
+    if dem_source is None:
         return results
 
-    with rasterio.open(dem_path) as ds:
+    with gis_lookup.open_raster(dem_source) as ds:
         nodata = ds.nodata
         pixel_width_deg = float(ds.transform.a)
         pixel_height_deg = abs(float(ds.transform.e))
@@ -337,10 +337,11 @@ def _sample_dem_values(
 ) -> List[float | None]:
     results: List[float | None] = [None] * len(lats)
     dem_path = DEM_REGION_ROOT / tile_id / DEM_FILENAME
-    if not dem_path.exists():
+    dem_source = gis_lookup.resolve_raster_source(dem_path)
+    if dem_source is None:
         return results
     coords = list(zip(lons.tolist(), lats.tolist()))
-    with rasterio.open(dem_path) as ds:
+    with gis_lookup.open_raster(dem_source) as ds:
         nodata = ds.nodata
         sampler = ds.sample(coords)
         for idx, point in enumerate(sampler):

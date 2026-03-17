@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 from dataclasses import dataclass
 from functools import lru_cache
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import shutil
 import tempfile
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
@@ -16,6 +18,10 @@ import pyarrow.parquet as pq
 
 _DEFAULT_B2_BUCKET = "wherewild-data"
 _DEFAULT_B2_PREFIX = "data"
+_DEFAULT_B2_READER_REMOTE = "wherewild-localdev-reader"
+_DEFAULT_B2_WRITER_REMOTE = "wherewild-localdev-writer"
+_DEFAULT_B2_ENDPOINT = "https://s3.us-west-004.backblazeb2.com"
+_DEFAULT_RCLONE_CONFIG = "/workspace/docker/rclone.conf"
 
 
 @dataclass(frozen=True)
@@ -26,6 +32,9 @@ class ParquetStorage:
     filesystem: Optional[pafs.FileSystem]
     bucket: Optional[str]
     prefix: Optional[str]
+    endpoint: Optional[str] = None
+    key_id: Optional[str] = None
+    app_key: Optional[str] = None
 
     @property
     def is_remote(self) -> bool:
@@ -36,6 +45,15 @@ class ParquetStorage:
         if self.filesystem is None:
             return str(path)
         rel = _relative_to_root(path, self.data_root, self.project_root)
+        if rel is not None and rel.parts and rel.parts[0] == ".b2-mount":
+            # A path under project root's mount point should map to the mounted key root.
+            rel = Path(*rel.parts[1:])
+        if rel is None:
+            mount_root = Path(os.environ.get("WW_B2_MOUNT", "/workspace/.b2-mount")).expanduser().resolve()
+            try:
+                rel = path.expanduser().resolve().relative_to(mount_root)
+            except ValueError:
+                rel = None
         if rel is None:
             raise ValueError(f"Path {path} is not under {self.data_root} or {self.project_root}")
         key = rel.as_posix().lstrip("/")
@@ -99,6 +117,36 @@ class ParquetStorage:
                 return cached.open("rb")
         return self.filesystem.open_input_file(self.resolve(path))
 
+    def vsis3_path(self, path: Path) -> str:
+        """Return GDAL /vsis3/ path for a path resolved against the remote."""
+        if self.filesystem is None:
+            raise ValueError("vsis3_path is only available for remote storage.")
+        return f"/vsis3/{self.resolve(path)}"
+
+    def gdal_env(self) -> dict[str, str]:
+        """Return GDAL environment values for S3-compatible B2 reads."""
+        if self.mode != "b2":
+            return {}
+        key_id = (self.key_id or "").strip()
+        app_key = (self.app_key or "").strip()
+        endpoint = (self.endpoint or "").strip()
+        if not key_id or not app_key or not endpoint:
+            return {}
+        endpoint_host, endpoint_scheme = _normalize_endpoint(endpoint)
+        env = {
+            "AWS_ACCESS_KEY_ID": key_id,
+            "AWS_SECRET_ACCESS_KEY": app_key,
+            "AWS_S3_ENDPOINT": endpoint_host,
+            "AWS_VIRTUAL_HOSTING": "FALSE",
+            "AWS_HTTPS": "NO" if endpoint_scheme == "http" else "YES",
+            # COG access pattern should rely on range reads and avoid expensive listings.
+            "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+        }
+        region = _b2_region_from_host(endpoint_host)
+        if region:
+            env["AWS_REGION"] = region
+        return env
+
 
 class ParquetStorageProxy:
     """Dynamic proxy that resolves storage from current environment."""
@@ -110,16 +158,25 @@ class ParquetStorageProxy:
     def _storage(self) -> ParquetStorage:
         return get_parquet_storage(self._data_root, self._project_root)
 
+    def current(self) -> ParquetStorage:
+        return self._storage()
+
     def __getattr__(self, name: str):
         return getattr(self._storage(), name)
 
 
 def get_parquet_storage(data_root: Path, project_root: Path) -> ParquetStorage:
     """Return a cached ParquetStorage for the current environment."""
+    return get_parquet_storage_with_mode(data_root, project_root, _storage_mode())
+
+
+def get_parquet_storage_with_mode(data_root: Path, project_root: Path, mode: str) -> ParquetStorage:
+    """Return a cached ParquetStorage for an explicit mode."""
+    normalized_mode = str(mode or "").strip().lower() or "local"
     return _get_parquet_storage(
         str(data_root.resolve()),
         str(project_root.resolve()),
-        _storage_mode(),
+        normalized_mode,
     )
 
 
@@ -141,14 +198,15 @@ def _get_parquet_storage(data_root: str, project_root: str, mode: str) -> Parque
             filesystem=None,
             bucket=None,
             prefix=None,
+            endpoint=None,
+            key_id=None,
+            app_key=None,
         )
 
     if mode != "b2":
         raise ValueError(f"Unknown parquet storage mode '{mode}' (expected 'local' or 'b2').")
 
-    endpoint = os.environ.get("WW_B2_S3_ENDPOINT")
-    key_id = os.environ.get("WW_B2_KEY_ID")
-    app_key = os.environ.get("WW_B2_APP_KEY")
+    endpoint, key_id, app_key = _resolve_b2_credentials()
     bucket = os.environ.get("WW_B2_BUCKET", _DEFAULT_B2_BUCKET)
     prefix = os.environ.get("WW_B2_PREFIX", _DEFAULT_B2_PREFIX)
 
@@ -158,11 +216,12 @@ def _get_parquet_storage(data_root: str, project_root: str, mode: str) -> Parque
             "WW_B2_APP_KEY are not fully set."
         )
 
+    endpoint_override, scheme = _normalize_endpoint(endpoint)
     filesystem = pafs.S3FileSystem(
         access_key=key_id,
         secret_key=app_key,
-        endpoint_override=endpoint,
-        scheme="https",
+        endpoint_override=endpoint_override,
+        scheme=scheme,
     )
 
     return ParquetStorage(
@@ -172,6 +231,9 @@ def _get_parquet_storage(data_root: str, project_root: str, mode: str) -> Parque
         filesystem=filesystem,
         bucket=bucket,
         prefix=prefix,
+        endpoint=endpoint,
+        key_id=key_id,
+        app_key=app_key,
     )
 
 
@@ -224,3 +286,72 @@ def _ensure_cached(storage: ParquetStorage, path: Path) -> Optional[Path]:
         return cache_path
     except Exception:
         return None
+
+
+def _resolve_b2_credentials() -> tuple[Optional[str], Optional[str], Optional[str]]:
+    endpoint = (os.environ.get("WW_B2_S3_ENDPOINT") or "").strip()
+    key_id = (os.environ.get("WW_B2_KEY_ID") or "").strip()
+    app_key = (os.environ.get("WW_B2_APP_KEY") or "").strip()
+    remotes = (
+        os.environ.get("WW_B2_READER_REMOTE", _DEFAULT_B2_READER_REMOTE),
+        os.environ.get("WW_B2_WRITER_REMOTE", _DEFAULT_B2_WRITER_REMOTE),
+    )
+    for remote in remotes:
+        if endpoint and key_id and app_key:
+            break
+        from_config = _load_rclone_remote(remote)
+        if from_config is None:
+            continue
+        cfg_endpoint, cfg_key_id, cfg_app_key = from_config
+        if not endpoint and cfg_endpoint:
+            endpoint = cfg_endpoint
+        if not key_id and cfg_key_id:
+            key_id = cfg_key_id
+        if not app_key and cfg_app_key:
+            app_key = cfg_app_key
+    if not endpoint:
+        endpoint = os.environ.get("WW_B2_S3_ENDPOINT_DEFAULT", _DEFAULT_B2_ENDPOINT).strip()
+    return endpoint or None, key_id or None, app_key or None
+
+
+def _load_rclone_remote(remote: Optional[str]) -> Optional[tuple[str, str, str]]:
+    remote_name = str(remote or "").strip()
+    if not remote_name:
+        return None
+    config_path = Path(os.environ.get("RCLONE_CONFIG", _DEFAULT_RCLONE_CONFIG))
+    if not config_path.exists():
+        return None
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(config_path)
+    except Exception:
+        return None
+    if not parser.has_section(remote_name):
+        return None
+    endpoint = parser.get(remote_name, "endpoint", fallback="").strip()
+    key_id = parser.get(remote_name, "account", fallback="").strip()
+    app_key = parser.get(remote_name, "key", fallback="").strip()
+    if not key_id or not app_key:
+        return None
+    return endpoint, key_id, app_key
+
+
+def _normalize_endpoint(endpoint: str) -> tuple[str, str]:
+    endpoint = str(endpoint or "").strip()
+    if not endpoint:
+        return "", "https"
+    if "://" not in endpoint:
+        endpoint = f"https://{endpoint}"
+    parsed = urlparse(endpoint)
+    host = (parsed.netloc or parsed.path).strip("/")
+    scheme = (parsed.scheme or "https").lower()
+    if scheme not in {"http", "https"}:
+        scheme = "https"
+    return host, scheme
+
+
+def _b2_region_from_host(host: str) -> Optional[str]:
+    parts = [part for part in host.split(".") if part]
+    if len(parts) >= 2 and parts[0] == "s3":
+        return parts[1]
+    return None

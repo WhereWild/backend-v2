@@ -4,18 +4,21 @@ api() {
   local pid_dir="/workspace/logs/pids"
   local pid_file="${pid_dir}/api.pid"
   local storage_mode="${WHEREWILD_PARQUET_STORAGE:-b2}"
+  local raster_mode="${WHEREWILD_RASTER_STORAGE:-auto}"
   ww_load_b2_env
   data_root="$(ww_data_root "$@")"
   if [[ "${1:-}" == "--local" || "${1:-}" == "--remote" ]]; then
     if [[ "${1:-}" == "--local" ]]; then
       storage_mode="local"
+      raster_mode="local"
     else
-      storage_mode="local"
-    # we have two local storage modes as a stub for if/when we eventually add s3 mode, for now both force local mounting since it's faster for parquets. When we do ML and have to read COGs we might want this back if all the data is not on the VM running it.
+      storage_mode="b2"
+      raster_mode="b2"
     fi
     shift
   fi
   export WHEREWILD_PARQUET_STORAGE="$storage_mode"
+  export WHEREWILD_RASTER_STORAGE="$raster_mode"
   mkdir -p "$log_dir" "$pid_dir"
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
     echo "api: already running (pid $(cat "$pid_file"))"
@@ -32,17 +35,21 @@ api() {
 api-fg() {
   local data_root
   local storage_mode="${WHEREWILD_PARQUET_STORAGE:-b2}"
+  local raster_mode="${WHEREWILD_RASTER_STORAGE:-auto}"
   ww_load_b2_env
   data_root="$(ww_data_root "$@")"
   if [[ "${1:-}" == "--local" || "${1:-}" == "--remote" ]]; then
     if [[ "${1:-}" == "--local" ]]; then
       storage_mode="local"
+      raster_mode="local"
     else
-      storage_mode="local"
+      storage_mode="b2"
+      raster_mode="b2"
     fi
     shift
   fi
   export WHEREWILD_PARQUET_STORAGE="$storage_mode"
+  export WHEREWILD_RASTER_STORAGE="$raster_mode"
   WHEREWILD_DATA_ROOT="$data_root" \
     uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
     --reload --reload-dir /workspace/main.py --reload-dir /workspace/util

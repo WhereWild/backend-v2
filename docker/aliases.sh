@@ -700,7 +700,131 @@ pd() {
 }
 
 pt() {
-  pytest -q "$@"
+  # Default to remote-mounted data unless caller explicitly requests local.
+  local mode="remote"
+  local -a args=()
+  local -a raw_args=()
+  local pt_verbose=0
+  local pt_quiet=0
+  local pt_timings=0
+  local pt_cov=1
+  local pt_changed=1
+  local pt_no_cache=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local)
+        if [[ "$mode" == "remote" ]]; then
+          echo "pt: choose only one of --local or --remote"
+          return 1
+        fi
+        mode="local"
+        ;;
+      --remote)
+        if [[ "$mode" == "local" ]]; then
+          echo "pt: choose only one of --local or --remote"
+          return 1
+        fi
+        mode="remote"
+        ;;
+      --verbose)
+        pt_verbose=1
+        ;;
+      --quiet)
+        pt_quiet=1
+        ;;
+      --timings|--timing)
+        pt_timings=1
+        ;;
+      --no-cov)
+        pt_cov=0
+        ;;
+      --changed)
+        pt_changed=1
+        ;;
+      --no-cache)
+        pt_no_cache=1
+        pt_changed=0
+        ;;
+      --)
+        shift
+        while [[ $# -gt 0 ]]; do
+          args+=("$1")
+          shift
+        done
+        break
+        ;;
+      *)
+        args+=("$1")
+        raw_args+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  local explicit_cov=0
+  for arg in "${raw_args[@]}"; do
+    case "$arg" in
+      --cov|--cov=*|--cov-report|--cov-report=*|--no-cov)
+        explicit_cov=1
+        break
+        ;;
+    esac
+  done
+
+  # Coverage with testmon can be misleading when no tests are selected.
+  # Default changed-mode runs to no coverage unless caller explicitly asks for it.
+  if [[ "$pt_changed" -eq 1 && "$pt_no_cache" -eq 0 && "$explicit_cov" -eq 0 ]]; then
+    pt_cov=0
+  fi
+
+  local -a base_args=()
+  if [[ "$pt_verbose" -eq 1 ]]; then
+    base_args+=("-vv")
+  elif [[ "$pt_quiet" -eq 1 ]]; then
+    base_args+=("-q")
+  fi
+  if [[ "$pt_timings" -eq 1 ]]; then
+    base_args+=("--durations=0" "--durations-min=0")
+  fi
+  if [[ "$pt_no_cache" -eq 1 ]]; then
+    base_args+=("--cache-clear")
+  fi
+  if [[ "$pt_changed" -eq 1 ]]; then
+    base_args+=("--testmon")
+  fi
+  base_args+=("${args[@]}")
+
+  local -a cov_args=()
+  if [[ "$pt_cov" -eq 1 ]]; then
+    cov_args+=(
+      "--cov=main"
+      "--cov=util"
+      "--cov=docs"
+      "--cov-report=term-missing"
+    )
+  fi
+
+  if [[ "$mode" == "local" ]]; then
+    WHEREWILD_DATA_ROOT="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}" \
+    WHEREWILD_PARQUET_STORAGE=local \
+      pytest "${cov_args[@]}" "${base_args[@]}"
+    return $?
+  fi
+
+  if [[ "$mode" == "remote" ]]; then
+    local mount_point="${WW_B2_MOUNT:-/workspace/.b2-mount}"
+    if ! mountpoint -q "$mount_point" 2>/dev/null; then
+      echo "pt: B2 mount not active — run b2-mount first"
+      return 1
+    fi
+    WHEREWILD_DATA_ROOT="$mount_point" \
+    WHEREWILD_PARQUET_STORAGE=local \
+      pytest "${cov_args[@]}" "${base_args[@]}"
+    return $?
+  fi
+
+  pytest "${cov_args[@]}" "${base_args[@]}"
 }
 
 pdb() {

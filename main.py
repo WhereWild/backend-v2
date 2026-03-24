@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import traceback
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
@@ -37,17 +38,8 @@ max_species_limit = 100
 
 
 
-app = FastAPI(title=api_title, version=api_version)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=list(cors_allow_origins),
-    allow_methods=list(cors_allow_methods),
-    allow_headers=list(cors_allow_headers),
-)
-
-
-@app.on_event("startup")
-def _preload_gis_legends() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     try:
         gis_lookup.preload_layer_legends()
     except FileNotFoundError:
@@ -56,6 +48,16 @@ def _preload_gis_legends() -> None:
     except OSError:
         # Remote/object storage might be unavailable at startup; defer to first request.
         pass
+    yield
+
+
+app = FastAPI(title=api_title, version=api_version, lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(cors_allow_origins),
+    allow_methods=list(cors_allow_methods),
+    allow_headers=list(cors_allow_headers),
+)
 def _path_exists(path: Path) -> bool:
     storage = get_parquet_storage(CONFIG.data_root, CONFIG.project_root)
     if storage.is_remote:

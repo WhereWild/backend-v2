@@ -195,10 +195,7 @@ def _parse_class_id(value: Any) -> Optional[int]:
         return int(text)
     match = re.search(r"\bclass[_\s-]*(\d+)\b", text, flags=re.IGNORECASE)
     if match:
-        try:
-            return int(match.group(1))
-        except (TypeError, ValueError):
-            return None
+        return int(match.group(1))
     return None
 
 
@@ -535,8 +532,6 @@ def _combine_semantic_entries(first: dict[str, Any], second: dict[str, Any]) -> 
     if order:
         order_idx = {value: idx for idx, value in enumerate(order)}
         variant_values = sorted(variant_values, key=lambda value: order_idx.get(value, 10_000))
-    if variant_values[0] == variant_values[1]:
-        variant_values = [variant_values[0]]
 
     composed_parts: list[str] = []
     for dim in dims:
@@ -546,10 +541,7 @@ def _combine_semantic_entries(first: dict[str, Any], second: dict[str, Any]) -> 
         if key == varying:
             if mode == "drop":
                 continue
-            if len(variant_values) == 1:
-                composed_parts.append(variant_values[0])
-            else:
-                composed_parts.append(f"{variant_values[0]} and {variant_values[1]}")
+            composed_parts.append(f"{variant_values[0]} and {variant_values[1]}")
             continue
         shared_first = _trait_string(first_values.get(key))
         shared_second = _trait_string(second_values.get(key))
@@ -855,8 +847,6 @@ def _top_categorical_phrase_from_payload(
     top = ranked[0]
     top_name = str(top.get("name") or "").strip()
     top_frac = float(top.get("fraction") or 0.0)
-    if not top_name:
-        return None
 
     def _name(entry: dict[str, Any]) -> str:
         return str(entry.get("name") or "").strip()
@@ -934,6 +924,7 @@ def _top_categorical_phrase_from_payload(
                 ]
                 combined_name = _combine_entry_pair_or_single(same_band_candidates[:2])
                 if combined_name:
+                    return f"{top_verb} in {primary_label_text}, as well as {combined_name}"
                     included_entries = selected_primary_candidates + same_band_candidates[:2]
                     combined_total_frac = sum(
                         float(entry.get("fraction") or 0.0)
@@ -1138,8 +1129,6 @@ def _build_location_text(
         has_more: bool,
         more_label: str,
     ) -> str:
-        if not names:
-            return ""
         text = _join_names(names, use_and=not has_more)
         if has_more:
             return f"{text} and other {more_label} in {parent}"
@@ -1227,6 +1216,8 @@ def _format_terrain_value(
     if converted is None:
         return None
     numeric = float(converted)
+    if not math.isfinite(numeric):
+        return None
     rounded = int(round(numeric / 100.0) * 100)
     return str(rounded)
 
@@ -1496,12 +1487,12 @@ def _select_variable_outlier_candidate(
 
             if low_level >= high_level:
                 level = low_level
-                qualifier = "moderately" if low_word == "moderate" else low_word
+                qualifier = low_word
                 polarity = "low"
                 strength = 1.0 - percentile
             else:
                 level = high_level
-                qualifier = "moderately" if high_word == "moderate" else high_word
+                qualifier = high_word
                 polarity = "high"
                 strength = percentile
 
@@ -2118,8 +2109,6 @@ def _categorical_outlier_text(
         ),
     )
     best = best_item["candidate"]
-    if not best:
-        return None
     best_adjusted_level = int(best_item.get("adjusted_level") or 0)
     best_polarity = str(best.get("polarity") or "").strip()
     best_context = str(best.get("context") or "").strip()
@@ -2133,8 +2122,6 @@ def _categorical_outlier_text(
             and str(cand.get("context") or "").strip() == best_context
         ):
             best_labels.append(str(item["row"].get("label") or "").strip())
-    if not best_adjusted:
-        return None
     class_label = _join_outlier_labels(best_labels, class_label)
     comparison = _QUALIFIER_COMPARISON.get(best_adjusted)
     if not comparison:
@@ -2142,10 +2129,8 @@ def _categorical_outlier_text(
     higher_phrase, lower_phrase = comparison
     if best_polarity == "high":
         phrase = higher_phrase
-    elif best_polarity == "low":
-        phrase = lower_phrase
     else:
-        return None
+        phrase = lower_phrase
     return _sentence_case(f"{phrase} in {class_label} compared to others in {best_context}")
 
 
@@ -2733,8 +2718,6 @@ def _lines_from_categorical_phrase(
 
         for part in parts:
             clause = part.strip().strip(".")
-            if not clause:
-                continue
             lower_clause = clause.lower()
             if " in " in clause and any(
                 lower_clause == prefix or lower_clause.startswith(f"{prefix} in ")
@@ -2781,8 +2764,6 @@ def _build_profile_sections(profile: dict[str, Any]) -> list[dict[str, Any]]:
         category_id = str(row.get("category") or "other")
         if detail:
             raw_lines = [line.strip() for line in detail.splitlines() if line.strip()]
-            if not raw_lines:
-                raw_lines = [detail]
             lines = [{"body": line_body} for line_body in raw_lines]
         else:
             lines = [{"body": "Not notable."}]

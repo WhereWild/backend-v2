@@ -2,6 +2,7 @@
 .env.local
 .python-version
 data/
+!tests/data/
 processed/
 cache/
 
@@ -23,6 +24,8 @@ python_packages/
 
 # Test and coverage output
 .pytest_cache/
+.testmondata
+.testmondata*
 .mypy_cache/
 .ruff_cache/
 .tox/

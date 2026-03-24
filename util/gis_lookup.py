@@ -476,6 +476,54 @@ def location_taxa_membership() -> Dict[tuple[str, str], frozenset[int]]:
     return {key: frozenset(value) for key, value in mapping.items()}
 
 
+@lru_cache(maxsize=4096)
+def location_taxa_for(scope: str, gid: str) -> frozenset[int]:
+    """Returns taxon ids known to occur for a single (scope, gid) location key.
+
+    This avoids loading the full location->taxa map on first location query.
+    """
+    normalized_scope = str(scope or "").strip()
+    normalized_gid = str(gid or "").strip()
+    if not normalized_scope or not is_valid_location_gid(normalized_gid):
+        return frozenset()
+    if not PARQUET.exists(CONFIG.location_catalog_path):
+        return frozenset()
+
+    try:
+        filtered = PARQUET.read_table(
+            CONFIG.location_catalog_path,
+            columns=["taxon_id"],
+            filters=[("scope", "=", normalized_scope), ("gid", "=", normalized_gid)],
+        ).combine_chunks()
+    except TypeError:
+        # Fallback path for readers that don't support parquet filters.
+        try:
+            table = PARQUET.read_table(
+                CONFIG.location_catalog_path,
+                columns=["scope", "gid", "taxon_id"],
+            ).combine_chunks()
+            scope_col = pc.cast(table["scope"], pa.string())
+            gid_col = pc.cast(table["gid"], pa.string())
+            mask = pc.and_(pc.equal(scope_col, normalized_scope), pc.equal(gid_col, normalized_gid))
+            filtered = table.filter(mask).combine_chunks()
+        except Exception:
+            return frozenset()
+    except Exception:
+        return frozenset()
+
+    if not filtered.num_rows:
+        return frozenset()
+
+    taxon_ids = filtered.column("taxon_id").to_pylist()
+    resolved: set[int] = set()
+    for taxon_id in taxon_ids:
+        try:
+            resolved.add(int(taxon_id))
+        except (TypeError, ValueError):
+            continue
+    return frozenset(resolved)
+
+
 @lru_cache(maxsize=1)
 def _load_location_taxa_table() -> pa.Table | None:
     if not PARQUET.exists(CONFIG.location_catalog_path):

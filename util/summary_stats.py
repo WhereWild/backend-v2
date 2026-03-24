@@ -379,20 +379,14 @@ def get_sorted_layer_records_in_value_range(
 
     def _value_at(position: int) -> float | None:
         """Gets the numeric value at a sorted index position."""
-        if position < 0 or position >= total:
-            return None
         if values_arr is not None:
             scalar = values_arr[position]
-            if scalar is None:
-                return None
             try:
                 return float(scalar.as_py())
             except (TypeError, ValueError):
                 return None
         catalog_scalar = catalogs_arr[position]
         origin_scalar = origins_arr[position]
-        if catalog_scalar is None or origin_scalar is None:
-            return None
         catalog = catalog_scalar.as_py()
         origin_id = origin_scalar.as_py()
         dataset = load_dataset(origin_id)
@@ -1505,8 +1499,6 @@ def _numeric_column_stats_streaming(
                 col for col in categorical_cols if col not in existing_categorical
             ]
         for column in categorical_cols:
-            if column not in df.columns:
-                continue
             series = df[column].dropna()
             if series.empty:
                 continue
@@ -1685,11 +1677,10 @@ def _write_summary_stats(
         directory: Output directory to write the stats parquet.
         stats: Mapping of variable id to metric dicts.
     """
+    stats = {variable: values for variable, values in stats.items() if values}
     if not stats:
         return
     frame = pd.DataFrame.from_dict(stats, orient="index") # passing index means we use the keys of the provided dict as the rows (each variable makes sense as a row, metrics are the columns)
-    if frame.empty:
-        return
     serialized = frame.reset_index().rename(columns={"index": "variable"}) # simply reset and rename the index to the variable column
     stats_path = directory / "summary_stats.parquet"
     try:
@@ -1841,17 +1832,13 @@ def _write_categorical_stats(
         entries: Tall categorical stats entries (variable/metric/value).
     """
     stats_path = directory / "categorical_stats.parquet"
+    entries = [entry for entry in entries if entry]
     if not entries:
         if merge_existing:
             return
         stats_path.unlink(missing_ok=True)
         return
     frame = pd.DataFrame(entries)
-    if frame.empty:
-        if merge_existing:
-            return
-        stats_path.unlink(missing_ok=True)
-        return
     try:
         if merge_existing and stats_path.exists():
             existing = pd.read_parquet(stats_path)

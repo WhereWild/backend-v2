@@ -130,6 +130,7 @@ You can also run `api-fg` to have the api run in the foreground so you can get l
 In the gdal terminal, you also have:
 
 - `pd <script>` to run a Python script/module (defaults to `/scripts`).
+- `pt [options] [pytest args...]` to run tests with repo defaults (supports changed-only mode, coverage toggles, and local/remote data roots).
 - `pdb <script>` to run a script in the background and log to `logs/scripts/<script_name>.log`.
 - `pdbs <script>` to stop a background `pdb` script by name.
 - `pdbc <script ...>` to run multiple scripts in the background, one after another, logging each to `logs/scripts/<script_name>.log`.
@@ -144,6 +145,32 @@ In the gdal terminal, you also have:
 - `b2-help` to print a quick help menu of B2 helper commands.
 - `b2-pull <path> [dest] [--dry-run] [--force]` to download a single file from B2 (defaults to `/workspace/data`). Example: `b2-pull gis/catalog.json`.
 - `b2-push <path> [dest] [--dry-run] [--force]` to upload a single local file (relative to `/workspace/data`) to B2. Example: `b2-push gis/catalog.json`.
+
+### Running Tests (`pt`)
+
+Use `pt` inside the GDAL container (`./gt.sh`) or via one-off exec:
+
+```sh
+docker compose exec -T gdal bash -lc '. /etc/wherewild_aliases.sh; pt'
+```
+
+Common examples:
+
+```sh
+pt                         # default run (remote mode + changed-mode via testmon)
+pt --no-cache              # full run, clears pytest cache, disables changed-only mode
+pt --no-cov                # run without coverage
+pt --local                 # force local data root (/workspace/data)
+pt --remote                # force B2 mount data root (/workspace/.b2-mount), requires b2-mount
+pt tests/api/test_health.py -q
+```
+
+Notes:
+
+- `pt` defaults to remote mode (`--remote`) and requires `b2-mount` to be active.
+- `pt` defaults to `--testmon` changed-mode behavior.
+- In changed-mode, coverage is disabled unless explicitly requested with pytest `--cov...` args.
+- Coverage-enabled runs include `main`, `util`, and `docs`.
 
 ## Backblaze B2 Setup
 

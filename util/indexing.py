@@ -239,14 +239,10 @@ def build_index_parquet(node_path: Path) -> None:
     catalog_number_col = "catalogNumber"
     data_parquet = Path(node_path) / CONFIG.occurrence_parquet_filename
     index_parquet = Path(node_path) / "occurrence_index.parquet"
-    allow_missing_parent = True
     layer_catalog = gis_lookup.load_layer_metadata()
     indexed_layer_types: dict[str, str] = {}
     category_offsets: dict[str, dict[str, dict[str, int | float]]] = {}
     data_parquet_exists = data_parquet.exists()
-    if not data_parquet_exists and not allow_missing_parent:
-        raise FileNotFoundError(data_parquet)
-
     parent_dir = data_parquet.parent
 
     if data_parquet_exists:
@@ -1581,8 +1577,7 @@ def load_relative_ranks(
     normalized_location = location_gid.strip() if location_gid else None
     if normalized_location:
         _column, scope, target = gis_lookup.location_lookup_for_gid(normalized_location)
-        membership = gis_lookup.location_taxa_membership()
-        allowed_taxa = membership.get((scope, target))
+        allowed_taxa = gis_lookup.location_taxa_for(scope, target)
         if not allowed_taxa:
             return []
         if target_taxon_id is not None and target_taxon_id not in allowed_taxa:
@@ -1644,6 +1639,8 @@ def load_relative_ranks(
         if not filtered.num_rows:
             return []
         for entry in filtered.to_pylist():
+            if str(entry.get("variable") or "") != str(variable_id):
+                continue
             metric_name = str(entry.get("metric") or "")
             normalized_metric = metric_name.strip().lower()
             if requested_metrics:
@@ -1891,7 +1888,7 @@ def list_rank_metric_options(
         raise ValueError("descendant_rank is required")
     ancestor_path = Path(ancestor["path"])
     index_path = ancestor_path / f"{canonical_rank.lower()}_index.parquet"
-    if not index_path.exists():
+    if not PARQUET.exists(index_path):
         return []
     try:
         schema = PARQUET.read_schema(index_path)
@@ -1958,7 +1955,7 @@ def child_relative_rankings(
 
     ancestor_path = Path(ancestor["path"])
     index_path = ancestor_path / f"{canonical_rank.lower()}_index.parquet"
-    if not index_path.exists():
+    if not PARQUET.exists(index_path):
         return [], None
 
     try:
@@ -1972,28 +1969,107 @@ def child_relative_rankings(
         return [], None
 
     column = _load_struct_column(index_path, column_name, column_length)
-    if column_length == 0:
-        return [], None
 
     allowed_taxa: Optional[frozenset[int]] = None
     location_counts: Optional[dict[int, int]] = None
     normalized_location = location_gid.strip() if location_gid else None
     if normalized_location:
         _column, scope, target = gis_lookup.location_lookup_for_gid(normalized_location)
-        location_counts = gis_lookup.location_taxon_counts(
-            scope,
-            target,
-            include_species_rollup=(canonical_rank == "SPECIES"),
-        )
-        if not location_counts:
+        allowed_taxa = gis_lookup.location_taxa_for(scope, target)
+        if not allowed_taxa:
             return [], None
-        allowed_taxa = frozenset(location_counts.keys())
+        try:
+            location_counts = gis_lookup.location_taxon_counts(
+                scope,
+                target,
+                include_species_rollup=(canonical_rank == "SPECIES"),
+            )
+        except Exception:
+            location_counts = None
+        if location_counts:
+            location_counts = {
+                taxon_id: count
+                for taxon_id, count in location_counts.items()
+                if taxon_id in allowed_taxa
+            }
+            if not location_counts:
+                location_counts = None
 
     taxon_values = column.field("taxonKey").to_pylist()
     metric_values = column.field("value").to_pylist()
     sample_counts = column.field("sampleCount").to_pylist()
 
     min_samples = max(0, int(min_samples or 0))
+    limit = max(1, int(limit or 1))
+    global_total = int(column_length)
+
+    # Fast path for location-filtered requests without distribution output:
+    # stream in requested sort order and stop after `limit` hits.
+    if allowed_taxa is not None and not return_distribution:
+        results: list[dict[str, Any]] = []
+        denominator = max(global_total - 1, 1)
+        if order_normalized == "desc":
+            indices = range(len(taxon_values) - 1, -1, -1)
+        else:
+            indices = range(len(taxon_values))
+        for idx in indices:
+            sample_count = sample_counts[idx]
+            if sample_count is None or (min_samples and sample_count < min_samples):
+                continue
+            taxon_key = taxon_values[idx]
+            taxon = taxa_navigation.get_taxon_by_id(str(taxon_key))
+            if taxon is None:
+                continue
+            taxon_id_value = taxa_navigation.taxon_id_as_int(taxon["taxon_key"])
+            if taxon_id_value is None or taxon_id_value not in allowed_taxa:
+                continue
+            taxon_rank = taxa_navigation.canonical_rank(taxon["rank"])
+            if (
+                canonical_rank == "SPECIES"
+                and not include_species_like
+                and taxon_rank != "SPECIES"
+            ):
+                continue
+            try:
+                numeric_value = float(metric_values[idx])
+            except (TypeError, ValueError):
+                continue
+            common_names = taxa_navigation.extract_common_names_for_language(
+                taxon,
+                language=CONFIG.common_name_language,
+            )
+            common_name = common_names[0] if common_names else None
+            media_record = taxa_navigation.resolve_taxon_media(taxon["taxon_key"])
+            preferred_image = taxa_navigation.preferred_image_payload(taxon)
+            percentile = idx / denominator if global_total > 1 else 0.0
+            record = {
+                "taxonId": taxon_id_value,
+                "taxon_id": taxon_id_value,
+                "taxon_key": taxon["taxon_key"],
+                "scientificName": taxon["scientific_name"],
+                "commonName": common_name,
+                "common_names": common_names,
+                "rank": taxon_rank,
+                "value": numeric_value,
+                "sampleCount": int(sample_count),
+                "count": global_total,
+                "position": len(results) + 1,
+                "percentile": percentile,
+                "metric": metric,
+                "variable": layer,
+            }
+            if preferred_image:
+                record.update(preferred_image)
+            elif media_record:
+                record["image_url"] = media_record.get("url")
+                record["image_license"] = media_record.get("license")
+                record["image_creator"] = media_record.get("creator")
+                record["image_rights_holder"] = media_record.get("rightsHolder")
+                record["image_references"] = media_record.get("references")
+            results.append(record)
+            if len(results) >= limit:
+                break
+        return results, None
 
     eligible: list[tuple[int, Any, float, int, Optional[int]]] = []
     for idx, (taxon_key, value, sample_count) in enumerate(
@@ -2008,9 +2084,11 @@ def child_relative_rankings(
                 continue
         resolved_sample_count: Optional[int]
         if location_counts is not None:
-            if taxon_id_value is None:
-                continue
             resolved_sample_count = location_counts.get(taxon_id_value)
+            if resolved_sample_count is None:
+                resolved_sample_count = (
+                    int(sample_count) if sample_count is not None else None
+                )
         else:
             resolved_sample_count = int(sample_count) if sample_count is not None else None
         if resolved_sample_count is None or (min_samples and resolved_sample_count < min_samples):
@@ -2052,7 +2130,6 @@ def child_relative_rankings(
 
     denominator = max(filtered_total - 1, 1)
     results: list[dict[str, Any]] = []
-    limit = max(1, int(limit or 1))
     for output_idx, entry in enumerate(eligible[:limit]):
         _original_index, taxon, numeric_value, sample_count, taxon_id = entry
         taxon_id = taxon_id if taxon_id is not None else taxa_navigation.taxon_id_as_int(taxon["taxon_key"])

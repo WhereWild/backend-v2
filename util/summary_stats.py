@@ -1589,7 +1589,6 @@ def _collect_categorical_stats(df: pd.DataFrame, categorical_cols: Sequence[str]
         except (TypeError, ValueError):
             total = len(series)
         counts = series.value_counts(dropna=True)
-        legend = _legend_for_layer(column)
         entries.append({"variable": column, "metric": "total_samples", "value": total})
         entries.append({"variable": column, "metric": "unique_classes", "value": int(len(counts))})
         significant = 0
@@ -1609,9 +1608,7 @@ def _collect_categorical_stats(df: pd.DataFrame, categorical_cols: Sequence[str]
                 class_id = int(raw_class_value)
             except (TypeError, ValueError):
                 class_id = raw_class_value
-            label = legend.get(class_id) if isinstance(class_id, int) else None
-            fallback = f"class_{class_id}"
-            metric_name = _slugify_metric(label, fallback)
+            metric_name = f"class_{class_id}"
             percentage = float(count) / float(total) if total else 0.0
             entries.append(
                 {
@@ -1633,7 +1630,6 @@ def _collect_categorical_stats_from_counts(
         total = int(totals_by_column.get(column, 0))
         if total <= 0:
             continue
-        legend = _legend_for_layer(column)
         entries.append({"variable": column, "metric": "total_samples", "value": total})
         entries.append({"variable": column, "metric": "unique_classes", "value": int(len(counts))})
         significant = 0
@@ -1652,9 +1648,7 @@ def _collect_categorical_stats_from_counts(
                 class_id = int(raw_class_value)
             except (TypeError, ValueError):
                 class_id = raw_class_value
-            label = legend.get(class_id) if isinstance(class_id, int) else None
-            fallback = f"class_{class_id}"
-            metric_name = _slugify_metric(label, fallback)
+            metric_name = f"class_{class_id}"
             percentage = float(count) / float(total) if total else 0.0
             entries.append(
                 {

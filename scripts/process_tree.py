@@ -60,6 +60,14 @@ def _index_is_current(node_path: Path) -> bool:
         return False
     data_path = node_path / CONFIG.occurrence_parquet_filename
     if not data_path.exists():
+        # A parent taxon may have no direct occurrence parquet while children do.
+        # In that case we must rebuild so child rows can be indexed.
+        taxon_key = taxa_navigation.taxon_key_from_path(node_path)
+        if taxon_key:
+            for child in taxa_navigation.get_children(taxon_key):
+                child_data_path = Path(child["path"]) / CONFIG.occurrence_parquet_filename
+                if child_data_path.exists():
+                    return False
         return True
     try:
         data_schema = pq.read_schema(data_path)
@@ -209,8 +217,14 @@ def _build_rank_artifacts_for_node(
 ) -> None:
     try:
         if has_descendants:
-            indexing.build_descendant_catalogs_for_ancestor(node["taxon_key"])
-            indexing.build_rank_indexes_for_ancestor(node["taxon_key"])
+            indexing.build_descendant_catalogs_for_ancestor(
+                node["taxon_key"],
+                verbose=False,
+            )
+            indexing.build_rank_indexes_for_ancestor(
+                node["taxon_key"],
+                verbose=False,
+            )
             print(
                 "built descendant catalogs and rank indexes for "
                 f"{node['scientific_name']}"

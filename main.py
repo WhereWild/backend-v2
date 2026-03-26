@@ -4,14 +4,16 @@ import math
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 from util.config import load_config
-from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units
+from util import descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units, tiles
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -35,6 +37,11 @@ forced_categorical_variables = frozenset({"landcover"})
 default_species_limit = 12
 
 max_species_limit = 100
+variable_tile_default_size = int(getattr(CONFIG, "sdm_tile_size", 256))
+variable_tile_max_size = int(getattr(CONFIG, "sdm_tile_max_size", 2048))
+variable_tile_cache_seconds = int(getattr(CONFIG, "sdm_tile_cache_seconds", 60))
+variable_tile_default_reproject = bool(getattr(CONFIG, "sdm_tile_reproject", True))
+derived_tile_variables = frozenset({"slope", "aspect", "aspect_deg"})
 
 
 
@@ -65,6 +72,37 @@ def _path_exists(path: Path) -> bool:
     return path.exists()
 
 
+@lru_cache(maxsize=1)
+def _map_enabled_variables() -> frozenset[str]:
+    """Return layer ids currently eligible for variable tile rendering."""
+    try:
+        layers = gis_lookup.load_layer_metadata()
+    except Exception:
+        return frozenset({"landcover", "koppen_geiger"})
+
+    enabled: set[str] = set()
+    for layer_id, meta in layers.items():
+        if not layer_id:
+            continue
+        is_derived = bool(meta.get("derived"))
+        if is_derived and layer_id not in derived_tile_variables:
+            continue
+        value_type = str(meta.get("value_type") or "").strip().lower()
+        if value_type not in {"numeric", "categorical"}:
+            continue
+        region_root = str(meta.get("region_root") or "").strip()
+        filename_template = str(meta.get("filename_template") or "").strip()
+        if not region_root or not filename_template:
+            continue
+        if is_derived and filename_template != "dem.tif":
+            continue
+        enabled.add(str(layer_id))
+
+    if not enabled:
+        enabled.update({"landcover", "koppen_geiger"})
+    return frozenset(sorted(enabled))
+
+
 @app.get("/health", summary="Simple liveness probe")
 def health_check() -> dict[str, str]:
     """Returns a simple liveness payload.
@@ -90,6 +128,103 @@ def list_environment_variables(
         gis_lookup.load_variable_metadata()[0],
         unit_system,
     )
+
+
+@app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
+async def variable_tile(
+    request: Request,
+    variable_id: str,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = Query(variable_tile_default_size, ge=32, le=variable_tile_max_size),
+    reproject: bool = Query(
+        variable_tile_default_reproject,
+        description="If true, warp to Web Mercator; if false, keep WGS84.",
+    ),
+    max_native_zoom: int = Query(
+        10,
+        ge=1,
+        le=18,
+        description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
+    ),
+) -> Response:
+    """Render a variable tile using the same overview + tile extraction flow as SDM tiles."""
+    if await request.is_disconnected():
+        return Response(status_code=204)
+
+    layer_id = (variable_id or "").strip().lower()
+    if not layer_id:
+        raise HTTPException(status_code=400, detail="variable_id is required.")
+    enabled_variables = _map_enabled_variables()
+    if layer_id not in enabled_variables:
+        allowed = ", ".join(sorted(enabled_variables))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Variable tiles currently support: {allowed}.",
+        )
+    if layer_id not in gis_lookup.load_layer_metadata():
+        raise HTTPException(status_code=404, detail=f"Unknown variable '{layer_id}'.")
+
+    if z > max_native_zoom:
+        zoom_diff = z - max_native_zoom
+        scale = 2 ** zoom_diff
+        parent_x = x // scale
+        parent_y = y // scale
+        subtile_x = x % scale
+        subtile_y = y % scale
+        parent_tile_size = min(tile_size * scale, variable_tile_max_size)
+        try:
+            if await request.is_disconnected():
+                return Response(status_code=204)
+            parent_payload = await run_in_threadpool(
+                tiles.render_variable_tile_bytes,
+                variable_id=layer_id,
+                z=max_native_zoom,
+                x=parent_x,
+                y=parent_y,
+                tile_size=parent_tile_size,
+                reproject=reproject,
+            )
+            if await request.is_disconnected():
+                return Response(status_code=204)
+            from PIL import Image
+            import io
+
+            parent_img = Image.open(io.BytesIO(parent_payload))
+            subtile_size = parent_tile_size // scale
+            left = subtile_x * subtile_size
+            top = subtile_y * subtile_size
+            subtile_img = parent_img.crop((left, top, left + subtile_size, top + subtile_size))
+            if subtile_size != tile_size:
+                subtile_img = subtile_img.resize((tile_size, tile_size), Image.LANCZOS)
+            buffer = io.BytesIO()
+            subtile_img.save(buffer, format="PNG")
+            payload = buffer.getvalue()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        try:
+            if await request.is_disconnected():
+                return Response(status_code=204)
+            payload = await run_in_threadpool(
+                tiles.render_variable_tile_bytes,
+                variable_id=layer_id,
+                z=z,
+                x=x,
+                y=y,
+                tile_size=tile_size,
+                reproject=reproject,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if await request.is_disconnected():
+        return Response(status_code=204)
+    headers = {
+        "Cache-Control": f"public, max-age={variable_tile_cache_seconds}",
+    }
+    return Response(content=payload, media_type="image/png", headers=headers)
 
 
 @app.get("/api/species")

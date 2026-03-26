@@ -8,12 +8,13 @@ import io
 from functools import lru_cache
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Iterator
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import csv
 import json
 import math
 import os
 import re
+import threading
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -27,6 +28,9 @@ PARQUET = ParquetStorageProxy(CONFIG.data_root, CONFIG.project_root)
 
 _LAYER_CACHE: dict[str, dict[str, Any]] = {}
 _INVALID_LOCATION_GID_TOKENS = frozenset({"nan", "none", "null", "na", "n/a", "undefined"})
+_MAX_CACHED_RASTERS = 128
+_raster_cache: OrderedDict[str, tuple] = OrderedDict()  # uri -> (ds, gdal_env)
+_raster_cache_lock = threading.Lock()
 _RASTER_STORAGE_ENV = "WHEREWILD_RASTER_STORAGE"
 
 
@@ -120,18 +124,49 @@ def _temporary_env(overrides: dict[str, str]) -> Iterator[None]:
 
 @contextmanager
 def open_raster(source: RasterSource) -> Iterator[Any]:
-    """Open a raster source with any required GDAL environment settings."""
+    """Open a raster source, reusing a cached handle when available."""
     import rasterio
 
+    uri = source.uri
+
+    with _raster_cache_lock:
+        if uri in _raster_cache:
+            _raster_cache.move_to_end(uri)
+            ds = _raster_cache[uri][0]
+        else:
+            ds = None
+
+    if ds is None:
+        if source.gdal_env:
+            with _temporary_env(source.gdal_env):
+                with rasterio.Env():
+                    ds = rasterio.open(uri)
+        else:
+            ds = rasterio.open(uri)
+
+        with _raster_cache_lock:
+            if uri not in _raster_cache:
+                _raster_cache[uri] = (ds, source.gdal_env or {})
+                _raster_cache.move_to_end(uri)
+                while len(_raster_cache) > _MAX_CACHED_RASTERS:
+                    _, (evicted_ds, _) = _raster_cache.popitem(last=False)
+                    try:
+                        evicted_ds.close()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+                _raster_cache.move_to_end(uri)
+                ds = _raster_cache[uri][0]
+
     if source.gdal_env:
-        # Some rasterio/GDAL builds reject AWS_* kwargs in rasterio.Env.
-        # Set process env vars temporarily so /vsis3 can authenticate/read ranges.
         with _temporary_env(source.gdal_env):
             with rasterio.Env():
-                with rasterio.open(source.uri) as ds:
-                    yield ds
-        return
-    with rasterio.open(source.uri) as ds:
+                yield ds
+    else:
         yield ds
 
 

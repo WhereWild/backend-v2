@@ -16,7 +16,24 @@ CONFIG = load_config("global")
 
 gis_global_inputs = [
             ("landcover_global.tif", "landcover.tif"),
-            ("koppen_geiger.tif"),
+            ("koppen_geiger.tif", "koppen_geiger.tif"),
+            ("landform.tif", "landform.tif"),
+            ("lithology.tif", "lithology.tif"),
+            ("clay.tif", "clay.tif"),
+            ("sand.tif", "sand.tif"),
+            ("silt.tif", "silt.tif"),
+            ("cfvo.tif", "cfvo.tif"),
+            ("wrb.tif", "wrb.tif"),
+            # CHELSA variables
+            ("clt.tif", "clt.tif"),
+            ("rsds.tif", "rsds.tif"),
+            ("scd.tif", "scd.tif"),
+            ("sfc.tif", "sfc.tif"),
+            ("swe.tif", "swe.tif"),
+            ("vpd.tif", "vpd.tif"),
+            ("soc.tif", "soc.tif"),
+            ("phh20.tif", "phh20.tif"),
+            ("nitrogen.tif", "nitrogen.tif"),            
         ]
 
 slice_region_lat_end = 90
@@ -48,12 +65,15 @@ regions = [
 
 os.makedirs(CONFIG.gis_regions_root, exist_ok=True)
 
-bioclim_tifs = [
-    CONFIG.bioclim_root / f for f in os.listdir(CONFIG.bioclim_root) if f.lower().endswith(".tif")
-]
+bioclim_tifs = []
+if CONFIG.bioclim_root.exists():
+    bioclim_tifs = [
+        CONFIG.bioclim_root / f for f in os.listdir(CONFIG.bioclim_root) if f.lower().endswith(".tif")
+    ]
 sources: list[tuple[Path, str]] = [(path, path.name) for path in bioclim_tifs]
 
-for filename, out_name in gis_global_inputs:
+for item in gis_global_inputs:
+    filename, out_name = item if isinstance(item, tuple) else (item, item)
     src_path = CONFIG.gis_root / filename
     if src_path.exists():
         sources.append((src_path, out_name))

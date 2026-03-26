@@ -53,7 +53,32 @@ _UNIT_ALIASES: dict[str, str] = {
     "kpa": "kpa",
     "kilopascal": "kpa",
     "kilopascals": "kpa",
+    "pa": "pa",
+    "pascal": "pa",
+    "pascals": "pa",
     "psi": "psi",
+    "m/s": "mps",
+    "ms-1": "mps",
+    "ms^-1": "mps",
+    "mps": "mps",
+    "mph": "mph",
+    "milesperhour": "mph",
+    "kg/m^2/year": "mm_per_year",
+    "kg/m2/year": "mm_per_year",
+    "kgm-2year-1": "mm_per_year",
+    "mm/year": "mm_per_year",
+    "mm/yr": "mm_per_year",
+    "in/year": "in_per_year",
+    "in/yr": "in_per_year",
+    "g/kg": "g_per_kg",
+    "gkg": "g_per_kg",
+    "gramperkilogram": "g_per_kg",
+    "gramsperkilogram": "g_per_kg",
+    "lb/ton": "lb_per_ton",
+    "lbs/ton": "lb_per_ton",
+    "lbton": "lb_per_ton",
+    "poundperton": "lb_per_ton",
+    "poundsperton": "lb_per_ton",
 }
 
 _UNIT_SYSTEM_BY_UNIT: dict[str, UnitSystem] = {
@@ -66,8 +91,15 @@ _UNIT_SYSTEM_BY_UNIT: dict[str, UnitSystem] = {
     "in": "imperial",
     "ft": "imperial",
     "mi": "imperial",
+    "pa": "metric",
     "kpa": "metric",
     "psi": "imperial",
+    "mps": "metric",
+    "mph": "imperial",
+    "mm_per_year": "metric",
+    "in_per_year": "imperial",
+    "g_per_kg": "metric",
+    "lb_per_ton": "imperial",
 }
 
 _LENGTH_FACTORS_M: dict[str, float] = {
@@ -90,16 +122,159 @@ _EQUIVALENT_UNIT: dict[str, dict[UnitSystem, str]] = {
     "mi": {"metric": "km", "imperial": "mi"},
     "c": {"metric": "c", "imperial": "f"},
     "f": {"metric": "c", "imperial": "f"},
+    "pa": {"metric": "pa", "imperial": "psi"},
     "kpa": {"metric": "kpa", "imperial": "psi"},
     "psi": {"metric": "kpa", "imperial": "psi"},
+    "mps": {"metric": "mps", "imperial": "mph"},
+    "mph": {"metric": "mps", "imperial": "mph"},
+    "mm_per_year": {"metric": "mm_per_year", "imperial": "in_per_year"},
+    "in_per_year": {"metric": "mm_per_year", "imperial": "in_per_year"},
+    "g_per_kg": {"metric": "g_per_kg", "imperial": "lb_per_ton"},
+    "lb_per_ton": {"metric": "g_per_kg", "imperial": "lb_per_ton"},
 }
 
 _DISPLAY_UNIT: dict[str, str] = {
     "c": "°C",
     "f": "°F",
     "kpa": "kPa",
+    "pa": "Pa",
     "psi": "psi",
+    "mps": "m/s",
+    "mph": "mph",
+    "mm_per_year": "mm/year",
+    "in_per_year": "in/year",
+    "g_per_kg": "g/kg",
+    "lb_per_ton": "lb/ton",
 }
+
+_VARIABLE_DISPLAY_SCALE: dict[str, float] = {
+    # Cloud area fraction is stored as hundredths of percent in source rasters.
+    "clt": 0.01,
+    # Coarse fragments are stored as cm^3/dm^3 (x10 of percent by volume).
+    "cfvo": 0.1,
+    # Soil texture fractions are stored as g/kg; display as percent by mass.
+    "clay": 0.1,
+    "sand": 0.1,
+    "silt": 0.1,
+    # Nitrogen is stored as cg/kg in source rasters; display as percent.
+    "nitrogen": 0.001,
+    # Soil organic carbon is stored as dg/kg in source rasters; display as percent.
+    "soc": 0.01,
+    # pH is stored as pH*10 in source rasters.
+    "phh2o": 0.1,
+}
+
+_SUMMARY_CONVERTIBLE_KEYS = {
+    "min",
+    "max",
+    "mean",
+    "median",
+    "std",
+    "stddev",
+    "q01",
+    "q10",
+    "q25",
+    "q50",
+    "q75",
+    "q90",
+    "q99",
+    "1st percentile",
+    "10th percentile",
+    "25th percentile",
+    "75th percentile",
+    "90th percentile",
+    "99th percentile",
+    "10-90 range",
+    "1-99 range",
+    "range",
+}
+
+
+def variable_display_scale(variable_id: Optional[str]) -> float:
+    if not variable_id:
+        return 1.0
+    return float(_VARIABLE_DISPLAY_SCALE.get(str(variable_id).strip().lower(), 1.0))
+
+
+def _scale_number(value: Any, factor: float) -> Any:
+    if factor == 1.0:
+        return value
+    if isinstance(value, (int, float)):
+        return float(value) * factor
+    return value
+
+
+def _scale_summary(summary: Optional[dict[str, Any]], factor: float) -> Optional[dict[str, Any]]:
+    if not summary or factor == 1.0:
+        return summary
+    scaled = dict(summary)
+    for key, value in summary.items():
+        if isinstance(value, (int, float)) and str(key).strip().lower() in _SUMMARY_CONVERTIBLE_KEYS:
+            scaled[key] = float(value) * factor
+    return scaled
+
+
+def _scale_density_curve(
+    curve: Optional[dict[str, Any]],
+    factor: float,
+) -> Optional[dict[str, Any]]:
+    if not curve or factor == 1.0:
+        return curve
+    adjusted = dict(curve)
+    points = adjusted.get("points") or []
+    density = adjusted.get("density") or []
+    adjusted["points"] = [float(value) * factor for value in points]
+    if factor:
+        adjusted["density"] = [float(value) / abs(factor) for value in density]
+    for key in ("min", "max", "bandwidth"):
+        if isinstance(adjusted.get(key), (int, float)):
+            adjusted[key] = float(adjusted[key]) * abs(factor) if key == "bandwidth" else float(adjusted[key]) * factor
+    return adjusted
+
+
+def _scale_observations(
+    observations: list[dict[str, Any]],
+    factor: float,
+    *,
+    value_key: str = "value",
+) -> list[dict[str, Any]]:
+    if factor == 1.0 or not observations:
+        return observations
+    scaled: list[dict[str, Any]] = []
+    for row in observations:
+        value = row.get(value_key)
+        if isinstance(value, (int, float)):
+            updated = dict(row)
+            updated[value_key] = float(value) * factor
+            scaled.append(updated)
+        else:
+            scaled.append(row)
+    return scaled
+
+
+def _scale_rank_entries(entries: list[dict[str, Any]], factor: float) -> list[dict[str, Any]]:
+    if factor == 1.0 or not entries:
+        return entries
+    scaled: list[dict[str, Any]] = []
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get("value"), (int, float)):
+            updated = dict(entry)
+            updated["value"] = float(entry["value"]) * factor
+            scaled.append(updated)
+        else:
+            scaled.append(entry)
+    return scaled
+
+
+def convert_value_from_display(value: float | None, variable_id: Optional[str]) -> float | None:
+    if value is None:
+        return value
+    factor = variable_display_scale(variable_id)
+    if factor == 1.0:
+        return value
+    if factor == 0:
+        return value
+    return float(value) / factor
 
 
 def normalize_unit_system(value: Optional[str]) -> Optional[UnitSystem]:
@@ -154,6 +329,26 @@ def conversion_params(from_unit: str, to_unit: str) -> Optional[ConversionParams
         if from_unit == "kpa":
             return ConversionParams(0.1450377377, 0.0)
         return ConversionParams(6.8947572932, 0.0)
+    if {from_unit, to_unit} == {"pa", "kpa"}:
+        if from_unit == "pa":
+            return ConversionParams(0.001, 0.0)
+        return ConversionParams(1000.0, 0.0)
+    if {from_unit, to_unit} == {"pa", "psi"}:
+        if from_unit == "pa":
+            return ConversionParams(0.0001450377377, 0.0)
+        return ConversionParams(6894.7572932, 0.0)
+    if {from_unit, to_unit} == {"mps", "mph"}:
+        if from_unit == "mps":
+            return ConversionParams(2.2369362921, 0.0)
+        return ConversionParams(0.44704, 0.0)
+    if {from_unit, to_unit} == {"mm_per_year", "in_per_year"}:
+        if from_unit == "mm_per_year":
+            return ConversionParams(1.0 / 25.4, 0.0)
+        return ConversionParams(25.4, 0.0)
+    if {from_unit, to_unit} == {"g_per_kg", "lb_per_ton"}:
+        if from_unit == "g_per_kg":
+            return ConversionParams(2.0, 0.0)
+        return ConversionParams(0.5, 0.0)
     if from_unit in _LENGTH_FACTORS_M and to_unit in _LENGTH_FACTORS_M:
         factor = _LENGTH_FACTORS_M[from_unit] / _LENGTH_FACTORS_M[to_unit]
         return ConversionParams(factor, 0.0)
@@ -214,32 +409,8 @@ def convert_summary(
     if not summary or not target_system or not unit:
         return summary
     converted: dict[str, Any] = dict(summary)
-    convertible_keys = {
-        "min",
-        "max",
-        "mean",
-        "median",
-        "std",
-        "stddev",
-        "q01",
-        "q10",
-        "q25",
-        "q50",
-        "q75",
-        "q90",
-        "q99",
-        "1st percentile",
-        "10th percentile",
-        "25th percentile",
-        "75th percentile",
-        "90th percentile",
-        "99th percentile",
-        "10-90 range",
-        "1-99 range",
-        "range",
-    }
     for key, value in summary.items():
-        if isinstance(value, (int, float)) and str(key).strip().lower() in convertible_keys:
+        if isinstance(value, (int, float)) and str(key).strip().lower() in _SUMMARY_CONVERTIBLE_KEYS:
             converted[key], _ = convert_value_for_system(float(value), unit, target_system)
     return converted
 
@@ -337,10 +508,21 @@ def apply_unit_system_to_env_response(
     unit_system: Optional[str],
     unit: Optional[str],
 ) -> dict[str, Any]:
+    updated = dict(response)
+    scale = variable_display_scale(updated.get("variable"))
+    if scale != 1.0:
+        updated["summary"] = _scale_summary(updated.get("summary"), scale)
+        updated["baselineSummary"] = _scale_summary(updated.get("baselineSummary"), scale)
+        updated["baseline_summary"] = _scale_summary(updated.get("baseline_summary"), scale)
+        scaled_curve = _scale_density_curve(updated.get("densityCurve"), scale)
+        updated["densityCurve"] = scaled_curve
+        updated["density_curve"] = _scale_density_curve(updated.get("density_curve"), scale) or scaled_curve
+        updated["binSamples"] = _scale_observations(updated.get("binSamples", []), scale)
+        updated["bin_samples"] = _scale_observations(updated.get("bin_samples", []), scale)
+
     resolved = normalize_unit_system(unit_system)
     if not resolved or not unit:
-        return response
-    updated = dict(response)
+        return updated
     target_unit = equivalent_unit(unit, resolved) or unit
     display = display_unit(target_unit)
     updated["units"] = display
@@ -364,10 +546,18 @@ def apply_unit_system_to_slice_response(
     unit_system: Optional[str],
     unit: Optional[str],
 ) -> dict[str, Any]:
+    updated = dict(response)
+    scale = variable_display_scale(updated.get("variable"))
+    if scale != 1.0:
+        updated["observations"] = _scale_observations(updated.get("observations", []), scale)
+        range_obj = dict(updated.get("range") or {})
+        range_obj["min"] = _scale_number(range_obj.get("min"), scale)
+        range_obj["max"] = _scale_number(range_obj.get("max"), scale)
+        updated["range"] = range_obj
+
     resolved = normalize_unit_system(unit_system)
     if not resolved or not unit:
-        return response
-    updated = dict(response)
+        return updated
     updated["observations"] = convert_observations(
         updated.get("observations", []), unit, resolved
     )
@@ -385,10 +575,15 @@ def apply_unit_system_to_rankings_response(
     unit_system: Optional[str],
     unit: Optional[str],
 ) -> dict[str, Any]:
+    updated = dict(response)
+    scale = variable_display_scale(updated.get("variable"))
+    if scale != 1.0:
+        updated["entries"] = _scale_rank_entries(updated.get("entries", []), scale)
+        updated["distribution"] = _scale_density_curve(updated.get("distribution"), scale)
+
     resolved = normalize_unit_system(unit_system)
     if not resolved or not unit:
-        return response
-    updated = dict(response)
+        return updated
     target_unit = equivalent_unit(unit, resolved) or unit
     updated["units"] = display_unit(target_unit)
     entries = []

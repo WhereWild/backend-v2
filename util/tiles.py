@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 import numpy as np
 from PIL import Image
+import pyarrow.fs as pafs
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
@@ -17,7 +18,7 @@ from rasterio.warp import reproject
 from rasterio.windows import Window, from_bounds as window_from_bounds, transform as window_transform
 
 from util.config import load_config
-from util import gis_lookup
+from util import gis_lookup, units
 
 
 CONFIG = load_config("global")
@@ -25,6 +26,8 @@ WEB_MERCATOR = "EPSG:3857"
 WGS84_CRS = "EPSG:4326"
 
 LANDCOVER_ID = "landcover"
+LITHOLOGY_ID = "lithology"
+WRB_ID = "wrb"
 CATEGORICAL_VALUE_TYPE = "categorical"
 NUMERIC_VALUE_TYPE = "numeric"
 DERIVED_ASPECT_ID = "aspect"
@@ -64,6 +67,59 @@ LANDCOVER_COLORS: dict[int, tuple[int, int, int]] = {
     210: (0, 70, 200),
     220: (255, 255, 255),
     250: (255, 255, 255),
+}
+
+# Fixed categorical palettes so class colors stay stable across runs/tiles.
+LITHOLOGY_COLORS: dict[int, tuple[int, int, int]] = {
+    0: (220, 220, 220),
+    1: (166, 206, 227),
+    2: (31, 120, 180),
+    3: (178, 223, 138),
+    4: (51, 160, 44),
+    5: (251, 154, 153),
+    6: (227, 26, 28),
+    7: (253, 191, 111),
+    8: (255, 127, 0),
+    9: (202, 178, 214),
+    10: (106, 61, 154),
+    11: (255, 255, 153),
+    12: (177, 89, 40),
+    13: (141, 211, 199),
+    14: (255, 255, 179),
+    15: (190, 186, 218),
+}
+
+WRB_COLORS: dict[int, tuple[int, int, int]] = {
+    0: (166, 206, 227),
+    1: (31, 120, 180),
+    2: (178, 223, 138),
+    3: (51, 160, 44),
+    4: (251, 154, 153),
+    5: (227, 26, 28),
+    6: (253, 191, 111),
+    7: (255, 127, 0),
+    8: (202, 178, 214),
+    9: (106, 61, 154),
+    10: (255, 255, 153),
+    11: (177, 89, 40),
+    12: (141, 211, 199),
+    13: (255, 255, 179),
+    14: (190, 186, 218),
+    15: (251, 128, 114),
+    16: (128, 177, 211),
+    17: (253, 180, 98),
+    18: (179, 222, 105),
+    19: (252, 205, 229),
+    20: (217, 217, 217),
+    21: (188, 128, 189),
+    22: (204, 235, 197),
+    23: (255, 237, 111),
+    24: (140, 150, 198),
+    25: (252, 141, 98),
+    26: (102, 194, 165),
+    27: (141, 160, 203),
+    28: (231, 138, 195),
+    29: (166, 216, 84),
 }
 
 # Viridis-like stops used for numeric layer rendering.
@@ -326,19 +382,28 @@ def _finalize_layer_values(
     transform: rasterio.Affine,
     crs: Any,
 ) -> np.ndarray:
-    if layer_id not in DERIVED_FROM_DEM_IDS:
-        return layer_values
+    output_values = layer_values
 
-    slope_degrees, aspect_degrees = _derive_slope_aspect(
-        layer_values,
-        transform=transform,
-        crs=crs,
-    )
-    if layer_id == DERIVED_SLOPE_ID:
-        return slope_degrees
-    if layer_id == DERIVED_ASPECT_DEG_ID:
-        return aspect_degrees
-    return _aspect_degrees_to_bins(aspect_degrees)
+    if layer_id in DERIVED_FROM_DEM_IDS:
+        slope_degrees, aspect_degrees = _derive_slope_aspect(
+            layer_values,
+            transform=transform,
+            crs=crs,
+        )
+        if layer_id == DERIVED_SLOPE_ID:
+            output_values = slope_degrees
+        elif layer_id == DERIVED_ASPECT_DEG_ID:
+            output_values = aspect_degrees
+        else:
+            output_values = _aspect_degrees_to_bins(aspect_degrees)
+
+    scale = units.variable_display_scale(layer_id)
+    if scale != 1.0:
+        finite = np.isfinite(output_values)
+        if np.any(finite):
+            output_values = output_values.copy()
+            output_values[finite] = output_values[finite] * scale
+    return output_values
 
 
 def _render_layer_values(
@@ -487,6 +552,10 @@ def _fallback_categorical_color(class_id: int) -> tuple[int, int, int]:
 def _categorical_palette(layer_id: str) -> dict[int, tuple[int, int, int]]:
     if layer_id == LANDCOVER_ID:
         return dict(LANDCOVER_COLORS)
+    if layer_id == LITHOLOGY_ID:
+        return dict(LITHOLOGY_COLORS)
+    if layer_id == WRB_ID:
+        return dict(WRB_COLORS)
 
     legend = gis_lookup.load_layer_legend(layer_id)
     class_ids = sorted(
@@ -538,33 +607,206 @@ def _colorize_categorical(class_ids: np.ndarray, layer_id: str) -> np.ndarray:
     return rgba
 
 
-def _numeric_range(values: np.ndarray, layer_id: str) -> tuple[float, float] | None:
-    override = NUMERIC_RANGE_OVERRIDES.get(layer_id)
-    if override is not None:
-        return override
-
-    layer_meta = _layer_metadata(layer_id)
-    units = str(layer_meta.get("units") or "").strip().lower()
-    if units in {"m", "meter", "meters"}:
-        return (-500.0, 9000.0)
-    if units in {"°c", "c", "degc", "degrees celsius"}:
-        return (-50.0, 50.0)
-    if units in {"mm", "millimeter", "millimeters"}:
-        return (0.0, 5000.0)
-    if units in {"%", "percent"}:
-        return (0.0, 100.0)
-
-    finite = values[np.isfinite(values)]
-    if finite.size == 0:
-        return None
-
-    lo = float(np.percentile(finite, 2))
-    hi = float(np.percentile(finite, 98))
-    if hi <= lo:
-        lo = float(np.min(finite))
-        hi = float(np.max(finite))
+def _normalize_numeric_range(lo: float, hi: float) -> tuple[float, float]:
+    if not math.isfinite(lo):
+        lo = 0.0
+    if not math.isfinite(hi):
+        hi = lo + 1.0
     if hi <= lo:
         hi = lo + 1.0
+    return float(lo), float(hi)
+
+
+def _units_default_numeric_range(units: str) -> tuple[float, float] | None:
+    normalized = (
+        units.strip()
+        .lower()
+        .replace(" ", "")
+        .replace("⁻", "-")
+        .replace("−", "-")
+        .replace("×", "x")
+        .replace("°", "deg")
+        .replace("¹", "1")
+        .replace("²", "2")
+        .replace("³", "3")
+    )
+    if normalized in {"m", "meter", "meters"}:
+        return (-500.0, 9000.0)
+    if normalized in {"degc", "c", "degreescelsius"}:
+        return (-50.0, 50.0)
+    if normalized in {"mm", "millimeter", "millimeters"}:
+        return (0.0, 5000.0)
+    if normalized in {"%", "percent"}:
+        return (0.0, 100.0)
+    if normalized in {"degrees", "degree"}:
+        return (0.0, 360.0)
+    if normalized in {"pa", "pascal", "pascals"}:
+        return (0.0, 8000.0)
+    if normalized in {"w/m2", "wm-2", "w/m^2", "wattsperm2"}:
+        return (0.0, 400.0)
+    if normalized in {"m/s", "ms⁻¹", "ms-1"}:
+        return (0.0, 30.0)
+    if normalized in {"kpa"}:
+        return (0.0, 10.0)
+    if normalized in {"m3/m3"}:
+        return (0.0, 1.0)
+    if normalized in {"cm3/dm3"}:
+        return (0.0, 1000.0)
+    if normalized in {"ph*10"}:
+        return (0.0, 140.0)
+    if normalized in {"ratiox100"}:
+        return (0.0, 100.0)
+    if normalized in {"standarddeviationx100"}:
+        return (0.0, 3000.0)
+    if normalized in {"coefficient"}:
+        return (0.0, 200.0)
+    if normalized in {"mjm-2d-1", "mjm-2day-1"}:
+        return (0.0, 40.0)
+    if "kgm" in normalized and "yr" in normalized:
+        return (0.0, 5000.0)
+    if "days" in normalized and "yr" in normalized:
+        return (0.0, 365.0)
+    if normalized in {"g/kg", "gkg"}:
+        return (0.0, 1000.0)
+    if normalized in {"cg/kg", "cgkg"}:
+        return (0.0, 10000.0)
+    if normalized in {"dg/kg", "dgkg"}:
+        return (0.0, 1000.0)
+    return None
+
+
+def _iter_layer_region_sources(
+    layer_id: str,
+    layer_meta: dict[str, Any],
+) -> Iterable[gis_lookup.RasterSource]:
+    region_root = CONFIG.gis_root / str(layer_meta.get("region_root") or "").strip()
+    filename = str(layer_meta.get("filename_template") or "").strip().format(id=layer_id)
+    yielded: set[str] = set()
+
+    if region_root.exists():
+        for region_dir in sorted(region_root.iterdir()):
+            if not region_dir.is_dir():
+                continue
+            source = gis_lookup.resolve_raster_source(region_dir / filename)
+            if source is None:
+                continue
+            if source.uri in yielded:
+                continue
+            yielded.add(source.uri)
+            yield source
+        return
+
+    storage_getter = getattr(gis_lookup, "_raster_storage", None)
+    if not callable(storage_getter):
+        return
+    try:
+        storage = storage_getter()
+    except Exception:
+        return
+    if not getattr(storage, "is_remote", False) or getattr(storage, "filesystem", None) is None:
+        return
+    try:
+        selector = pafs.FileSelector(storage.resolve(region_root), recursive=True)
+        for info in storage.filesystem.get_file_info(selector):
+            if info.type != pafs.FileType.File:
+                continue
+            path = str(info.path)
+            if not path.endswith(f"/{filename}"):
+                continue
+            uri = f"/vsis3/{path}"
+            if uri in yielded:
+                continue
+            yielded.add(uri)
+            yield gis_lookup.RasterSource(
+                uri=uri,
+                gdal_env=storage.gdal_env(),
+                is_remote=True,
+            )
+    except Exception:
+        return
+
+
+@lru_cache(maxsize=128)
+def _global_numeric_range(layer_id: str) -> tuple[float, float] | None:
+    scale = units.variable_display_scale(layer_id)
+    override = NUMERIC_RANGE_OVERRIDES.get(layer_id)
+    if override is not None:
+        lo, hi = _normalize_numeric_range(float(override[0]), float(override[1]))
+        if scale != 1.0:
+            lo, hi = _normalize_numeric_range(lo * scale, hi * scale)
+        return lo, hi
+
+    layer_meta = _layer_metadata(layer_id)
+    explicit_min = layer_meta.get("render_min")
+    explicit_max = layer_meta.get("render_max")
+    if explicit_min is not None and explicit_max is not None:
+        try:
+            lo, hi = _normalize_numeric_range(float(explicit_min), float(explicit_max))
+            if scale != 1.0:
+                lo, hi = _normalize_numeric_range(lo * scale, hi * scale)
+            return lo, hi
+        except (TypeError, ValueError):
+            pass
+
+    def _tag_float(tags: dict[str, str], *keys: str) -> float | None:
+        if not tags:
+            return None
+        lower = {str(k).lower(): v for k, v in tags.items()}
+        for key in keys:
+            raw = lower.get(key.lower())
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                return value
+        return None
+
+    range_min: float | None = None
+    range_max: float | None = None
+    max_sources = 4096
+    for index, source in enumerate(_iter_layer_region_sources(layer_id, layer_meta)):
+        if index >= max_sources:
+            break
+        try:
+            with gis_lookup.open_raster(source) as ds:
+                band_tags = ds.tags(1) if ds.count >= 1 else {}
+                if not band_tags:
+                    band_tags = ds.tags()
+                lo = _tag_float(
+                    band_tags,
+                    "STATISTICS_MINIMUM",
+                    "STATISTICS_MIN",
+                    "minimum",
+                    "min",
+                )
+                hi = _tag_float(
+                    band_tags,
+                    "STATISTICS_MAXIMUM",
+                    "STATISTICS_MAX",
+                    "maximum",
+                    "max",
+                )
+                if lo is None or hi is None:
+                    continue
+                if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
+                    continue
+                range_min = lo if range_min is None else min(range_min, lo)
+                range_max = hi if range_max is None else max(range_max, hi)
+        except Exception:
+            continue
+    if range_min is not None and range_max is not None:
+        lo, hi = _normalize_numeric_range(range_min, range_max)
+        if scale != 1.0:
+            lo, hi = _normalize_numeric_range(lo * scale, hi * scale)
+        return lo, hi
+
+    fallback = _units_default_numeric_range(str(layer_meta.get("units") or ""))
+    if fallback is None:
+        return None
+    lo, hi = _normalize_numeric_range(float(fallback[0]), float(fallback[1]))
     return lo, hi
 
 
@@ -574,7 +816,9 @@ def _colorize_numeric(values: np.ndarray, layer_id: str) -> np.ndarray:
     if not np.any(finite):
         return rgba
 
-    value_range = _numeric_range(values, layer_id)
+    value_range = _global_numeric_range(layer_id)
+    if value_range is None:
+        value_range = (0.0, 1.0)
     if value_range is None:
         return rgba
     lo, hi = value_range

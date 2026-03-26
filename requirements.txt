@@ -15,6 +15,7 @@ better-profanity>=0.7.0
 # API runtime
 fastapi>=0.121.0
 uvicorn[standard]>=0.38.0
+python-multipart>=0.0.9
 # docs (used for local dev)
 mkdocs-material>=9.7.1
 mkdocstrings[python]>=0.29.0

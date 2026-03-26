@@ -26,3 +26,5 @@ __tests__/
 
 # Node / frontend junk if repo is mixed
 node_modules/
+.build_tmp
+.cache

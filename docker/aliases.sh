@@ -684,16 +684,14 @@ pd() {
     return 1
   fi
 
-  if [[ "$module" != */* ]]; then
+  if [[ "$module" != */* && ( "$module" != *.* || "$module" == *.py ) ]]; then
     module="scripts/$module"
   fi
 
-  if [[ "$module" == */*.py ]]; then
-    module="${module%.py}"
-    module="${module#/}"
-    module="${module#./}"
-    module="${module//\//.}"
-  fi
+  module="${module%.py}"
+  module="${module#/}"
+  module="${module#./}"
+  module="${module//\//.}"
 
   export WHEREWILD_PARQUET_STORAGE="${WHEREWILD_PARQUET_STORAGE:-local}"
   python -m "$module" "$@"
@@ -836,7 +834,7 @@ pdb() {
     return 1
   fi
 
-  if [[ "$module" != */* ]]; then
+  if [[ "$module" != */* && ( "$module" != *.* || "$module" == *.py ) ]]; then
     module="scripts/$module"
   fi
 
@@ -847,12 +845,10 @@ pdb() {
   local pid_file="$pid_dir/$log_name.pid"
   local log_file="$log_dir/$log_name.log"
 
-  if [[ "$module" == */*.py ]]; then
-    module="${module%.py}"
-    module="${module#/}"
-    module="${module#./}"
-    module="${module//\//.}"
-  fi
+  module="${module%.py}"
+  module="${module#/}"
+  module="${module#./}"
+  module="${module//\//.}"
 
   mkdir -p "$log_dir" "$pid_dir"
 
@@ -876,7 +872,7 @@ pdbs() {
   fi
 
   local module_path="$module"
-  if [[ "$module_path" != */* ]]; then
+  if [[ "$module_path" != */* && ( "$module_path" != *.* || "$module_path" == *.py ) ]]; then
     module_path="scripts/$module_path"
   fi
 
@@ -930,7 +926,7 @@ pdbc() {
 
   (
     for module in "$@"; do
-      if [[ "$module" != */* ]]; then
+      if [[ "$module" != */* && ( "$module" != *.* || "$module" == *.py ) ]]; then
         module="scripts/$module"
       fi
 
@@ -939,12 +935,10 @@ pdbc() {
       pid_file="$pid_dir/$log_name.pid"
       log_file="$log_dir/$log_name.log"
 
-      if [[ "$module" == */*.py ]]; then
-        module="${module%.py}"
-        module="${module#/}"
-        module="${module#./}"
-        module="${module//\//.}"
-      fi
+      module="${module%.py}"
+      module="${module#/}"
+      module="${module#./}"
+      module="${module//\//.}"
 
       if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
         echo "pdbc: $log_name already running (use pdbs $log_name to stop)"
@@ -960,4 +954,83 @@ pdbc() {
   ) &
 
   echo "pdbc started: $log_dir"
+}
+
+pdbca() {
+  local log_dir="/workspace/logs/scripts"
+  local pid_dir="/workspace/logs/pids"
+  local roots_csv="${WW_PDBCA_ROOTS:-0,1,2,3,4,5,6,7,8}"
+  local modules=("$@")
+
+  if [[ "${#modules[@]}" -eq 0 ]]; then
+    modules=(enrich_tree process_tree process_positions)
+  fi
+
+  mkdir -p "$log_dir" "$pid_dir"
+
+  local run_id
+  run_id="$(date +%Y%m%d-%H%M%S)"
+  local queue_log="$log_dir/pdbca-$run_id.log"
+
+  (
+    IFS=',' read -r -a roots <<< "$roots_csv"
+    for raw_root in "${roots[@]}"; do
+      root="${raw_root//[[:space:]]/}"
+      if [[ -z "$root" ]]; then
+        continue
+      fi
+
+      echo "[pdbca] root=$root begin ts=$(date -Iseconds)" >> "$queue_log"
+
+      for module in "${modules[@]}"; do
+        module_path="$module"
+        if [[ "$module_path" != */* && ( "$module_path" != *.* || "$module_path" == *.py ) ]]; then
+          module_path="scripts/$module_path"
+        fi
+
+        log_name="${module_path##*/}"
+        log_name="${log_name%.py}"
+        pid_file="$pid_dir/${log_name}.root-${root}.pid"
+        log_file="$log_dir/${log_name}.root-${root}.log"
+
+        module_dotted="$module_path"
+        module_dotted="${module_dotted%.py}"
+        module_dotted="${module_dotted#/}"
+        module_dotted="${module_dotted#./}"
+        module_dotted="${module_dotted//\//.}"
+
+        if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+          echo "[pdbca] skip root=$root module=$module_dotted reason=already-running pid=$(cat "$pid_file")" >> "$queue_log"
+          exit 1
+        fi
+
+        echo "[pdbca] start root=$root module=$module_dotted log=$log_file ts=$(date -Iseconds)" >> "$queue_log"
+        WHEREWILD_ROOT_TAXON_ID="$root" \
+          WHEREWILD_PARQUET_STORAGE="${WHEREWILD_PARQUET_STORAGE:-local}" \
+          PYTHONUNBUFFERED=1 \
+          setsid python -u -m "$module_dotted" > "$log_file" 2>&1 &
+        pid="$!"
+        echo "$pid" > "$pid_file"
+
+        wait "$pid"
+        rc="$?"
+        rm -f "$pid_file"
+
+        if [[ "$rc" -ne 0 ]]; then
+          echo "[pdbca] fail root=$root module=$module_dotted rc=$rc log=$log_file ts=$(date -Iseconds)" >> "$queue_log"
+          exit "$rc"
+        fi
+
+        echo "[pdbca] done root=$root module=$module_dotted rc=$rc ts=$(date -Iseconds)" >> "$queue_log"
+      done
+
+      echo "[pdbca] root=$root done ts=$(date -Iseconds)" >> "$queue_log"
+    done
+
+    echo "[pdbca] complete ts=$(date -Iseconds)" >> "$queue_log"
+  ) &
+
+  echo "pdbca started: $queue_log"
+  echo "pdbca roots: $roots_csv"
+  echo "pdbca modules: ${modules[*]}"
 }

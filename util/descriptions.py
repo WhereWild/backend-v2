@@ -143,6 +143,23 @@ def _to_natural_climate_name(text: str) -> str:
     return stripped
 
 
+def _to_natural_landform_name(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return lowered
+    if "plain" in lowered:
+        return "plains"
+    if "hill" in lowered:
+        return "hills"
+    if "mountain" in lowered:
+        return "mountains"
+    if "plateau" in lowered:
+        return "plateaus"
+    if "valley" in lowered:
+        return "valleys"
+    return lowered
+
+
 def _strip_phrase(phrase: str) -> tuple[str, str]:
     for prefix in ("often in ", "primarily in ", "across a broad range of "):
         if phrase.startswith(prefix):
@@ -1347,7 +1364,7 @@ def _aspect_preference_text(taxon_dir: Path) -> Optional[str]:
         return None
     preferred_facing = [f"{direction}-facing" for direction in preferred]
     facing_text = _join_names(preferred_facing)
-    return f"Aspect: prefers {facing_text} slopes"
+    return f"Prefers {facing_text} slopes"
 
 
 # ---------------------------------------------------------------------------
@@ -1411,6 +1428,10 @@ def _select_variable_outlier_candidate(
 
     config = load_config("global")
     if bool(getattr(config, "skip_description_outliers", False)):
+        return None
+    # Location-filtered descriptions should use direct local-vs-global comparisons,
+    # not expensive relative-rank scans.
+    if location_gid:
         return None
 
     entries = indexing.load_relative_ranks(
@@ -1791,6 +1812,8 @@ def _categorical_display_label(
     group_label: str,
     legend_entry: Optional[dict[str, Any]],
 ) -> str:
+    if variable_id == "landform":
+        return _to_natural_landform_name(class_name)
     if style == "group_map":
         if group_value == "forest":
             traits = _extract_legend_traits(legend_entry)
@@ -2294,6 +2317,67 @@ def _precip_location_compare_text(
     return f"{degree} {direction} in {location_name}"
 
 
+def _swe_location_compare_text(
+    *,
+    local_mean: Any,
+    global_mean: Any,
+    location_name: str,
+) -> Optional[str]:
+    try:
+        local_value = float(local_mean)
+        global_value = float(global_mean)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(local_value) and math.isfinite(global_value)):
+        return None
+    diff = local_value - global_value
+    magnitude = abs(diff)
+    if magnitude < 5:
+        return f"about the same in {location_name}"
+    if magnitude < 20:
+        degree = "slightly"
+    elif magnitude < 60:
+        degree = "a bit"
+    elif magnitude < 150:
+        degree = "noticeably"
+    else:
+        degree = "much"
+    direction = "snowier" if diff > 0 else "less snowy"
+    return f"{degree} {direction} in {location_name}"
+
+
+def _soil_location_compare_text(
+    *,
+    dominant_name: str,
+    local_pct: Any,
+    global_pct: Any,
+    location_name: str,
+) -> Optional[str]:
+    try:
+        local_value = float(local_pct)
+        global_value = float(global_pct)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(local_value) and math.isfinite(global_value)):
+        return None
+    diff = local_value - global_value
+    magnitude = abs(diff)
+    if magnitude < 2:
+        return None
+    if magnitude < 5:
+        degree = "slightly"
+    elif magnitude < 10:
+        degree = "a bit"
+    elif magnitude < 20:
+        degree = "noticeably"
+    else:
+        degree = "much"
+    adjective_more = {"sand": "sandier", "silt": "siltier", "clay": "more clay-rich"}.get(dominant_name, f"more {dominant_name}")
+    adjective_less = {"sand": "less sandy", "silt": "less silty", "clay": "less clay-rich"}.get(dominant_name, f"less {dominant_name}")
+    direction = adjective_more if diff > 0 else adjective_less
+    return f"{degree} {direction} in {location_name}"
+
+
 # ---------------------------------------------------------------------------
 # Status rows
 # ---------------------------------------------------------------------------
@@ -2341,25 +2425,21 @@ def _terrain_status_rows(
     )
 
     detail_parts: list[str] = []
-    elevation_outlier_text = (
-        _elevation_outlier_text(
-            taxon,
-            taxon_dir,
-            location_gid=location_gid,
-        )
-        if not location_gid
-        else None
-    )
     if min_value and max_value:
         if display_units:
-            elevation_text = f"Elevation: {min_value}-{max_value} {display_units}"
+            elevation_text = f"Found from {min_value}-{max_value} {display_units}"
         else:
-            elevation_text = f"Elevation: {min_value}-{max_value}"
-        if elevation_outlier_text:
-            elevation_text += f" ({elevation_outlier_text})"
+            elevation_text = f"Found from {min_value}-{max_value}"
         detail_parts.append(elevation_text)
-    elif elevation_outlier_text:
-        detail_parts.append(f"Elevation: {elevation_outlier_text}")
+    landform_phrase = _top_categorical_phrase(
+        taxon_dir,
+        variable_id="landform",
+        label="landform",
+        taxon_id=taxon_id,
+        location_gid=location_gid,
+    )
+    if landform_phrase:
+        detail_parts.append(_sentence_case(landform_phrase.lower()))
     if slope_grade is not None:
         if slope_p10_grade is not None:
             low_grade = min(slope_p10_grade, slope_grade)
@@ -2369,13 +2449,13 @@ def _terrain_status_rows(
             low_pct = int(round(low_grade))
             high_pct = int(round(high_grade))
             slope_text = (
-                f"Slope: often {_slope_range_phrase(low_band, high_band)} "
+                f"Often {_slope_range_phrase(low_band, high_band)} "
                 f"({low_pct} to {high_pct} percent grade)"
             )
         else:
             slope_band = _slope_band_from_grade(slope_grade)
             slope_pct = int(round(slope_grade))
-            slope_text = f"Slope: often {_slope_phrase_for_band(slope_band)} ({slope_pct} percent grade)"
+            slope_text = f"Often {_slope_phrase_for_band(slope_band)} ({slope_pct} percent grade)"
         detail_parts.append(slope_text)
     aspect_text = _aspect_preference_text(taxon_dir)
     if aspect_text:
@@ -2391,7 +2471,15 @@ def _terrain_status_rows(
     ]
 
 
-def _temperature_status_rows(
+def _swe_typically_snowy(swe_median: Optional[float]) -> bool:
+    return swe_median is not None and swe_median >= 5
+
+
+def _swe_sometimes_snowy(swe_max: Optional[float]) -> bool:
+    return swe_max is not None and swe_max >= 5
+
+
+def _weather_status_rows(
     taxon: dict[str, Any],
     taxon_dir: Path,
     *,
@@ -2401,6 +2489,7 @@ def _temperature_status_rows(
 ) -> list[dict[str, Any]]:
     from util import gis_lookup
 
+    # --- Temperature (bio_5 = max temp of warmest month, bio_6 = min temp of coldest month) ---
     bio6 = _numeric_summary_for_context(
         taxon_id=taxon_id,
         taxon_dir=taxon_dir,
@@ -2413,138 +2502,131 @@ def _temperature_status_rows(
         variable_id="bio_5",
         location_gid=location_gid,
     )
-    bio1_local = (
-        _numeric_summary_for_context(
-            taxon_id=taxon_id,
-            taxon_dir=taxon_dir,
-            variable_id="bio_1",
-            location_gid=location_gid,
-        )
-        if location_gid
-        else {}
-    )
-    bio1_global = (
-        _numeric_summary_for_context(
-            taxon_id=taxon_id,
-            taxon_dir=taxon_dir,
-            variable_id="bio_1",
-            location_gid=None,
-        )
-        if location_gid
-        else {}
-    )
     coldest_winter_raw = bio6.get("min")
     hottest_raw = bio5.get("max")
-    raw_units: Optional[str] = None
-    display_units = ""
+    temp_raw_units: Optional[str] = None
+    temp_display_units = ""
     try:
         _entries, variable_lookup = gis_lookup.load_variable_metadata()
-        raw_units = str((variable_lookup.get("bio_6") or {}).get("units") or "").strip() or None
+        temp_raw_units = str((variable_lookup.get("bio_6") or {}).get("units") or "").strip() or None
+        precip_raw_units_from_meta: Optional[str] = str((variable_lookup.get("bio_12") or {}).get("units") or "").strip() or None
+        swe_raw_units_from_meta: Optional[str] = str((variable_lookup.get("swe") or {}).get("units") or "").strip() or None
     except Exception:
-        raw_units = None
-    target_unit = units.equivalent_unit(raw_units, unit_system) if raw_units else raw_units
-    display_units = str(units.display_unit(target_unit) or "").strip()
+        temp_raw_units = None
+        precip_raw_units_from_meta = None
+        swe_raw_units_from_meta = None
+    temp_target_unit = units.equivalent_unit(temp_raw_units, unit_system) if temp_raw_units else temp_raw_units
+    temp_display_units = str(units.display_unit(temp_target_unit) or "").strip()
+
+    # Precip units (shared by bio_12, bio_18, bio_19)
+    precip_raw_units: Optional[str] = precip_raw_units_from_meta
+    precip_target_unit = units.equivalent_unit(precip_raw_units, unit_system) if precip_raw_units else precip_raw_units
+    precip_display_units = str(units.display_unit(precip_target_unit) or "").strip()
+
+    def _safe_float(val: Any) -> Optional[float]:
+        try:
+            f = float(val)
+            return f if math.isfinite(f) else None
+        except (TypeError, ValueError):
+            return None
+
+    def _with_precip_units(value: str) -> str:
+        return f"{value} {precip_display_units}" if precip_display_units else value
+
+    def _precip_range(low: str, high: str) -> str:
+        if precip_display_units:
+            return f"{low}-{high} {precip_display_units}"
+        return f"{low}-{high}"
+
     coldest_winter = _format_scalar_value_for_system(
         coldest_winter_raw,
-        unit=raw_units,
+        unit=temp_raw_units,
         unit_system=unit_system,
     )
     hottest = _format_scalar_value_for_system(
         hottest_raw,
-        unit=raw_units,
+        unit=temp_raw_units,
         unit_system=unit_system,
     )
 
-    detail: Optional[str] = None
+    # Summer rain (bio_18 = precipitation of warmest quarter)
+    bio18 = _numeric_summary_for_context(
+        taxon_id=taxon_id,
+        taxon_dir=taxon_dir,
+        variable_id="bio_18",
+        location_gid=location_gid,
+    )
+    summer_precip_raw = _safe_float(bio18.get("median"))
+    summer_rain_label: Optional[str] = (
+        _annual_precip_label(summer_precip_raw * 4) if summer_precip_raw is not None else None
+    )
+    summer_rain_formatted: Optional[str] = (
+        _format_scalar_value_for_system(summer_precip_raw, unit=precip_raw_units, unit_system=unit_system)
+        if summer_precip_raw is not None else None
+    )
+
+    # Winter precip (bio_19 = precipitation of coldest quarter) — context when no snow
+    bio19 = _numeric_summary_for_context(
+        taxon_id=taxon_id,
+        taxon_dir=taxon_dir,
+        variable_id="bio_19",
+        location_gid=location_gid,
+    )
+    winter_precip_raw = _safe_float(bio19.get("median"))
+    winter_precip_label: Optional[str] = (
+        _annual_precip_label(winter_precip_raw * 4) if winter_precip_raw is not None else None
+    )
+
+    # Snow (SWE = snow water equivalent, median as typical, max as upper bound)
+    swe_summary = _numeric_summary_for_context(
+        taxon_id=taxon_id,
+        taxon_dir=taxon_dir,
+        variable_id="swe",
+        location_gid=location_gid,
+    )
+    swe_raw_units: Optional[str] = swe_raw_units_from_meta
+    swe_display_units = str(units.display_unit(units.equivalent_unit(swe_raw_units, unit_system) if swe_raw_units else swe_raw_units) or "").strip()
+
+    swe_median = _safe_float(swe_summary.get("median"))
+    swe_max = _safe_float(swe_summary.get("max"))
+    swe_max_formatted = _format_scalar_value_for_system(swe_max, unit=swe_raw_units, unit_system=unit_system)
+    if swe_max_formatted and swe_display_units:
+        swe_max_formatted = f"{swe_max_formatted} {swe_display_units}"
+
+    typically_snowy = _swe_typically_snowy(swe_median)
+    sometimes_snowy = _swe_sometimes_snowy(swe_max)
+
     detail_parts: list[str] = []
-    if coldest_winter is not None:
-        label = _winter_coldness_label(float(coldest_winter_raw))
-        low_outlier_text = (
-            _select_variable_outlier_text(
-                variable_id="bio_6",
-                taxon=taxon,
-                taxon_dir=taxon_dir,
-                preferred_metrics=("min", "mean"),
-                location_gid=location_gid,
-            )
-            if not location_gid
-            else None
-        )
-        if display_units:
-            line = f"Can tolerate {label} winter lows ({coldest_winter} {display_units})"
-        else:
-            line = f"Can tolerate {label} winter lows ({coldest_winter})"
-        if low_outlier_text:
-            line += f" ({low_outlier_text})"
-        detail_parts.append(line)
+    # --- Summer line: "[rain label] summers, highs up to [temp]" ---
     if hottest is not None:
-        label = _summer_heat_label(float(hottest_raw))
-        high_outlier_text = (
-            _select_variable_outlier_text(
-                variable_id="bio_5",
-                taxon=taxon,
-                taxon_dir=taxon_dir,
-                preferred_metrics=("max", "mean"),
-                location_gid=location_gid,
-            )
-            if not location_gid
-            else None
-        )
-        if display_units:
-            line = f"Can tolerate {label} summer highs ({hottest} {display_units})"
+        temp_str = f"{hottest} {temp_display_units}" if temp_display_units else hottest
+        if summer_rain_label and summer_rain_formatted:
+            line = f"{summer_rain_label.capitalize()} ({_with_precip_units(summer_rain_formatted)}) summers, highs up to {temp_str}"
         else:
-            line = f"Can tolerate {label} summer highs ({hottest})"
-        if high_outlier_text:
-            line += f" ({high_outlier_text})"
+            line = f"Highs up to {temp_str}"
         detail_parts.append(line)
-    if detail_parts:
-        if location_gid:
-            location_name = _location_label(location_gid)
-            comparison = _temperature_location_compare_text(
-                local_mean=bio1_local.get("mean"),
-                global_mean=bio1_global.get("mean"),
-                location_name=location_name,
-            )
-            local_mean_value = _format_scalar_value_for_system(
-                bio1_local.get("mean"),
-                unit=raw_units,
-                unit_system=unit_system,
-            )
-            global_mean_value = _format_scalar_value_for_system(
-                bio1_global.get("mean"),
-                unit=raw_units,
-                unit_system=unit_system,
-            )
-            if comparison and local_mean_value and global_mean_value:
-                if display_units:
-                    detail_parts.append(
-                        f"Mean temperature: {comparison} ({local_mean_value} {display_units} vs {global_mean_value} {display_units})."
-                    )
-                else:
-                    detail_parts.append(
-                        f"Mean temperature: {comparison} ({local_mean_value} vs {global_mean_value})."
-                    )
-        detail = "\n".join(detail_parts)
-    return [
-        {
-            "category": "temperature",
-            "notable": False,
-            "level": None,
-            "detail": detail,
-        }
-    ]
 
+    # --- Winter line: snow + temp combined ---
+    if coldest_winter is not None:
+        temp_str = f"{coldest_winter} {temp_display_units}" if temp_display_units else coldest_winter
+        if typically_snowy:
+            line = f"Snowy winters, lows down to {temp_str}"
+            if swe_max_formatted:
+                line += f", can tolerate snowpack up to {swe_max_formatted}"
+        elif sometimes_snowy:
+            line = f"Typically snow-free winters, lows down to {temp_str}, can tolerate snowpack up to {swe_max_formatted}"
+        else:
+            snow_free_qualifier = "Always" if (swe_max is None or swe_max < 1) else "Typically"
+            if winter_precip_label:
+                line = f"{snow_free_qualifier} snow-free, {winter_precip_label} winters, lows down to {temp_str}"
+            else:
+                line = f"{snow_free_qualifier} snow-free winters, lows down to {temp_str}"
+        detail_parts.append(line)
+    elif sometimes_snowy and swe_max_formatted:
+        # No temp data but we have snow info
+        detail_parts.append(f"Snowpack up to {swe_max_formatted}")
 
-def _precipitation_status_rows(
-    taxon: dict[str, Any],
-    taxon_dir: Path,
-    *,
-    taxon_id: Optional[int] = None,
-    location_gid: Optional[str] = None,
-    unit_system: Optional[units.UnitSystem] = None,
-) -> list[dict[str, Any]]:
-    from util import gis_lookup
-
+    # --- Precipitation (bio_12 = annual) ---
     bio12 = _numeric_summary_for_context(
         taxon_id=taxon_id,
         taxon_dir=taxon_dir,
@@ -2553,118 +2635,195 @@ def _precipitation_status_rows(
     )
     driest_raw = bio12.get("min")
     wettest_raw = bio12.get("max")
-    average_raw = bio12.get("mean")
-    bio12_global = (
-        _numeric_summary_for_context(
-            taxon_id=taxon_id,
-            taxon_dir=taxon_dir,
-            variable_id="bio_12",
-            location_gid=None,
-        )
-        if location_gid
-        else {}
-    )
+    average_raw = bio12.get("median")
 
-    raw_units: Optional[str] = None
-    try:
-        _entries, variable_lookup = gis_lookup.load_variable_metadata()
-        raw_units = str((variable_lookup.get("bio_12") or {}).get("units") or "").strip() or None
-    except Exception:
-        raw_units = None
-    target_unit = units.equivalent_unit(raw_units, unit_system) if raw_units else raw_units
-    display_units = str(units.display_unit(target_unit) or "").strip()
-    driest = _format_scalar_value_for_system(
-        driest_raw,
-        unit=raw_units,
-        unit_system=unit_system,
-    )
-    wettest = _format_scalar_value_for_system(
-        wettest_raw,
-        unit=raw_units,
-        unit_system=unit_system,
-    )
-    average = _format_scalar_value_for_system(
-        average_raw,
-        unit=raw_units,
-        unit_system=unit_system,
-    )
+    driest = _format_scalar_value_for_system(driest_raw, unit=precip_raw_units, unit_system=unit_system)
+    wettest = _format_scalar_value_for_system(wettest_raw, unit=precip_raw_units, unit_system=unit_system)
+    average = _format_scalar_value_for_system(average_raw, unit=precip_raw_units, unit_system=unit_system)
 
-    def _with_units(value: str) -> str:
-        return f"{value} {display_units}" if display_units else value
+    def _with_precip_units(value: str) -> str:
+        return f"{value} {precip_display_units}" if precip_display_units else value
 
-    def _range_with_units(low: str, high: str) -> str:
-        if display_units:
-            return f"{low}-{high} {display_units}"
+    def _precip_range(low: str, high: str) -> str:
+        if precip_display_units:
+            return f"{low}-{high} {precip_display_units}"
         return f"{low}-{high}"
 
-    detail: Optional[str] = None
-    detail_lines: list[str] = []
     if average is not None:
         mean_label = _annual_precip_label(float(average_raw))
-        preference_line = f"Prefers {mean_label} ({_with_units(average)})"
-        if not location_gid:
-            outlier = _select_variable_outlier_candidate(
-                variable_id="bio_12",
-                taxon=taxon,
-                taxon_dir=taxon_dir,
-                preferred_metrics=("mean",),
-                location_gid=location_gid,
-            )
-            if outlier:
-                qualifier = str(outlier.get("qualifier") or "").strip()
-                polarity = str(outlier.get("polarity") or "").strip()
-                context = str(outlier.get("context") or "").strip()
-                if qualifier and polarity and context:
-                    condition = "dry" if polarity == "low" else "wet"
-                    preference_line += f", which is {qualifier} {condition} for {context}"
-        else:
-            location_name = _location_label(location_gid)
-            comparison = _precip_location_compare_text(
-                local_mean=average_raw,
-                global_mean=bio12_global.get("mean"),
-                location_name=location_name,
-            )
-            global_mean_value = _format_scalar_value_for_system(
-                bio12_global.get("mean"),
-                unit=raw_units,
-                unit_system=unit_system,
-            )
-            if comparison and global_mean_value:
-                if display_units:
-                    preference_line += (
-                        f", {comparison} "
-                        f"({_with_units(average)} vs {_with_units(global_mean_value)})"
-                    )
-                else:
-                    preference_line += f", {comparison} ({average} vs {global_mean_value})"
-        detail_lines.append(preference_line)
+        preference_line = f"Prefers {mean_label} ({_with_precip_units(average)})"
+        detail_parts.append(preference_line)
         if driest is not None and wettest is not None:
             low_label = _annual_precip_label(float(driest_raw))
             high_label = _annual_precip_label(float(wettest_raw))
             if low_label == high_label:
-                detail_lines.append(
-                    f"Can tolerate {low_label} ({_range_with_units(driest, wettest)})"
+                detail_parts.append(
+                    f"Can tolerate {low_label} ({_precip_range(driest, wettest)})"
                 )
             else:
-                detail_lines.append(
-                    f"Can tolerate {low_label} ({_with_units(driest)}) to {high_label} ({_with_units(wettest)})"
+                detail_parts.append(
+                    f"Can tolerate {low_label} ({_with_precip_units(driest)}) to {high_label} ({_with_precip_units(wettest)})"
                 )
     elif driest is not None and wettest is not None:
         low_label = _annual_precip_label(float(driest_raw))
         high_label = _annual_precip_label(float(wettest_raw))
         if low_label == high_label:
-            detail_lines.append(
-                f"Can tolerate {low_label} ({_range_with_units(driest, wettest)})"
+            detail_parts.append(
+                f"Can tolerate {low_label} ({_precip_range(driest, wettest)})"
             )
         else:
-            detail_lines.append(
-                f"Can tolerate {low_label} ({_with_units(driest)}) to {high_label} ({_with_units(wettest)})"
+            detail_parts.append(
+                f"Can tolerate {low_label} ({_with_precip_units(driest)}) to {high_label} ({_with_precip_units(wettest)})"
             )
-    if detail_lines:
-        detail = "\n".join(detail_lines)
+
+    detail: Optional[str] = "\n".join(detail_parts) if detail_parts else None
     return [
         {
-            "category": "precipitation",
+            "category": "weather",
+            "notable": False,
+            "level": None,
+            "detail": detail,
+        }
+    ]
+
+
+def _soil_texture_status_rows(
+    taxon: dict[str, Any],
+    taxon_dir: Path,
+    *,
+    taxon_id: Optional[int] = None,
+    location_gid: Optional[str] = None,
+    unit_system: Optional[units.UnitSystem] = None,
+) -> list[dict[str, Any]]:
+    _ = unit_system
+
+    def _mean_percent(variable_id: str) -> Optional[float]:
+        summary = _numeric_summary_for_context(
+            taxon_id=taxon_id,
+            taxon_dir=taxon_dir,
+            variable_id=variable_id,
+            location_gid=location_gid,
+        )
+        try:
+            mean_value = float(summary.get("mean"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(mean_value):
+            return None
+        scale = units.variable_display_scale(variable_id)
+        return mean_value * scale
+
+    def _nitrogen_phrase(percent_value: float) -> Optional[str]:
+        if percent_value < 0.05:
+            return "extremely nutrient poor"
+        if percent_value < 0.10:
+            return "very nutrient poor"
+        if percent_value < 0.20:
+            return "nutrient poor"
+        if percent_value < 0.50:
+            return None
+        if percent_value < 1.00:
+            return "nutrient rich"
+        if percent_value <= 2.00:
+            return "very nutrient rich"
+        return "extremely nutrient rich"
+
+    def _ph_label(ph_value: float) -> str:
+        if ph_value < 3.5:
+            return "ultra-acidic"
+        if ph_value <= 4.4:
+            return "extremely acidic"
+        if ph_value <= 5.0:
+            return "very strongly acidic"
+        if ph_value <= 5.5:
+            return "strongly acidic"
+        if ph_value <= 6.0:
+            return "moderately acidic"
+        if ph_value <= 6.5:
+            return "slightly acidic"
+        if ph_value <= 7.3:
+            return "neutral"
+        if ph_value <= 7.8:
+            return "slightly alkaline"
+        if ph_value <= 8.4:
+            return "moderately alkaline"
+        if ph_value <= 9.0:
+            return "strongly alkaline"
+        return "very strongly alkaline"
+
+    sand_pct = _mean_percent("sand")
+    silt_pct = _mean_percent("silt")
+    clay_pct = _mean_percent("clay")
+    coarse_fragments_pct = _mean_percent("cfvo")
+    nitrogen_pct = _mean_percent("nitrogen")
+    ph_value = _mean_percent("phh2o")
+    if sand_pct is None or silt_pct is None or clay_pct is None:
+        return []
+
+    components = [
+        ("sand", sand_pct),
+        ("silt", silt_pct),
+        ("clay", clay_pct),
+    ]
+    ranked = sorted(components, key=lambda item: item[1], reverse=True)
+    dominant_name, dominant_value = ranked[0]
+    second_value = ranked[1][1]
+    dominant_gap = dominant_value - second_value
+
+    descriptor = "balanced"
+    if dominant_value > 40 and dominant_gap >= 5:
+        intensity = "somewhat"
+        if dominant_value > 60:
+            intensity = "extremely"
+        elif dominant_value > 50:
+            intensity = "very"
+        adjective = {
+            "sand": "sandy",
+            "silt": "silty",
+            "clay": "clay-rich",
+        }.get(dominant_name, dominant_name)
+        descriptor = f"{intensity} {adjective}"
+
+    coarse_descriptor: Optional[str] = None
+    if coarse_fragments_pct is not None:
+        if coarse_fragments_pct > 28:
+            coarse_descriptor = "extremely coarse"
+        elif coarse_fragments_pct > 25:
+            coarse_descriptor = "very coarse"
+        elif coarse_fragments_pct > 20:
+            coarse_descriptor = "quite coarse"
+        elif coarse_fragments_pct > 17:
+            coarse_descriptor = "somewhat coarse"
+
+    texture_phrase = descriptor
+    if coarse_descriptor:
+        texture_phrase = f"{texture_phrase}, {coarse_descriptor}"
+
+    texture_line = f"Typically {texture_phrase} soil"
+    detail_lines: list[str] = [texture_line]
+
+    nutrient_phrase: Optional[str] = None
+    if nitrogen_pct is not None:
+        nutrient_phrase = _nitrogen_phrase(nitrogen_pct)
+    ph_phrase: Optional[str] = None
+    if ph_value is not None:
+        ph_phrase = _ph_label(ph_value)
+
+    if nutrient_phrase and ph_phrase:
+        chem_line = f"Typically {nutrient_phrase} and {ph_phrase} soil"
+    elif ph_phrase:
+        chem_line = f"Typically {ph_phrase} soil"
+    elif nutrient_phrase:
+        chem_line = f"Typically {nutrient_phrase} soil"
+    else:
+        chem_line = None
+
+    if chem_line:
+        detail_lines.append(chem_line)
+    detail = "\n".join(detail_lines)
+    return [
+        {
+            "category": "soil",
             "notable": False,
             "level": None,
             "detail": detail,
@@ -2862,25 +3021,7 @@ def build_taxon_description(
         location_gid=location_gid,
     )
     habitat = _format_categorical_phrase(habitat_raw, label="habitat") if habitat_raw else None
-    habitat_outlier = _categorical_outlier_text(
-        taxon,
-        taxon_dir,
-        variable_id="landcover",
-        taxon_id=taxon_id,
-        location_gid=location_gid,
-    )
-    if habitat and habitat_outlier:
-        habitat = f"{habitat}\n{habitat_outlier}."
     climate = _format_categorical_phrase(climate_raw, label="climate") if climate_raw else None
-    climate_outlier = _categorical_outlier_text(
-        taxon,
-        taxon_dir,
-        variable_id="koppen_geiger",
-        taxon_id=taxon_id,
-        location_gid=location_gid,
-    )
-    if climate and climate_outlier:
-        climate = f"{climate}\n{climate_outlier}."
 
     location_text = None
     if taxon_id is not None:
@@ -2904,14 +3045,14 @@ def build_taxon_description(
             location_gid=location_gid,
             unit_system=resolved_unit_system,
         )
-        + _temperature_status_rows(
+        + _weather_status_rows(
             taxon,
             taxon_dir,
             taxon_id=taxon_id,
             location_gid=location_gid,
             unit_system=resolved_unit_system,
         )
-        + _precipitation_status_rows(
+        + _soil_texture_status_rows(
             taxon,
             taxon_dir,
             taxon_id=taxon_id,

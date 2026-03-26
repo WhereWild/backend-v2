@@ -1,0 +1,623 @@
+from __future__ import annotations
+
+import colorsys
+from contextlib import nullcontext
+from dataclasses import dataclass
+from functools import lru_cache
+import io
+import math
+from typing import Any, Iterable
+
+import numpy as np
+from PIL import Image
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.transform import from_bounds
+from rasterio.warp import reproject
+from rasterio.windows import Window, from_bounds as window_from_bounds, transform as window_transform
+
+from util.config import load_config
+from util import gis_lookup
+
+
+CONFIG = load_config("global")
+WEB_MERCATOR = "EPSG:3857"
+WGS84_CRS = "EPSG:4326"
+
+LANDCOVER_ID = "landcover"
+CATEGORICAL_VALUE_TYPE = "categorical"
+NUMERIC_VALUE_TYPE = "numeric"
+DERIVED_ASPECT_ID = "aspect"
+DERIVED_ASPECT_DEG_ID = "aspect_deg"
+DERIVED_SLOPE_ID = "slope"
+DERIVED_FROM_DEM_IDS = frozenset({DERIVED_SLOPE_ID, DERIVED_ASPECT_ID, DERIVED_ASPECT_DEG_ID})
+
+# Keep existing landcover palette for continuity with prior branch behavior.
+LANDCOVER_COLORS: dict[int, tuple[int, int, int]] = {
+    10: (255, 255, 100),
+    11: (255, 255, 100),
+    12: (255, 255, 0),
+    20: (170, 240, 240),
+    51: (76, 115, 0),
+    52: (0, 100, 0),
+    61: (170, 200, 0),
+    62: (0, 160, 0),
+    71: (0, 80, 0),
+    72: (0, 60, 0),
+    81: (40, 100, 0),
+    82: (40, 80, 0),
+    91: (160, 180, 50),
+    92: (120, 130, 0),
+    120: (150, 100, 0),
+    121: (150, 75, 0),
+    122: (150, 100, 0),
+    130: (255, 180, 50),
+    140: (255, 220, 210),
+    150: (255, 235, 175),
+    152: (255, 210, 120),
+    153: (255, 235, 175),
+    180: (0, 220, 130),
+    190: (195, 20, 0),
+    200: (255, 245, 215),
+    201: (220, 220, 220),
+    202: (255, 245, 215),
+    210: (0, 70, 200),
+    220: (255, 255, 255),
+    250: (255, 255, 255),
+}
+
+# Viridis-like stops used for numeric layer rendering.
+NUMERIC_COLOR_STOPS = np.asarray(
+    [
+        [68, 1, 84],
+        [59, 82, 139],
+        [33, 145, 140],
+        [94, 201, 98],
+        [253, 231, 37],
+    ],
+    dtype=np.float32,
+)
+
+# Deterministic numeric ranges so adjacent tiles use the same color scale.
+NUMERIC_RANGE_OVERRIDES: dict[str, tuple[float, float]] = {
+    "bio_1": (-20.0, 40.0),
+    "bio_2": (0.0, 25.0),
+    "bio_3": (0.0, 100.0),
+    "bio_4": (0.0, 2000.0),
+    "bio_5": (-10.0, 55.0),
+    "bio_6": (-50.0, 30.0),
+    "bio_7": (0.0, 70.0),
+    "bio_8": (-30.0, 40.0),
+    "bio_9": (-30.0, 40.0),
+    "bio_10": (-30.0, 40.0),
+    "bio_11": (-50.0, 30.0),
+    "bio_12": (0.0, 4000.0),
+    "bio_13": (0.0, 1500.0),
+    "bio_14": (0.0, 300.0),
+    "bio_15": (0.0, 200.0),
+    "bio_16": (0.0, 2500.0),
+    "bio_17": (0.0, 1000.0),
+    "bio_18": (0.0, 2500.0),
+    "bio_19": (0.0, 1500.0),
+    "elevation": (-500.0, 6000.0),
+    "slope": (0.0, 90.0),
+    "aspect_deg": (0.0, 360.0),
+}
+
+
+@dataclass(frozen=True)
+class TileSpec:
+    z: int
+    x: int
+    y: int
+    tile_size: int
+
+
+def tile_bounds_mercator(spec: TileSpec) -> tuple[float, float, float, float]:
+    origin_shift = 2 * math.pi * 6378137 / 2.0
+    res = (2 * origin_shift) / (spec.tile_size * (2**spec.z))
+    minx = spec.x * spec.tile_size * res - origin_shift
+    maxx = (spec.x + 1) * spec.tile_size * res - origin_shift
+    maxy = origin_shift - spec.y * spec.tile_size * res
+    miny = origin_shift - (spec.y + 1) * spec.tile_size * res
+    return minx, miny, maxx, maxy
+
+
+def _mercator_to_lonlat(x: float, y: float) -> tuple[float, float]:
+    origin_shift = 2 * math.pi * 6378137 / 2.0
+    lon = (x / origin_shift) * 180.0
+    lat = (y / origin_shift) * 180.0
+    lat = 180.0 / math.pi * (2.0 * math.atan(math.exp(lat * math.pi / 180.0)) - math.pi / 2.0)
+    return lon, lat
+
+
+def tile_bounds_wgs84(spec: TileSpec) -> tuple[float, float, float, float]:
+    minx, miny, maxx, maxy = tile_bounds_mercator(spec)
+    lon_w, lat_s = _mercator_to_lonlat(minx, miny)
+    lon_e, lat_n = _mercator_to_lonlat(maxx, maxy)
+    return min(lon_w, lon_e), min(lat_s, lat_n), max(lon_w, lon_e), max(lat_s, lat_n)
+
+
+def _iter_region_origins(
+    bounds_wgs84: tuple[float, float, float, float],
+    region_size: float,
+) -> Iterable[tuple[int, int]]:
+    min_lon, min_lat, max_lon, max_lat = bounds_wgs84
+    start_lat = math.floor(min_lat / region_size) * region_size
+    end_lat = math.floor(max_lat / region_size) * region_size
+    start_lon = math.floor(min_lon / region_size) * region_size
+    end_lon = math.floor(max_lon / region_size) * region_size
+    lat = start_lat
+    while lat <= end_lat:
+        lon = start_lon
+        while lon <= end_lon:
+            yield int(lat), int(lon)
+            lon += region_size
+        lat += region_size
+
+
+def _region_id_from_origin(lat0: int, lon0: int) -> str:
+    return f"lat{lat0}_lon{lon0}"
+
+
+def _estimate_overview_factor(
+    ds: rasterio.DatasetReader,
+    bounds_wgs84: tuple[float, float, float, float],
+    tile_size: int,
+) -> tuple[list[int], float]:
+    overviews = ds.overviews(1) or []
+    src_res_x = abs(ds.transform.a)
+    src_res_y = abs(ds.transform.e)
+    min_lon, min_lat, max_lon, max_lat = bounds_wgs84
+    dst_res_x = abs(max_lon - min_lon) / tile_size
+    dst_res_y = abs(max_lat - min_lat) / tile_size
+    desired = max(dst_res_x / src_res_x, dst_res_y / src_res_y) if src_res_x and src_res_y else 1.0
+    return overviews, desired
+
+
+def _choose_overview_level(overviews: list[int], desired: float) -> tuple[int | None, int | None]:
+    if not overviews:
+        return None, None
+    for idx, factor in enumerate(overviews):
+        if factor >= desired:
+            return idx, factor
+    return len(overviews) - 1, overviews[-1]
+
+
+def _intersect_bounds(
+    left: float,
+    bottom: float,
+    right: float,
+    top: float,
+    *,
+    ds: rasterio.DatasetReader,
+) -> tuple[float, float, float, float] | None:
+    ds_left, ds_bottom, ds_right, ds_top = ds.bounds
+    x0 = max(left, ds_left)
+    y0 = max(bottom, ds_bottom)
+    x1 = min(right, ds_right)
+    y1 = min(top, ds_top)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def _clamp_window(window: Window, width: int, height: int) -> Window:
+    col_off = max(0, int(math.floor(window.col_off)))
+    row_off = max(0, int(math.floor(window.row_off)))
+    col_end = min(width, int(math.ceil(window.col_off + window.width)))
+    row_end = min(height, int(math.ceil(window.row_off + window.height)))
+    return Window(
+        col_off=col_off,
+        row_off=row_off,
+        width=max(0, col_end - col_off),
+        height=max(0, row_end - row_off),
+    )
+
+
+def _window_shape(window: Window) -> tuple[int, int]:
+    return int(window.height), int(window.width)
+
+
+def _is_wgs84(ds: rasterio.DatasetReader) -> bool:
+    if ds.crs is None:
+        return False
+    crs_text = str(ds.crs).upper()
+    return crs_text in {"EPSG:4326", "OGC:CRS84"}
+
+
+def _layer_metadata(layer_id: str) -> dict[str, Any]:
+    layer = gis_lookup.load_layer_metadata().get(layer_id)
+    if layer is None:
+        raise ValueError(f"Layer '{layer_id}' not found in GIS catalog.")
+    region_root = str(layer.get("region_root") or "").strip()
+    filename_template = str(layer.get("filename_template") or "").strip()
+    if not region_root or not filename_template:
+        raise ValueError(f"Layer '{layer_id}' is missing region raster metadata.")
+    if bool(layer.get("derived")) and layer_id not in DERIVED_FROM_DEM_IDS:
+        raise ValueError(f"Layer '{layer_id}' is derived and not currently tile-renderable.")
+    return layer
+
+
+def _layer_value_type(layer_id: str, layer_meta: dict[str, Any]) -> str:
+    value_type = str(layer_meta.get("value_type") or "").strip().lower()
+    if layer_id in {DERIVED_SLOPE_ID, DERIVED_ASPECT_DEG_ID}:
+        return NUMERIC_VALUE_TYPE
+    if layer_id == DERIVED_ASPECT_ID:
+        return CATEGORICAL_VALUE_TYPE
+    if layer_id == LANDCOVER_ID:
+        return CATEGORICAL_VALUE_TYPE
+    if value_type == CATEGORICAL_VALUE_TYPE:
+        return CATEGORICAL_VALUE_TYPE
+    return NUMERIC_VALUE_TYPE
+
+
+def _get_region_source(layer_id: str, layer_meta: dict[str, Any], region_id: str) -> gis_lookup.RasterSource | None:
+    region_root = str(layer_meta.get("region_root") or "").strip()
+    filename_template = str(layer_meta.get("filename_template") or "").strip()
+    filename = filename_template.format(id=layer_id)
+    cog_path = CONFIG.gis_root / region_root / region_id / filename
+    return gis_lookup.resolve_raster_source(cog_path)
+
+
+def _resolution_meters(
+    transform: rasterio.Affine,
+    shape: tuple[int, int],
+    crs: Any,
+) -> tuple[float, float]:
+    xres = abs(transform.a)
+    yres = abs(transform.e)
+    if not xres or not yres:
+        return 1.0, 1.0
+
+    crs_text = str(crs).upper() if crs is not None else ""
+    if crs_text in {"EPSG:4326", "OGC:CRS84"}:
+        center_row = shape[0] / 2.0
+        center_lat = transform.f + (transform.e * center_row)
+        meters_per_degree_lat = 111_320.0
+        meters_per_degree_lon = meters_per_degree_lat * max(0.01, math.cos(math.radians(center_lat)))
+        return max(1e-6, xres * meters_per_degree_lon), max(1e-6, yres * meters_per_degree_lat)
+    return max(1e-6, xres), max(1e-6, yres)
+
+
+def _derive_slope_aspect(
+    dem: np.ndarray,
+    *,
+    transform: rasterio.Affine,
+    crs: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    finite = np.isfinite(dem)
+    if not np.any(finite):
+        empty = np.full(dem.shape, np.nan, dtype=np.float32)
+        return empty, empty
+
+    fill_value = float(np.nanmedian(dem[finite]))
+    filled = np.where(finite, dem, fill_value).astype(np.float32, copy=False)
+    xres_m, yres_m = _resolution_meters(transform, dem.shape, crs)
+    dz_dy, dz_dx = np.gradient(filled, yres_m, xres_m)
+
+    slope = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy))).astype(np.float32)
+    raw_aspect = np.degrees(np.arctan2(dz_dy, -dz_dx))
+    aspect = (90.0 - raw_aspect) % 360.0
+    aspect = aspect.astype(np.float32)
+
+    slope[~finite] = np.nan
+    aspect[~finite] = np.nan
+    aspect[slope <= 0.001] = np.nan
+    return slope, aspect
+
+
+def _aspect_degrees_to_bins(aspect_degrees: np.ndarray) -> np.ndarray:
+    out = np.full(aspect_degrees.shape, np.nan, dtype=np.float32)
+    finite = np.isfinite(aspect_degrees)
+    if not np.any(finite):
+        return out
+    normalized = np.mod(aspect_degrees[finite], 360.0)
+    # 1..8 bins for N, NE, E, SE, S, SW, W, NW (matching legend ids).
+    bins = (np.floor((normalized + 22.5) / 45.0) % 8.0) + 1.0
+    out[finite] = bins.astype(np.float32)
+    return out
+
+
+def _finalize_layer_values(
+    layer_id: str,
+    layer_values: np.ndarray,
+    *,
+    transform: rasterio.Affine,
+    crs: Any,
+) -> np.ndarray:
+    if layer_id not in DERIVED_FROM_DEM_IDS:
+        return layer_values
+
+    slope_degrees, aspect_degrees = _derive_slope_aspect(
+        layer_values,
+        transform=transform,
+        crs=crs,
+    )
+    if layer_id == DERIVED_SLOPE_ID:
+        return slope_degrees
+    if layer_id == DERIVED_ASPECT_DEG_ID:
+        return aspect_degrees
+    return _aspect_degrees_to_bins(aspect_degrees)
+
+
+def _render_layer_values(
+    layer_id: str,
+    spec: TileSpec,
+    *,
+    reproject_to_mercator: bool,
+) -> np.ndarray:
+    layer_meta = _layer_metadata(layer_id)
+
+    bounds_wgs84 = tile_bounds_wgs84(spec)
+    bounds_mercator = tile_bounds_mercator(spec)
+    region_size = float(layer_meta.get("region_size") or 10.0)
+    value_type = _layer_value_type(layer_id, layer_meta)
+    resampling = Resampling.nearest if value_type == CATEGORICAL_VALUE_TYPE else Resampling.bilinear
+    dest = np.full((spec.tile_size, spec.tile_size), np.nan, dtype=np.float32)
+
+    if reproject_to_mercator:
+        minx, miny, maxx, maxy = bounds_mercator
+        dst_transform = from_bounds(minx, miny, maxx, maxy, spec.tile_size, spec.tile_size)
+        dst_crs = WEB_MERCATOR
+    else:
+        min_lon, min_lat, max_lon, max_lat = bounds_wgs84
+        dst_transform = from_bounds(min_lon, min_lat, max_lon, max_lat, spec.tile_size, spec.tile_size)
+        dst_crs = WGS84_CRS
+
+    min_lon, min_lat, max_lon, max_lat = bounds_wgs84
+    for lat0, lon0 in _iter_region_origins(bounds_wgs84, region_size):
+        region_id = _region_id_from_origin(lat0, lon0)
+        source = _get_region_source(layer_id, layer_meta, region_id)
+        if source is None:
+            continue
+
+        with gis_lookup.open_raster(source) as ds:
+            overlap = _intersect_bounds(min_lon, min_lat, max_lon, max_lat, ds=ds)
+            if overlap is None:
+                continue
+
+            src_window = _clamp_window(
+                window_from_bounds(*overlap, transform=ds.transform),
+                ds.width,
+                ds.height,
+            )
+            src_h, src_w = _window_shape(src_window)
+            if src_h <= 0 or src_w <= 0:
+                continue
+
+            overviews, desired = _estimate_overview_factor(ds, bounds_wgs84, spec.tile_size)
+            chosen_level, chosen_factor = _choose_overview_level(overviews, desired)
+            overview_factor = max(1, int(chosen_factor or 1))
+
+            if not reproject_to_mercator and _is_wgs84(ds):
+                raw_dst_window = window_from_bounds(*overlap, transform=dst_transform)
+                dst_window = _clamp_window(raw_dst_window, spec.tile_size, spec.tile_size)
+                dst_h, dst_w = _window_shape(dst_window)
+                if dst_h <= 0 or dst_w <= 0:
+                    continue
+                env_ctx = rasterio.Env(OVR_LEVEL=str(chosen_level)) if chosen_level is not None else nullcontext()
+                with env_ctx:
+                    tile = ds.read(
+                        1,
+                        window=src_window,
+                        out_shape=(dst_h, dst_w),
+                        resampling=resampling,
+                    ).astype(np.float32, copy=False)
+                if ds.nodata is not None:
+                    tile[tile == ds.nodata] = np.nan
+                dst_local_transform = window_transform(dst_window, dst_transform)
+                tile = _finalize_layer_values(
+                    layer_id,
+                    tile,
+                    transform=dst_local_transform,
+                    crs=dst_crs,
+                )
+                row0 = int(dst_window.row_off)
+                col0 = int(dst_window.col_off)
+                row1 = row0 + dst_h
+                col1 = col0 + dst_w
+                section = dest[row0:row1, col0:col1]
+                mask = np.isfinite(tile)
+                section[mask] = tile[mask]
+                continue
+
+            read_h = max(1, int(math.ceil(src_h / overview_factor)))
+            read_w = max(1, int(math.ceil(src_w / overview_factor)))
+            env_ctx = rasterio.Env(OVR_LEVEL=str(chosen_level)) if chosen_level is not None else nullcontext()
+            with env_ctx:
+                source_tile = ds.read(
+                    1,
+                    window=src_window,
+                    out_shape=(read_h, read_w),
+                    resampling=resampling,
+                ).astype(np.float32, copy=False)
+
+            if ds.nodata is not None:
+                source_tile[source_tile == ds.nodata] = np.nan
+            src_transform = window_transform(src_window, ds.transform) * rasterio.Affine.scale(
+                src_w / read_w,
+                src_h / read_h,
+            )
+            source_tile = _finalize_layer_values(
+                layer_id,
+                source_tile,
+                transform=src_transform,
+                crs=ds.crs,
+            )
+            temp = np.full_like(dest, np.nan)
+            reproject(
+                source=source_tile,
+                destination=temp,
+                src_transform=src_transform,
+                src_crs=ds.crs,
+                src_nodata=np.nan,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                dst_nodata=np.nan,
+                resampling=resampling,
+            )
+            mask = np.isfinite(temp)
+            dest[mask] = temp[mask]
+
+    return dest
+
+
+def _coerce_int_id(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(round(number))
+
+
+def _fallback_categorical_color(class_id: int) -> tuple[int, int, int]:
+    hue = ((class_id * 137) % 360) / 360.0
+    saturation = 0.65
+    value = 0.92
+    r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+@lru_cache(maxsize=64)
+def _categorical_palette(layer_id: str) -> dict[int, tuple[int, int, int]]:
+    if layer_id == LANDCOVER_ID:
+        return dict(LANDCOVER_COLORS)
+
+    legend = gis_lookup.load_layer_legend(layer_id)
+    class_ids = sorted(
+        {
+            class_id
+            for class_id in (_coerce_int_id(entry.get("id")) for entry in legend.values())
+            if class_id is not None
+        }
+    )
+    if not class_ids:
+        return {}
+
+    palette: dict[int, tuple[int, int, int]] = {}
+    total = max(1, len(class_ids))
+    for index, class_id in enumerate(class_ids):
+        hue = index / total
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.7, 0.88)
+        palette[class_id] = (int(r * 255), int(g * 255), int(b * 255))
+    return palette
+
+
+def _colorize_categorical(class_ids: np.ndarray, layer_id: str) -> np.ndarray:
+    nan_mask = ~np.isfinite(class_ids)
+    rgba = np.zeros((*class_ids.shape, 4), dtype=np.uint8)
+    int_ids = np.zeros(class_ids.shape, dtype=np.int32)
+    finite = ~nan_mask
+    int_ids[finite] = np.rint(class_ids[finite]).astype(np.int32)
+
+    palette = _categorical_palette(layer_id)
+    for class_id, color in palette.items():
+        mask = int_ids == class_id
+        rgba[mask, 0] = color[0]
+        rgba[mask, 1] = color[1]
+        rgba[mask, 2] = color[2]
+        rgba[mask, 3] = 255
+
+    unknown_mask = (rgba[..., 3] == 0) & finite
+    if np.any(unknown_mask):
+        unknown_ids = np.unique(int_ids[unknown_mask])
+        for class_id in unknown_ids:
+            color = _fallback_categorical_color(int(class_id))
+            mask = unknown_mask & (int_ids == class_id)
+            rgba[mask, 0] = color[0]
+            rgba[mask, 1] = color[1]
+            rgba[mask, 2] = color[2]
+            rgba[mask, 3] = 255
+
+    rgba[nan_mask, 3] = 0
+    return rgba
+
+
+def _numeric_range(values: np.ndarray, layer_id: str) -> tuple[float, float] | None:
+    override = NUMERIC_RANGE_OVERRIDES.get(layer_id)
+    if override is not None:
+        return override
+
+    layer_meta = _layer_metadata(layer_id)
+    units = str(layer_meta.get("units") or "").strip().lower()
+    if units in {"m", "meter", "meters"}:
+        return (-500.0, 9000.0)
+    if units in {"°c", "c", "degc", "degrees celsius"}:
+        return (-50.0, 50.0)
+    if units in {"mm", "millimeter", "millimeters"}:
+        return (0.0, 5000.0)
+    if units in {"%", "percent"}:
+        return (0.0, 100.0)
+
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return None
+
+    lo = float(np.percentile(finite, 2))
+    hi = float(np.percentile(finite, 98))
+    if hi <= lo:
+        lo = float(np.min(finite))
+        hi = float(np.max(finite))
+    if hi <= lo:
+        hi = lo + 1.0
+    return lo, hi
+
+
+def _colorize_numeric(values: np.ndarray, layer_id: str) -> np.ndarray:
+    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return rgba
+
+    value_range = _numeric_range(values, layer_id)
+    if value_range is None:
+        return rgba
+    lo, hi = value_range
+
+    norm = np.clip((values - lo) / max(1e-9, (hi - lo)), 0.0, 1.0)
+    finite_norm = norm[finite]
+    positions = np.linspace(0.0, 1.0, NUMERIC_COLOR_STOPS.shape[0], dtype=np.float32)
+    rgba[finite, 0] = np.interp(finite_norm, positions, NUMERIC_COLOR_STOPS[:, 0]).astype(np.uint8)
+    rgba[finite, 1] = np.interp(finite_norm, positions, NUMERIC_COLOR_STOPS[:, 1]).astype(np.uint8)
+    rgba[finite, 2] = np.interp(finite_norm, positions, NUMERIC_COLOR_STOPS[:, 2]).astype(np.uint8)
+    rgba[finite, 3] = 255
+    return rgba
+
+
+def _colorize_layer(values: np.ndarray, layer_id: str, value_type: str) -> np.ndarray:
+    if value_type == CATEGORICAL_VALUE_TYPE:
+        return _colorize_categorical(values, layer_id)
+    return _colorize_numeric(values, layer_id)
+
+
+def render_variable_tile_bytes(
+    variable_id: str,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = 256,
+    reproject: bool = True,
+) -> bytes:
+    layer_id = str(variable_id or "").strip().lower()
+    if not layer_id:
+        raise ValueError("variable_id is required.")
+
+    layer_meta = _layer_metadata(layer_id)
+    value_type = _layer_value_type(layer_id, layer_meta)
+
+    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+    values = _render_layer_values(
+        layer_id,
+        spec,
+        reproject_to_mercator=reproject,
+    )
+    rgba = _colorize_layer(values, layer_id, value_type)
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()

@@ -38,6 +38,7 @@ class LocationRecord:
     parent_gid: Optional[str]
 
 
+
 @dataclass(frozen=True)
 class RasterSource:
     uri: str
@@ -102,14 +103,33 @@ def resolve_raster_source(path: Path) -> Optional[RasterSource]:
 
 
 @contextmanager
+def _temporary_env(overrides: dict[str, str]) -> Iterator[None]:
+    previous: dict[str, Optional[str]] = {}
+    for key, value in overrides.items():
+        previous[key] = os.environ.get(key)
+        os.environ[key] = str(value)
+    try:
+        yield
+    finally:
+        for key, old_value in previous.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+
+
+@contextmanager
 def open_raster(source: RasterSource) -> Iterator[Any]:
     """Open a raster source with any required GDAL environment settings."""
     import rasterio
 
     if source.gdal_env:
-        with rasterio.Env(**source.gdal_env):
-            with rasterio.open(source.uri) as ds:
-                yield ds
+        # Some rasterio/GDAL builds reject AWS_* kwargs in rasterio.Env.
+        # Set process env vars temporarily so /vsis3 can authenticate/read ranges.
+        with _temporary_env(source.gdal_env):
+            with rasterio.Env():
+                with rasterio.open(source.uri) as ds:
+                    yield ds
         return
     with rasterio.open(source.uri) as ds:
         yield ds

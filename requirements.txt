@@ -1,5 +1,6 @@
 # only include stuff that needs to be in docker (e.g. rasterio)
 rasterio>=1.4.3
+pillow>=10.4.0
 geopandas>=0.14
 rapidfuzz>=3.9.0
 pyarrow>=17.0.0

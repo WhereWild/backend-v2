@@ -166,6 +166,18 @@ def _iter_worklist_batches(
     print(f"[worklist] batch rows pending GIS lookup: {worklist.num_rows}")
     yield worklist
 
+
+def _is_nodata_value(value: float, nodata: float | None) -> bool:
+    if nodata is None:
+        return False
+    try:
+        if np.isnan(nodata):
+            return bool(np.isnan(value))
+    except TypeError:
+        return False
+    return value == nodata
+
+
 def _sample_layer_values(
     layer_id: str,
     lats: np.ndarray,
@@ -199,8 +211,11 @@ def _sample_layer_values(
         sampler = ds.sample(coords)
         for point in sampler:
             value = point[0]
-            if ds.nodata is not None and value == ds.nodata:
-                results.append(None)
+            if _is_nodata_value(value, ds.nodata):
+                if layer_id == "swe":
+                    results.append(0.0)
+                else:
+                    results.append(None)
             else:
                 results.append(float(value))
     return results

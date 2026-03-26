@@ -67,7 +67,9 @@ class GlobalConfig:
     project_root: Path = field(default_factory=_project_root)
 
     # Pipeline tuning
-    root_taxon_id: str = "1"
+    root_taxon_id: str = field(
+        default_factory=lambda: os.environ.get("WHEREWILD_ROOT_TAXON_ID", "2519")
+    )
     process_tree_indexes_only: bool = False
     process_tree_ranks_only: bool = False
     process_positions_flush_rows: int = 10_000_000
@@ -114,6 +116,7 @@ class GlobalConfig:
 
     # API + aggregation behavior
     skip_description_outliers: bool = False
+    sdm_tile_size: int = 256
 
     # Enrichment
 

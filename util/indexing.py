@@ -779,7 +779,11 @@ def _descendant_rank_targets(ancestor_rank: str) -> list[str]:
     return list(descendant_rank_order[start_idx + 1 :])
 
 
-def build_descendant_catalogs_for_ancestor(ancestor_taxon_id: str) -> None:
+def build_descendant_catalogs_for_ancestor(
+    ancestor_taxon_id: str,
+    *,
+    verbose: bool = True,
+) -> None:
     """Builds descendant catalog parquets for all ranks below an ancestor.
     
     Args:
@@ -788,11 +792,15 @@ def build_descendant_catalogs_for_ancestor(ancestor_taxon_id: str) -> None:
     Returns:
         None. Writes `{rank}.parquet` files under the ancestor directory.
     """
+    def _log(message: str) -> None:
+        if verbose:
+            print(message)
+
     ancestor = taxa_navigation.get_taxon_by_id(str(ancestor_taxon_id))
     if ancestor is None:
         raise ValueError(f"Unknown ancestor taxon id {ancestor_taxon_id}")
     start = time.perf_counter()
-    print(
+    _log(
         f"[desc-catalog] start ancestor={ancestor.get('scientific_name') or ancestor['taxon_key']} "
         f"({ancestor['taxon_key']})"
     )
@@ -807,7 +815,7 @@ def build_descendant_catalogs_for_ancestor(ancestor_taxon_id: str) -> None:
         if not rank:
             continue
         by_rank.setdefault(rank, []).append(taxon)
-    print(
+    _log(
         f"[desc-catalog] ancestor={ancestor['taxon_key']} descendants={descendant_count} "
         f"targets={','.join(targets)}"
     )
@@ -828,13 +836,13 @@ def build_descendant_catalogs_for_ancestor(ancestor_taxon_id: str) -> None:
         if rank == "SUBSPECIES":
             if ancestor_rank != "SPECIES":
                 output_parquet.unlink(missing_ok=True)
-                print(
+                _log(
                     f"[desc-catalog] ancestor={ancestor['taxon_key']} rank={rank} "
                     "skip (non-species ancestor)"
                 )
                 continue
             if PARQUET.exists(output_parquet):
-                print(
+                _log(
                     f"[desc-catalog] ancestor={ancestor['taxon_key']} rank={rank} "
                     f"skip existing {output_parquet}"
                 )
@@ -848,7 +856,7 @@ def build_descendant_catalogs_for_ancestor(ancestor_taxon_id: str) -> None:
             not in species_group
         ):
             if PARQUET.exists(output_parquet):
-                print(
+                _log(
                     f"[desc-catalog] ancestor={ancestor['taxon_key']} rank={rank} "
                     f"skip existing {output_parquet}"
                 )
@@ -858,19 +866,19 @@ def build_descendant_catalogs_for_ancestor(ancestor_taxon_id: str) -> None:
                 descendants_for_rank.extend(by_rank.get(alt, []))
         else:
             if PARQUET.exists(output_parquet):
-                print(
+                _log(
                     f"[desc-catalog] ancestor={ancestor['taxon_key']} rank={rank} "
                     f"skip existing {output_parquet}"
                 )
                 continue
             descendants_for_rank = list(by_rank.get(rank, []))
-        print(
+        _log(
             f"[desc-catalog] ancestor={ancestor['taxon_key']} rank={rank} "
             f"rows={len(descendants_for_rank)}"
         )
         _write_descendant_catalog(output_parquet, descendants_for_rank)
     elapsed = time.perf_counter() - start
-    print(
+    _log(
         f"[desc-catalog] done ancestor={ancestor['taxon_key']} "
         f"elapsed={elapsed:.2f}s"
     )
@@ -1122,6 +1130,8 @@ def _write_rank_index(
 def _build_rank_index_parquet(
     ancestor,
     canonical_rank: str,
+    *,
+    verbose: bool = True,
 ) -> None:
     """Builds a rank index parquet for a given ancestor and descendant rank.
     
@@ -1132,16 +1142,20 @@ def _build_rank_index_parquet(
     Returns:
         None. Writes a `{rank}_index.parquet` under the ancestor directory.
     """
+    def _log(message: str) -> None:
+        if verbose:
+            print(message)
+
     ancestor_path = Path(ancestor["path"])
     catalog_path = ancestor_path / f"{canonical_rank.lower()}.parquet"
     index_path = ancestor_path / f"{canonical_rank.lower()}_index.parquet"
     start = time.perf_counter()
-    print(
+    _log(
         f"[rank-index] start ancestor={ancestor.get('taxon_key')} "
         f"rank={canonical_rank} catalog={catalog_path}"
     )
     if not PARQUET.exists(catalog_path):
-        print(f"[rank-index] missing catalog {catalog_path}")
+        _log(f"[rank-index] missing catalog {catalog_path}")
         index_path.unlink(missing_ok=True)
         return None
     try:
@@ -1150,14 +1164,14 @@ def _build_rank_index_parquet(
             columns=["taxon_key", "sample_count"],
         ).to_pandas()
     except (OSError, ValueError):
-        print(f"[rank-index] failed reading catalog {catalog_path}")
+        _log(f"[rank-index] failed reading catalog {catalog_path}")
         index_path.unlink(missing_ok=True)
         return None
     if frame.empty:
-        print(f"[rank-index] empty catalog {catalog_path}")
+        _log(f"[rank-index] empty catalog {catalog_path}")
         index_path.unlink(missing_ok=True)
         return None
-    print(
+    _log(
         f"[rank-index] catalog rows ancestor={ancestor['taxon_key']} "
         f"rank={canonical_rank} rows={len(frame)}"
     )
@@ -1176,7 +1190,7 @@ def _build_rank_index_parquet(
     existing_non_temporal_metric_columns = [
         name for name in existing_metric_columns if not _is_temporal_metric_column(name)
     ]
-    print(
+    _log(
         f"[rank-index] existing columns ancestor={ancestor['taxon_key']} "
         f"rank={canonical_rank} count={len(existing_metric_columns)} "
         f"temporal={len(existing_temporal_metric_columns)}"
@@ -1185,12 +1199,12 @@ def _build_rank_index_parquet(
         existing_temporal_metric_columns
     )
     if existing_temporal_metric_columns:
-        print(
+        _log(
             f"[rank-index] rebuild {ancestor_path} {canonical_rank} "
             f"(removing {len(existing_temporal_metric_columns)} temporal metric columns)"
         )
     elif incremental_mode:
-        print(
+        _log(
             f"[rank-index] completeness-check {ancestor_path} {canonical_rank} "
             f"(existing_non_temporal_cols={len(existing_non_temporal_metric_columns)})"
         )
@@ -1202,19 +1216,19 @@ def _build_rank_index_parquet(
     for record in frame.itertuples(index=False):
         taxa_seen += 1
         taxon_key = getattr(record, "taxon_key", None)
-        print(
+        _log(
             f"[rank-index] taxon ancestor={ancestor['taxon_key']} rank={canonical_rank} "
             f"{taxa_seen}/{len(frame)} taxon_key={taxon_key}"
         )
         if taxon_key is None:
-            print(
+            _log(
                 f"[rank-index] taxon ancestor={ancestor['taxon_key']} rank={canonical_rank} "
                 f"{taxa_seen}/{len(frame)} skip (missing taxon_key)"
             )
             continue
         taxon = taxa_navigation.get_taxon_by_id(str(taxon_key))
         if taxon is None:
-            print(
+            _log(
                 f"[rank-index] taxon ancestor={ancestor['taxon_key']} rank={canonical_rank} "
                 f"{taxa_seen}/{len(frame)} skip (taxon lookup failed)"
             )
@@ -1228,7 +1242,7 @@ def _build_rank_index_parquet(
             exclude_columns=existing_column_set if incremental_mode else None,
         )
         if not metric_entries:
-            print(
+            _log(
                 f"[rank-index] taxon ancestor={ancestor['taxon_key']} rank={canonical_rank} "
                 f"{taxa_seen}/{len(frame)} no new metrics"
             )
@@ -1238,32 +1252,32 @@ def _build_rank_index_parquet(
         for column_name, entries in metric_entries.items():
             bucket = column_entries.setdefault(column_name, [])
             bucket.extend(entries)
-        print(
+        _log(
             f"[rank-index] taxon ancestor={ancestor['taxon_key']} rank={canonical_rank} "
             f"{taxa_seen}/{len(frame)} added_cols={len(metric_entries)} "
             f"added_entries={metric_count} total_new_cols={len(column_entries)}"
         )
     total_entries = sum(len(v) for v in column_entries.values())
-    print(
+    _log(
         f"[rank-index] collected ancestor={ancestor['taxon_key']} rank={canonical_rank} "
         f"taxa={taxa_seen} with_entries={taxa_with_entries} "
         f"new_cols={len(column_entries)} entries={total_entries}"
     )
     if column_entries:
         sample_columns = ", ".join(sorted(column_entries.keys())[:8])
-        print(
+        _log(
             f"[rank-index] new column sample ancestor={ancestor['taxon_key']} "
             f"rank={canonical_rank}: {sample_columns}"
         )
 
     if not column_entries:
         if incremental_mode:
-            print(
+            _log(
                 f"[rank-index] up-to-date ancestor={ancestor['taxon_key']} "
                 f"rank={canonical_rank} (no missing columns)"
             )
             return None
-        print(f"[rank-index] no stats entries for {ancestor_path} {canonical_rank}")
+        _log(f"[rank-index] no stats entries for {ancestor_path} {canonical_rank}")
         index_path.unlink(missing_ok=True)
         return None
 
@@ -1272,7 +1286,7 @@ def _build_rank_index_parquet(
         column_entries,
         merge_existing=incremental_mode,
     )
-    print(
+    _log(
         f"[rank-index] wrote new index ancestor={ancestor['taxon_key']} "
         f"rank={canonical_rank} cols={len(column_entries)} "
         f"mode={'incremental' if incremental_mode else 'full'} "
@@ -1283,6 +1297,8 @@ def _build_rank_index_parquet(
 
 def build_rank_indexes_for_ancestor(
     ancestor_taxon_id: str,
+    *,
+    verbose: bool = True,
 ) -> None:
     """Builds rank index parquets for all descendant ranks of an ancestor.
     
@@ -1304,7 +1320,7 @@ def build_rank_indexes_for_ancestor(
         if not PARQUET.exists(catalog_path):
             index_path.unlink(missing_ok=True)
             continue
-        _build_rank_index_parquet(ancestor, rank)
+        _build_rank_index_parquet(ancestor, rank, verbose=verbose)
     return None
 
 def build_density_curve(

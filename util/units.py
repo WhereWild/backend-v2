@@ -150,6 +150,12 @@ _DISPLAY_UNIT: dict[str, str] = {
 _VARIABLE_DISPLAY_SCALE: dict[str, float] = {
     # Cloud area fraction is stored as hundredths of percent in source rasters.
     "clt": 0.01,
+    # SWE is stored as kg/m²/year * 10 in CHELSA source rasters.
+    "swe": 0.1,
+    # Near-surface wind speed is stored as m/s * 100 in CHELSA source rasters.
+    "sfc": 0.01,
+    # Vapor pressure deficit is stored as Pa * 10 in CHELSA source rasters.
+    "vpd": 0.1,
     # Coarse fragments are stored as cm^3/dm^3 (x10 of percent by volume).
     "cfvo": 0.1,
     # Soil texture fractions are stored as g/kg; display as percent by mass.

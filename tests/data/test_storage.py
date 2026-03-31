@@ -202,6 +202,7 @@ def test_get_parquet_storage_modes_and_errors(monkeypatch, tmp_path):
     monkeypatch.delenv("WW_B2_S3_ENDPOINT", raising=False)
     monkeypatch.delenv("WW_B2_KEY_ID", raising=False)
     monkeypatch.delenv("WW_B2_APP_KEY", raising=False)
+    monkeypatch.setattr(storage, "_load_rclone_remote", lambda _r: None)
     with pytest.raises(RuntimeError):
         storage._get_parquet_storage(str(data_root), str(project_root), "b2")
 

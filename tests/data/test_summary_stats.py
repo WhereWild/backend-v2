@@ -409,7 +409,6 @@ def test_density_graph_and_loaders_edge_cases(stub_env, monkeypatch, tmp_path, c
     _cfg, stub = stub_env
     d = tmp_path / "d"
     d.mkdir()
-    occ = d / "occurrence.parquet"
     monkeypatch.setattr(ss, "_iter_descendant_tables", lambda _p: [pa.table({"obscured": ["No"], "coordinateUncertaintyInMeters": [1], "x": [1.0]})])
     monkeypatch.setattr(ss, "_layer_value_type", lambda _c: "numeric")
     ss.write_density_graph(d)

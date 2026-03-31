@@ -862,7 +862,6 @@ def _top_categorical_phrase_from_payload(
     # --- Ranking phase ---
     ranked = sorted(ranking_entries, key=lambda row: float(row.get("fraction") or 0.0), reverse=True)
     top = ranked[0]
-    top_name = str(top.get("name") or "").strip()
     top_frac = float(top.get("fraction") or 0.0)
 
     def _name(entry: dict[str, Any]) -> str:

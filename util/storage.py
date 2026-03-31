@@ -180,15 +180,6 @@ def get_parquet_storage_with_mode(data_root: Path, project_root: Path, mode: str
     )
 
 
-def get_parquet_storage_with_mode(data_root: Path, project_root: Path, mode: str) -> ParquetStorage:
-    """Return a cached ParquetStorage for a specific mode."""
-    return _get_parquet_storage(
-        str(data_root.resolve()),
-        str(project_root.resolve()),
-        mode,
-    )
-
-
 def _storage_mode() -> str:
     mode = os.environ.get("WHEREWILD_PARQUET_STORAGE") or os.environ.get("WHEREWILD_STORAGE", "local")
     mode = str(mode).strip().lower()

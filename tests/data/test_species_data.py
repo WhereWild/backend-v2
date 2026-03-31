@@ -6,7 +6,6 @@ so the test suite stays fast even with thousands of taxa.
 from __future__ import annotations
 
 import random
-from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest

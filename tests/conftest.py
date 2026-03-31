@@ -67,6 +67,14 @@ def data_root():
     return load_config("global").data_root
 
 
+@pytest.fixture(scope="session")
+def parquet_storage():
+    from util.config import load_config
+    from util.storage import get_parquet_storage
+    cfg = load_config("global")
+    return get_parquet_storage(cfg.data_root, cfg.project_root)
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--mem-report",

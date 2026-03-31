@@ -1,12 +1,86 @@
 stages:
+  - lint
+  - test
+  - coverage
   - build
 
 variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  WHEREWILD_DATA_ROOT: /tmp/ww-data
+  # Docker build vars (used only by build stage)
   DOCKER_TLS_CERTDIR: ""
   DOCKER_HOST: "tcp://docker:2375"
   DOCKER_DRIVER: overlay2
-  # Override in GitLab CI/CD variables if you want a different repo/name.
   DOCKER_IMAGE: "$DOCKERHUB_USERNAME/wherewild-backend"
+
+cache:
+  key:
+    prefix: "${CI_PROJECT_PATH_SLUG}"
+    files:
+      - requirements.txt
+  paths:
+    - .pip-cache
+
+lint:
+  stage: lint
+  image: python:3.12-slim
+  cache: []
+  script:
+    - pip install ruff --quiet
+    - ruff check .
+
+.test_base: &test_base
+  stage: test
+  image:
+    name: ghcr.io/osgeo/gdal:ubuntu-full-latest
+    entrypoint: [""]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq python3-pip python3-venv
+    - python3 -m venv /opt/venv
+    - /opt/venv/bin/pip install --cache-dir "$PIP_CACHE_DIR" -r requirements.txt
+
+# Unit tests — use local storage, tmp_path dirs are valid
+test:unit:
+  <<: *test_base
+  variables:
+    WHEREWILD_PARQUET_STORAGE: local
+    WHEREWILD_DATA_ROOT: /tmp/ww-data
+    COVERAGE_FILE: .coverage.unit
+  script:
+    - /opt/venv/bin/python -m pytest -p no:testmon -q --ignore=tests/api --ignore=tests/data/test_location_index.py --ignore=tests/data/test_gis_catalog.py --ignore=tests/data/test_species_data.py --cov=main --cov=util --cov-report=term-missing
+  artifacts:
+    paths:
+      - .coverage.unit
+    expire_in: 1 day
+
+# Integration tests — read real data from B2 directly
+test:integration:
+  <<: *test_base
+  variables:
+    WHEREWILD_PARQUET_STORAGE: b2
+    COVERAGE_FILE: .coverage.integration
+  script:
+    - /opt/venv/bin/python -m pytest -p no:testmon -q --cov=main --cov=util --cov-report=term-missing tests/api tests/data/test_location_index.py tests/data/test_gis_catalog.py tests/data/test_species_data.py
+  artifacts:
+    paths:
+      - .coverage.integration
+    expire_in: 1 day
+
+coverage:combine:
+  <<: *test_base
+  stage: coverage
+  needs: [test:unit, test:integration]
+  script:
+    - /opt/venv/bin/coverage combine
+    - /opt/venv/bin/coverage report --include="main.py,util/*.py"
+    - /opt/venv/bin/coverage xml -o coverage.xml
+  coverage: '/^TOTAL\s+\d+\s+\d+\s+(\d+%)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    expire_in: 30 days
 
 build_and_push_dockerhub:
   stage: build

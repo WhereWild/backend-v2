@@ -1,35 +1,34 @@
 """Data integrity tests for the location index (data/gis/locations/)."""
 from __future__ import annotations
 
-import pyarrow.parquet as pq
 import pyarrow.compute as pc
 import pytest
 
 
 @pytest.fixture(scope="module")
-def locations_dir(data_root):
+def locations_dir(data_root, parquet_storage):
     d = data_root / "gis" / "locations"
-    if not d.exists():
+    if not parquet_storage.exists(d):
         pytest.skip(f"Locations directory not found: {d}")
     return d
 
 
 @pytest.fixture(scope="module")
-def location_taxa_path(locations_dir):
+def location_taxa_path(locations_dir, parquet_storage):
     p = locations_dir / "location_taxa.parquet"
-    if not p.exists():
+    if not parquet_storage.exists(p):
         pytest.skip(f"location_taxa.parquet not found: {p}")
     return p
 
 
 @pytest.fixture(scope="module")
-def location_taxa_schema(location_taxa_path):
-    return pq.read_schema(location_taxa_path)
+def location_taxa_schema(location_taxa_path, parquet_storage):
+    return parquet_storage.read_schema(location_taxa_path)
 
 
 @pytest.fixture(scope="module")
-def location_taxa_meta(location_taxa_path):
-    return pq.read_metadata(location_taxa_path)
+def location_taxa_meta(location_taxa_path, parquet_storage):
+    return parquet_storage.read_metadata(location_taxa_path)
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +36,7 @@ def location_taxa_meta(location_taxa_path):
 # ---------------------------------------------------------------------------
 
 def test_location_taxa_exists(location_taxa_path):
-    assert location_taxa_path.exists()
+    assert location_taxa_path is not None
 
 
 def test_location_taxa_has_required_columns(location_taxa_schema):
@@ -61,24 +60,24 @@ def test_location_taxa_has_rows(location_taxa_meta):
 # Value sanity — reads single columns only, uses compute kernels not to_pylist
 # ---------------------------------------------------------------------------
 
-def test_location_taxa_no_null_gids(location_taxa_path):
-    col = pq.read_table(location_taxa_path, columns=["gid"])["gid"]
+def test_location_taxa_no_null_gids(location_taxa_path, parquet_storage):
+    col = parquet_storage.read_table(location_taxa_path, columns=["gid"])["gid"]
     assert col.null_count == 0, f"{col.null_count} null GIDs in location_taxa.parquet"
 
 
-def test_location_taxa_no_null_taxon_ids(location_taxa_path):
-    col = pq.read_table(location_taxa_path, columns=["taxon_id"])["taxon_id"]
+def test_location_taxa_no_null_taxon_ids(location_taxa_path, parquet_storage):
+    col = parquet_storage.read_table(location_taxa_path, columns=["taxon_id"])["taxon_id"]
     assert col.null_count == 0, f"{col.null_count} null taxon_ids in location_taxa.parquet"
 
 
-def test_location_taxa_counts_are_positive(location_taxa_path):
-    col = pq.read_table(location_taxa_path, columns=["count"])["count"]
+def test_location_taxa_counts_are_positive(location_taxa_path, parquet_storage):
+    col = parquet_storage.read_table(location_taxa_path, columns=["count"])["count"]
     min_count = pc.min(col).as_py()
     assert min_count > 0, f"Minimum count is {min_count} — expected all counts > 0"
 
 
-def test_location_taxa_scopes_are_known(location_taxa_path):
-    col = pq.read_table(location_taxa_path, columns=["scope"])["scope"]
+def test_location_taxa_scopes_are_known(location_taxa_path, parquet_storage):
+    col = parquet_storage.read_table(location_taxa_path, columns=["scope"])["scope"]
     scopes = pc.unique(col).to_pylist()
     assert len(scopes) > 0, "No scopes found"
     for scope in scopes:
@@ -89,6 +88,6 @@ def test_location_taxa_scopes_are_known(location_taxa_path):
 # Hierarchy / location catalog
 # ---------------------------------------------------------------------------
 
-def test_hierarchy_csv_exists(locations_dir):
+def test_hierarchy_csv_exists(locations_dir, parquet_storage):
     p = locations_dir / "hierarchy.csv"
-    assert p.exists(), f"hierarchy.csv not found at {p}"
+    assert parquet_storage.exists(p), f"hierarchy.csv not found at {p}"

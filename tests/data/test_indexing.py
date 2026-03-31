@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -374,7 +373,7 @@ def test_rank_index_builders_more_branches(stub_env, monkeypatch, tmp_path):
     stub._exists[catalog] = True
     stub._tables[catalog] = pq.read_table(catalog)
     called = {}
-    monkeypatch.setattr(idx, "_build_rank_index_parquet", lambda a, r: called.setdefault("v", (a["taxon_key"], r)))
+    monkeypatch.setattr(idx, "_build_rank_index_parquet", lambda a, r, **_k: called.setdefault("v", (a["taxon_key"], r)))
     idx.build_rank_indexes_for_ancestor("1")
     assert called["v"] == ("1", "SPECIES")
 

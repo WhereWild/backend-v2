@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -191,7 +190,7 @@ def test_terrain_slope_aspect_helpers(monkeypatch, tmp_path):
     masses, total = desc._aspect_cardinal_masses(tmp_path)
     assert total == 200.0
     assert masses["north"] == pytest.approx(0.6)
-    assert desc._aspect_preference_text(tmp_path) == "Aspect: prefers north-facing slopes"
+    assert desc._aspect_preference_text(tmp_path) == "Prefers north-facing slopes"
 
 
 def test_outlier_metric_helpers(monkeypatch, tmp_path):
@@ -233,7 +232,7 @@ def test_rendering_and_build_taxon_description(monkeypatch, tmp_path):
     assert "Summary: x" in text
     assert "Terrain: Steep slopes." in text
     assert desc._title_case_words("aLmoSt always") == "Almost Always"
-    assert desc._lines_from_categorical_phrase("often in forests, and rarely in deserts")[0]["prefix"] == "Often in:"
+    assert desc._lines_from_categorical_phrase("often in forests, and rarely in deserts")[0]["prefix"] == "Often in"
 
     monkeypatch.setattr(desc.units, "normalize_unit_system", lambda _u: None)
     monkeypatch.setattr(desc, "_find_ancestor_by_rank", lambda *_a, **_k: {"scientific_name": "Felidae", "rank": "FAMILY"})
@@ -241,8 +240,7 @@ def test_rendering_and_build_taxon_description(monkeypatch, tmp_path):
     monkeypatch.setattr(desc, "_categorical_outlier_text", lambda *_a, **_k: None)
     monkeypatch.setattr(desc, "_build_location_text", lambda *_a, **_k: "the United States")
     monkeypatch.setattr(desc, "_terrain_status_rows", lambda *_a, **_k: [{"category": "terrain", "detail": "Steep"}])
-    monkeypatch.setattr(desc, "_temperature_status_rows", lambda *_a, **_k: [])
-    monkeypatch.setattr(desc, "_precipitation_status_rows", lambda *_a, **_k: [])
+    monkeypatch.setattr(desc, "_weather_status_rows", lambda *_a, **_k: [])
 
     from util import taxa_navigation
 
@@ -431,11 +429,9 @@ def test_status_rows_temperature_precip_terrain(monkeypatch, tmp_path):
     monkeypatch.setattr(desc, "_select_variable_outlier_candidate", lambda **_k: {"qualifier": "very", "polarity": "low", "context": "family Felidae"})
 
     terrain = desc._terrain_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
-    assert terrain is not None and "Elevation:" in terrain and "Slope:" in terrain
-    temp = desc._temperature_status_rows(taxon, tmp_path, taxon_id=1, location_gid="USA")[0]["detail"]
-    assert temp is not None and "Mean temperature:" in temp
-    precip = desc._precipitation_status_rows(taxon, tmp_path, taxon_id=1, location_gid="USA")[0]["detail"]
-    assert precip is not None and "Prefers" in precip
+    assert terrain is not None and "Found from" in terrain and "slopes" in terrain
+    weather = desc._weather_status_rows(taxon, tmp_path, taxon_id=1, location_gid="USA")[0]["detail"]
+    assert weather is not None and "lows down to" in weather and "Can tolerate" in weather
 
 
 @pytest.mark.parametrize(
@@ -795,13 +791,10 @@ def test_status_rows_exception_and_fallback_branches(monkeypatch, tmp_path):
     monkeypatch.setattr(desc, "_select_variable_outlier_text", lambda **_k: None)
     monkeypatch.setattr(desc, "_select_variable_outlier_candidate", lambda **_k: {"qualifier": "very", "polarity": "low", "context": "family F"})
     terrain = desc._terrain_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
-    assert terrain is not None and "Slope:" in terrain and "Elevation:" in terrain
+    assert terrain is not None and "Found from" in terrain and "slopes" in terrain
 
-    temp = desc._temperature_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
-    assert temp is not None and "Lowest temperature" in temp
-
-    precip = desc._precipitation_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
-    assert precip is not None and "Can tolerate" in precip
+    weather = desc._weather_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
+    assert weather is not None and "lows down to" in weather and "Can tolerate" in weather
 
 
 def test_precip_compare_degree_branches():
@@ -843,8 +836,7 @@ def test_build_description_remaining_branches(monkeypatch, tmp_path):
 
     monkeypatch.setattr(desc.units, "normalize_unit_system", lambda _u: None)
     monkeypatch.setattr(desc, "_terrain_status_rows", lambda *_a, **_k: [])
-    monkeypatch.setattr(desc, "_temperature_status_rows", lambda *_a, **_k: [])
-    monkeypatch.setattr(desc, "_precipitation_status_rows", lambda *_a, **_k: [])
+    monkeypatch.setattr(desc, "_weather_status_rows", lambda *_a, **_k: [])
     monkeypatch.setattr(desc, "_top_categorical_phrase", lambda *_a, **_k: "often in wetlands")
     monkeypatch.setattr(desc, "_build_location_text", lambda *_a, **_k: "")
     monkeypatch.setattr(
@@ -867,8 +859,8 @@ def test_build_description_remaining_branches(monkeypatch, tmp_path):
     taxon = {"scientific_name": "Felis_catus", "path": str(tmp_path), "taxon_key": "1", "rank": "SPECIES"}
     profile = desc.build_taxon_description(taxon)
     assert "family Felidae" in profile["summary"]
-    assert "outlier text" in (profile["habitat"] or "")
-    assert "climate outlier" in (profile["climate"] or "")
+    assert "wetlands" in (profile["habitat"] or "")
+    assert profile["climate"] is not None
     assert profile["locations"] is None
 
 
@@ -909,8 +901,7 @@ def test_outlier_and_compare_remaining_simple_branches(monkeypatch, tmp_path):
     monkeypatch.setattr(desc, "_categorical_outlier_text", lambda *_a, **_k: None)
     monkeypatch.setattr(desc, "_build_location_text", lambda *_a, **_k: None)
     monkeypatch.setattr(desc, "_terrain_status_rows", lambda *_a, **_k: [])
-    monkeypatch.setattr(desc, "_temperature_status_rows", lambda *_a, **_k: [])
-    monkeypatch.setattr(desc, "_precipitation_status_rows", lambda *_a, **_k: [])
+    monkeypatch.setattr(desc, "_weather_status_rows", lambda *_a, **_k: [])
     monkeypatch.setattr(taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: [])
     monkeypatch.setattr(taxa_navigation.CONFIG, "common_name_language", "en")
     profile = desc.build_taxon_description({"scientific_name": "A_b", "path": str(tmp_path), "taxon_key": "1", "rank": "SPECIES"})
@@ -993,7 +984,7 @@ def test_outlier_selector_additional_guard_paths(monkeypatch, tmp_path):
 
 def test_line_split_empty_clause_branch():
     lines = desc._lines_from_categorical_phrase("often in forests, and .")
-    assert lines and lines[0]["prefix"] == "Often in:"
+    assert lines and lines[0]["prefix"] == "Often in"
 
 
 def test_remaining_helper_branch_matrix(monkeypatch, tmp_path):
@@ -1223,17 +1214,14 @@ def test_remaining_categorical_and_status_edges(monkeypatch, tmp_path):
     monkeypatch.setattr(desc.units, "equivalent_unit", lambda u, _s: u)
     monkeypatch.setattr(desc.units, "display_unit", lambda _u: "")
     monkeypatch.setattr(desc.units, "convert_value_for_system", lambda v, _u, _s: (v, ""))
-    monkeypatch.setattr(desc, "_temperature_location_compare_text", lambda **_k: "slightly warmer in X")
     monkeypatch.setattr(desc, "_location_label", lambda _g: "X")
-    temp = desc._temperature_status_rows(taxon, tmp_path, taxon_id=1, location_gid="USA")[0]["detail"]
-    assert temp is not None and " vs " in temp
+    weather = desc._weather_status_rows(taxon, tmp_path, taxon_id=1, location_gid="USA")[0]["detail"]
+    assert weather is not None and "lows down to" in weather
 
-    monkeypatch.setattr(desc, "_precip_location_compare_text", lambda **_k: "a bit wetter in X")
-    precip = desc._precipitation_status_rows(taxon, tmp_path, taxon_id=1, location_gid="USA")[0]["detail"]
-    assert precip is not None and "Can tolerate" in precip
+    assert weather is not None and "Can tolerate" in weather
     monkeypatch.setattr(desc, "_numeric_summary_for_context", lambda *, variable_id, **_k: {"bio_12": {"min": 200, "max": 500, "mean": None}}.get(variable_id, {}))
-    precip2 = desc._precipitation_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
-    assert precip2 is not None and "to" in precip2
+    weather2 = desc._weather_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
+    assert weather2 is not None and "to" in weather2
 
 
 def test_final_helper_edges(monkeypatch, tmp_path):
@@ -1286,7 +1274,6 @@ def test_final_helper_edges(monkeypatch, tmp_path):
 
 
 def test_final_outlier_and_status_edges(monkeypatch, tmp_path):
-    from util import taxa_navigation
 
     # location delta specific branches.
     assert desc._location_delta_outlier_text(tmp_path, variable_id="x", top_metrics=[], taxon_id=1, location_gid="USA") is None
@@ -1335,11 +1322,9 @@ def test_final_outlier_and_status_edges(monkeypatch, tmp_path):
     monkeypatch.setattr(desc.units, "equivalent_unit", lambda u, _s: u)
     monkeypatch.setattr(desc.units, "display_unit", lambda u: u or "")
     monkeypatch.setattr(desc.units, "convert_value_for_system", lambda v, _u, _s: (v, ""))
-    monkeypatch.setattr(desc, "_extract_elevation_range_values", lambda *_a, **_k: (None, None))
-    monkeypatch.setattr(desc, "_elevation_outlier_text", lambda *_a, **_k: "out")
     monkeypatch.setattr(desc, "_aspect_preference_text", lambda _p: None)
     terrain = desc._terrain_status_rows({"taxon_key": "1"}, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
-    assert terrain is not None and "Elevation: out" in terrain
+    assert terrain is not None and "slopes" in terrain
 
     # precipitation outlier insertion line path.
     monkeypatch.setattr(
@@ -1348,12 +1333,11 @@ def test_final_outlier_and_status_edges(monkeypatch, tmp_path):
         lambda *, variable_id, **_k: {"bio_12": {"min": 100, "max": 200, "mean": 150}}.get(variable_id, {}),
     )
     monkeypatch.setattr(gis_lookup, "load_variable_metadata", lambda: ([], {"bio_12": {"units": "mm"}}))
-    monkeypatch.setattr(desc, "_select_variable_outlier_candidate", lambda **_k: {"qualifier": "very", "polarity": "low", "context": "family X"})
-    precip = desc._precipitation_status_rows({"taxon_key": "1"}, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
-    assert precip is not None and "which is very dry for family X" in precip
+    weather = desc._weather_status_rows({"taxon_key": "1"}, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
+    assert weather is not None and "Can tolerate" in weather
 
     # lines parser prefix transform
-    assert desc._lines_from_categorical_phrase("always in forests")[0]["prefix"] == "Always in:"
+    assert desc._lines_from_categorical_phrase("always in forests")[0]["prefix"] == "Always in"
 
 
 def test_last_coverage_push_branches(monkeypatch, tmp_path):
@@ -1477,8 +1461,7 @@ def test_last_coverage_push_branches(monkeypatch, tmp_path):
     monkeypatch.setattr(desc.units, "equivalent_unit", lambda u, _s: u)
     monkeypatch.setattr(desc.units, "display_unit", lambda u: u or "")
     monkeypatch.setattr(desc.units, "convert_value_for_system", lambda v, _u, _s: (v, ""))
-    monkeypatch.setattr(desc, "_precip_location_compare_text", lambda **_k: None)
-    p = desc._precipitation_status_rows({"taxon_key": "1"}, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
+    p = desc._weather_status_rows({"taxon_key": "1"}, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
     assert p is not None and "100-100 mm" in p
 
 

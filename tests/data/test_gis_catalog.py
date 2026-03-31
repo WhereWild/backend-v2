@@ -6,11 +6,11 @@ import pytest
 
 
 @pytest.fixture(scope="module")
-def catalog(data_root):
+def catalog(data_root, parquet_storage):
     catalog_path = data_root / "gis" / "catalog.json"
-    if not catalog_path.exists():
+    if not parquet_storage.exists(catalog_path):
         pytest.skip(f"GIS catalog not found: {catalog_path}")
-    with open(catalog_path) as f:
+    with parquet_storage.open_input_file(catalog_path) as f:
         return json.load(f)
 
 
@@ -93,18 +93,17 @@ def test_variable_metadata_each_has_value_type(variables_map):
 # Legends exist for categorical variables
 # ---------------------------------------------------------------------------
 
-def test_categorical_variables_have_legend_files(variables_map):
+def test_categorical_variables_have_legend_files(variables_map, parquet_storage):
     from util.config import load_config
     legends_dir = load_config("global").gis_legends_root
-    if not legends_dir.exists():
+    if not parquet_storage.exists(legends_dir):
         pytest.skip(f"Legends directory not found: {legends_dir}")
     missing = []
     for var_id, entry in variables_map.items():
         vtype = (entry.get("value_type") or "").lower()
         if vtype != "categorical":
             continue
-        # Legend files are named {layer_id}_legend.json
         legend_file = legends_dir / f"{var_id}_legend.json"
-        if not legend_file.exists():
+        if not parquet_storage.exists(legend_file):
             missing.append(var_id)
     assert not missing, f"Missing legend files for categorical variables: {missing}"

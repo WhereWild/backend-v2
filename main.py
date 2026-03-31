@@ -1,8 +1,11 @@
 from __future__ import annotations
 import io
+import json
 import math
 import shutil
+import tempfile
 import traceback
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -13,9 +16,11 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Upload
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
-import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
+import scripts.enrich_tree as enrich_tree
 from util.config import load_config
 from util import custom_upload_processing, descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units, tiles
 from util.storage import get_parquet_storage

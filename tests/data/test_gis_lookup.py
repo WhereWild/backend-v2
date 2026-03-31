@@ -15,10 +15,15 @@ from util import gis_lookup
 
 
 class _StubParquet:
+    is_remote = False
+
     def __init__(self):
         self._exists: dict[Path, bool] = {}
         self._files: dict[Path, bytes] = {}
         self._read_table = None
+
+    def current(self):
+        return self
 
     def exists(self, path):
         return self._exists.get(Path(path), False)

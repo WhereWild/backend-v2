@@ -1173,7 +1173,12 @@ def species_environment_stats(
 
     if not location_gid:
         summary = summary_stats.load_numeric_summary(str(taxon_dir), variable_id)
-        density_curve = summary_stats.load_density_graph(str(taxon_dir), variable_id)
+        if variable_id == "aspect_deg":
+            _samples = summary_stats.gather_numeric_records(taxon_id, taxon_dir, variable_id)
+            _values = [s["value"] for s in _samples]
+            density_curve = indexing.build_density_curve(_values, point_count=density_points, circular=True) if _values else None
+        else:
+            density_curve = summary_stats.load_density_graph(str(taxon_dir), variable_id)
         if not summary or not density_curve:
             raise HTTPException(
                 status_code=503,
@@ -1233,7 +1238,7 @@ def species_environment_stats(
             detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}'.",
         )
     summary = summary_stats.summarize_values(values)
-    density_curve = indexing.build_density_curve(values, point_count=density_points)
+    density_curve = indexing.build_density_curve(values, point_count=density_points, circular=(variable_id == "aspect_deg"))
     ranks = []
     print(
         f"[timing][env] taxon_id={taxon_id} variable={variable_id} "
@@ -1380,7 +1385,11 @@ def species_environment_slice(
     """
     if not math.isfinite(min_value) or not math.isfinite(max_value):
         raise HTTPException(status_code=400, detail="min and max must be finite numbers")
-    if max_value < min_value:
+    # For aspect_deg, min > max signals a selection that wraps through 0°/360°
+    # (e.g. start=315°, end=45° means the arc through North). Preserve the order
+    # so the query layer can issue two range queries and merge them.
+    circular_wrap = variable_id == "aspect_deg" and max_value < min_value
+    if max_value < min_value and not circular_wrap:
         min_value, max_value = max_value, min_value
     variable_entry = gis_lookup.load_variable_metadata()[1].get(variable_id)
     if not variable_entry:
@@ -1416,23 +1425,53 @@ def species_environment_slice(
     location_gid = location.strip() if location else None
     rows: list[tuple[str, float | None, float | None, float | None]] = []
     if location_gid:
-        rows = summary_stats.numeric_range_samples_for_location(
-            taxon_id,
-            variable_id,
-            min_value,
-            max_value,
-            location_gid=location_gid,
-            limit=limit,
-        )
-    else:
-        try:
-            rows = summary_stats.get_sorted_layer_records_in_value_range(
-                index_path,
+        if circular_wrap:
+            rows_a = summary_stats.numeric_range_samples_for_location(
+                taxon_id, variable_id, min_value, 360.0, location_gid=location_gid, limit=limit,
+            )
+            rows_b = summary_stats.numeric_range_samples_for_location(
+                taxon_id, variable_id, 0.0, max_value, location_gid=location_gid, limit=limit,
+            )
+            seen: set[str] = set()
+            for row in rows_a + rows_b:
+                if row[0] not in seen:
+                    seen.add(row[0])
+                    rows.append(row)
+            if limit:
+                rows = rows[:limit]
+        else:
+            rows = summary_stats.numeric_range_samples_for_location(
+                taxon_id,
                 variable_id,
-                value_min=min_value,
-                value_max=max_value,
+                min_value,
+                max_value,
+                location_gid=location_gid,
                 limit=limit,
             )
+    else:
+        try:
+            if circular_wrap:
+                rows_a = summary_stats.get_sorted_layer_records_in_value_range(
+                    index_path, variable_id, value_min=min_value, value_max=360.0, limit=limit,
+                )
+                rows_b = summary_stats.get_sorted_layer_records_in_value_range(
+                    index_path, variable_id, value_min=0.0, value_max=max_value, limit=limit,
+                )
+                seen = set()
+                for row in rows_a + rows_b:
+                    if row[0] not in seen:
+                        seen.add(row[0])
+                        rows.append(row)
+                if limit:
+                    rows = rows[:limit]
+            else:
+                rows = summary_stats.get_sorted_layer_records_in_value_range(
+                    index_path,
+                    variable_id,
+                    value_min=min_value,
+                    value_max=max_value,
+                    limit=limit,
+                )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

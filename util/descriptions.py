@@ -2517,11 +2517,9 @@ def _weather_status_rows(
         _entries, variable_lookup = gis_lookup.load_variable_metadata()
         temp_raw_units = str((variable_lookup.get("bio_6") or {}).get("units") or "").strip() or None
         precip_raw_units_from_meta: Optional[str] = str((variable_lookup.get("bio_12") or {}).get("units") or "").strip() or None
-        swe_raw_units_from_meta: Optional[str] = str((variable_lookup.get("swe") or {}).get("units") or "").strip() or None
     except Exception:
         temp_raw_units = None
         precip_raw_units_from_meta = None
-        swe_raw_units_from_meta = None
     temp_target_unit = units.equivalent_unit(temp_raw_units, unit_system) if temp_raw_units else temp_raw_units
     temp_display_units = str(units.display_unit(temp_target_unit) or "").strip()
 

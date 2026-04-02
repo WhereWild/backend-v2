@@ -447,6 +447,110 @@ def load_location_catalog() -> tuple[List[LocationRecord], dict[str, LocationRec
         by_gid[record.gid] = record
     return entries, by_gid
 
+def sample_raster_value(source: RasterSource, lat: float, lon: float) -> Optional[float]:
+    try:
+        import rasterio
+        import rasterio.windows
+
+        # If remote, try to find the file via the B2 mount instead of /vsis3/
+        uri = source.uri
+        if source.is_remote and uri.startswith("/vsis3/"):
+            mount_root = os.environ.get("WW_B2_MOUNT", "/workspace/.b2-mount")
+            # Strip /vsis3/bucket/prefix/ to get the relative data path
+            storage = _raster_storage()
+            bucket = storage.bucket or ""
+            prefix = (storage.prefix or "").strip("/")
+            vsis3_prefix = f"/vsis3/{bucket}/{prefix}/"
+            if uri.startswith(vsis3_prefix):
+                rel = uri[len(vsis3_prefix):]
+                mount_path = Path(mount_root) / rel
+                if mount_path.exists():
+                    uri = str(mount_path)
+
+        with rasterio.open(uri) as ds:
+            row, col = ds.index(lon, lat)
+            window = rasterio.windows.Window(col, row, 1, 1)
+            data = ds.read(1, window=window, masked=True)
+            return None if data.mask.all() else float(data.data.flat[0])
+    except Exception as e:
+        print(f"[sample_raster] exception: {e}")
+        return None
+
+_DERIVED_DEM_VARIABLES = frozenset({"slope", "aspect", "aspect_deg"})
+
+
+def sample_dem_derived_value(layer_id: str, lat: float, lon: float) -> Optional[float]:
+    """Sample a DEM-derived variable (slope, aspect, aspect_deg) at a point.
+
+    Reads a 3×3 elevation window centred on the coordinate and applies the
+    same np.gradient derivation used in tiles._derive_slope_aspect.
+    Returns None when the window falls outside the raster or contains nodata.
+    """
+    import numpy as np
+    import rasterio.windows
+
+    cog_path = get_cog_path(layer_id, lat, lon)
+    if cog_path is None:
+        return None
+    source = resolve_raster_source(cog_path)
+    if source is None:
+        return None
+
+    try:
+        with open_raster(source) as ds:
+            row, col = ds.index(lon, lat)
+            radius = 1
+            if (
+                row - radius < 0
+                or col - radius < 0
+                or row + radius >= ds.height
+                or col + radius >= ds.width
+            ):
+                return None
+            win = rasterio.windows.Window(col - radius, row - radius, 3, 3)
+            data = ds.read(1, window=win).astype(np.float32, copy=False)
+            if data.shape != (3, 3):
+                return None
+            if ds.nodata is not None:
+                data[data == ds.nodata] = np.nan
+
+            # Resolution in metres — mirrors tiles._resolution_meters logic.
+            win_transform = ds.window_transform(win)
+            xres = abs(win_transform.a)
+            yres = abs(win_transform.e)
+            crs_text = str(ds.crs).upper() if ds.crs is not None else ""
+            if crs_text in {"EPSG:4326", "OGC:CRS84"}:
+                mpd = 111_320.0
+                xres_m = xres * mpd * max(0.01, math.cos(math.radians(lat)))
+                yres_m = yres * mpd
+            else:
+                xres_m, yres_m = xres, yres
+            if xres_m == 0 or yres_m == 0:
+                return None
+
+            dz_dy, dz_dx = np.gradient(data, yres_m, xres_m)
+            slope = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy)))
+            raw_aspect = np.degrees(np.arctan2(dz_dy, -dz_dx))
+            aspect_deg_arr = (90.0 - raw_aspect) % 360.0
+
+            c = 1  # centre of the 3×3 window
+            if layer_id == "slope":
+                val = float(slope[c, c])
+                return None if not math.isfinite(val) else val
+
+            asp = float(aspect_deg_arr[c, c])
+            if not math.isfinite(asp):
+                return None
+            if layer_id == "aspect_deg":
+                return asp
+
+            # aspect binned 1–8 — mirrors tiles._aspect_degrees_to_bins
+            bin_val = int(math.floor((asp % 360.0 + 22.5) / 45.0) % 8) + 1
+            return float(bin_val)
+    except Exception as e:
+        print(f"[sample_derived] exception: {e}")
+        return None
+
 
 def is_valid_location_gid(gid: Any) -> bool:
     """Returns True when a location token is usable as a GID filter."""

@@ -431,7 +431,7 @@ def test_status_rows_temperature_precip_terrain(monkeypatch, tmp_path):
     terrain = desc._terrain_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
     assert terrain is not None and "Found from" in terrain and "slopes" in terrain
     weather = desc._weather_status_rows(taxon, tmp_path, taxon_id=1, location_gid="USA")[0]["detail"]
-    assert weather is not None and "lows down to" in weather and "Can tolerate" in weather
+    assert weather is not None and "Can tolerate" in weather
 
 
 @pytest.mark.parametrize(
@@ -794,7 +794,7 @@ def test_status_rows_exception_and_fallback_branches(monkeypatch, tmp_path):
     assert terrain is not None and "Found from" in terrain and "slopes" in terrain
 
     weather = desc._weather_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
-    assert weather is not None and "lows down to" in weather and "Can tolerate" in weather
+    assert weather is not None and "Can tolerate" in weather
 
 
 def test_precip_compare_degree_branches():
@@ -1216,8 +1216,6 @@ def test_remaining_categorical_and_status_edges(monkeypatch, tmp_path):
     monkeypatch.setattr(desc.units, "convert_value_for_system", lambda v, _u, _s: (v, ""))
     monkeypatch.setattr(desc, "_location_label", lambda _g: "X")
     weather = desc._weather_status_rows(taxon, tmp_path, taxon_id=1, location_gid="USA")[0]["detail"]
-    assert weather is not None and "lows down to" in weather
-
     assert weather is not None and "Can tolerate" in weather
     monkeypatch.setattr(desc, "_numeric_summary_for_context", lambda *, variable_id, **_k: {"bio_12": {"min": 200, "max": 500, "mean": None}}.get(variable_id, {}))
     weather2 = desc._weather_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]

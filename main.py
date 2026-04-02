@@ -1570,6 +1570,78 @@ def list_relative_ranking_options(
         "rank": rank.upper(),
         "options": options,
     }
+@app.get("/gis/point")
+def gis_point_value(
+    lat: float = Query(..., description="Latitude"),
+    lon: float = Query(..., description="Longitude"),
+    variable: str = Query(..., description="GIS layer / variable id"),
+    unit_system: Optional[str] = Query(None),
+) -> dict[str, Any]:
+    """Returns the raster value for a variable at a lat/lon coordinate.
+
+    This is the primitive used for both observation-pinning and
+    arbitrary map-click lookups. Returns null value when the coordinate
+    falls outside the layer's coverage or on a nodata pixel.
+
+
+    Returns:
+        A dict with variable, units, lat, lon, and value (float or null).
+    """
+    if not math.isfinite(lat) or not math.isfinite(lon):
+        raise HTTPException(status_code=400, detail="lat and lon must be finite numbers")
+    variable = variable.strip()
+    variable_entry = gis_lookup.load_variable_metadata()[1].get(variable)
+    if not variable_entry:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Variable '{variable}' is not available.",
+        )
+    raw_units = variable_entry.get("units")
+    if variable in gis_lookup._DERIVED_DEM_VARIABLES:
+        raw_value = gis_lookup.sample_dem_derived_value(variable, lat, lon)
+    else:
+        cog_source = gis_lookup.get_cog_source(variable, lat, lon)
+        if cog_source is None:
+            return {
+                "variable": variable,
+                "units": raw_units,
+                "lat": lat,
+                "lon": lon,
+                "value": None,
+            }
+        raw_value = gis_lookup.sample_raster_value(cog_source, lat, lon)
+
+    display_scale = units.variable_display_scale(variable)
+    if raw_value is not None and display_scale != 1.0:
+        raw_value = raw_value * display_scale
+
+    response = {
+        "variable": variable,
+        "units": raw_units,
+        "lat": lat,
+        "lon": lon,
+        "value": raw_value,
+        "class_name": None,
+    }
+    # Reuse the units machinery — wrap in a minimal env-response shape
+    if raw_value is not None and unit_system and raw_units:
+        wrapped = units.apply_unit_system_to_env_response(
+            {"summary": {"mean": raw_value}, "units": raw_units},
+            unit_system,
+            raw_units,
+        )
+        converted_mean = (wrapped.get("summary") or {}).get("mean")
+        if isinstance(converted_mean, (int, float)):
+            response["value"] = converted_mean
+            response["units"] = wrapped.get("units", raw_units)
+    # Attach human-readable class name for categorical variables
+    if raw_value is not None:
+        legend = gis_lookup.load_layer_legend(variable)
+        if legend:
+            entry = legend.get(str(int(raw_value))) if raw_value == int(raw_value) else legend.get(str(raw_value))
+            if entry:
+                response["class_name"] = entry.get("name")
+    return response
 
 @app.post("/upload/raw-observations")
 async def upload_raw_observations(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> FileResponse:

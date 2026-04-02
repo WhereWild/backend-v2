@@ -1327,13 +1327,17 @@ def build_density_curve(
     values: Sequence[float],
     *,
     point_count: int,
+    circular: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Builds a kernel density estimate curve for numeric values.
-    
+
     Args:
         values: Numeric values to estimate a density curve for.
         point_count: Number of points to sample along the curve.
-    
+        circular: If True, treats the variable as circular over [0, 360) using a
+            wrapped Gaussian kernel so the density is continuous across 0°/360°.
+            Intended for directional variables like aspect in degrees.
+
     Returns:
         A dict with sampled points, density values, and min/max/bandwidth metadata.
     """
@@ -1341,6 +1345,27 @@ def build_density_curve(
         return None
     array = np.asarray(values, dtype=float)
     count = len(array)
+
+    if circular:
+        std = float(array.std()) or 1.0
+        bandwidth = 1.06 * std * (count ** (-0.2))
+        if not math.isfinite(bandwidth) or bandwidth <= 0:
+            bandwidth = 18.0  # ~360/20 fallback
+        # Pad with ±360 ghost copies so the kernel sees across the 0/360 seam.
+        padded = np.concatenate([array - 360, array, array + 360])
+        xs = np.linspace(0, 360, point_count)
+        diffs = (xs[:, None] - padded[None, :]) / bandwidth
+        kernel = np.exp(-0.5 * diffs ** 2)
+        factor = 1.0 / (count * bandwidth * math.sqrt(2 * math.pi))
+        densities = kernel.sum(axis=1) * factor
+        return {
+            "points": [float(v) for v in xs.tolist()],
+            "density": [float(v) for v in densities.tolist()],
+            "min": 0.0,
+            "max": 360.0,
+            "bandwidth": bandwidth,
+        }
+
     min_val = float(array.min())
     max_val = float(array.max())
     if math.isclose(min_val, max_val):

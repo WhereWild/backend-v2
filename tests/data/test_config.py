@@ -95,3 +95,8 @@ def test_load_config_unknown_name_raises_and_global_is_cached(monkeypatch):
     assert first is second
     with pytest.raises(KeyError):
         config_module.load_config("not-a-config")
+
+
+def test_global_config_includes_expected_phenology_positive_defaults(tmp_path):
+    cfg = config_module.GlobalConfig(project_root=tmp_path)
+    assert cfg.ml_phenology_rcs_positive_values == ("flowers", "buds", "fruits")

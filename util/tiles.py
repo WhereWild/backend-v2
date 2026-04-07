@@ -6,23 +6,31 @@ from dataclasses import dataclass
 from functools import lru_cache
 import io
 import math
-from typing import Any, Iterable
+from pathlib import Path
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 from PIL import Image
 import pyarrow.fs as pafs
 import rasterio
+from rasterio.crs import CRS as _CRS
 from rasterio.enums import Resampling
-from rasterio.transform import from_bounds
+from rasterio.transform import Affine, from_bounds
 from rasterio.warp import reproject
 from rasterio.windows import Window, from_bounds as window_from_bounds, transform as window_transform
 
 from util.config import load_config
-from util import gis_lookup, units
+from util import gis_lookup, models, units
 
 
 CONFIG = load_config("global")
 WEB_MERCATOR = "EPSG:3857"
+
+
+def _is_temporal_column(col: str) -> bool:
+    return gis_lookup.is_temporal_layer_id(col)
+
+
 WGS84_CRS = "EPSG:4326"
 
 LANDCOVER_ID = "landcover"
@@ -865,3 +873,383 @@ def render_variable_tile_bytes(
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+HEATMAP_COLOR_STOPS = np.asarray(
+    [
+        [28, 38, 102],
+        [34, 94, 168],
+        [59, 170, 165],
+        [246, 190, 0],
+        [230, 57, 70],
+    ],
+    dtype=np.float32,
+)
+
+
+def _colorize_heatmap(values: np.ndarray, vmin: float = 0.0, vmax: float = 1.0) -> np.ndarray:
+    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return rgba
+
+    span = max(float(vmax) - float(vmin), 1e-6)
+    norm = np.clip((values - vmin) / span, 0.0, 1.0)
+    finite_norm = norm[finite]
+    positions = np.linspace(0.0, 1.0, HEATMAP_COLOR_STOPS.shape[0], dtype=np.float32)
+    rgba[finite, 0] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 0]).astype(np.uint8)
+    rgba[finite, 1] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 1]).astype(np.uint8)
+    rgba[finite, 2] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 2]).astype(np.uint8)
+    rgba[finite, 3] = np.clip(40.0 + (finite_norm * 215.0), 0.0, 255.0).astype(np.uint8)
+    return rgba
+
+
+def _load_model_layers(
+    taxon_id: int,
+    model_id: str | None,
+    layers: Sequence[str] | None,
+) -> list[str]:
+    if layers:
+        layer_list = [str(layer).strip() for layer in layers if str(layer).strip()]
+    else:
+        layer_list = models.model_feature_columns(model_id, taxon_id=taxon_id)
+
+    if not layer_list:
+        requested = (model_id or "").strip() or models.DEFAULT_MODEL_ID
+        raise ValueError(f"No feature columns available for taxon {taxon_id} and model '{requested}'.")
+
+    # Temporal columns don't live in the GIS catalog — only validate non-temporal ones.
+    layer_meta = gis_lookup.load_layer_metadata()
+    unknown_gis = [layer for layer in layer_list if not _is_temporal_column(layer) and layer not in layer_meta]
+    if unknown_gis:
+        raise ValueError(
+            "Model feature columns are not available in the GIS catalog: " + ", ".join(sorted(unknown_gis))
+        )
+    return layer_list
+
+
+def _render_feature_stack(
+    layer_list: list[str],
+    spec: "TileSpec",
+    reproject: bool,
+    forecast_hours: int,
+    *,
+    layer_cache: "dict[str, np.ndarray] | None" = None,
+) -> np.ndarray:
+    """Render a (tile_size, tile_size, C) feature tensor for the given layer list.
+
+    If *layer_cache* is provided, already-rendered layers are read from it and
+    newly rendered layers are stored back into it so subsequent calls sharing the
+    same cache dict skip redundant I/O.
+    """
+    from util import weather_tiles as _wt
+
+    tile_size = spec.tile_size
+    stack = np.empty((tile_size, tile_size, len(layer_list)), dtype=np.float32)
+    for idx, layer_id in enumerate(layer_list):
+        if layer_cache is not None and layer_id in layer_cache:
+            stack[:, :, idx] = layer_cache[layer_id]
+            continue
+        parsed_temporal = gis_lookup.parse_temporal_layer_id(layer_id)
+        if parsed_temporal is not None:
+            variable_id, _agg, window_hours = parsed_temporal
+            try:
+                arr = _wt.sample_grid_for_tile(variable_id, window_hours, forecast_hours, spec)
+            except Exception as exc:
+                arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+                print(f"[model-tile] WARNING: temporal layer {layer_id} failed: {exc}")
+        else:
+            try:
+                arr = _render_layer_values(
+                    layer_id,
+                    spec,
+                    reproject_to_mercator=reproject,
+                )
+            except Exception as exc:
+                arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+                print(
+                    f"[model-tile] WARNING: layer {layer_id} read failed for tile "
+                    f"z={spec.z} x={spec.x} y={spec.y} — filling NaN. Error: {exc}"
+                )
+        stack[:, :, idx] = arr
+        if layer_cache is not None:
+            layer_cache[layer_id] = arr
+        if idx == 0 or idx == len(layer_list) - 1 or (idx + 1) % 10 == 0:
+            print(f"[model-tile] rendered layers {idx + 1}/{len(layer_list)} current_layer={layer_id}")
+    return stack
+
+
+def _compute_model_probs(
+    taxon_id: int,
+    spec: TileSpec,
+    *,
+    model_id: str | None = None,
+    layers: Sequence[str] | None = None,
+    reproject: bool = True,
+    forecast_hours: int = 0,
+    apply_phenology: bool = True,
+    phenology_only: bool = False,
+    layer_cache: "dict[str, np.ndarray] | None" = None,
+) -> np.ndarray:
+    """Compute per-pixel probabilities for a single taxon. Returns (H, W) float array."""
+    has_phenology = models.has_phenology_model(taxon_id)
+    has_full = models.has_full_model(taxon_id)
+
+    if phenology_only:
+        active_model_id = (
+            models.AUTO_PHENOLOGY_MODEL_ID if has_phenology else models.AUTO_FULL_MODEL_ID if has_full else model_id
+        )
+    elif apply_phenology and has_full and not has_phenology:
+        active_model_id = models.AUTO_FULL_MODEL_ID
+    else:
+        active_model_id = model_id
+
+    active_layers = _load_model_layers(taxon_id, active_model_id, layers if active_model_id == model_id else None)
+    print(
+        f"[model-tile] taxon={taxon_id} model={active_model_id} "
+        f"features={len(active_layers)} forecast_hours={forecast_hours}"
+    )
+    stack = _render_feature_stack(active_layers, spec, reproject, forecast_hours, layer_cache=layer_cache)
+    probs = models.predict(active_model_id, stack, feature_ids=active_layers, taxon_id=taxon_id)
+
+    # Plants with both SDM + phenology: multiply for combined view
+    if apply_phenology and not phenology_only and has_phenology and active_model_id == model_id:
+        try:
+            pheno_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
+            all_layers = list(dict.fromkeys(active_layers + pheno_layers))
+            if all_layers != active_layers:
+                stack = _render_feature_stack(all_layers, spec, reproject, forecast_hours, layer_cache=layer_cache)
+                probs = models.predict(model_id, stack, feature_ids=all_layers, taxon_id=taxon_id)
+            pheno_probs = models.predict(
+                models.AUTO_PHENOLOGY_MODEL_ID,
+                stack,
+                feature_ids=all_layers,
+                taxon_id=taxon_id,
+            )
+            probs = probs * pheno_probs
+        except ValueError:
+            pass
+
+    return probs
+
+
+def render_model_tile_bytes(
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    *,
+    model_id: str | None = None,
+    layers: Sequence[str] | None = None,
+    tile_size: int = 256,
+    reproject: bool = True,
+    forecast_hours: int = 0,
+    apply_phenology: bool = True,
+    phenology_only: bool = False,
+) -> bytes:
+    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+    probs = _compute_model_probs(
+        taxon_id,
+        spec,
+        model_id=model_id,
+        layers=layers,
+        reproject=reproject,
+        forecast_hours=forecast_hours,
+        apply_phenology=apply_phenology,
+        phenology_only=phenology_only,
+    )
+    rgba = _colorize_heatmap(probs)
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def render_aggregate_tile_bytes(
+    z: int,
+    x: int,
+    y: int,
+    *,
+    tile_size: int = 256,
+    reproject: bool = True,
+    forecast_hours: int = 0,
+) -> bytes:
+    """Render an aggregate heatmap averaged across all species with available models.
+
+    Each species contributes its best combined score (SDM × phenology for plants,
+    full model for non-plants, SDM alone as fallback). Scores are averaged pixel-wise.
+    """
+    taxon_ids = models.get_all_sdm_taxon_ids()
+    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+
+    # Shared layer cache: GIS rasters and weather grids are sampled once and
+    # reused across all taxon model forward passes.
+    layer_cache: dict[str, np.ndarray] = {}
+
+    acc: np.ndarray | None = None
+    count = 0
+    for taxon_id in taxon_ids:
+        try:
+            probs = _compute_model_probs(
+                int(taxon_id),
+                spec,
+                reproject=reproject,
+                forecast_hours=forecast_hours,
+                apply_phenology=True,
+                layer_cache=layer_cache,
+            )
+            acc = probs if acc is None else acc + probs
+            count += 1
+        except Exception as exc:
+            print(f"[aggregate-tile] skipping taxon={taxon_id}: {exc}")
+
+    if acc is None or count == 0:
+        # No models — return transparent tile
+        empty = np.zeros((tile_size, tile_size, 4), dtype=np.uint8)
+        image = Image.fromarray(empty, mode="RGBA")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    avg = acc / count
+    print(f"[aggregate-tile] z={z} x={x} y={y} species={count} avg_max={float(avg.max()):.3f}")
+    rgba = _colorize_heatmap(avg)
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _warp_array_to_tile_png(
+    src_array: "np.ndarray",
+    src_transform: "Affine",
+    src_crs: "rasterio.crs.CRS",
+    spec: "TileSpec",
+    tile_size: int,
+    vmin: float,
+    vmax: float,
+) -> bytes:
+    """Warp an in-memory WGS84 float32 array to a Web Mercator tile and return PNG bytes."""
+    merc_minx, merc_miny, merc_maxx, merc_maxy = tile_bounds_mercator(spec)
+    dst_crs = _CRS.from_epsg(3857)
+    dst_transform = from_bounds(merc_minx, merc_miny, merc_maxx, merc_maxy, tile_size, tile_size)
+    dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+    try:
+        reproject(
+            source=src_array,
+            destination=dest,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
+            src_nodata=np.nan,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
+    except Exception:
+        pass
+    rgba = _colorize_heatmap(dest, vmin=vmin, vmax=vmax)
+    image = Image.fromarray(rgba, mode="RGBA")
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def render_homepage_tile_bytes(
+    z: int,
+    x: int,
+    y: int,
+    *,
+    raster_path: "Path | str",
+    tile_size: int = 256,
+    vmin: float = 0.0,
+    vmax: float = 1.0,
+) -> bytes:
+    """Serve a tile from the pre-built aggregate SDM GeoTIFF. Fast — no model inference."""
+    from pathlib import Path as _Path
+
+    raster_path = _Path(raster_path)
+    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+
+    dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+    if raster_path.exists():
+        with rasterio.open(raster_path) as ds:
+            merc_minx, merc_miny, merc_maxx, merc_maxy = tile_bounds_mercator(spec)
+            dst_transform = from_bounds(merc_minx, merc_miny, merc_maxx, merc_maxy, tile_size, tile_size)
+            try:
+                reproject(
+                    source=rasterio.band(ds, 1),
+                    destination=dest,
+                    dst_transform=dst_transform,
+                    dst_crs=_CRS.from_epsg(3857),
+                    dst_nodata=np.nan,
+                    resampling=Resampling.bilinear,
+                )
+            except Exception:
+                pass
+
+    rgba = _colorize_heatmap(dest, vmin=vmin, vmax=vmax)
+    image = Image.fromarray(rgba, mode="RGBA")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def render_homepage_tile_from_arrays(
+    z: int,
+    x: int,
+    y: int,
+    *,
+    taxon_arrays: "dict[str, np.ndarray]",
+    taxon_ids: "list[str]",
+    src_transform: "Affine",
+    src_crs: "rasterio.crs.CRS",
+    gis_arrays: "dict[str, np.ndarray] | None" = None,
+    tile_size: int = 256,
+    vmin: float = 0.0,
+    vmax: float = 1.0,
+) -> bytes:
+    """Average the given per-taxon WGS84 arrays and warp to a Mercator tile PNG."""
+    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+
+    # Average selected taxa
+    first = next((taxon_arrays[tid] for tid in taxon_ids if tid in taxon_arrays), None)
+    if first is None:
+        return _warp_array_to_tile_png(
+            np.full((1, 1), np.nan, dtype=np.float32),
+            src_transform,
+            src_crs,
+            spec,
+            tile_size,
+            vmin,
+            vmax,
+        )
+    acc = np.zeros(first.shape, dtype=np.float64)
+    count = np.zeros(first.shape, dtype=np.int32)
+    for tid in taxon_ids:
+        arr = taxon_arrays.get(tid)
+        if arr is None:
+            continue
+        finite = np.isfinite(arr)
+        acc[finite] += arr[finite]
+        count[finite] += 1
+    avg = np.full(first.shape, np.nan, dtype=np.float32)
+    has = count > 0
+    avg[has] = (acc[has] / count[has]).astype(np.float32)
+
+    # Ocean mask in-situ
+    if gis_arrays:
+        lc = gis_arrays.get("landcover")
+        elev = gis_arrays.get("elevation")
+        ocean = np.zeros(avg.shape, dtype=bool)
+        if lc is not None:
+            is_water = np.isfinite(lc) & (lc == 210)
+            no_lc = ~np.isfinite(lc)
+            if elev is not None:
+                ocean |= is_water & ((elev < 1.0) | ~np.isfinite(elev))
+                ocean |= no_lc & ((elev < 1.0) | ~np.isfinite(elev))
+            else:
+                ocean |= is_water | no_lc
+        avg[ocean] = np.nan
+
+    return _warp_array_to_tile_png(avg, src_transform, src_crs, spec, tile_size, vmin, vmax)

@@ -397,7 +397,8 @@ def main() -> None:
         subprocess.run(
             ["rclone", "copy", str(upload_dir), remote_dest, "--transfers=4",
              "--include", "aggregate_sdm*.tif",
-             "--include", "aggregate_sdm*.json"],
+             "--include", "aggregate_sdm*.json",
+             "--include", "taxon_probs.npz"],
             check=True,
         )
         print("[infer] B2 push complete")

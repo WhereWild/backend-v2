@@ -1,6 +1,6 @@
-'''
+"""
 This file functions as a library, providing functions that perform standard operations one might use when querying GIS data from taxa or coordinates.
-'''
+"""
 
 from contextlib import contextmanager
 from pathlib import Path
@@ -31,7 +31,9 @@ _INVALID_LOCATION_GID_TOKENS = frozenset({"nan", "none", "null", "na", "n/a", "u
 _MAX_CACHED_RASTERS = 128
 _raster_cache: OrderedDict[str, tuple] = OrderedDict()  # uri -> (ds, gdal_env)
 _raster_cache_lock = threading.Lock()
+_raster_active: set[str] = set()  # URIs whose cached ds is currently being yielded
 _RASTER_STORAGE_ENV = "WHEREWILD_RASTER_STORAGE"
+_TEMPORAL_LAYER_ID_RE = re.compile(r"^(.+?)_(avg|sum)_(\d+)h$")
 
 
 @dataclass(frozen=True)
@@ -42,12 +44,52 @@ class LocationRecord:
     parent_gid: Optional[str]
 
 
-
 @dataclass(frozen=True)
 class RasterSource:
     uri: str
     gdal_env: dict[str, str]
     is_remote: bool
+
+
+def parse_temporal_layer_id(layer_id: str) -> tuple[str, str, int] | None:
+    """Parse temporal layer ids like temperature_2m_avg_24h."""
+    match = _TEMPORAL_LAYER_ID_RE.match(str(layer_id))
+    if match is None:
+        return None
+    return match.group(1), match.group(2), int(match.group(3))
+
+
+def is_temporal_layer_id(layer_id: str) -> bool:
+    return parse_temporal_layer_id(layer_id) is not None
+
+
+def temporal_feature_names_from_config(config: Any | None = None) -> list[str]:
+    """Build temporal feature column ids from config."""
+    cfg = CONFIG if config is None else config
+    cols: list[str] = []
+    for var, windows in cfg.temporal_window_hours_by_variable.items():
+        agg = str(cfg.temporal_agg_by_variable.get(var) or "").strip().lower()
+        if not agg:
+            raise ValueError(
+                f"Missing temporal aggregation config for variable {var!r}. Add it to temporal_agg_by_variable."
+            )
+        if agg not in {"avg", "sum"}:
+            raise ValueError(f"Unsupported temporal aggregation {agg!r} for variable {var!r}.")
+        for hours in windows:
+            cols.append(f"{var}_{agg}_{hours}h")
+
+    vpd_windows = cfg.temporal_window_hours_by_variable.get(
+        "vapor_pressure_deficit",
+        cfg.temporal_window_hours_by_variable.get(
+            "temperature_2m",
+            cfg.temporal_window_hours_default,
+        ),
+    )
+    for hours in vpd_windows:
+        layer_id = f"vapor_pressure_deficit_avg_{hours}h"
+        if layer_id not in cols:
+            cols.append(layer_id)
+    return cols
 
 
 def raster_exists(path: Path) -> bool:
@@ -124,19 +166,27 @@ def _temporary_env(overrides: dict[str, str]) -> Iterator[None]:
 
 @contextmanager
 def open_raster(source: RasterSource) -> Iterator[Any]:
-    """Open a raster source, reusing a cached handle when available."""
+    """Open a raster source, reusing a cached handle when available.
+
+    Each call gets exclusive use of the cached handle; concurrent callers open a
+    private handle instead of sharing, preventing GDAL seek-state corruption.
+    """
     import rasterio
 
     uri = source.uri
+    close_when_done = False
 
+    # Claim the cached handle only if it is not currently in use
     with _raster_cache_lock:
-        if uri in _raster_cache:
+        if uri in _raster_cache and uri not in _raster_active:
             _raster_cache.move_to_end(uri)
+            _raster_active.add(uri)
             ds = _raster_cache[uri][0]
         else:
             ds = None
 
     if ds is None:
+        # Open a private handle for this caller
         if source.gdal_env:
             with _temporary_env(source.gdal_env):
                 with rasterio.Env():
@@ -146,28 +196,37 @@ def open_raster(source: RasterSource) -> Iterator[Any]:
 
         with _raster_cache_lock:
             if uri not in _raster_cache:
+                # Install into cache and claim it
                 _raster_cache[uri] = (ds, source.gdal_env or {})
                 _raster_cache.move_to_end(uri)
+                _raster_active.add(uri)
                 while len(_raster_cache) > _MAX_CACHED_RASTERS:
-                    _, (evicted_ds, _) = _raster_cache.popitem(last=False)
+                    evicted_uri, (evicted_ds, _) = _raster_cache.popitem(last=False)
+                    _raster_active.discard(evicted_uri)
                     try:
                         evicted_ds.close()
                     except Exception:
                         pass
             else:
-                try:
-                    ds.close()
-                except Exception:
-                    pass
-                _raster_cache.move_to_end(uri)
-                ds = _raster_cache[uri][0]
+                # Cache already populated by another thread; use this as private handle
+                close_when_done = True
 
-    if source.gdal_env:
-        with _temporary_env(source.gdal_env):
-            with rasterio.Env():
-                yield ds
-    else:
-        yield ds
+    try:
+        if source.gdal_env:
+            with _temporary_env(source.gdal_env):
+                with rasterio.Env():
+                    yield ds
+        else:
+            yield ds
+    finally:
+        if close_when_done:
+            try:
+                ds.close()
+            except Exception:
+                pass
+        else:
+            with _raster_cache_lock:
+                _raster_active.discard(uri)
 
 
 @contextmanager
@@ -179,13 +238,14 @@ def open_raster_path(path: Path) -> Iterator[Any]:
     with open_raster(source) as ds:
         yield ds
 
+
 @lru_cache(maxsize=1)
 def _load_gis_catalog() -> Dict[str, Any]:
     """Loads the GIS catalog JSON into memory.
-    
+
     Args:
         None.
-    
+
     Returns:
         The parsed GIS catalog dictionary with categories and layers.
     """
@@ -196,10 +256,10 @@ def _load_gis_catalog() -> Dict[str, Any]:
 @lru_cache(maxsize=256)
 def _get_layer(layer_id: str) -> Dict[str, Any] | None:
     """Returns the layer "object" for a given layer id.
-    
+
     Args:
         layer_id: The layer id for the requested layer, e.g. `bio_1`.
-    
+
     Returns:
         A dictionary representation of the layer's info, accessed such as _get_layer("bio_1")["units"].
     """
@@ -214,10 +274,10 @@ def _get_layer(layer_id: str) -> Dict[str, Any] | None:
 @lru_cache(maxsize=1)
 def load_layer_metadata() -> Dict[str, Dict[str, Any]]:
     """Builds a mapping of layer id to raw layer metadata.
-    
+
     Args:
         None.
-    
+
     Returns:
         A dict of layer id to the layer entry in the GIS catalog.
     """
@@ -304,10 +364,10 @@ def _expand_temporal_layers(category: dict[str, Any]) -> list[dict[str, Any]]:
 @lru_cache(maxsize=1)
 def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Builds a list of variable metadata entries and a lookup by id.
-    
+
     Args:
         None.
-    
+
     Returns:
         A tuple of (entries, mapping) where entries are sorted variable metadata
         and mapping maps layer id to the same metadata entry.
@@ -337,6 +397,8 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
             layer_id = layer.get("id")
             if not layer_id:
                 continue
+            if layer_id in mapping:
+                continue
             entry = {
                 "id": layer_id,
                 "name": layer.get("display_name") or layer.get("name") or layer_id,
@@ -354,10 +416,10 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
 @lru_cache(maxsize=64)
 def load_layer_legend(layer_id: str) -> dict[str, dict[str, Any]]:
     """Loads a categorical legend mapping for a GIS layer.
-    
+
     Args:
         layer_id: The layer id whose legend should be loaded.
-    
+
     Returns:
         A mapping of class id or slugified class name to legend metadata.
     """
@@ -396,7 +458,7 @@ def load_layer_legend(layer_id: str) -> dict[str, dict[str, Any]]:
 @lru_cache(maxsize=1)
 def preload_layer_legends() -> int:
     """Loads all categorical layer legends into memory.
-    
+
     Returns:
         Count of legends loaded.
     """
@@ -414,10 +476,10 @@ def preload_layer_legends() -> int:
 @lru_cache(maxsize=1)
 def load_location_catalog() -> tuple[List[LocationRecord], dict[str, LocationRecord]]:
     """Loads the location catalog into a tuple of a list of all locations (for search) and a dict of location ids to location records.
-    
+
     Args:
         None.
-    
+
     Returns:
         A list of all locations and a dict of location ids to location records.
     """
@@ -447,6 +509,7 @@ def load_location_catalog() -> tuple[List[LocationRecord], dict[str, LocationRec
         by_gid[record.gid] = record
     return entries, by_gid
 
+
 def sample_raster_value(source: RasterSource, lat: float, lon: float) -> Optional[float]:
     try:
         import rasterio
@@ -462,7 +525,7 @@ def sample_raster_value(source: RasterSource, lat: float, lon: float) -> Optiona
             prefix = (storage.prefix or "").strip("/")
             vsis3_prefix = f"/vsis3/{bucket}/{prefix}/"
             if uri.startswith(vsis3_prefix):
-                rel = uri[len(vsis3_prefix):]
+                rel = uri[len(vsis3_prefix) :]
                 mount_path = Path(mount_root) / rel
                 if mount_path.exists():
                     uri = str(mount_path)
@@ -475,6 +538,7 @@ def sample_raster_value(source: RasterSource, lat: float, lon: float) -> Optiona
     except Exception as e:
         print(f"[sample_raster] exception: {e}")
         return None
+
 
 _DERIVED_DEM_VARIABLES = frozenset({"slope", "aspect", "aspect_deg"})
 
@@ -500,12 +564,7 @@ def sample_dem_derived_value(layer_id: str, lat: float, lon: float) -> Optional[
         with open_raster(source) as ds:
             row, col = ds.index(lon, lat)
             radius = 1
-            if (
-                row - radius < 0
-                or col - radius < 0
-                or row + radius >= ds.height
-                or col + radius >= ds.width
-            ):
+            if row - radius < 0 or col - radius < 0 or row + radius >= ds.height or col + radius >= ds.width:
                 return None
             win = rasterio.windows.Window(col - radius, row - radius, 3, 3)
             data = ds.read(1, window=win).astype(np.float32, copy=False)
@@ -564,10 +623,10 @@ def is_valid_location_gid(gid: Any) -> bool:
 
 def location_lookup_for_gid(gid: str) -> tuple[str, str, str]:
     """Returns the location column, scope label, and normalized gid for filtering.
-    
+
     Args:
         gid: The gid of the region being filtered on.
-    
+
     Returns:
         A tuple of (column_name, scope_label, normalized_gid).
     """
@@ -587,11 +646,11 @@ def location_lookup_for_gid(gid: str) -> tuple[str, str, str]:
 
 def build_location_mask(table: pa.Table, location_gid: str) -> Optional[pa.Array]:
     """Builds a mask for a parquet so only rows that match the location gid are present after the filter.
-    
+
     Args:
         table: The input parquet or table.
         location_gid: The gid for the region being filtered on.
-    
+
     Returns:
         A mask for the parquet that filters for only rows within the gid in question.
     """
@@ -605,15 +664,13 @@ def build_location_mask(table: pa.Table, location_gid: str) -> Optional[pa.Array
     return pc.equal(column, target)
 
 
-
-
 @lru_cache(maxsize=1)
 def location_taxa_membership() -> Dict[tuple[str, str], frozenset[int]]:
     """Returns a dict mapping gids at certain scopes to a set of taxon ids that occur within the region.
-    
+
     Args:
         None.
-    
+
     Returns:
         A dict mapping gids at certain scopes to a set of taxon ids that occur within the region.
     """
@@ -840,11 +897,11 @@ def resolve_location_context(
     mapping: dict[str, LocationRecord],
 ) -> List[str]:
     """Builds the ancestor name path for a location record.
-    
+
     Args:
         record: Location record whose parent chain should be resolved.
         mapping: Mapping of gid to location record for lookups.
-    
+
     Returns:
         A list of ancestor names from top-level to immediate parent.
     """
@@ -859,21 +916,25 @@ def resolve_location_context(
     context.reverse()
     return context
 
+
 "Helper method to strip diacritics"
+
+
 def strip_diacritics(text: str) -> str:
     if not text:
-        return ''
-    normalized = unicodedata.normalize('NFD', str(text))
-    stripped = ''.join(ch for ch in normalized if unicodedata.category(ch)!= 'Mn')
+        return ""
+    normalized = unicodedata.normalize("NFD", str(text))
+    stripped = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
     return stripped.lower().strip()
+
 
 def search_locations(query: str, limit: int) -> List[dict[str, Any]]:
     """Searches location records by name substring.
-    
+
     Args:
         query: Search term matched against location names.
         limit: Maximum number of results to return.
-    
+
     Returns:
         A list of match dictionaries with gid, name, level, and hierarchy path.
     """
@@ -884,7 +945,7 @@ def search_locations(query: str, limit: int) -> List[dict[str, Any]]:
     entries, mapping = load_location_catalog()
     results: List[dict[str, Any]] = []
     for record in entries:
-        name_norm = strip_diacritics(record.name or '')
+        name_norm = strip_diacritics(record.name or "")
         if search_norm not in name_norm:
             continue
         context = resolve_location_context(record, mapping)
@@ -900,6 +961,7 @@ def search_locations(query: str, limit: int) -> List[dict[str, Any]]:
             break
     return results
 
+
 def list_children(parent_token: str, level: Optional[int] = None, limit: int = 500) -> List[dict[str, Any]]:
     """
     Return child locations of `parent_token` (gid or name). If level is provided, filter by level.
@@ -912,7 +974,7 @@ def list_children(parent_token: str, level: Optional[int] = None, limit: int = 5
     results: List[dict[str, Any]] = []
 
     # 1) try treat parent_token as gid and return records whose gid starts with parent + '.'
-    if '.' in parent_token or parent_token.upper() in by_gid:
+    if "." in parent_token or parent_token.upper() in by_gid:
         # If the token is exactly a gid key in by_gid, use its gid as parent
         parent_gid = parent_token if parent_token in by_gid else None
         if parent_gid is None:
@@ -925,7 +987,14 @@ def list_children(parent_token: str, level: Optional[int] = None, limit: int = 5
                 if level is not None and rec.level != level:
                     continue
                 if str(rec.gid).startswith(pre):
-                    results.append({"gid": rec.gid, "name": rec.name, "level": rec.level, "hierarchy": resolve_location_context(rec, by_gid)})
+                    results.append(
+                        {
+                            "gid": rec.gid,
+                            "name": rec.name,
+                            "level": rec.level,
+                            "hierarchy": resolve_location_context(rec, by_gid),
+                        }
+                    )
                     if len(results) >= limit:
                         return results
             # if found some, return
@@ -940,7 +1009,14 @@ def list_children(parent_token: str, level: Optional[int] = None, limit: int = 5
         # check if parent_gid equals a gid whose name matches
         parent_gid = rec.parent_gid
         if parent_gid and parent_gid in by_gid and by_gid[parent_gid].name.lower() == lower:
-            results.append({"gid": rec.gid, "name": rec.name, "level": rec.level, "hierarchy": resolve_location_context(rec, by_gid)})
+            results.append(
+                {
+                    "gid": rec.gid,
+                    "name": rec.name,
+                    "level": rec.level,
+                    "hierarchy": resolve_location_context(rec, by_gid),
+                }
+            )
             if len(results) >= limit:
                 return results
 
@@ -957,12 +1033,13 @@ def list_children(parent_token: str, level: Optional[int] = None, limit: int = 5
 
     return results
 
+
 def _region_origin(value: float) -> float:
     """Simply converts a lat/lon to its 10° region origin. Origins are at the southwest corner of the region.
-    
+
     Args:
         value: The lat/lon in question.
-    
+
     Returns:
         The lat/lon of the origin of the region the point is in.
     """
@@ -971,11 +1048,11 @@ def _region_origin(value: float) -> float:
 
 def get_region_name(latitude: float, longitude: float) -> str:
     """Returns the "region name" of a point. The "region name" is the folder name of the region, e.g. `lat10lon-20`.
-    
+
     Args:
         latitude: The latitude of the point.
         longitude: The longitude of the point.
-    
+
     Returns:
         The region name of the region the point is contained within.
     """
@@ -987,14 +1064,14 @@ def get_region_name(latitude: float, longitude: float) -> str:
 @lru_cache(maxsize=64)
 def get_layer_tile_info(layer_id: str) -> dict:
     """Returns useful metadata about the COGs a layer stores. Obtained by reading values from any COG of the layer.
-    
+
     Args:
         layer_id: The id of the layer in question.
-    
+
     Returns:
         A dict containing the span of the region, the pixel size, and the block size and shape in terms of lat/lon. Values are currently always be the same for lat/lon.
     """
-    layer = _get_layer(layer_id) # this is the JSON object for the layer
+    layer = _get_layer(layer_id)  # this is the JSON object for the layer
     if layer is None:
         raise ValueError(f"Layer {layer_id} not found in catalog")
 
@@ -1052,12 +1129,13 @@ def get_layer_tile_info(layer_id: str) -> dict:
         "block_shape": (block_h, block_w),
     }
 
+
 def list_layer_ids() -> List[str]:
     """Returns all GIS layer ids from the catalog.
-    
+
     Args:
         None.
-    
+
     Returns:
         A list of layer ids in catalog order.
     """
@@ -1076,14 +1154,15 @@ def list_layer_ids() -> List[str]:
                 ids.append(str(layer_id))
     return ids
 
+
 def get_cog_path(layer_id: str, latitude: float, longitude: float) -> Optional[Path]:
     """Gets the path to the COG of a given layer at a given coordinate.
-    
+
     Args:
         layer_id: The layer id in question.
         latitude: The latitude of the point in question.
         longitude: The longitude of the point in question.
-    
+
     Returns:
         The filepath to the COG based on the parameters so values can be read.
     """

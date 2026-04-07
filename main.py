@@ -1,13 +1,17 @@
 from __future__ import annotations
 import io
 import math
+import re
 import shutil
 import traceback
 from contextlib import asynccontextmanager
+from dataclasses import dataclass as _dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional
+
+import numpy as _np_global
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 import pandas as pd
 
 from util.config import load_config
-from util import custom_upload_processing, descriptions, gis_lookup, indexing, summary_stats, taxa_navigation, units, tiles
+from util import custom_upload_processing, descriptions, gis_lookup, indexing, models, summary_stats, taxa_navigation, units, tiles, weather_tiles
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
@@ -58,6 +62,9 @@ async def lifespan(app: FastAPI):
     except OSError:
         # Remote/object storage might be unavailable at startup; defer to first request.
         pass
+    import threading
+    threading.Thread(target=weather_tiles.load_cache, daemon=True, name="weather-cache").start()
+    threading.Thread(target=_get_homepage_cache, daemon=True, name="homepage-cache").start()
     yield
 
 
@@ -104,6 +111,15 @@ def _map_enabled_variables() -> frozenset[str]:
     if not enabled:
         enabled.update({"landcover", "koppen_geiger"})
     return frozenset(sorted(enabled))
+
+
+@app.get("/api/weather/status", summary="Live weather cache status")
+def weather_cache_status() -> dict:
+    return {
+        "ref_times": weather_tiles._cache_ref_times,
+        "cached_variables": list(weather_tiles._cache.keys()),
+        "ready": len(weather_tiles._cache) == len(weather_tiles.LIVE_WEATHER_VARIABLES),
+    }
 
 
 @app.get("/health", summary="Simple liveness probe")
@@ -159,6 +175,19 @@ async def variable_tile(
     layer_id = (variable_id or "").strip().lower()
     if not layer_id:
         raise HTTPException(status_code=400, detail="variable_id is required.")
+
+    # Live weather variables bypass the GeoTIFF pipeline entirely
+    if layer_id in weather_tiles.LIVE_WEATHER_VARIABLES:
+        payload = await run_in_threadpool(
+            weather_tiles.render_weather_tile_bytes,
+            variable_id=layer_id, z=z, x=x, y=y, tile_size=tile_size,
+        )
+        if payload is None:
+            # Cache not yet populated — return transparent tile
+            return Response(status_code=204)
+        headers = {"Cache-Control": f"public, max-age={variable_tile_cache_seconds}"}
+        return Response(content=payload, media_type="image/png", headers=headers)
+
     enabled_variables = _map_enabled_variables()
     if layer_id not in enabled_variables:
         allowed = ", ".join(sorted(enabled_variables))
@@ -228,6 +257,448 @@ async def variable_tile(
         "Cache-Control": f"public, max-age={variable_tile_cache_seconds}",
     }
     return Response(content=payload, media_type="image/png", headers=headers)
+
+
+@app.get("/api/species/{taxon_id}/heatmap")
+def species_heatmap_metadata(
+    taxon_id: int,
+    model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
+) -> dict[str, Any]:
+    return models.describe_model(model_id, taxon_id=taxon_id)
+
+
+@app.get("/api/species/{taxon_id}/heatmap/tiles/{z}/{x}/{y}.png")
+async def species_heatmap_tile(
+    request: Request,
+    taxon_id: int,
+    z: int,
+    x: int,
+    y: int,
+    model_id: str = Query(models.DEFAULT_MODEL_ID, description="Model id or artifact id."),
+    tile_size: int = Query(variable_tile_default_size, ge=32, le=variable_tile_max_size),
+    reproject: bool = Query(
+        variable_tile_default_reproject,
+        description="If true, warp to Web Mercator; if false, keep WGS84.",
+    ),
+    max_native_zoom: int = Query(
+        10,
+        ge=1,
+        le=18,
+        description="Max zoom to render natively. Higher zooms extract subtiles from this zoom.",
+    ),
+    forecast_hours: int = Query(0, ge=0, description="GFS forecast offset in hours (0 = current)."),
+    apply_phenology: bool = Query(True, description="Multiply SDM by phenology model if available."),
+    phenology_only: bool = Query(False, description="Render raw phenology model output only (no SDM)."),
+) -> Response:
+    if await request.is_disconnected():
+        return Response(status_code=204)
+
+    resolved_model = models.describe_model(model_id, taxon_id=taxon_id)
+    if not resolved_model.get("available"):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No heatmap model found for taxon_id {taxon_id}.",
+        )
+
+    if z > max_native_zoom:
+        zoom_diff = z - max_native_zoom
+        scale = 2 ** zoom_diff
+        parent_x = x // scale
+        parent_y = y // scale
+        subtile_x = x % scale
+        subtile_y = y % scale
+        parent_tile_size = min(tile_size * scale, variable_tile_max_size)
+        try:
+            if await request.is_disconnected():
+                return Response(status_code=204)
+            parent_payload = await run_in_threadpool(
+                tiles.render_model_tile_bytes,
+                taxon_id=taxon_id,
+                z=max_native_zoom,
+                x=parent_x,
+                y=parent_y,
+                model_id=model_id,
+                tile_size=parent_tile_size,
+                reproject=reproject,
+                forecast_hours=forecast_hours,
+                apply_phenology=apply_phenology,
+                phenology_only=phenology_only,
+            )
+            if await request.is_disconnected():
+                return Response(status_code=204)
+            from PIL import Image
+            import io
+
+            parent_img = Image.open(io.BytesIO(parent_payload))
+            subtile_size = parent_tile_size // scale
+            left = subtile_x * subtile_size
+            top = subtile_y * subtile_size
+            subtile_img = parent_img.crop((left, top, left + subtile_size, top + subtile_size))
+            if subtile_size != tile_size:
+                subtile_img = subtile_img.resize((tile_size, tile_size), Image.LANCZOS)
+            buffer = io.BytesIO()
+            subtile_img.save(buffer, format="PNG")
+            payload = buffer.getvalue()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        try:
+            if await request.is_disconnected():
+                return Response(status_code=204)
+            payload = await run_in_threadpool(
+                tiles.render_model_tile_bytes,
+                taxon_id=taxon_id,
+                z=z,
+                x=x,
+                y=y,
+                model_id=model_id,
+                tile_size=tile_size,
+                reproject=reproject,
+                forecast_hours=forecast_hours,
+                apply_phenology=apply_phenology,
+                phenology_only=phenology_only,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if await request.is_disconnected():
+        return Response(status_code=204)
+    headers = {
+        "Cache-Control": f"public, max-age={variable_tile_cache_seconds}",
+    }
+    return Response(content=payload, media_type="image/png", headers=headers)
+
+
+@app.get("/api/heatmap/aggregate/tiles/{z}/{x}/{y}.png")
+async def aggregate_heatmap_tile(
+    request: Request,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = Query(variable_tile_default_size, ge=32, le=variable_tile_max_size),
+    reproject: bool = Query(variable_tile_default_reproject),
+    forecast_hours: int = Query(0, ge=0, description="GFS forecast offset in hours (0 = current)."),
+) -> Response:
+    if await request.is_disconnected():
+        return Response(status_code=204)
+
+    try:
+        payload = await run_in_threadpool(
+            tiles.render_aggregate_tile_bytes,
+            z=z,
+            x=x,
+            y=y,
+            tile_size=tile_size,
+            reproject=reproject,
+            forecast_hours=forecast_hours,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if await request.is_disconnected():
+        return Response(status_code=204)
+    headers = {
+        "Cache-Control": f"public, max-age={variable_tile_cache_seconds}",
+    }
+    return Response(content=payload, media_type="image/png", headers=headers)
+
+
+_HOMEPAGE_RASTER = Path(__file__).parent / "data" / "gis" / "temporal" / "homepage" / "aggregate_sdm.tif"
+_TAXON_PROBS_PATH = _HOMEPAGE_RASTER.parent / "taxon_probs.npz"
+
+@_dataclass
+class _HomepageCache:
+    meta: dict
+    taxon_probs: dict  # str(taxon_id) -> np.ndarray
+    gis_arrays: dict   # layer_id -> np.ndarray (only labeled layers)
+    vmin: float
+    vmax: float
+    mtime: float
+
+_VALID_GROUPS = {"birds", "animals", "arthropods", "fungi", "plants", "other"}
+
+_homepage_cache: "_HomepageCache | None" = None
+
+def _get_homepage_cache() -> "_HomepageCache | None":
+    import json as _json
+    global _homepage_cache
+    if not _TAXON_PROBS_PATH.exists():
+        return None
+    mtime = _TAXON_PROBS_PATH.stat().st_mtime
+    if _homepage_cache is None or _homepage_cache.mtime != mtime:
+        meta_path = _HOMEPAGE_RASTER.parent / "base_features_meta.json"
+        if not meta_path.exists():
+            return None
+        meta = _json.loads(meta_path.read_text())
+        taxon_probs = dict(_np_global.load(_TAXON_PROBS_PATH))
+        gis_arrays: dict = {}
+        npz_path = _HOMEPAGE_RASTER.parent / "base_features.npz"
+        if npz_path.exists():
+            base = _np_global.load(npz_path)
+            for _key in ("landcover", "elevation"):
+                if _key in base:
+                    gis_arrays[_key] = base[_key]
+        vmin, vmax = 0.0, 1.0
+        stats_path = _HOMEPAGE_RASTER.parent / "aggregate_sdm_stats.json"
+        if stats_path.exists():
+            import json as _json2
+            _stats = _json2.loads(stats_path.read_text())
+            vmin, vmax = float(_stats.get("vmin", 0.0)), float(_stats.get("vmax", 1.0))
+        _homepage_cache = _HomepageCache(meta=meta, taxon_probs=taxon_probs, gis_arrays=gis_arrays, vmin=vmin, vmax=vmax, mtime=mtime)
+    return _homepage_cache
+
+def _raster_for_group(group: str | None) -> tuple[Path, float, float]:
+    """Return (raster_path, vmin, vmax) for a given group (None = overall)."""
+    import json as _json
+    if group and group in _VALID_GROUPS:
+        path = _HOMEPAGE_RASTER.parent / f"aggregate_sdm_{group}.tif"
+        if path.exists():
+            stats_path = _HOMEPAGE_RASTER.parent / "aggregate_sdm_group_stats.json"
+            if stats_path.exists():
+                all_stats = _json.loads(stats_path.read_text())
+                s = all_stats.get(group, {})
+                return path, float(s.get("vmin", 0.0)), float(s.get("vmax", 1.0))
+            return path, 0.0, 1.0
+    # Fall back to overall
+    vmin, vmax = 0.0, 1.0
+    stats_path = _HOMEPAGE_RASTER.parent / "aggregate_sdm_stats.json"
+    if stats_path.exists():
+        s = _json.loads(stats_path.read_text())
+        vmin, vmax = float(s.get("vmin", 0.0)), float(s.get("vmax", 1.0))
+    return _HOMEPAGE_RASTER, vmin, vmax
+
+
+@app.get("/api/heatmap/homepage/tiles/{z}/{x}/{y}.png")
+async def homepage_heatmap_tile(
+    request: Request,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = Query(variable_tile_default_size, ge=32, le=variable_tile_max_size),
+    group: str | None = Query(None),
+) -> Response:
+    if await request.is_disconnected():
+        return Response(status_code=204)
+
+    raster_path, vmin, vmax = _raster_for_group(group)
+    if not raster_path.exists():
+        # Group raster not generated yet, fall back to overall
+        raster_path, vmin, vmax = _raster_for_group(None)
+    cache = _get_homepage_cache()
+    if cache and group is None:
+        vmin, vmax = cache.vmin, cache.vmax
+
+    payload = await run_in_threadpool(
+        tiles.render_homepage_tile_bytes,
+        z=z, x=x, y=y,
+        raster_path=raster_path,
+        tile_size=tile_size,
+        vmin=vmin,
+        vmax=vmax,
+    )
+
+    if await request.is_disconnected():
+        return Response(status_code=204)
+    headers = {"Cache-Control": "public, max-age=3600"}
+    return Response(content=payload, media_type="image/png", headers=headers)
+
+
+_TEMPORAL_REASON_LABELS: dict[str, tuple[str, str]] = {
+    # (high-value label, low-value label)
+    "temperature_2m":           ("warm temperatures",       "cool temperatures"),
+    "precipitation":            ("recent rainfall",          "dry conditions"),
+    "soil_moisture_0_to_7cm":   ("moist soils",             "dry soils"),
+    "soil_moisture_0_to_10cm":  ("moist soils",             "dry soils"),
+    "soil_temperature_0_to_7cm":  ("warm soils",            "cool soils"),
+    "soil_temperature_0_to_10cm": ("warm soils",            "cool soils"),
+    "cloud_cover":              ("overcast skies",           "clear skies"),
+    "snowfall_water_equivalent":("snow cover",              "snow-free ground"),
+    "relative_humidity_2m":     ("high humidity",           "low humidity"),
+    "vapor_pressure_deficit":   ("high evaporation demand", "low evaporation demand"),
+    "dew_point_2m":             ("humid air",               "dry air"),
+}
+
+_LANDCOVER_CLASS_TO_GROUP: dict[int, str] = {
+    10: "cropland", 11: "cropland", 12: "cropland", 20: "cropland",
+    51: "forest", 52: "forest", 61: "forest", 62: "forest",
+    71: "forest", 72: "forest", 81: "forest", 82: "forest",
+    91: "forest", 92: "forest",
+    120: "shrubland", 121: "shrubland", 122: "shrubland",
+    130: "grassland",
+    140: "lichens_mosses",
+    150: "sparse_vegetation", 152: "sparse_vegetation", 153: "sparse_vegetation",
+    180: "wetlands",
+    190: "urban",
+    200: "bare_areas", 201: "bare_areas", 202: "bare_areas",
+    210: "water",
+    220: "ice_snow",
+}
+
+_LANDCOVER_GROUP_LABELS: dict[str, str] = {
+    "cropland":          "agricultural areas",
+    "forest":            "forested areas",
+    "shrubland":         "shrubland habitat",
+    "grassland":         "open grasslands",
+    "lichens_mosses":    "tundra habitat",
+    "sparse_vegetation": "sparse vegetation",
+    "wetlands":          "wetland habitat",
+    "urban":             "urban areas",
+    "bare_areas":        "open bare ground",
+    "water":             "aquatic habitat",
+    "ice_snow":          "alpine habitat",
+}
+
+
+@app.get("/api/heatmap/homepage/scores")
+def homepage_viewport_scores(
+    min_lon: float = Query(...),
+    min_lat: float = Query(...),
+    max_lon: float = Query(...),
+    max_lat: float = Query(...),
+) -> dict[str, Any]:
+    """Return per-taxon average probability for the given viewport bbox.
+
+    Slices pre-built per-taxon rasters to the bbox and returns
+    {taxon_id: avg_prob} — no model inference at request time.
+    """
+    import numpy as _np
+
+    cache = _get_homepage_cache()
+    if not cache:
+        return {"scores": {}, "reasons": {}}
+
+    meta = cache.meta
+    out_h, out_w = meta["shape"]
+    res = meta["resolution_degrees"]
+    bounds = meta["bounds"]
+
+    # Clamp viewport to raster extent
+    c_min_lon = max(min_lon, bounds["min_lon"])
+    c_max_lon = min(max_lon, bounds["max_lon"])
+    c_min_lat = max(min_lat, bounds["min_lat"])
+    c_max_lat = min(max_lat, bounds["max_lat"])
+    if c_min_lon >= c_max_lon or c_min_lat >= c_max_lat:
+        return {"scores": {}, "reasons": {}}
+
+    col0 = max(0, round((c_min_lon - bounds["min_lon"]) / res))
+    col1 = min(out_w, round((c_max_lon - bounds["min_lon"]) / res))
+    row0 = max(0, round((bounds["max_lat"] - c_max_lat) / res))
+    row1 = min(out_h, round((bounds["max_lat"] - c_min_lat) / res))
+    if col1 <= col0 or row1 <= row0:
+        return {"scores": {}, "reasons": {}}
+
+    # Load temporal slices for reason computation
+    _TEMPORAL_WINDOW_LABELS = {1:"1h",8:"8h",24:"24h",72:"3d",168:"7d",720:"30d",2160:"90d"}
+    temporal_dir = _HOMEPAGE_RASTER.parent.parent / "rasters"
+    temporal_arrays: dict[str, "_np.ndarray | None"] = {}
+    for p in temporal_dir.glob("*.npy"):
+        # Match files like temperature_2m_24h.npy
+        stem = p.stem
+        temporal_arrays[stem] = _np.load(p).astype(_np.float32)
+
+    # Slice temporal arrays to viewport
+    era5_res = 0.25
+    er0 = max(0, round((90.0 - c_max_lat) / era5_res))
+    er1_bound = round((90.0 - c_min_lat) / era5_res)
+    ec0 = max(0, round((c_min_lon + 180.0) / era5_res))
+    ec1_bound = round((c_max_lon + 180.0) / era5_res)
+    need_h, need_w = row1 - row0, col1 - col0
+    temporal_patches: dict[str, "_np.ndarray"] = {}
+    for feat_id, full in temporal_arrays.items():
+        if full is None:
+            continue
+        er1 = min(full.shape[0], er1_bound)
+        ec1 = min(full.shape[1], ec1_bound)
+        sliced = full[er0:er1, ec0:ec1]
+        if sliced.shape != (need_h, need_w):
+            out = _np.full((need_h, need_w), _np.nan, dtype=_np.float32)
+            h = min(sliced.shape[0], need_h)
+            w = min(sliced.shape[1], need_w)
+            out[:h, :w] = sliced[:h, :w]
+            sliced = out
+        temporal_patches[feat_id] = sliced
+
+    scores: dict[str, float] = {}
+    reasons: dict[str, list[str]] = {}
+    for taxon_id_str, probs_full in cache.taxon_probs.items():
+        probs_patch = probs_full[row0:row1, col0:col1]
+        finite = probs_patch[_np.isfinite(probs_patch)]
+        if finite.size == 0:
+            continue
+        scores[taxon_id_str] = float(finite.mean())
+
+        prob_flat = probs_patch.flatten()
+
+        def _top_temporal_reason() -> "str | None":
+            best: tuple[float, str] | None = None
+            for feat_id, arr in temporal_patches.items():
+                feat_flat = arr.flatten()
+                valid = _np.isfinite(feat_flat) & _np.isfinite(prob_flat)
+                if valid.sum() < 10:
+                    continue
+                fv, pv = feat_flat[valid], prob_flat[valid]
+                if fv.std() == 0 or pv.std() == 0:
+                    continue
+                corr = float(_np.corrcoef(fv, pv)[0, 1])
+                if not _np.isfinite(corr):
+                    continue
+                parsed_temporal = gis_lookup.parse_temporal_layer_id(feat_id)
+                var_name = parsed_temporal[0] if parsed_temporal else re.sub(r'_\d+[hd]$', '', feat_id)
+                label_pair = _TEMPORAL_REASON_LABELS.get(var_name)
+                if not label_pair:
+                    continue
+                label = label_pair[0] if corr >= 0 else label_pair[1]
+                if best is None or abs(corr) > best[0]:
+                    best = (abs(corr), label)
+            return best[1] if best else None
+
+        def _landcover_reason() -> "str | None":
+            lc_full = cache.gis_arrays.get("landcover")
+            if lc_full is None:
+                return None
+            lc_patch = lc_full[row0:row1, col0:col1].flatten()
+            valid = _np.isfinite(lc_patch) & _np.isfinite(prob_flat)
+            if not valid.any():
+                return None
+            lc_vals = _np.rint(lc_patch[valid]).astype(int)
+            prob_vals = prob_flat[valid]
+            from collections import defaultdict as _dd
+            group_probs: dict = _dd(list)
+            for cls, p in zip(lc_vals, prob_vals):
+                group = _LANDCOVER_CLASS_TO_GROUP.get(int(cls))
+                if group:
+                    group_probs[group].append(p)
+            best_group = max(
+                (g for g, ps in group_probs.items() if len(ps) >= 3),
+                key=lambda g: float(_np.mean(group_probs[g])),
+                default=None,
+            )
+            return _LANDCOVER_GROUP_LABELS.get(best_group) if best_group else None
+
+        temporal_reason = _top_temporal_reason()
+        gis_reason = _landcover_reason()
+
+        taxon_reasons = [r for r in [temporal_reason, gis_reason] if r]
+        if taxon_reasons:
+            reasons[taxon_id_str] = taxon_reasons
+
+    print(f"[scores] returning {len(scores)} scores")
+    return {"scores": scores, "reasons": reasons}
+
+
+@app.get("/api/species/with-models")
+def list_species_with_models() -> List[dict[str, Any]]:
+    """Returns serialized species info for every taxon that has a trained SDM artifact."""
+    taxon_ids = models.get_all_sdm_taxon_ids()
+    result = []
+    for taxon_id in taxon_ids:
+        taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+        if taxon is None:
+            continue
+        payload = taxa_navigation.serialize_taxon(taxon)
+        if payload:
+            result.append(payload)
+    return result
 
 
 @app.get("/api/species")
@@ -300,6 +771,7 @@ def get_species_detail(
     except Exception as exc:
         print(f"[description] failed for taxon_id={taxon_id}: {exc}")
         traceback.print_exc()
+    payload["heatmap"] = models.describe_model(models.DEFAULT_MODEL_ID, taxon_id=taxon_id)
     return payload
 
 

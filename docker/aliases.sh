@@ -393,6 +393,18 @@ B2 helpers (inside gt):
 - b2-stop
   Stop any running b2 jobs (mount/copy/sync).
 
+- b2-ls <path>
+  List files on the remote at the given path (relative to /data).
+  Example: b2-ls gis/temporal/homepage
+
+- b2-pull-dir <path> [--dry-run]
+  Download a directory from B2 into /workspace/data/<path>.
+  Example: b2-pull-dir gis/temporal/homepage
+
+- b2-push-dir <path> [--dry-run] [--force]
+  Upload a local directory from /workspace/data/<path> to B2.
+  Example: b2-push-dir gis/temporal/homepage --force
+
 - b2-env
   Print WHEREWILD_DATA_ROOT for the mount path.
 EOF
@@ -673,6 +685,125 @@ b2-push() {
   else
     "$rclone_bin" copyto "$source_path" "${remote}:${bucket}/${remote_path}" "$dry_flag"
   fi
+}
+
+b2-ls() {
+  local remote="${WW_B2_READER_REMOTE:-wherewild-localdev-reader}"
+  local bucket="${WW_B2_BUCKET:-wherewild-data}"
+  local prefix="${WW_B2_PREFIX:-data}"
+  local path="${1:-}"
+
+  path="${path#./}"
+  path="${path#/}"
+  path="${path#workspace/}"
+  path="${path#data/}"
+
+  local remote_path="${bucket}"
+  if [[ -n "$prefix" ]]; then
+    remote_path="${bucket}/${prefix}"
+  fi
+  if [[ -n "$path" ]]; then
+    remote_path="${remote_path}/${path}"
+  fi
+
+  rclone lsf "${remote}:${remote_path}"
+}
+
+b2-pull-dir() {
+  local remote="${WW_B2_READER_REMOTE:-wherewild-localdev-reader}"
+  local bucket="${WW_B2_BUCKET:-wherewild-data}"
+  local prefix="${WW_B2_PREFIX:-data}"
+  local local_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
+  local transfers="${WW_RCLONE_TRANSFERS:-16}"
+  local dry_run=0
+  local args=()
+  local arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=1 ;;
+      *) args+=("$arg") ;;
+    esac
+  done
+
+  local path="${args[0]:-}"
+  if [[ -z "$path" ]]; then
+    echo "b2-pull-dir: provide a path (relative to /data, e.g. gis/temporal/homepage)"
+    return 1
+  fi
+
+  path="${path#./}"
+  path="${path#/}"
+  path="${path#workspace/}"
+  path="${path#data/}"
+
+  local remote_path="${bucket}"
+  if [[ -n "$prefix" ]]; then
+    remote_path="${bucket}/${prefix}/${path}"
+  else
+    remote_path="${bucket}/${path}"
+  fi
+
+  local dest="${local_root}/${path}"
+  mkdir -p "$dest"
+  echo "b2-pull-dir: ${remote}:${remote_path} → ${dest}"
+  rclone copy "${remote}:${remote_path}" "$dest" \
+    --transfers "$transfers" \
+    ${dry_run:+--dry-run}
+}
+
+b2-push-dir() {
+  local remote="${WW_B2_WRITER_REMOTE:-wherewild-localdev-writer}"
+  local bucket="${WW_B2_BUCKET:-wherewild-data}"
+  local prefix="${WW_B2_PREFIX:-data}"
+  local local_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
+  local transfers="${WW_RCLONE_TRANSFERS:-4}"
+  local force=0
+  local dry_run=0
+  local args=()
+  local arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      --dry-run) dry_run=1 ;;
+      *) args+=("$arg") ;;
+    esac
+  done
+
+  local path="${args[0]:-}"
+  if [[ -z "$path" ]]; then
+    echo "b2-push-dir: provide a path (relative to /data, e.g. gis/temporal/homepage)"
+    return 1
+  fi
+
+  path="${path#./}"
+  path="${path#/}"
+  path="${path#workspace/}"
+  path="${path#data/}"
+
+  if [[ "$force" -ne 1 && "$dry_run" -ne 1 ]]; then
+    echo "b2-push-dir: refuses to overwrite remote without --force (use --dry-run to preview)"
+    return 1
+  fi
+
+  local source="${local_root}/${path}"
+  if [[ ! -d "$source" ]]; then
+    echo "b2-push-dir: local directory not found: $source"
+    return 1
+  fi
+
+  local remote_path="${bucket}"
+  if [[ -n "$prefix" ]]; then
+    remote_path="${bucket}/${prefix}/${path}"
+  else
+    remote_path="${bucket}/${path}"
+  fi
+
+  echo "b2-push-dir: ${source} → ${remote}:${remote_path}"
+  rclone copy "$source" "${remote}:${remote_path}" \
+    --transfers "$transfers" \
+    ${dry_run:+--dry-run}
 }
 
 pd() {

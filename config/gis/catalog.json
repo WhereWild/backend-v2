@@ -87,6 +87,24 @@
         { "id": "snow_depth", "code": "SNOW_DEPTH", "display_name": "Snow Depth", "units": "m", "value_type": "numeric", "agg": "avg", "windows": [1] },
         { "id": "weather_code_simple", "code": "WEATHER_CODE_SIMPLE", "display_name": "Weather Code (Simple)", "units": "class id", "value_type": "categorical", "agg": "snapshot", "windows": [1] }
       ]
+    },
+    {
+      "name": "live_weather",
+      "display_name": "Live Weather",
+      "description": "Current conditions from NCEP GFS 0.13° forecast model, updated every 6 hours.",
+      "source": "NCEP GFS 013 via Open-Meteo AWS Open Data",
+      "license": "Public Domain",
+      "layers": [
+        { "id": "temperature_2m", "code": "TEMPERATURE_2M", "display_name": "Air Temperature (2m)", "units": "°C", "value_type": "numeric" },
+        { "id": "cloud_cover", "code": "CLOUD_COVER", "display_name": "Cloud Cover", "units": "%", "value_type": "numeric" },
+        { "id": "precipitation", "code": "PRECIPITATION", "display_name": "Precipitation", "units": "mm", "value_type": "numeric" },
+        { "id": "snowfall_water_equivalent", "code": "SNOWFALL_WATER_EQUIV", "display_name": "Snowfall Water Equivalent", "units": "mm", "value_type": "numeric" },
+        { "id": "soil_moisture_0_to_7cm", "code": "SOIL_MOISTURE_0_7CM", "display_name": "Soil Moisture (0–7cm)", "units": "m³/m³", "value_type": "numeric" },
+        { "id": "soil_temperature_0_to_7cm", "code": "SOIL_TEMPERATURE_0_7CM", "display_name": "Soil Temperature (0–7cm)", "units": "°C", "value_type": "numeric" },
+        { "id": "dew_point_2m", "code": "DEW_POINT_2M", "display_name": "Dew Point (2m)", "units": "°C", "value_type": "numeric", "derived": true },
+        { "id": "vapor_pressure_deficit", "code": "VPD", "display_name": "Vapor Pressure Deficit", "units": "kPa", "value_type": "numeric", "derived": true },
+        { "id": "weather_code_simple", "code": "WEATHER_CODE_SIMPLE", "display_name": "Weather Code", "units": "class id", "value_type": "categorical", "derived": true }
+      ]
     }
   ]
 }

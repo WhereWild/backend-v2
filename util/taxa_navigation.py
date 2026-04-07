@@ -691,6 +691,20 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
     if not preferred_image and taxon_key:
         media_record = resolve_taxon_media(taxon_key)
 
+    path_str = str(taxon.get("path", ""))
+    if "Arthropoda_54" in path_str:
+        taxon_group = "arthropods"
+    elif "Aves_212" in path_str:
+        taxon_group = "birds"
+    elif "Animalia_1" in path_str:
+        taxon_group = "animals"
+    elif "Fungi_5" in path_str:
+        taxon_group = "fungi"
+    elif "Plantae_6" in path_str:
+        taxon_group = "plants"
+    else:
+        taxon_group = "other"
+
     result = {
         "taxon_id": taxon_id,
         "scientific_name": scientific_name,
@@ -701,6 +715,7 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
         "slug": slug,
         "rank": rank,
         "occurrences": occurrences,
+        "taxon_group": taxon_group,
     }
 
     # Add image and attribution if available

@@ -18,6 +18,14 @@ _REGISTRY: Dict[str, Type] = {}
 _CONFIG_CACHE: Dict[str, Any] = {}
 
 
+def _env_bool(var: str, default: bool) -> bool:
+    """Read an env var as a boolean. Accepts '1', 'true', 'yes' (case-insensitive) as True."""
+    val = os.environ.get(var)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes")
+
+
 def register_config(name: str):
     """Decorator that records dataclasses for auto-loading."""
 
@@ -67,9 +75,7 @@ class GlobalConfig:
     project_root: Path = field(default_factory=_project_root)
 
     # Pipeline tuning
-    root_taxon_id: str = field(
-        default_factory=lambda: os.environ.get("WHEREWILD_ROOT_TAXON_ID", "2519")
-    )
+    root_taxon_id: str = field(default_factory=lambda: os.environ.get("WHEREWILD_ROOT_TAXON_ID", "1"))
     process_tree_indexes_only: bool = False
     process_tree_ranks_only: bool = False
     process_positions_flush_rows: int = 10_000_000
@@ -82,9 +88,7 @@ class GlobalConfig:
     _rank_synonyms: dict[str, frozenset[str]] = field(
         default_factory=lambda: {
             "SPECIES": frozenset(("SPECIES", "SP", "SPP", "SPECIESGROUP")),
-            "SUBSPECIES": frozenset(
-                ("SUBSPECIES", "SUBSPECIE", "SUBSP", "SSP", "SUBSP.", "SSP.")
-            ),
+            "SUBSPECIES": frozenset(("SUBSPECIES", "SUBSPECIE", "SUBSP", "SSP", "SUBSP.", "SSP.")),
             "VARIETY": frozenset(("VARIETY", "VAR", "VAR.", "VARIETAS")),
             "FORM": frozenset(("FORM", "FORMA", "F.", "FOR.")),
         }
@@ -118,6 +122,53 @@ class GlobalConfig:
     skip_description_outliers: bool = False
     sdm_tile_size: int = 256
 
+    # ML training
+    ml_train_taxon_id: str = field(default_factory=lambda: os.environ.get("ML_TRAIN_TAXON_ID", "2429791"))
+    ml_model_kind: str = "gbt"
+    ml_max_positives: int = 10000
+    ml_negative_ratio: int = 15
+    ml_negative_window_factors: tuple[float, ...] = (1.5, 2.5, 4.0, 6.0, 9.0, 13.0)
+    ml_negative_global_growth_factor: float = 5.0
+    ml_negative_global_max_extra_rounds: int = 12
+    ml_negative_prefilter_oversample_factor: float = 4.0
+    ml_negative_ring_oversample_factor: float = 2.0
+    ml_negative_batch_min: int = 4_096
+    ml_negative_min_bbox_span_degrees: float = 0.25
+    ml_negative_base_padding_degrees: float = 0.25
+    ml_test_size: float = 0.2
+    ml_random_seed: int = 42
+    ml_enable_background_eval: bool = False
+    ml_push_model_to_b2: bool = True
+    ml_negative_mode: str = "taxa"  # "raster" | "taxa"
+    ml_negative_taxa_max_per_taxon: int = 30
+    ml_negative_taxa_candidate_pool: int = 10000
+    ml_parquet_storage_mode: str = "local"
+    ml_raster_storage_mode: str = "auto"
+    ml_phenology_mode: bool = field(default_factory=lambda: _env_bool("ML_PHENOLOGY_MODE", False))
+    ml_phenology_temporal_only: bool = field(default_factory=lambda: _env_bool("ML_PHENOLOGY_TEMPORAL_ONLY", True))
+    ml_sdm_include_temporal: bool = field(default_factory=lambda: _env_bool("ML_SDM_INCLUDE_TEMPORAL", False))
+    # Batch subtree training
+    ml_subtree_root_taxon_id: str = field(default_factory=lambda: os.environ.get("ML_SUBTREE_ROOT_TAXON_ID", "2519"))
+    ml_train_phenology: bool = field(default_factory=lambda: _env_bool("ML_TRAIN_PHENOLOGY", True))
+    ml_train_full: bool = field(default_factory=lambda: _env_bool("ML_TRAIN_FULL", False))
+    # Location-based training
+    ml_location_gid: str = field(default_factory=lambda: os.environ.get("ML_LOCATION_GID", "USA.45_1"))
+    # One of: arthropods, birds, animals, fungi, plants, all
+    ml_taxon_group: str = field(default_factory=lambda: os.environ.get("ML_TAXON_GROUP", "all"))
+    ml_location_min_samples_country: int = field(
+        default_factory=lambda: int(os.environ.get("ML_LOCATION_MIN_SAMPLES_COUNTRY", "500"))
+    )
+    ml_location_min_samples_state: int = field(
+        default_factory=lambda: int(os.environ.get("ML_LOCATION_MIN_SAMPLES_STATE", "250"))
+    )
+    # Phenology mode: column containing reproductive condition summary and positive values
+    ml_phenology_rcs_column: str = "rcs"
+    ml_phenology_rcs_positive_values: tuple[str, ...] = (
+        "flowers",
+        "buds",
+        "fruits",
+    )
+
     # Enrichment
 
     # GIS + locations
@@ -149,9 +200,7 @@ class GlobalConfig:
             "snow_depth": ("copernicus_era5_land",),
             "snowfall_water_equivalent": ("copernicus_era5", "copernicus_era5_ensemble"),
             "soil_moisture_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
-            "soil_moisture_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "soil_temperature_0_to_7cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
-            "soil_temperature_7_to_28cm": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "temperature_2m": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "vapor_pressure_deficit": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
             "weather_code_simple": ("copernicus_era5", "copernicus_era5_ensemble", "copernicus_era5_land"),
@@ -170,9 +219,7 @@ class GlobalConfig:
             "precipitation": (1, 8, 24, 72, 168, 720, 2160),
             "snowfall_water_equivalent": (1, 8, 24, 72, 168, 720, 2160),
             "soil_moisture_0_to_7cm": (1, 8, 24, 72, 168, 720, 2160),
-            "soil_moisture_7_to_28cm": (1, 8, 24, 72, 168, 720, 2160),
             "soil_temperature_0_to_7cm": (1, 8, 24, 72, 168, 720, 2160),
-            "soil_temperature_7_to_28cm": (1, 8, 24, 72, 168, 720, 2160),
             "temperature_2m": (1, 8, 24, 72, 168, 720, 2160),
             # Snapshots
             "snow_depth": (1,),
@@ -193,7 +240,6 @@ class GlobalConfig:
         "temperature_2m",
         "dew_point_2m",
         "soil_temperature_0_to_7cm",
-        "soil_temperature_7_to_28cm",
     )
     temporal_agg_by_variable: dict[str, str] = field(
         default_factory=lambda: {
@@ -204,9 +250,7 @@ class GlobalConfig:
             "dew_point_2m": "avg",
             "snow_depth": "avg",
             "soil_moisture_0_to_7cm": "avg",
-            "soil_moisture_7_to_28cm": "avg",
             "soil_temperature_0_to_7cm": "avg",
-            "soil_temperature_7_to_28cm": "avg",
             "temperature_2m": "avg",
         }
     )
@@ -219,6 +263,15 @@ class GlobalConfig:
             "copernicus_era5_ensemble": "lat_asc_lon_pm180",
         }
     )
+    # Temporal raster builder settings
+    temporal_raster_b2_dest: str = "wherewild-localdev-writer:wherewild-data/gis/temporal/rasters"
+    temporal_raster_upload_enabled: bool = True
+    temporal_raster_force_rebuild: bool = False
+    # Subset of VAR_CONFIGS keys to build; empty tuple = build all
+    temporal_raster_vars: tuple[str, ...] = ()
+    # Subset of window labels to build; empty tuple = build all
+    temporal_raster_windows: tuple[str, ...] = ()
+
     # Cap the number of occurrence rows per worklist batch to bound memory.
     # Set to 0 to disable batching (process all rows at once).
     temporal_worklist_batch_rows: int = 1_500_000
@@ -318,6 +371,7 @@ class GlobalConfig:
     @property
     def taxa_csv_path(self) -> Path:
         return self.species_dir / self.taxa_csv_filename
+
     @property
     def vernacular_tsv_path(self) -> Path:
         return self.data_root / self.vernacular_filename
@@ -375,6 +429,10 @@ class GlobalConfig:
         return self.data_root / "bioclim"
 
     @property
+    def models_root(self) -> Path:
+        return self.data_root / "models"
+
+    @property
     def temporal_cache_root(self) -> Path:
         return _resolve_env_path(
             "TEMPORAL_CACHE_ROOT",
@@ -391,16 +449,12 @@ class GlobalConfig:
 
     @property
     def rank_synonyms(self) -> dict[str, frozenset[str]]:
-        return {
-            key: frozenset(value.upper() for value in values)
-            for key, values in self._rank_synonyms.items()
-        }
+        return {key: frozenset(value.upper() for value in values) for key, values in self._rank_synonyms.items()}
 
     @property
     def location_columns(self) -> tuple[tuple[str, str], ...]:
         return tuple(
-            (self.location_level_columns[level], self.location_scope_by_level[level])
-            for level in self.location_levels
+            (self.location_level_columns[level], self.location_scope_by_level[level]) for level in self.location_levels
         )
 
     @property
@@ -409,10 +463,7 @@ class GlobalConfig:
 
     @property
     def occurrence_list_column_indices(self) -> dict[str, int]:
-        return {
-            col: self.occurrence_all_columns.index(col)
-            for col in self.occurrence_list_columns
-        }
+        return {col: self.occurrence_all_columns.index(col) for col in self.occurrence_list_columns}
 
 
 def load_config(name: str) -> Any:

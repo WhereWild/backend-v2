@@ -78,8 +78,20 @@ def test_catalog_layer_and_variable_metadata(stub_env):
     config, stub = stub_env
     catalog = {
         "categories": [
-            {"name": "physical", "display_name": "Physical", "layers": [{"id": "bio_1", "display_name": "Temp", "value_type": "numeric", "units": "C"}]},
-            {"name": "temporal", "display_name": "Temporal", "windows": [24], "layers": [{"id": "wind", "agg": "avg", "display_name": "Wind", "value_type": "numeric", "units": "m/s"}, {"id": "nowcast", "agg": "snapshot", "display_name": "Nowcast", "value_type": "categorical"}]},
+            {
+                "name": "physical",
+                "display_name": "Physical",
+                "layers": [{"id": "bio_1", "display_name": "Temp", "value_type": "numeric", "units": "C"}],
+            },
+            {
+                "name": "temporal",
+                "display_name": "Temporal",
+                "windows": [24],
+                "layers": [
+                    {"id": "wind", "agg": "avg", "display_name": "Wind", "value_type": "numeric", "units": "m/s"},
+                    {"id": "nowcast", "agg": "snapshot", "display_name": "Nowcast", "value_type": "categorical"},
+                ],
+            },
         ]
     }
     stub._files[config.gis_catalog_path] = json.dumps(catalog).encode("utf-8")
@@ -125,14 +137,25 @@ def test_metadata_skips_layers_without_id(stub_env):
     try:
         gis_lookup._expand_temporal_layers = lambda _category: [{"id": None}]  # type: ignore[assignment]
         assert gis_lookup.load_layer_metadata() == {"bio_1": {"id": "bio_1"}}
-        assert gis_lookup.load_variable_metadata()[1] == {"bio_1": {"id": "bio_1", "name": "bio_1", "units": None, "description": None, "value_type": None, "category": "physical"}}
+        assert gis_lookup.load_variable_metadata()[1] == {
+            "bio_1": {
+                "id": "bio_1",
+                "name": "bio_1",
+                "units": None,
+                "description": None,
+                "value_type": None,
+                "category": "physical",
+            }
+        }
     finally:
         gis_lookup._expand_temporal_layers = original_expand  # type: ignore[assignment]
 
 
 def test_temporal_registry_and_layer_ids_when_category_absent(stub_env):
     config, stub = stub_env
-    stub._files[config.gis_catalog_path] = json.dumps({"categories": [{"name": "other", "layers": [{"id": "x"}]}]}).encode("utf-8")
+    stub._files[config.gis_catalog_path] = json.dumps(
+        {"categories": [{"name": "other", "layers": [{"id": "x"}]}]}
+    ).encode("utf-8")
 
     assert gis_lookup.load_temporal_registry() == {"windows": [], "layers": []}
     assert gis_lookup.list_layer_ids() == ["x"]
@@ -163,11 +186,62 @@ def test_expand_temporal_layers_branches():
     assert [item["id"] for item in expanded] == ["a_avg_6h", "a_avg_12h", "b"]
 
 
+def test_parse_temporal_layer_id_helpers():
+    assert gis_lookup.parse_temporal_layer_id("temperature_2m_avg_24h") == (
+        "temperature_2m",
+        "avg",
+        24,
+    )
+    assert gis_lookup.parse_temporal_layer_id("precipitation_sum_168h") == (
+        "precipitation",
+        "sum",
+        168,
+    )
+    assert gis_lookup.parse_temporal_layer_id("weather_code_simple") is None
+    assert gis_lookup.is_temporal_layer_id("temperature_2m_avg_24h")
+    assert not gis_lookup.is_temporal_layer_id("weather_code_simple")
+
+
+def test_temporal_feature_names_from_config_requires_explicit_aggregation():
+    cfg = SimpleNamespace(
+        temporal_window_hours_by_variable={"precipitation": (24,)},
+        temporal_agg_by_variable={},
+        temporal_window_hours_default=(24,),
+    )
+
+    with pytest.raises(ValueError, match="precipitation"):
+        gis_lookup.temporal_feature_names_from_config(cfg)
+
+
+def test_temporal_feature_names_from_config_uses_configured_windows():
+    cfg = SimpleNamespace(
+        temporal_window_hours_by_variable={
+            "precipitation": (24,),
+            "temperature_2m": (1, 8),
+        },
+        temporal_agg_by_variable={
+            "precipitation": "sum",
+            "temperature_2m": "avg",
+        },
+        temporal_window_hours_default=(24,),
+    )
+
+    assert gis_lookup.temporal_feature_names_from_config(cfg) == [
+        "precipitation_sum_24h",
+        "temperature_2m_avg_1h",
+        "temperature_2m_avg_8h",
+        "vapor_pressure_deficit_avg_1h",
+        "vapor_pressure_deficit_avg_8h",
+    ]
+
+
 def test_load_layer_legend_and_preload(stub_env, monkeypatch):
     config, stub = stub_env
     config.gis_legends_root.mkdir(parents=True, exist_ok=True)
     legend_path = config.gis_legends_root / "landcover_legend.json"
-    stub._files[legend_path] = json.dumps({"classes": [{"id": 1, "name": "Warm Temperate"}, {"id": None, "name": "bad"}]}).encode("utf-8")
+    stub._files[legend_path] = json.dumps(
+        {"classes": [{"id": 1, "name": "Warm Temperate"}, {"id": None, "name": "bad"}]}
+    ).encode("utf-8")
 
     legend = gis_lookup.load_layer_legend("landcover")
     assert legend["1"]["name"] == "Warm Temperate"
@@ -289,7 +363,9 @@ def test_location_taxa_membership_and_location_taxa_for(stub_env):
     stub._exists[config.location_catalog_path] = True
     filtered = pa.table({"taxon_id": ["1", "2", "x"]})
     empty = pa.table({"taxon_id": []})
-    stub._read_table = lambda _path, **kwargs: filtered if kwargs.get("filters") else pa.table({"scope": ["country_scope"], "gid": ["USA"], "taxon_id": [5]})
+    stub._read_table = lambda _path, **kwargs: (
+        filtered if kwargs.get("filters") else pa.table({"scope": ["country_scope"], "gid": ["USA"], "taxon_id": [5]})
+    )
     gis_lookup.location_taxa_for.cache_clear()
     assert gis_lookup.location_taxa_for("country_scope", "USA") == frozenset({1, 2})
     assert gis_lookup.location_taxa_for("", "USA") == frozenset()
@@ -424,7 +500,9 @@ def test_region_and_cog_path_helpers(stub_env, monkeypatch):
     with pytest.raises(KeyError):
         gis_lookup.get_cog_path("bio_1", 0, 0)
 
-    monkeypatch.setattr(gis_lookup, "_get_layer", lambda _layer_id: {"region_root": "regions", "filename_template": "{id}.tif"})
+    monkeypatch.setattr(
+        gis_lookup, "_get_layer", lambda _layer_id: {"region_root": "regions", "filename_template": "{id}.tif"}
+    )
     expected = config.gis_root / "regions" / "lat0_lon0" / "bio_1.tif"
     assert gis_lookup.get_cog_path("bio_1", 0.4, 0.2) == expected
 
@@ -530,6 +608,7 @@ def test_location_taxon_counts_remaining_branches(monkeypatch):
     assert gis_lookup.location_taxon_counts("country_scope", "USA") == {1: 1}
 
     from util import taxa_navigation
+
     monkeypatch.setattr(taxa_navigation, "get_taxon_by_id", lambda _k: None)
     gis_lookup.location_taxon_counts.cache_clear()
     assert gis_lookup.location_taxon_counts("country_scope", "USA", include_species_rollup=True) == {1: 1}
@@ -552,7 +631,9 @@ def test_get_layer_tile_info_success_and_errors(stub_env, monkeypatch, tmp_path)
     sample_path = regions / "lat0_lon0" / "bio_1.tif"
     sample_path.write_bytes(b"x")
 
-    monkeypatch.setattr(gis_lookup, "_get_layer", lambda _layer_id: {"region_root": "regions", "filename_template": "{id}.tif"})
+    monkeypatch.setattr(
+        gis_lookup, "_get_layer", lambda _layer_id: {"region_root": "regions", "filename_template": "{id}.tif"}
+    )
 
     class _Dataset:
         bounds = SimpleNamespace(top=10, bottom=0, right=20, left=0)
@@ -577,12 +658,16 @@ def test_get_layer_tile_info_success_and_errors(stub_env, monkeypatch, tmp_path)
         gis_lookup.get_layer_tile_info("bio_1")
 
     gis_lookup.get_layer_tile_info.cache_clear()
-    monkeypatch.setattr(gis_lookup, "_get_layer", lambda _layer_id: {"region_root": "empty", "filename_template": "{id}.tif"})
+    monkeypatch.setattr(
+        gis_lookup, "_get_layer", lambda _layer_id: {"region_root": "empty", "filename_template": "{id}.tif"}
+    )
     (config.gis_root / "empty").mkdir(parents=True, exist_ok=True)
     with pytest.raises(FileNotFoundError):
         gis_lookup.get_layer_tile_info("bio_1")
 
     gis_lookup.get_layer_tile_info.cache_clear()
-    monkeypatch.setattr(gis_lookup, "_get_layer", lambda _layer_id: {"region_root": "regions", "filename_template": "{id}.missing"})
+    monkeypatch.setattr(
+        gis_lookup, "_get_layer", lambda _layer_id: {"region_root": "regions", "filename_template": "{id}.missing"}
+    )
     with pytest.raises(FileNotFoundError):
         gis_lookup.get_layer_tile_info("bio_1")

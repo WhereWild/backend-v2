@@ -264,7 +264,7 @@ class GlobalConfig:
         }
     )
     # Temporal raster builder settings
-    temporal_raster_b2_dest: str = "wherewild-localdev-writer:wherewild-data/gis/temporal/rasters"
+    temporal_raster_b2_dest: str = "wherewild-localdev-writer:wherewild-data/data/gis/temporal/rasters"
     temporal_raster_upload_enabled: bool = True
     temporal_raster_force_rebuild: bool = False
     # Subset of VAR_CONFIGS keys to build; empty tuple = build all

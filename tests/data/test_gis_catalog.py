@@ -52,7 +52,7 @@ def test_catalog_each_layer_has_id(all_layers):
 
 
 def test_catalog_each_layer_has_value_type(all_layers):
-    known_types = {"numeric", "categorical"}
+    known_types = {"numeric", "categorical", "circular"}
     for layer in all_layers:
         vtype = (layer.get("value_type") or "").lower()
         assert vtype in known_types, (
@@ -83,7 +83,7 @@ def test_variable_metadata_each_has_name(variables_map):
 
 
 def test_variable_metadata_each_has_value_type(variables_map):
-    known = {"numeric", "categorical"}
+    known = {"numeric", "categorical", "circular"}
     for var_id, entry in variables_map.items():
         vtype = (entry.get("value_type") or "").lower()
         assert vtype in known, f"Variable '{var_id}' has unknown value_type '{vtype}'"

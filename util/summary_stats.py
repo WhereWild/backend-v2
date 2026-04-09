@@ -69,6 +69,66 @@ def _layer_value_type(layer_id: str) -> str | None:
     return None
 
 
+def _is_circular_variable(layer_id: str) -> bool:
+    return _layer_value_type(layer_id) == "circular"
+
+
+def _empty_numeric_summary() -> dict[str, Any]:
+    return {
+        "count": 0,
+        "min": None,
+        "1st percentile": None,
+        "10th percentile": None,
+        "25th percentile": None,
+        "median": None,
+        "75th percentile": None,
+        "90th percentile": None,
+        "99th percentile": None,
+        "max": None,
+        "mean": None,
+        "std": None,
+        "interquartile range": None,
+        "10-90 range": None,
+        "1-99 range": None,
+        "range": None,
+    }
+
+
+def _wrap_degrees(value: float) -> float:
+    wrapped = float(value) % 360.0
+    if math.isclose(wrapped, 360.0):
+        return 0.0
+    if math.isclose(wrapped, -0.0):
+        return 0.0
+    return wrapped
+
+
+def _storage_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "count",
+        "min",
+        "10th percentile",
+        "25th percentile",
+        "median",
+        "75th percentile",
+        "90th percentile",
+        "max",
+        "mean",
+        "std",
+        "10-90 range",
+        "range",
+    )
+    return {key: summary.get(key) for key in keys}
+
+
+def summarize_layer_values(layer_id: str, values: Sequence[float]) -> dict[str, Any]:
+    return summarize_values(values, circular=_is_circular_variable(layer_id))
+
+
+def summarize_layer_values_for_storage(layer_id: str, values: Sequence[float]) -> dict[str, Any]:
+    return _storage_summary(summarize_layer_values(layer_id, values))
+
+
 def _legend_for_layer(layer_id: str) -> Dict[int, str]:
     """Loads a categorical legend mapping for a layer id.
     
@@ -936,12 +996,13 @@ def build_categorical_samples(
     return samples
 
 
-def summarize_values(values: Sequence[float]) -> dict[str, Any]:
+def summarize_values(values: Sequence[float], *, circular: bool = False) -> dict[str, Any]:
     """Summarizes numeric values using the same metrics as saved summary stats.
-    
+
     Args:
         values: Numeric values to summarize.
-    
+        circular: Whether values should be treated as wrapped degrees on [0, 360).
+
     Returns:
         A summary dict with count, percentiles, mean, std, and range metrics.
     """
@@ -949,23 +1010,38 @@ def summarize_values(values: Sequence[float]) -> dict[str, Any]:
     array = array[np.isfinite(array)]
     count = int(array.size)
     if count == 0:
+        return _empty_numeric_summary()
+    if circular:
+        normalized = np.mod(array, 360.0)
+        radians = np.deg2rad(normalized)
+        sin_mean = float(np.sin(radians).mean())
+        cos_mean = float(np.cos(radians).mean())
+        mean_angle = _wrap_degrees(np.degrees(np.arctan2(sin_mean, cos_mean)))
+        shifted = ((normalized - mean_angle + 180.0) % 360.0) - 180.0
+        q1, q10, q25, q50, q75, q90, q99 = np.percentile(shifted, [1, 10, 25, 50, 75, 90, 99])
+        min_shift = float(shifted.min())
+        max_shift = float(shifted.max())
+        resultant = float(math.hypot(sin_mean, cos_mean))
+        std_val = None
+        if resultant > 0.0 and math.isfinite(resultant):
+            std_val = float(np.degrees(math.sqrt(max(0.0, -2.0 * math.log(resultant)))))
         return {
-            "count": 0,
-            "min": None,
-            "1st percentile": None,
-            "10th percentile": None,
-            "25th percentile": None,
-            "median": None,
-            "75th percentile": None,
-            "90th percentile": None,
-            "99th percentile": None,
-            "max": None,
-            "mean": None,
-            "std": None,
-            "interquartile range": None,
-            "10-90 range": None,
-            "1-99 range": None,
-            "range": None,
+            "count": count,
+            "min": _wrap_degrees(mean_angle + min_shift),
+            "1st percentile": _wrap_degrees(mean_angle + float(q1)),
+            "10th percentile": _wrap_degrees(mean_angle + float(q10)),
+            "25th percentile": _wrap_degrees(mean_angle + float(q25)),
+            "median": _wrap_degrees(mean_angle + float(q50)),
+            "75th percentile": _wrap_degrees(mean_angle + float(q75)),
+            "90th percentile": _wrap_degrees(mean_angle + float(q90)),
+            "99th percentile": _wrap_degrees(mean_angle + float(q99)),
+            "max": _wrap_degrees(mean_angle + max_shift),
+            "mean": mean_angle,
+            "std": std_val,
+            "interquartile range": float(q75 - q25),
+            "10-90 range": float(q90 - q10),
+            "1-99 range": float(q99 - q1),
+            "range": float(max_shift - min_shift),
         }
     q1, q10, q25, q50, q75, q90, q99 = np.percentile(array, [1, 10, 25, 50, 75, 90, 99])
     min_val = float(array.min())
@@ -1443,29 +1519,9 @@ def _numeric_column_stats_exact(
     if not numeric_cols:
         return {}
 
-    df_numeric = df[numeric_cols]
-    desc = df_numeric.describe(percentiles=[0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99])
-
     stats: Dict[str, Dict[str, float]] = {}
     for col in numeric_cols:
-        q10 = desc.at["10%", col]
-        q25 = desc.at["25%", col]
-        q75 = desc.at["75%", col]
-        q90 = desc.at["90%", col]
-        stats[col] = {
-            "count": int(desc.at["count", col]),
-            "min": float(desc.at["min", col]),
-            "10th percentile": float(q10),
-            "25th percentile": float(q25),
-            "median": float(desc.at["50%", col]),
-            "75th percentile": float(q75),
-            "90th percentile": float(q90),
-            "max": float(desc.at["max", col]),
-            "mean": float(desc.at["mean", col]),
-            "std": float(desc.at["std", col]),
-            "10-90 range": float(q90 - q10),
-            "range": float(desc.at["max", col] - desc.at["min", col]),
-        }
+        stats[col] = summarize_layer_values_for_storage(col, df[col].tolist())
 
     _write_summary_stats(parquet_path.parent, stats, merge_existing=True)
     return stats
@@ -1480,6 +1536,7 @@ def _numeric_column_stats_streaming(
     categorical_counts: Dict[str, Counter] = defaultdict(Counter)
     categorical_totals: Dict[str, int] = defaultdict(int)
     numeric_stats: Dict[str, Dict[str, Any]] = {}
+    circular_values: Dict[str, list[float]] = defaultdict(list)
 
     tables_seen = False
     for table in _iter_descendant_tables(parquet_path):
@@ -1515,6 +1572,12 @@ def _numeric_column_stats_streaming(
         if existing_numeric:
             numeric_cols = [col for col in numeric_cols if col not in existing_numeric]
         for column in numeric_cols:
+            if _is_circular_variable(column):
+                values = pd.to_numeric(df[column], errors="coerce").to_numpy()
+                values = values[np.isfinite(values)]
+                if values.size:
+                    circular_values[column].extend(values.astype(float).tolist())
+                continue
             stats_entry = numeric_stats.get(column)
             if stats_entry is None:
                 stats_entry = _init_streaming_stats()
@@ -1562,6 +1625,11 @@ def _numeric_column_stats_streaming(
             "10-90 range": float(q90 - q10),
             "range": float(max_value - min_value),
         }
+
+    for column, values in circular_values.items():
+        if not values:
+            continue
+        stats[column] = summarize_layer_values_for_storage(column, values)
 
     _write_summary_stats(parquet_path.parent, stats, merge_existing=True)
     return stats

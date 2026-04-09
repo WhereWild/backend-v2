@@ -64,7 +64,7 @@
         { "id": "elevation", "code": "ELEVATION", "display_name": "Elevation", "units": "m", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif", "value_type": "numeric" },
         { "id": "slope", "code": "SLOPE", "display_name": "Slope", "units": "degrees", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif", "value_type": "numeric", "derived": true },
         { "id": "aspect", "code": "ASPECT", "display_name": "Aspect (binned)", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif", "value_type": "categorical", "derived": true },
-        { "id": "aspect_deg", "code": "ASPECT_DEG", "display_name": "Aspect", "units": "degrees", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif", "value_type": "numeric", "derived": true },
+        { "id": "aspect_deg", "code": "ASPECT_DEG", "display_name": "Aspect", "units": "degrees", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif", "value_type": "circular", "derived": true },
         { "id": "landform", "code": "LANDFORM", "display_name": "Landform Classes", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "landform.tif", "value_type": "categorical" }
       ]
     },

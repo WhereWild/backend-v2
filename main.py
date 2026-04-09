@@ -98,7 +98,7 @@ def _map_enabled_variables() -> frozenset[str]:
         if is_derived and layer_id not in derived_tile_variables:
             continue
         value_type = str(meta.get("value_type") or "").strip().lower()
-        if value_type not in {"numeric", "categorical"}:
+        if value_type not in {"numeric", "categorical", "circular"}:
             continue
         region_root = str(meta.get("region_root") or "").strip()
         filename_template = str(meta.get("filename_template") or "").strip()
@@ -1265,12 +1265,13 @@ def species_environment_stats(
         return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
     if not location_gid:
-        summary = summary_stats.load_numeric_summary(str(taxon_dir), variable_id)
-        if variable_id == "aspect_deg":
+        if value_type == "circular":
             _samples = summary_stats.gather_numeric_records(taxon_id, taxon_dir, variable_id)
             _values = [s["value"] for s in _samples]
+            summary = summary_stats.summarize_values(_values, circular=True) if _values else None
             density_curve = indexing.build_density_curve(_values, point_count=density_points, circular=True) if _values else None
         else:
+            summary = summary_stats.load_numeric_summary(str(taxon_dir), variable_id)
             density_curve = summary_stats.load_density_graph(str(taxon_dir), variable_id)
         if not summary or not density_curve:
             raise HTTPException(
@@ -1330,8 +1331,8 @@ def species_environment_stats(
             status_code=404,
             detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}'.",
         )
-    summary = summary_stats.summarize_values(values)
-    density_curve = indexing.build_density_curve(values, point_count=density_points, circular=(variable_id == "aspect_deg"))
+    summary = summary_stats.summarize_values(values, circular=(value_type == "circular"))
+    density_curve = indexing.build_density_curve(values, point_count=density_points, circular=(value_type == "circular"))
     ranks = []
     print(
         f"[timing][env] taxon_id={taxon_id} variable={variable_id} "
@@ -1803,15 +1804,16 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
         raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}") from exc
 
     print("Finished converting file to parquet, normalizing fields...")
-
     df = custom_upload_processing._normalize_coordinate_columns(df)
     df = custom_upload_processing._ensure_catalog_numbers(df)
+    df = custom_upload_processing._ensure_observation_names(df)
+    df = custom_upload_processing._build_internal_upload_dataframe(df)
     print("Finished normalizing fields. adding tileID...")
     df = custom_upload_processing._add_tile_ids(df)
-    print("Finished adding tileID, adding columns for GIS data, building parquet files")
+    print("Finished adding tileID, adding columns for GIS data, building parquet files...")
     df = custom_upload_processing._add_gis_columns(df)
 
-    archive_path, out_name, work_dir = custom_upload_processing._build_index_archive(df, filename)
+    archive_path, out_name, work_dir = custom_upload_processing._build_index_archive(df)
 
     background_tasks.add_task(shutil.rmtree, work_dir, True)
 

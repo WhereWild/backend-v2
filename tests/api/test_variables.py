@@ -26,7 +26,7 @@ def test_variables_each_has_required_fields(client):
 
 def test_variables_value_types_are_known(client):
     body = client.get("/variables").json()
-    known_types = {"numeric", "categorical"}
+    known_types = {"numeric", "categorical", "circular"}
     for var in body:
         vtype = (var.get("value_type") or "").lower()
         assert vtype in known_types, f"Unexpected value_type '{vtype}' for {var.get('id')}"

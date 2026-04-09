@@ -1,4 +1,5 @@
 """Tests for GET /species/{taxon_id}/environment/{variable_id} and sample sub-endpoints"""
+
 import pytest
 from fastapi import HTTPException
 
@@ -8,6 +9,7 @@ import main
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _env_url(taxon_id, variable_id, **params):
     base = f"/species/{taxon_id}/environment/{variable_id}"
@@ -21,6 +23,7 @@ def _env_url(taxon_id, variable_id, **params):
 # /species/{taxon_id}/environment/{variable_id} — numeric variable
 # ---------------------------------------------------------------------------
 
+
 def test_env_numeric_returns_200(client, known_taxon_id, known_numeric_var):
     r = client.get(_env_url(known_taxon_id, known_numeric_var))
     assert r.status_code == 200
@@ -29,8 +32,12 @@ def test_env_numeric_returns_200(client, known_taxon_id, known_numeric_var):
 def test_env_numeric_top_level_fields(client, known_taxon_id, known_numeric_var):
     body = client.get(_env_url(known_taxon_id, known_numeric_var)).json()
     required = {
-        "speciesId", "variable", "variableName", "variableType",
-        "summary", "densityCurve",
+        "speciesId",
+        "variable",
+        "variableName",
+        "variableType",
+        "summary",
+        "densityCurve",
     }
     missing = required - body.keys()
     assert not missing, f"Response missing fields: {missing}"
@@ -87,6 +94,7 @@ def test_env_numeric_unit_system_imperial(client, known_taxon_id, known_numeric_
 # /species/{taxon_id}/environment/{variable_id} — categorical variable
 # ---------------------------------------------------------------------------
 
+
 def test_env_categorical_returns_200(client, known_taxon_id, known_categorical_var):
     r = client.get(_env_url(known_taxon_id, known_categorical_var))
     assert r.status_code == 200
@@ -113,6 +121,7 @@ def test_env_categorical_density_curve_is_none(client, known_taxon_id, known_cat
 # Error cases
 # ---------------------------------------------------------------------------
 
+
 def test_env_invalid_variable_returns_404(client, known_taxon_id):
     r = client.get(_env_url(known_taxon_id, "not_a_real_variable"))
     assert r.status_code == 404
@@ -127,33 +136,26 @@ def test_env_invalid_taxon_returns_404(client, known_numeric_var):
 # /species/{taxon_id}/environment/{variable_id}/slice
 # ---------------------------------------------------------------------------
 
+
 def test_env_slice_returns_200(client, known_taxon_id, known_numeric_var):
-    r = client.get(
-        f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=-10&max=25"
-    )
+    r = client.get(f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=-10&max=25")
     assert r.status_code == 200
 
 
 def test_env_slice_shape(client, known_taxon_id, known_numeric_var):
-    body = client.get(
-        f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=-10&max=25"
-    ).json()
+    body = client.get(f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=-10&max=25").json()
     required = {"speciesId", "variable", "range", "count", "observations"}
     missing = required - body.keys()
     assert not missing, f"Slice response missing fields: {missing}"
 
 
 def test_env_slice_count_matches_observations(client, known_taxon_id, known_numeric_var):
-    body = client.get(
-        f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=-10&max=25"
-    ).json()
+    body = client.get(f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=-10&max=25").json()
     assert body["count"] == len(body["observations"])
 
 
 def test_env_slice_observation_fields(client, known_taxon_id, known_numeric_var):
-    body = client.get(
-        f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=-10&max=25"
-    ).json()
+    body = client.get(f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=-10&max=25").json()
     required = {"catalogNumber", "latitude", "longitude", "value"}
     for obs in body["observations"][:20]:
         missing = required - obs.keys()
@@ -162,9 +164,7 @@ def test_env_slice_observation_fields(client, known_taxon_id, known_numeric_var)
 
 def test_env_slice_values_within_range(client, known_taxon_id, known_numeric_var):
     mn, mx = -10.0, 25.0
-    body = client.get(
-        f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min={mn}&max={mx}"
-    ).json()
+    body = client.get(f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min={mn}&max={mx}").json()
     for obs in body["observations"]:
         v = obs["value"]
         assert mn <= v <= mx, f"Observation value {v} outside requested range [{mn}, {mx}]"
@@ -176,9 +176,7 @@ def test_env_slice_missing_min_returns_422(client, known_taxon_id, known_numeric
 
 
 def test_env_slice_categorical_variable_returns_400(client, known_taxon_id, known_categorical_var):
-    r = client.get(
-        f"/species/{known_taxon_id}/environment/{known_categorical_var}/slice?min=0&max=10"
-    )
+    r = client.get(f"/species/{known_taxon_id}/environment/{known_categorical_var}/slice?min=0&max=10")
     assert r.status_code == 400
 
 
@@ -202,9 +200,7 @@ def test_env_slice_non_finite_max_returns_400(client, known_taxon_id, known_nume
 
 def test_env_slice_swapped_min_max_auto_corrects(client, known_taxon_id, known_numeric_var):
     """Swapped min/max are auto-corrected (line 842). Should return 200, not error."""
-    r = client.get(
-        f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=25&max=-10"
-    )
+    r = client.get(f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=25&max=-10")
     assert r.status_code == 200
     body = r.json()
     assert body["range"]["min"] <= body["range"]["max"]
@@ -213,10 +209,99 @@ def test_env_slice_swapped_min_max_auto_corrects(client, known_taxon_id, known_n
 def test_env_slice_with_unit_system_imperial(client, known_taxon_id, known_numeric_var):
     """unit_system param triggers value conversion (lines 853-854)."""
     r = client.get(
-        f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice"
-        f"?min=-10&max=25&unit_system=imperial"
+        f"/species/{known_taxon_id}/environment/{known_numeric_var}/slice?min=-10&max=25&unit_system=imperial"
     )
     assert r.status_code == 200
+
+
+def test_variable_tiles_accept_circular_aspect_deg(client, monkeypatch):
+    monkeypatch.setattr(
+        main.gis_lookup,
+        "load_layer_metadata",
+        lambda: {
+            "aspect_deg": {
+                "value_type": "circular",
+                "derived": True,
+                "region_root": "regions",
+                "filename_template": "dem.tif",
+            }
+        },
+    )
+    monkeypatch.setattr(main.tiles, "render_variable_tile_bytes", lambda **_kwargs: b"png")
+    main._map_enabled_variables.cache_clear()
+
+    try:
+        response = client.get("/api/variables/aspect_deg/tiles/1/0/0.png")
+    finally:
+        main._map_enabled_variables.cache_clear()
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content == b"png"
+
+
+def test_env_circular_with_location_uses_circular_summary(client, monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        main.gis_lookup,
+        "load_variable_metadata",
+        lambda: (
+            [],
+            {
+                "aspect_deg": {
+                    "name": "Aspect",
+                    "units": "degrees",
+                    "value_type": "circular",
+                }
+            },
+        ),
+    )
+    monkeypatch.setattr(main.taxa_navigation, "get_taxon_by_id", lambda _taxon_id: {"path": "/tmp/fake-taxon"})
+    monkeypatch.setattr(main, "_path_exists", lambda _path: True)
+    monkeypatch.setattr(
+        main.summary_stats,
+        "gather_numeric_records",
+        lambda *_args, **_kwargs: [{"value": 359.0}, {"value": 1.0}],
+    )
+
+    def _fake_summarize(values, *, circular=False):
+        captured["summary_circular"] = circular
+        return {
+            "count": len(values),
+            "min": 359.0,
+            "1st percentile": 359.02,
+            "10th percentile": 359.2,
+            "25th percentile": 359.5,
+            "median": 0.0,
+            "75th percentile": 0.5,
+            "90th percentile": 0.8,
+            "99th percentile": 0.98,
+            "max": 1.0,
+            "mean": 0.0,
+            "std": 1.0,
+            "interquartile range": 1.0,
+            "10-90 range": 1.6,
+            "1-99 range": 1.96,
+            "range": 2.0,
+        }
+
+    def _fake_density(values, *, point_count, circular=False):
+        captured["density_circular"] = circular
+        return {"points": [0.0], "density": [1.0], "min": 0.0, "max": 360.0, "bandwidth": 1.0}
+
+    monkeypatch.setattr(main.summary_stats, "summarize_values", _fake_summarize)
+    monkeypatch.setattr(main.indexing, "build_density_curve", _fake_density)
+    monkeypatch.setattr(main.units, "apply_unit_system_to_env_response", lambda response, *_args: response)
+
+    response = client.get(_env_url(123, "aspect_deg", location="gadm.1"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["variableType"] == "circular"
+    assert body["summary"]["mean"] == pytest.approx(0.0)
+    assert captured["summary_circular"] is True
+    assert captured["density_circular"] is True
 
 
 def test_env_slice_with_location(client, known_taxon_id, known_numeric_var, known_species_location_gid):
@@ -235,6 +320,7 @@ def test_env_slice_with_location(client, known_taxon_id, known_numeric_var, know
 # /species/{taxon_id}/environment/{variable_id} — with location filter
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.slow
 def test_env_categorical_with_location(client, known_taxon_id, known_categorical_var, known_species_location_gid):
     """Categorical env with location calls build_categorical_stats_for_location (lines 544-558)."""
@@ -246,11 +332,11 @@ def test_env_categorical_with_location(client, known_taxon_id, known_categorical
 
 
 @pytest.mark.slow
-def test_env_categorical_with_location_has_baseline(client, known_taxon_id, known_categorical_var, known_species_location_gid):
+def test_env_categorical_with_location_has_baseline(
+    client, known_taxon_id, known_categorical_var, known_species_location_gid
+):
     """When location filter is used, baseline distribution is loaded (lines 573-576)."""
-    body = client.get(
-        _env_url(known_taxon_id, known_categorical_var, location=known_species_location_gid)
-    ).json()
+    body = client.get(_env_url(known_taxon_id, known_categorical_var, location=known_species_location_gid)).json()
     # baseline fields are always present in response (may be empty if no baseline data)
     assert "baselineCategoricalDistribution" in body
     assert "baselineCategoricalTotals" in body
@@ -270,9 +356,7 @@ def test_env_numeric_with_location(client, known_taxon_id, known_numeric_var, kn
 
 def test_env_numeric_with_location_has_baseline(client, known_taxon_id, known_numeric_var, known_species_location_gid):
     """When location filter is used, baseline summary is computed (line 696)."""
-    body = client.get(
-        _env_url(known_taxon_id, known_numeric_var, location=known_species_location_gid)
-    ).json()
+    body = client.get(_env_url(known_taxon_id, known_numeric_var, location=known_species_location_gid)).json()
     # baselineSummary may be populated if baseline data exists
     assert "baselineSummary" in body
 
@@ -293,6 +377,7 @@ def test_env_numeric_with_empty_location_returns_404(client, known_taxon_id, kno
 # ---------------------------------------------------------------------------
 # /species/{taxon_id}/environment/{variable_id}/class/{class_value}/samples
 # ---------------------------------------------------------------------------
+
 
 def _class_url(taxon_id, variable_id, class_value, **params):
     base = f"/species/{taxon_id}/environment/{variable_id}/class/{class_value}/samples"
@@ -316,7 +401,9 @@ def test_env_class_samples_response_shape(client, known_taxon_id, known_categori
     assert not missing, f"class_samples response missing fields: {missing}"
 
 
-def test_env_class_samples_count_matches_observations(client, known_taxon_id, known_categorical_var, known_categorical_class_value):
+def test_env_class_samples_count_matches_observations(
+    client, known_taxon_id, known_categorical_var, known_categorical_class_value
+):
     body = client.get(_class_url(known_taxon_id, known_categorical_var, known_categorical_class_value)).json()
     assert body["count"] == len(body["observations"])
 
@@ -344,12 +431,18 @@ def test_env_class_samples_with_limit(client, known_taxon_id, known_categorical_
     assert len(body["observations"]) <= 2
 
 
-def test_env_class_samples_with_location(client, known_taxon_id, known_categorical_var, known_categorical_class_value, known_species_location_gid):
+def test_env_class_samples_with_location(
+    client, known_taxon_id, known_categorical_var, known_categorical_class_value, known_species_location_gid
+):
     """location filter calls categorical_class_samples_for_location (lines 773-780)."""
-    r = client.get(_class_url(
-        known_taxon_id, known_categorical_var, known_categorical_class_value,
-        location=known_species_location_gid,
-    ))
+    r = client.get(
+        _class_url(
+            known_taxon_id,
+            known_categorical_var,
+            known_categorical_class_value,
+            location=known_species_location_gid,
+        )
+    )
     assert r.status_code == 200
     body = r.json()
     assert "observations" in body
@@ -414,18 +507,24 @@ def test_slice_not_found_and_passthrough_errors(monkeypatch):
 
     monkeypatch.setattr(main.taxa_navigation, "get_taxon_by_id", lambda _tid: None)
     with pytest.raises(HTTPException) as exc1:
-        main.species_environment_slice(1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None)
+        main.species_environment_slice(
+            1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None
+        )
     assert exc1.value.status_code == 404
 
     monkeypatch.setattr(main.taxa_navigation, "get_taxon_by_id", lambda _tid: {"path": "/tmp/ok", "taxon_key": "1"})
     monkeypatch.setattr(main, "_path_exists", lambda p: not str(p).endswith("occurrence_index.parquet"))
     with pytest.raises(HTTPException) as exc2:
-        main.species_environment_slice(1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None)
+        main.species_environment_slice(
+            1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None
+        )
     assert exc2.value.status_code == 404
 
     monkeypatch.setattr(main, "_path_exists", lambda p: str(p) != "/tmp/ok")
     with pytest.raises(HTTPException) as exc_taxon_path:
-        main.species_environment_slice(1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None)
+        main.species_environment_slice(
+            1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None
+        )
     assert exc_taxon_path.value.status_code == 404
 
     monkeypatch.setattr(main, "_path_exists", lambda _p: True)
@@ -435,7 +534,9 @@ def test_slice_not_found_and_passthrough_errors(monkeypatch):
         lambda *_a, **_k: (_ for _ in ()).throw(FileNotFoundError("missing file")),
     )
     with pytest.raises(HTTPException) as exc3:
-        main.species_environment_slice(1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None)
+        main.species_environment_slice(
+            1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None
+        )
     assert exc3.value.status_code == 404
 
     monkeypatch.setattr(
@@ -444,5 +545,7 @@ def test_slice_not_found_and_passthrough_errors(monkeypatch):
         lambda *_a, **_k: (_ for _ in ()).throw(ValueError("bad value")),
     )
     with pytest.raises(HTTPException) as exc4:
-        main.species_environment_slice(1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None)
+        main.species_environment_slice(
+            1, "bio_1", min_value=0, max_value=1, limit=None, location=None, unit_system=None
+        )
     assert exc4.value.status_code == 400

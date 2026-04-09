@@ -66,9 +66,7 @@ def stub_env(monkeypatch, tmp_path):
 
 
 def _make_index_table():
-    struct_type = pa.struct(
-        [("catalogNumber", pa.string()), ("originId", pa.int64()), ("value", pa.float64())]
-    )
+    struct_type = pa.struct([("catalogNumber", pa.string()), ("originId", pa.int64()), ("value", pa.float64())])
     arr = pa.array(
         [
             {"catalogNumber": "a", "originId": 1, "value": 1.0},
@@ -78,7 +76,9 @@ def _make_index_table():
         type=struct_type,
     )
     meta = {
-        b"origin_map": json.dumps([{"id": 1, "relative_path": "one"}, {"id": 2, "relative_path": "two"}]).encode("utf-8"),
+        b"origin_map": json.dumps([{"id": 1, "relative_path": "one"}, {"id": 2, "relative_path": "two"}]).encode(
+            "utf-8"
+        ),
         b"catalog_column": b"catalogNumber",
         b"category_offsets": json.dumps({"bio_1": {"1": {"start": 0, "count": 2}}}).encode("utf-8"),
     }
@@ -89,7 +89,11 @@ def _make_index_table():
 def test_small_helpers_and_metadata_access(stub_env, monkeypatch):
     cfg, stub = stub_env
     monkeypatch.setattr(ss.gis_lookup, "load_layer_metadata", lambda: {"bio_1": {"value_type": "Numeric"}})
-    monkeypatch.setattr(ss.gis_lookup, "load_layer_legend", lambda _id: {"1": {"id": 1, "name": "Forest"}, "x": "bad", "2": {"id": "bad", "name": "Skip"}})
+    monkeypatch.setattr(
+        ss.gis_lookup,
+        "load_layer_legend",
+        lambda _id: {"1": {"id": 1, "name": "Forest"}, "x": "bad", "2": {"id": "bad", "name": "Skip"}},
+    )
     assert ss._layer_value_type("bio_1") == "numeric"
     assert ss._layer_value_type("missing") is None
     assert ss._legend_for_layer("bio_1") == {1: "Forest"}
@@ -182,7 +186,11 @@ def test_distribution_and_categorical_builders(stub_env, monkeypatch, tmp_path):
             "value": ["0.7", "10.0", "1.0", "x"],
         }
     )
-    monkeypatch.setattr(ss.gis_lookup, "load_layer_legend", lambda _id: {"1": {"id": 1, "name": "Forest", "description": "desc"}, "class 1": {"id": 1, "name": "Forest"}})
+    monkeypatch.setattr(
+        ss.gis_lookup,
+        "load_layer_legend",
+        lambda _id: {"1": {"id": 1, "name": "Forest", "description": "desc"}, "class 1": {"id": 1, "name": "Forest"}},
+    )
     dist = ss.load_categorical_distribution(data_dir, "koppen")
     assert dist["distribution"][0]["class_name"] == "Forest"
     assert dist["distribution"][0]["count"] == 7
@@ -207,7 +215,20 @@ def test_numeric_summary_and_loading_helpers(stub_env, monkeypatch, tmp_path):
     assert summary["mean"] == pytest.approx(2.0)
     assert ss.summarize_values([])["count"] == 0
 
-    out = ss._density_point_count(0), ss._density_point_count(10), ss._density_point_count(100), ss._density_point_count(1000)
+    circular = ss.summarize_values([359.0, 1.0], circular=True)
+    assert circular["count"] == 2
+    assert circular["mean"] == pytest.approx(0.0)
+    assert circular["median"] == pytest.approx(0.0)
+    assert circular["range"] == pytest.approx(2.0)
+    assert circular["10th percentile"] > 350.0
+    assert circular["90th percentile"] < 10.0
+
+    out = (
+        ss._density_point_count(0),
+        ss._density_point_count(10),
+        ss._density_point_count(100),
+        ss._density_point_count(1000),
+    )
     assert out == (0, 10, 64, 128)
     assert ss._build_density_curve([], 10) is None
     assert ss._build_density_curve([1.0, 1.0], 8)["points"]
@@ -227,7 +248,13 @@ def test_numeric_summary_and_loading_helpers(stub_env, monkeypatch, tmp_path):
     samples = ss.read_numeric_from_parquet(p, "bio_1")
     assert samples == [{"catalog_id": "a", "value": 1.5, "latitude": 1.0, "longitude": 3.0}]
 
-    monkeypatch.setattr(ss.taxa_navigation, "iter_filtered_occurrence_tables", lambda *_a, **_k: [pa.table({"catalogNumber": ["a"], "decimalLatitude": [1.0], "decimalLongitude": [2.0], "bio_1": [4.0]})])
+    monkeypatch.setattr(
+        ss.taxa_navigation,
+        "iter_filtered_occurrence_tables",
+        lambda *_a, **_k: [
+            pa.table({"catalogNumber": ["a"], "decimalLatitude": [1.0], "decimalLongitude": [2.0], "bio_1": [4.0]})
+        ],
+    )
     gathered = ss.gather_numeric_records_from_tables(1, "bio_1", None)
     assert gathered[0]["value"] == 4.0
 
@@ -409,7 +436,11 @@ def test_density_graph_and_loaders_edge_cases(stub_env, monkeypatch, tmp_path, c
     _cfg, stub = stub_env
     d = tmp_path / "d"
     d.mkdir()
-    monkeypatch.setattr(ss, "_iter_descendant_tables", lambda _p: [pa.table({"obscured": ["No"], "coordinateUncertaintyInMeters": [1], "x": [1.0]})])
+    monkeypatch.setattr(
+        ss,
+        "_iter_descendant_tables",
+        lambda _p: [pa.table({"obscured": ["No"], "coordinateUncertaintyInMeters": [1], "x": [1.0]})],
+    )
     monkeypatch.setattr(ss, "_layer_value_type", lambda _c: "numeric")
     ss.write_density_graph(d)
     assert (d / ss.density_graph_filename).exists()
@@ -426,7 +457,19 @@ def test_density_graph_and_loaders_edge_cases(stub_env, monkeypatch, tmp_path, c
 
     density_path = d / ss.density_graph_filename
     stub._exists[density_path] = True
-    stub._tables[density_path] = pa.table({"variable": [], "points": [], "density": [], "min": [], "max": [], "bandwidth": [], "count": [], "sampleCount": [], "pointCount": []})
+    stub._tables[density_path] = pa.table(
+        {
+            "variable": [],
+            "points": [],
+            "density": [],
+            "min": [],
+            "max": [],
+            "bandwidth": [],
+            "count": [],
+            "sampleCount": [],
+            "pointCount": [],
+        }
+    )
     assert ss.load_density_graph(str(d), "x") is None
 
     stub._tables[density_path] = OSError("boom")
@@ -440,7 +483,9 @@ def test_slice_and_range_edge_branches(stub_env, monkeypatch):
     struct_type = pa.struct([("catalogNumber", pa.string()), ("originId", pa.int64())])
     arr = pa.array([{"catalogNumber": "a", "originId": 1}], type=struct_type)
     meta = {b"origin_map": json.dumps([{"id": 1, "relative_path": "one"}]).encode("utf-8")}
-    stub._tables[index_path] = pa.Table.from_arrays([arr], schema=pa.schema([pa.field("bio_1", struct_type)]).with_metadata(meta))
+    stub._tables[index_path] = pa.Table.from_arrays(
+        [arr], schema=pa.schema([pa.field("bio_1", struct_type)]).with_metadata(meta)
+    )
 
     one = Path("/tmp/one") / "occurrence.parquet"
     stub._exists[one] = True
@@ -478,7 +523,11 @@ def test_more_distribution_and_resolution_branches(stub_env, monkeypatch, tmp_pa
     assert ss.resolve_categorical_class_value("koppen", "class_5") == 5
     assert ss.resolve_categorical_class_value("koppen", "class_word") == "word"
 
-    monkeypatch.setattr(ss.taxa_navigation, "iter_filtered_occurrence_tables", lambda *_a, **_k: [pa.table({"catalogNumber": ["a"], "koppen": [None]})])
+    monkeypatch.setattr(
+        ss.taxa_navigation,
+        "iter_filtered_occurrence_tables",
+        lambda *_a, **_k: [pa.table({"catalogNumber": ["a"], "koppen": [None]})],
+    )
     assert ss.build_categorical_stats_for_location(1, "koppen", "USA", sample_limit=3) is None
 
     monkeypatch.setattr(ss, "get_layer_records_for_class", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("x")))
@@ -567,11 +616,27 @@ def test_prepare_and_loader_additional_branches(stub_env, monkeypatch):
     assert out["catalog_column"] == "catalogNumber"
 
     # dataset loader edge branches
-    load = ss._make_dataset_loader({}, Path("/tmp"), catalog_column="catalogNumber", layer_id="bio_1", data_filename="occ.parquet", lat_col="decimalLatitude", lon_col="decimalLongitude")
+    load = ss._make_dataset_loader(
+        {},
+        Path("/tmp"),
+        catalog_column="catalogNumber",
+        layer_id="bio_1",
+        data_filename="occ.parquet",
+        lat_col="decimalLatitude",
+        lon_col="decimalLongitude",
+    )
     assert load(1) is None
 
     monkeypatch.setattr(ss.PARQUET, "exists", lambda _p: False)
-    load2 = ss._make_dataset_loader({1: {"relative_path": "a"}}, Path("/tmp"), catalog_column="catalogNumber", layer_id="bio_1", data_filename="occ.parquet", lat_col="decimalLatitude", lon_col="decimalLongitude")
+    load2 = ss._make_dataset_loader(
+        {1: {"relative_path": "a"}},
+        Path("/tmp"),
+        catalog_column="catalogNumber",
+        layer_id="bio_1",
+        data_filename="occ.parquet",
+        lat_col="decimalLatitude",
+        lon_col="decimalLongitude",
+    )
     assert load2(1) is None
 
 
@@ -585,9 +650,20 @@ def test_slice_records_dataset_miss_branches(monkeypatch):
         "index_dir": Path("/tmp"),
         "catalog_column": "catalogNumber",
     }
-    monkeypatch.setattr(ss, "_make_dataset_loader", lambda *_a, **_k: (lambda _o: None))
+    monkeypatch.setattr(ss, "_make_dataset_loader", lambda *_a, **_k: lambda _o: None)
     assert ss._slice_records(prepared, "bio_1", start=0, stop=1, data_filename="x", lat_col="lat", lon_col="lon") == []
-    monkeypatch.setattr(ss, "_make_dataset_loader", lambda *_a, **_k: (lambda _o: {"index": {}, "latitudes": pa.array([]), "longitudes": pa.array([]), "layer_values": pa.array([])}))
+    monkeypatch.setattr(
+        ss,
+        "_make_dataset_loader",
+        lambda *_a, **_k: (
+            lambda _o: {
+                "index": {},
+                "latitudes": pa.array([]),
+                "longitudes": pa.array([]),
+                "layer_values": pa.array([]),
+            }
+        ),
+    )
     assert ss._slice_records(prepared, "bio_1", start=0, stop=1, data_filename="x", lat_col="lat", lon_col="lon") == []
 
 
@@ -602,7 +678,11 @@ def test_categorical_distribution_additional_branches(stub_env, monkeypatch, tmp
             "value": ["2", "0.5", "0.2", "0.3"],
         }
     )
-    monkeypatch.setattr(ss.gis_lookup, "load_layer_legend", lambda _id: {"2": {"id": 2, "name": "Two"}, "name slug": {"id": 5, "name": "Five"}})
+    monkeypatch.setattr(
+        ss.gis_lookup,
+        "load_layer_legend",
+        lambda _id: {"2": {"id": 2, "name": "Two"}, "name slug": {"id": 5, "name": "Five"}},
+    )
     dist = ss.load_categorical_distribution(tmp_path, "v")
     assert dist["totals"]["significant_unique_classes"] == 2.0
     values = [d["value"] for d in dist["distribution"]]
@@ -623,7 +703,9 @@ def test_resolve_and_samples_more_branches(stub_env, monkeypatch):
 
     t2 = pa.table({"catalogNumber": ["a"], "decimalLatitude": [1.0], "decimalLongitude": [2.0], "bio_1": [5.0]})
     monkeypatch.setattr(ss.taxa_navigation, "iter_filtered_occurrence_tables", lambda *_a, **_k: [t2])
-    assert ss.numeric_range_samples_for_location(1, "bio_1", 0, 10, location_gid="USA", limit=5) == [("a", 1.0, 2.0, 5.0)]
+    assert ss.numeric_range_samples_for_location(1, "bio_1", 0, 10, location_gid="USA", limit=5) == [
+        ("a", 1.0, 2.0, 5.0)
+    ]
 
 
 def test_numeric_read_and_gather_more_branches(stub_env, monkeypatch, tmp_path):
@@ -643,7 +725,13 @@ def test_numeric_read_and_gather_more_branches(stub_env, monkeypatch, tmp_path):
     out = ss.read_numeric_from_parquet(p, "bio_1")
     assert out == [{"catalog_id": "b", "value": 2.0, "latitude": 2.0, "longitude": 4.0}]
 
-    monkeypatch.setattr(ss.taxa_navigation, "iter_filtered_occurrence_tables", lambda *_a, **_k: [pa.table({"catalogNumber": ["a"], "decimalLatitude": [1.0], "decimalLongitude": [2.0], "bio_1": [None]})])
+    monkeypatch.setattr(
+        ss.taxa_navigation,
+        "iter_filtered_occurrence_tables",
+        lambda *_a, **_k: [
+            pa.table({"catalogNumber": ["a"], "decimalLatitude": [1.0], "decimalLongitude": [2.0], "bio_1": [None]})
+        ],
+    )
     assert ss.gather_numeric_records_from_tables(1, "bio_1", None) == []
 
     d = tmp_path / "d2"
@@ -682,7 +770,9 @@ def test_streaming_and_exact_more_branches(monkeypatch, tmp_path):
 
     df1 = pd.DataFrame({"obscured": ["No"], "coordinateUncertaintyInMeters": [1], "num": [1.0], "cat": [1]})
     df2 = pd.DataFrame({"obscured": ["No"], "coordinateUncertaintyInMeters": [1], "num": [2.0], "cat": [2]})
-    monkeypatch.setattr(ss, "_iter_descendant_tables", lambda _p: [pa.Table.from_pandas(df1), pa.Table.from_pandas(df2)])
+    monkeypatch.setattr(
+        ss, "_iter_descendant_tables", lambda _p: [pa.Table.from_pandas(df1), pa.Table.from_pandas(df2)]
+    )
     monkeypatch.setattr(ss, "_layer_value_type", lambda c: "categorical" if c == "cat" else "numeric")
     monkeypatch.setattr(ss, "_write_summary_stats", lambda *_a, **_k: None)
     monkeypatch.setattr(ss, "_write_categorical_stats", lambda *_a, **_k: None)
@@ -758,10 +848,20 @@ def test_summary_stats_remaining_branches(stub_env, monkeypatch, tmp_path):
     monkeypatch.setattr(
         ss,
         "_iter_descendant_tables",
-        lambda _p: [pa.table({"obscured": ["No"], "coordinateUncertaintyInMeters": [1], "x": [1.0], "y": [float("nan")]})],
+        lambda _p: [
+            pa.table({"obscured": ["No"], "coordinateUncertaintyInMeters": [1], "x": [1.0], "y": [float("nan")]})
+        ],
     )
     monkeypatch.setattr(ss, "_layer_value_type", lambda c: "numeric")
-    monkeypatch.setattr(ss, "_build_density_curve", lambda vals, _pc: None if vals and vals[0] == 1.0 else {"points": [0.0], "density": [1.0], "min": 0.0, "max": 0.0, "bandwidth": 1.0})
+    monkeypatch.setattr(
+        ss,
+        "_build_density_curve",
+        lambda vals, _pc: (
+            None
+            if vals and vals[0] == 1.0
+            else {"points": [0.0], "density": [1.0], "min": 0.0, "max": 0.0, "bandwidth": 1.0}
+        ),
+    )
     ss.write_density_graph(d)
 
     # _write_categorical_stats merge-existing path
@@ -797,12 +897,16 @@ def test_summary_stats_branch_sweep(stub_env, monkeypatch, tmp_path):
     p1 = tmp_path / "r.parquet"
     stub._exists[p1] = True
     meta = {b"origin_map": json.dumps([{"id": 1, "relative_path": "a"}]).encode("utf-8")}
-    stub._tables[p1] = pa.Table.from_arrays([pa.array([], type=struct_type)], schema=pa.schema([pa.field("bio_1", struct_type)]).with_metadata(meta))
+    stub._tables[p1] = pa.Table.from_arrays(
+        [pa.array([], type=struct_type)], schema=pa.schema([pa.field("bio_1", struct_type)]).with_metadata(meta)
+    )
     assert ss.get_sorted_layer_records_in_value_range(p1, "bio_1", 0, 1) == []
 
     arr = pa.array([{"catalogNumber": "a", "originId": 1, "value": None}], type=struct_type)
-    stub._tables[p1] = pa.Table.from_arrays([arr], schema=pa.schema([pa.field("bio_1", struct_type)]).with_metadata(meta))
-    data = (tmp_path / "a" / "occurrence.parquet")
+    stub._tables[p1] = pa.Table.from_arrays(
+        [arr], schema=pa.schema([pa.field("bio_1", struct_type)]).with_metadata(meta)
+    )
+    data = tmp_path / "a" / "occurrence.parquet"
     data.parent.mkdir(parents=True, exist_ok=True)
     stub._exists[data] = True
     stub._tables[data] = pa.table(
@@ -822,7 +926,10 @@ def test_summary_stats_branch_sweep(stub_env, monkeypatch, tmp_path):
         b"origin_map": json.dumps([{"id": 1, "relative_path": "a"}]).encode("utf-8"),
         b"category_offsets": json.dumps({"bio_1": {"1.0": {"start": 0, "count": 0}}}).encode("utf-8"),
     }
-    stub._tables[p1] = pa.Table.from_arrays([pa.array([{"catalogNumber": "a", "originId": 1, "value": 1.0}], type=struct_type)], schema=pa.schema([pa.field("bio_1", struct_type)]).with_metadata(meta2))
+    stub._tables[p1] = pa.Table.from_arrays(
+        [pa.array([{"catalogNumber": "a", "originId": 1, "value": 1.0}], type=struct_type)],
+        schema=pa.schema([pa.field("bio_1", struct_type)]).with_metadata(meta2),
+    )
     monkeypatch.setattr(ss, "resolve_categorical_class_value", lambda *_a, **_k: 1)
     assert ss.get_layer_records_for_class(p1, "bio_1", 1) == []
 
@@ -902,12 +1009,32 @@ def test_summary_stats_deep_branches(stub_env, monkeypatch, tmp_path):
     data = {
         1: None,
         2: {"index": {}, "latitudes": pa.array([1.0]), "longitudes": pa.array([2.0]), "layer_values": pa.array([1.0])},
-        3: {"index": {"c": 0}, "latitudes": pa.array([1.0]), "longitudes": pa.array([2.0]), "layer_values": pa.array([None])},
-        4: {"index": {"d": 0}, "latitudes": pa.array([1.0]), "longitudes": pa.array([2.0]), "layer_values": pa.array(["bad"])},
-        5: {"index": {"e": 0}, "latitudes": pa.array([1.0]), "longitudes": pa.array([2.0]), "layer_values": pa.array([2.5])},
-        6: {"index": {"f": 0}, "latitudes": pa.array([1.0]), "longitudes": pa.array([2.0]), "layer_values": pa.array([3.5])},
+        3: {
+            "index": {"c": 0},
+            "latitudes": pa.array([1.0]),
+            "longitudes": pa.array([2.0]),
+            "layer_values": pa.array([None]),
+        },
+        4: {
+            "index": {"d": 0},
+            "latitudes": pa.array([1.0]),
+            "longitudes": pa.array([2.0]),
+            "layer_values": pa.array(["bad"]),
+        },
+        5: {
+            "index": {"e": 0},
+            "latitudes": pa.array([1.0]),
+            "longitudes": pa.array([2.0]),
+            "layer_values": pa.array([2.5]),
+        },
+        6: {
+            "index": {"f": 0},
+            "latitudes": pa.array([1.0]),
+            "longitudes": pa.array([2.0]),
+            "layer_values": pa.array([3.5]),
+        },
     }
-    monkeypatch.setattr(ss, "_make_dataset_loader", lambda *_a, **_k: (lambda oid: data.get(oid)))
+    monkeypatch.setattr(ss, "_make_dataset_loader", lambda *_a, **_k: lambda oid: data.get(oid))
     out = ss.get_sorted_layer_records_in_value_range(tmp_path / "x.parquet", "bio_1", 2.0, 3.0)
     assert out and out[0][0] == "e"
 
@@ -987,7 +1114,18 @@ def test_summary_stats_remaining_missing_lines(stub_env, monkeypatch, tmp_path):
         "index_dir": tmp_path,
         "catalog_column": "catalogNumber",
     }
-    assert ss._slice_records(prepared, "bio_1", start=0, stop=0, data_filename="occurrence.parquet", lat_col="decimalLatitude", lon_col="decimalLongitude") == []
+    assert (
+        ss._slice_records(
+            prepared,
+            "bio_1",
+            start=0,
+            stop=0,
+            data_filename="occurrence.parquet",
+            lat_col="decimalLatitude",
+            lon_col="decimalLongitude",
+        )
+        == []
+    )
 
     # value-range result loop branches: missing dataset/index, parse fail, min-continue, max-break
     col = pa.array(
@@ -1004,11 +1142,26 @@ def test_summary_stats_remaining_missing_lines(stub_env, monkeypatch, tmp_path):
     datasets = {
         1: None,
         2: {"index": {}, "latitudes": pa.array([1.0]), "longitudes": pa.array([2.0]), "layer_values": pa.array([1.0])},
-        3: {"index": {"c": 0}, "latitudes": pa.array([1.0]), "longitudes": pa.array([2.0]), "layer_values": pa.array(["bad"])},
-        4: {"index": {"d": 0}, "latitudes": pa.array([1.0]), "longitudes": pa.array([2.0]), "layer_values": pa.array([0.5])},
-        5: {"index": {"e": 0}, "latitudes": pa.array([1.0]), "longitudes": pa.array([2.0]), "layer_values": pa.array([5.0])},
+        3: {
+            "index": {"c": 0},
+            "latitudes": pa.array([1.0]),
+            "longitudes": pa.array([2.0]),
+            "layer_values": pa.array(["bad"]),
+        },
+        4: {
+            "index": {"d": 0},
+            "latitudes": pa.array([1.0]),
+            "longitudes": pa.array([2.0]),
+            "layer_values": pa.array([0.5]),
+        },
+        5: {
+            "index": {"e": 0},
+            "latitudes": pa.array([1.0]),
+            "longitudes": pa.array([2.0]),
+            "layer_values": pa.array([5.0]),
+        },
     }
-    monkeypatch.setattr(ss, "_make_dataset_loader", lambda *_a, **_k: (lambda origin_id: datasets.get(origin_id)))
+    monkeypatch.setattr(ss, "_make_dataset_loader", lambda *_a, **_k: lambda origin_id: datasets.get(origin_id))
     out = ss.get_sorted_layer_records_in_value_range(tmp_path / "x.parquet", "bio_1", 1.0, 3.0)
     assert out == [("c", 1.0, 2.0, "bad")]
 
@@ -1078,9 +1231,26 @@ def test_summary_stats_remaining_missing_lines(stub_env, monkeypatch, tmp_path):
         return orig_astype(self, *args, **kwargs)
 
     monkeypatch.setattr(pd.Series, "astype", _fake_astype)
-    monkeypatch.setattr(ss, "_iter_descendant_tables", lambda _p: [pa.table({"obscured": ["No", "No"], "coordinateUncertaintyInMeters": [1, 1], "skipcol": [1.0, 2.0], "keep": [1.0, 2.0]})])
+    monkeypatch.setattr(
+        ss,
+        "_iter_descendant_tables",
+        lambda _p: [
+            pa.table(
+                {
+                    "obscured": ["No", "No"],
+                    "coordinateUncertaintyInMeters": [1, 1],
+                    "skipcol": [1.0, 2.0],
+                    "keep": [1.0, 2.0],
+                }
+            )
+        ],
+    )
     monkeypatch.setattr(ss, "_layer_value_type", lambda _c: "numeric")
-    monkeypatch.setattr(ss, "_build_density_curve", lambda *_a, **_k: {"points": [0.0], "density": [1.0], "min": 0.0, "max": 0.0, "bandwidth": 1.0})
+    monkeypatch.setattr(
+        ss,
+        "_build_density_curve",
+        lambda *_a, **_k: {"points": [0.0], "density": [1.0], "min": 0.0, "max": 0.0, "bandwidth": 1.0},
+    )
     monkeypatch.setattr(ss, "density_max_samples", 1)
     monkeypatch.setattr(ss.random, "randrange", lambda _n: 0)
     orig_write_table = ss.pq.write_table

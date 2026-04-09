@@ -31,7 +31,6 @@ docs_util_skip_files = ("__init__.py", "config.py")
 readme_filename = "README.md"
 
 
-
 def _strip_module_docstring(source: str) -> tuple[str, str | None]:
     docstring = None
     doc_start = doc_end = None
@@ -64,9 +63,7 @@ def _split_member_names(source: str) -> tuple[list[str], list[str]]:
     public_members = []
     internal_members = []
     for node in tree.body:
-        if not isinstance(
-            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         name = node.name
         if name.startswith("_"):
@@ -92,9 +89,7 @@ def _write_module_docs(
     source, _ = _strip_module_docstring(source)
     with mkdocs_gen_files.open(doc_path, "w") as handle:
         handle.write(f"# {resolved_title}\n\n")
-        handle.write(
-            f"This page is generated from the `{module_ref}` module docstrings.\n\n"
-        )
+        handle.write(f"This page is generated from the `{module_ref}` module docstrings.\n\n")
         handle.write("## Public API\n\n")
         if public_members:
             handle.write(f"::: {module_ref}\n")
@@ -127,9 +122,7 @@ def _write_script_source(module_path: Path, out_dir: str) -> None:
     source, docstring = _strip_module_docstring(source)
     with mkdocs_gen_files.open(doc_path, "w") as handle:
         handle.write(f"# {title}\n\n")
-        handle.write(
-            f"This page mirrors the script source at `scripts/{module_path.name}`.\n\n"
-        )
+        handle.write(f"This page mirrors the script source at `scripts/{module_path.name}`.\n\n")
         if docstring:
             handle.write(docstring)
             handle.write("\n\n")
@@ -182,10 +175,7 @@ def _write_api_docs(module_path: Path, out_dir: str) -> None:
 
     with mkdocs_gen_files.open(doc_path, "w") as handle:
         handle.write("# Material API Docs\n\n")
-        handle.write(
-            "This page is generated from `main.py` and includes endpoint metadata "
-            "when available.\n\n"
-        )
+        handle.write("This page is generated from `main.py` and includes endpoint metadata when available.\n\n")
         if endpoints:
             handle.write("## Endpoints\n\n")
             for name, endpoint, doc, segment in endpoints:
@@ -224,18 +214,14 @@ def _write_api_docs(module_path: Path, out_dir: str) -> None:
 
 
 libraries = []
-for module_path in sorted(
-    (CONFIG.project_root / docs_util_dir_name).glob("*.py")
-):
+for module_path in sorted((CONFIG.project_root / docs_util_dir_name).glob("*.py")):
     if module_path.name in docs_util_skip_files:
         continue
     _write_module_docs(module_path, "libraries", f"util.{module_path.stem}")
     libraries.append(module_path.stem)
 
 scripts = []
-for module_path in sorted(
-    (CONFIG.project_root / docs_scripts_dir_name).glob("*.py")
-):
+for module_path in sorted((CONFIG.project_root / docs_scripts_dir_name).glob("*.py")):
     if module_path.name in docs_script_skip_files:
         continue
     _write_script_source(module_path, "scripts")
@@ -248,9 +234,7 @@ with mkdocs_gen_files.open("readme.md", "w") as handle:
 if api_module.exists():
     _write_api_docs(api_module, "api")
 
-about_source = (
-    CONFIG.project_root / docs_dir_name / docs_gen_ref_filename
-).read_text(encoding="utf-8")
+about_source = (CONFIG.project_root / docs_dir_name / docs_gen_ref_filename).read_text(encoding="utf-8")
 with mkdocs_gen_files.open("about_docs.md", "w") as handle:
     handle.write("# About These Docs\n\n")
     handle.write(
@@ -293,6 +277,7 @@ with mkdocs_gen_files.open("SUMMARY.md", "w") as handle:
     handle.write("- API\n")
     handle.write("    - [Overview](api/index.md)\n")
     if api_module.exists():
+        handle.write("    - [Upload Processing](api/upload-processing.md)\n")
         handle.write("    - [Material API Docs](api/main.md)\n")
         handle.write("    - [Default FastAPI Docs](http://localhost:8000/docs)\n")
         handle.write("    - [Default OpenAPI Schema](http://localhost:8000/openapi.json)\n")

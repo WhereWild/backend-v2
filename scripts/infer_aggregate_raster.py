@@ -27,7 +27,7 @@ CONFIG = load_config("global")
 BASE_FEATURES_DIR = Path("data/gis/temporal/homepage")
 FORECAST_HOURS = 0
 OUTPUT_PATH = Path("data/gis/temporal/homepage/aggregate_sdm.tif")
-TAXON_CAP: int | None = 10
+TAXON_CAP: int | None = None
 N_WORKERS: int = 1
 PUSH_TO_B2: bool = True
 

@@ -205,7 +205,7 @@
     },
     {
       "id": 190,
-      "name": "Impervious surfaces",
+      "name": "Urban",
       "description": "Built-up or impervious urban surfaces.",
       "group": "urban",
       "group_label": "Urban"

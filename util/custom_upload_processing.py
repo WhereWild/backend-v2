@@ -162,7 +162,7 @@ def _write_variable_metadata_manifest(
     try:
         _entries, by_id = gis_lookup.load_variable_metadata()
     except Exception:
-        pd.DataFrame(columns=["id", "name", "exported_name", "category", "units", "value_type"]).to_parquet(
+        pd.DataFrame(columns=["id", "name", "exported_name", "category", "units", "value_type", "source_ids"]).to_parquet(
             metadata_path,
             index=False,
         )
@@ -175,6 +175,7 @@ def _write_variable_metadata_manifest(
             continue
         readable_name = _variable_label(variable_id)
         exported_name = rename_map.get(variable_id, str(variable_id))
+        source_ids: list[str] = entry.get("source_ids") or []
         rows.append(
             {
                 "id": str(variable_id),
@@ -183,6 +184,7 @@ def _write_variable_metadata_manifest(
                 "category": category,
                 "units": entry.get("units"),
                 "value_type": entry.get("value_type"),
+                "source_ids": json.dumps(source_ids),
             }
         )
     frame = pd.DataFrame(rows)
@@ -779,5 +781,10 @@ def _build_index_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
                 archive.writestr(csv_arcname, csv_bytes)
             except Exception:
                 pass
+        try:
+            data_sources = gis_lookup.load_data_sources()
+            archive.writestr("data_sources.json", json.dumps(data_sources))
+        except Exception:
+            pass
 
     return archive_path, archive_name, work_dir

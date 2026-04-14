@@ -54,6 +54,9 @@ species_deep_zoom_render_limit = max(1, int(getattr(CONFIG, "sdm_deep_zoom_rende
 variable_tile_cache_seconds = int(getattr(CONFIG, "sdm_tile_cache_seconds", 60))
 variable_tile_default_reproject = bool(getattr(CONFIG, "sdm_tile_reproject", True))
 derived_tile_variables = frozenset({"slope", "aspect", "aspect_deg"})
+# Continuous circular variables where scalar summary stats (min/mean/max) and
+# relative rankings are statistically nonsensical and should be omitted.
+no_summary_stats_variables = frozenset({"aspect_deg"})
 _SPECIES_DEEP_ZOOM_RENDER_SEMAPHORE = asyncio.Semaphore(species_deep_zoom_render_limit)
 
 
@@ -87,6 +90,16 @@ def _path_exists(path: Path) -> bool:
     if storage.is_remote:
         return storage.exists(path)
     return path.exists()
+
+
+def _with_env_observation_count(
+    response: dict[str, Any],
+    observation_count: int,
+) -> dict[str, Any]:
+    updated = dict(response)
+    updated["observationCount"] = observation_count
+    updated["observation_count"] = observation_count
+    return updated
 
 
 @lru_cache(maxsize=1)
@@ -1346,8 +1359,9 @@ def species_environment_stats(
                 baseline_categorical_totals = baseline_stats.get("totals", {})
         totals = categorical_payload.get("totals", {})
         total_samples = totals.get("total_samples") or 0
+        observation_count = int(total_samples)
         summary = {
-            "count": int(total_samples),
+            "count": observation_count,
             "min": None,
             "mean": None,
             "max": None,
@@ -1361,7 +1375,7 @@ def species_environment_stats(
             ranks = []
         else:
             ranks = indexing.load_relative_ranks(taxon_dir, variable_id)
-        response = {
+        response = _with_env_observation_count({
             "speciesId": taxon_id,
             "species_id": taxon_id,
             "variable": variable_id,
@@ -1393,19 +1407,27 @@ def species_environment_stats(
             "baseline_summary": baseline_numeric_summary,
             "relativeRanks": ranks,
             "relative_ranks": ranks,
-        }
+        }, observation_count)
         return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
     if not location_gid:
+        skip_summary = variable_id in no_summary_stats_variables
+        observation_count = 0
         if value_type == "circular":
             _samples = summary_stats.gather_numeric_records(taxon_id, taxon_dir, variable_id)
             _values = [s["value"] for s in _samples]
-            summary = summary_stats.summarize_values(_values, circular=True) if _values else None
+            observation_count = len(_values)
+            summary = None if skip_summary else (summary_stats.summarize_values(_values, circular=True) if _values else None)
             density_curve = indexing.build_density_curve(_values, point_count=density_points, circular=True) if _values else None
         else:
             summary = summary_stats.load_numeric_summary(str(taxon_dir), variable_id)
+            if isinstance(summary, dict) and summary.get("count") is not None:
+                try:
+                    observation_count = int(summary.get("count") or 0)
+                except (TypeError, ValueError):
+                    observation_count = 0
             density_curve = summary_stats.load_density_graph(str(taxon_dir), variable_id)
-        if not summary or not density_curve:
+        if (not skip_summary and not summary) or not density_curve:
             raise HTTPException(
                 status_code=503,
                 # We COULD compute on-demand here but I think it's better to fail loudly as the data *should* be here for performance reasons.
@@ -1415,8 +1437,8 @@ def species_environment_stats(
                     "Rebuild summary_stats.parquet and density_graph.parquet."
                 ),
             )
-        ranks = indexing.load_relative_ranks(taxon_dir, variable_id)
-        response = {
+        ranks = [] if skip_summary else indexing.load_relative_ranks(taxon_dir, variable_id)
+        response = _with_env_observation_count({
             "speciesId": taxon_id,
             "species_id": taxon_id,
             "variable": variable_id,
@@ -1448,7 +1470,7 @@ def species_environment_stats(
             "dominant_categories": [],
             "relativeRanks": ranks,
             "relative_ranks": ranks,
-        }
+        }, observation_count)
         return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
     samples = summary_stats.gather_numeric_records(
@@ -1463,10 +1485,12 @@ def species_environment_stats(
             status_code=404,
             detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}'.",
         )
-    summary = summary_stats.summarize_values(values, circular=(value_type == "circular"))
+    observation_count = len(values)
+    skip_summary = variable_id in no_summary_stats_variables
+    summary = None if skip_summary else summary_stats.summarize_values(values, circular=(value_type == "circular"))
     density_curve = indexing.build_density_curve(values, point_count=density_points, circular=(value_type == "circular"))
     ranks = []
-    response = {
+    response = _with_env_observation_count({
         "speciesId": taxon_id,
         "species_id": taxon_id,
         "variable": variable_id,
@@ -1498,7 +1522,7 @@ def species_environment_stats(
         "dominant_categories": [],
         "relativeRanks": ranks,
         "relative_ranks": ranks,
-    }
+    }, observation_count)
     return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
 
@@ -1765,6 +1789,11 @@ def get_relative_rankings(
         A dict containing ranking entries and optional distribution data.
     """
     location_gid = location.strip() if location else None
+    if variable in no_summary_stats_variables:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Variable '{variable}' does not support relative rankings.",
+        )
     try:
         entries, distribution_values = indexing.child_relative_rankings(
             str(taxon_id),
@@ -1826,6 +1855,7 @@ def list_relative_ranking_options(
         options = indexing.list_rank_metric_options(str(taxon_id), rank)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    options = [opt for opt in options if opt.get("variable") not in no_summary_stats_variables]
     return {
         "ancestor_taxon_id": taxon_id,
         "rank": rank.upper(),

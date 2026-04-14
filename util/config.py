@@ -123,9 +123,11 @@ class GlobalConfig:
     # on species page load. Disabled for performance; descriptions use direct summaries.
     skip_description_outliers: bool = True
     sdm_tile_size: int = 256
+    sdm_parent_tile_max_size: int = 512
+    sdm_deep_zoom_render_limit: int = 1
 
     # ML training
-    ml_train_taxon_id: str = field(default_factory=lambda: os.environ.get("ML_TRAIN_TAXON_ID", "2429791"))
+    ml_train_taxon_id: str = field(default_factory=lambda: os.environ.get("ML_TRAIN_TAXON_ID", "7904574"))
     ml_model_kind: str = "gbt"
     ml_max_positives: int = 10000
     ml_negative_ratio: int = 15
@@ -148,7 +150,7 @@ class GlobalConfig:
     ml_raster_storage_mode: str = "auto"
     ml_phenology_mode: bool = field(default_factory=lambda: _env_bool("ML_PHENOLOGY_MODE", False))
     ml_phenology_temporal_only: bool = field(default_factory=lambda: _env_bool("ML_PHENOLOGY_TEMPORAL_ONLY", True))
-    ml_sdm_include_temporal: bool = field(default_factory=lambda: _env_bool("ML_SDM_INCLUDE_TEMPORAL", False))
+    ml_sdm_include_temporal: bool = field(default_factory=lambda: _env_bool("ML_SDM_INCLUDE_TEMPORAL", True))
     # Batch subtree training
     ml_subtree_root_taxon_id: str = field(default_factory=lambda: os.environ.get("ML_SUBTREE_ROOT_TAXON_ID", "2519"))
     ml_train_phenology: bool = field(default_factory=lambda: _env_bool("ML_TRAIN_PHENOLOGY", True))
@@ -254,6 +256,7 @@ class GlobalConfig:
             "soil_moisture_0_to_7cm": "avg",
             "soil_temperature_0_to_7cm": "avg",
             "temperature_2m": "avg",
+            "weather_code_simple": "avg",
         }
     )
     # Override grid mode per model for temporal OM files.

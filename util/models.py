@@ -120,6 +120,15 @@ def _load_json_file(path: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+@lru_cache(maxsize=256)
+def _cached_source_indices(
+    expected_columns: tuple[str, ...],
+    channel_ids: tuple[str, ...],
+) -> np.ndarray:
+    channel_idx = {name: idx for idx, name in enumerate(channel_ids)}
+    return np.array([channel_idx.get(name, -1) for name in expected_columns], dtype=np.intp)
+
+
 def resolve_model_artifact(
     model_id: str | None,
     *,
@@ -144,7 +153,6 @@ def model_feature_columns(
     if artifact is None:
         return []
     return [str(col) for col in artifact.payload.get("feature_columns") or [] if str(col).strip()]
-
 
 
 def describe_model(
@@ -190,11 +198,10 @@ def has_full_model(taxon_id: str | int | None) -> bool:
 def get_all_sdm_taxon_ids() -> list[int]:
     """Return taxon IDs for all taxa that have a trained SDM artifact."""
     import re
+
     model_kind = str(CONFIG.ml_model_kind).strip().lower() or "gbt"
     # Match taxon_{id}_{kind}_sdm* or old-style taxon_{id}_{kind} (no mode suffix)
-    pattern = re.compile(
-        rf"^taxon_(\d+)_{re.escape(model_kind)}(?:_sdm|$)"
-    )
+    pattern = re.compile(rf"^taxon_(\d+)_{re.escape(model_kind)}(?:_sdm|$)")
     seen: dict[int, None] = {}
     for artifact_dir in _iter_model_artifact_dirs():
         m = pattern.match(artifact_dir.name)
@@ -239,31 +246,34 @@ def _predict_sklearn_artifact(
         return np.zeros(features.shape[:-1], dtype=np.float32)
 
     h, w, c = features.shape
-    expected_columns = [str(col) for col in payload.get("feature_columns") or [] if str(col).strip()]
+    expected_columns = tuple(str(col) for col in payload.get("feature_columns") or [] if str(col).strip())
     if not expected_columns:
         raise ValueError("Model payload missing feature_columns")
 
-    channel_ids = list(feature_ids) if feature_ids else []
+    channel_ids = tuple(feature_ids) if feature_ids else ()
     if channel_ids and len(channel_ids) != c:
-        raise ValueError(
-            f"feature_ids length ({len(channel_ids)}) does not match channel count ({c})"
-        )
+        raise ValueError(f"feature_ids length ({len(channel_ids)}) does not match channel count ({c})")
     if not channel_ids:
         raise ValueError("feature_ids are required for model prediction")
 
     flat = _preflat if _preflat is not None else features.reshape(-1, c).astype(np.float32, copy=False)
+    valid_mask = _valid_mask if _valid_mask is not None else np.any(np.isfinite(flat), axis=1)
+    if not np.any(valid_mask):
+        return np.full((h, w), np.nan, dtype=np.float32)
 
-    # Vectorized column selection — one fancy-index op instead of a Python loop
-    channel_idx = {name: idx for idx, name in enumerate(channel_ids)}
-    src_indices = np.array([channel_idx.get(name, -1) for name in expected_columns], dtype=np.intp)
-    matrix = np.full((flat.shape[0], len(expected_columns)), np.nan, dtype=np.float32)
+    valid_flat = flat[valid_mask]
+
+    # Vectorized column selection for just the rows that have at least one finite feature.
+    src_indices = _cached_source_indices(expected_columns, channel_ids)
+    matrix = np.full((valid_flat.shape[0], len(expected_columns)), np.nan, dtype=np.float32)
     valid_cols = src_indices >= 0
     if valid_cols.any():
-        matrix[:, valid_cols] = flat[:, src_indices[valid_cols]]
+        matrix[:, valid_cols] = valid_flat[:, src_indices[valid_cols]]
 
-    valid_mask = _valid_mask if _valid_mask is not None else np.any(np.isfinite(flat), axis=1)
     frame = pd.DataFrame(matrix, columns=expected_columns)
     transformed = payload["preprocessor"].transform(frame)
-    probs = payload["model"].predict_proba(transformed)[:, 1].astype(np.float32)
-    probs[~valid_mask] = np.nan
+    valid_probs = payload["model"].predict_proba(transformed)[:, 1].astype(np.float32)
+
+    probs = np.full(flat.shape[0], np.nan, dtype=np.float32)
+    probs[valid_mask] = valid_probs
     return probs.reshape(h, w)

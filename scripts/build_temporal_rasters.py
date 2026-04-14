@@ -973,3 +973,9 @@ if __name__ == "__main__":
     _post_build_ts = datetime.now(timezone.utc).timestamp()
     weather_tiles.preload_all_forecasts()
     weather_tiles.cleanup_weather_disk_cache(_post_build_ts)
+
+    # Clear homepage scores cache — taxon_probs.npz and weather data have been rebuilt
+    _scores_cache = Path("/workspace/cache/scores")
+    if _scores_cache.exists():
+        for _f in _scores_cache.glob("*.json"):
+            _f.unlink(missing_ok=True)

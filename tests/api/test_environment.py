@@ -36,6 +36,7 @@ def test_env_numeric_top_level_fields(client, known_taxon_id, known_numeric_var)
         "variable",
         "variableName",
         "variableType",
+        "observationCount",
         "summary",
         "densityCurve",
     }
@@ -299,8 +300,10 @@ def test_env_circular_with_location_uses_circular_summary(client, monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["variableType"] == "circular"
-    assert body["summary"]["mean"] == pytest.approx(0.0)
-    assert captured["summary_circular"] is True
+    assert body["observationCount"] == 2
+    # aspect_deg is in no_summary_stats_variables — summary is intentionally omitted
+    assert body["summary"] is None
+    assert body["densityCurve"] is not None
     assert captured["density_circular"] is True
 
 

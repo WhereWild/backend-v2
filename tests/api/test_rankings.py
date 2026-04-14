@@ -1,4 +1,5 @@
 """Tests for GET /relative-rankings/{taxon_id} and /relative-rankings/{taxon_id}/options"""
+import main as app_main
 
 
 # ---------------------------------------------------------------------------
@@ -126,3 +127,41 @@ def test_ranking_options_invalid_taxon_returns_400(client):
     """Unknown taxon raises ValueError in list_rank_metric_options → 400 (lines 1022-1023)."""
     r = client.get("/relative-rankings/999999999/options?rank=SPECIES")
     assert r.status_code == 400
+
+
+def test_ranking_options_excludes_no_summary_stats_variables(client, known_genus_taxon_id, monkeypatch):
+    """Circular variables in no_summary_stats_variables must be filtered from options."""
+    monkeypatch.setattr(
+        app_main.indexing,
+        "list_rank_metric_options",
+        lambda *_args, **_kwargs: [
+            {"variable": "elevation", "metric": "mean", "column": "elevation::mean", "count": 10},
+            {"variable": "aspect_deg", "metric": "mean", "column": "aspect_deg::mean", "count": 10},
+        ],
+    )
+    body = client.get(
+        f"/relative-rankings/{known_genus_taxon_id}/options?rank=SPECIES"
+    ).json()
+    variables = [opt["variable"] for opt in body["options"]]
+    assert "aspect_deg" not in variables
+    assert "elevation" in variables
+
+
+def test_rankings_rejects_no_summary_stats_variable(client, known_genus_taxon_id):
+    """Variables excluded from summary stats are unsupported for rankings."""
+    response = client.get(
+        f"/relative-rankings/{known_genus_taxon_id}"
+        "?rank=SPECIES&variable=aspect_deg&metric=mean"
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Variable 'aspect_deg' does not support relative rankings."
+
+
+def test_rankings_rejects_no_summary_stats_variable_even_with_invalid_params(client, known_genus_taxon_id):
+    """Unsupported variables must fail explicitly instead of silently succeeding."""
+    response = client.get(
+        f"/relative-rankings/{known_genus_taxon_id}"
+        "?rank=SPECIES&variable=aspect_deg&metric=not_a_real_metric&order=sideways"
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Variable 'aspect_deg' does not support relative rankings."

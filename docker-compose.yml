@@ -19,6 +19,7 @@ services:
       - SYS_ADMIN
     security_opt:
       - apparmor:unconfined
+    mem_limit: 16g
     init: true
     stdin_open: true
     tty: true

@@ -26,7 +26,7 @@ api() {
   fi
   WHEREWILD_DATA_ROOT="$data_root" \
     setsid uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
-    --reload --reload-dir /workspace/main.py --reload-dir /workspace/util \
+    --workers 6 \
     > /workspace/logs/api.log 2>&1 &
   echo "$!" > "$pid_file"
   echo "api started: http://localhost:8000/docs (data: $data_root)"
@@ -52,7 +52,7 @@ api-fg() {
   export WHEREWILD_RASTER_STORAGE="$raster_mode"
   WHEREWILD_DATA_ROOT="$data_root" \
     uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
-    --reload --reload-dir /workspace/main.py --reload-dir /workspace/util
+    --workers 2
 }
 alias docs='mkdir -p /workspace/logs && cd /workspace && setsid -f mkdocs serve --dev-addr 0.0.0.0:9101 > /workspace/logs/docs.log 2>&1 && echo "docs started: http://localhost:9101/"'
 api-stop() {

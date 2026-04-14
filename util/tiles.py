@@ -4,10 +4,12 @@ import colorsys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
 import io
 import math
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
+import warnings
 
 import numpy as np
 from PIL import Image
@@ -22,9 +24,188 @@ from rasterio.windows import Window, from_bounds as window_from_bounds, transfor
 from util.config import load_config
 from util import gis_lookup, models, units
 
+from rasterio.errors import NotGeoreferencedWarning
+
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+
 
 CONFIG = load_config("global")
 WEB_MERCATOR = "EPSG:3857"
+# Separate on-disk tile caches across data roots so repo copies do not reuse stale PNGs.
+_TILE_CACHE_NAMESPACE = hashlib.md5(str(CONFIG.data_root).encode()).hexdigest()[:12]
+
+# ---------------------------------------------------------------------------
+# Shared on-disk tile cache — all workers read/write the same directory.
+# Size-based eviction: when total exceeds _TILE_CACHE_MAX_BYTES, oldest files
+# (by mtime) are removed until usage drops to 80% of the limit.
+# ---------------------------------------------------------------------------
+_TILE_CACHE_DIR = Path("/workspace/cache/tiles")
+_TILE_CACHE_MAX_BYTES = 256 * 1024 * 1024  # 256 MB
+
+CancelCheck = Callable[[], None]
+
+
+class TileRenderCancelled(Exception):
+    """Raised when the client disconnects during a cooperative tile render."""
+
+
+def _check_cancel(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None:
+        cancel_check()
+
+
+def crop_subtile_png(
+    parent_payload: bytes,
+    *,
+    parent_tile_size: int,
+    scale: int,
+    subtile_x: int,
+    subtile_y: int,
+    tile_size: int,
+) -> bytes:
+    parent_img = Image.open(io.BytesIO(parent_payload))
+    subtile_size = parent_tile_size // scale
+    left = subtile_x * subtile_size
+    top = subtile_y * subtile_size
+    subtile_img = parent_img.crop((left, top, left + subtile_size, top + subtile_size))
+    if subtile_size != tile_size:
+        subtile_img = subtile_img.resize((tile_size, tile_size), Image.LANCZOS)
+    buffer = io.BytesIO()
+    subtile_img.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _tile_cache_path(key: str) -> Path:
+    return _TILE_CACHE_DIR / f"{key}.png"
+
+
+def _read_tile_cache(key: str) -> bytes | None:
+    path = _tile_cache_path(key)
+    try:
+        data = path.read_bytes()
+        path.touch()  # bump mtime so LRU eviction keeps hot tiles
+        return data
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _write_tile_cache(key: str, data: bytes) -> None:
+    try:
+        _TILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _tile_cache_path(key).write_bytes(data)
+        _evict_tile_cache_if_needed()
+    except Exception:
+        pass
+
+
+def _evict_tile_cache_if_needed() -> None:
+    try:
+        entries = []
+        total = 0
+        for p in _TILE_CACHE_DIR.glob("*.png"):
+            st = p.stat()
+            entries.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+        if total <= _TILE_CACHE_MAX_BYTES:
+            return
+        target = int(_TILE_CACHE_MAX_BYTES * 0.8)
+        entries.sort()  # oldest mtime first
+        for _, size, path in entries:
+            if total <= target:
+                break
+            path.unlink(missing_ok=True)
+            total -= size
+    except Exception:
+        pass
+
+
+def _make_tile_cache_key(**kwargs: object) -> str:
+    raw = "&".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class _ResolvedModelRenderInputs:
+    active_model_id: str | None
+    active_layers: list[str]
+    render_layers: list[str]
+    resolved_model_ids: tuple[str, ...]
+
+
+def _resolve_model_render_inputs(
+    taxon_id: int,
+    *,
+    model_id: str | None = None,
+    layers: Sequence[str] | None = None,
+    apply_phenology: bool = True,
+    phenology_only: bool = False,
+) -> _ResolvedModelRenderInputs:
+    """Resolve the exact feature layers and model artifacts used to render a tile."""
+    has_phenology = models.has_phenology_model(taxon_id)
+    has_full = models.has_full_model(taxon_id)
+
+    if phenology_only:
+        active_model_id = (
+            models.AUTO_PHENOLOGY_MODEL_ID if has_phenology else models.AUTO_FULL_MODEL_ID if has_full else model_id
+        )
+    elif apply_phenology and has_full and not has_phenology:
+        active_model_id = models.AUTO_FULL_MODEL_ID
+    else:
+        active_model_id = model_id
+
+    active_layers = _load_model_layers(taxon_id, active_model_id, layers if active_model_id == model_id else None)
+    render_layers = list(active_layers)
+    resolved_model_ids: list[str] = []
+
+    active_artifact = models.resolve_model_artifact(active_model_id, taxon_id=taxon_id)
+    if active_artifact is not None:
+        resolved_model_ids.append(active_artifact.model_id)
+
+    if apply_phenology and not phenology_only and has_phenology and active_model_id == model_id:
+        pheno_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
+        render_layers = list(dict.fromkeys(active_layers + pheno_layers))
+        pheno_artifact = models.resolve_model_artifact(models.AUTO_PHENOLOGY_MODEL_ID, taxon_id=taxon_id)
+        if pheno_artifact is not None:
+            resolved_model_ids.append(pheno_artifact.model_id)
+
+    return _ResolvedModelRenderInputs(
+        active_model_id=active_model_id,
+        active_layers=active_layers,
+        render_layers=render_layers,
+        resolved_model_ids=tuple(dict.fromkeys(resolved_model_ids)),
+    )
+
+
+def _temporal_layers_version_token(layer_ids: Sequence[str], forecast_hours: int) -> str | None:
+    """Return a version token derived from the temporal raster files used by these layers."""
+    from util import weather_tiles as _wt
+
+    temporal_versions: list[str] = []
+    seen_paths: set[str] = set()
+    for layer_id in layer_ids:
+        parsed_temporal = gis_lookup.parse_temporal_layer_id(layer_id)
+        if parsed_temporal is None:
+            continue
+        variable_id, _agg, window_hours = parsed_temporal
+        path = _wt.temporal_raster_path(variable_id, window_hours, forecast_hours)
+        if path is None:
+            continue
+        path_key = str(path)
+        if path_key in seen_paths:
+            continue
+        seen_paths.add(path_key)
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            mtime_ns = -1
+        temporal_versions.append(f"{path.name}:{mtime_ns}")
+
+    if not temporal_versions:
+        return None
+    raw = "|".join(sorted(temporal_versions))
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
 def _is_temporal_column(col: str) -> bool:
@@ -419,6 +600,7 @@ def _render_layer_values(
     spec: TileSpec,
     *,
     reproject_to_mercator: bool,
+    overview_bias: int = 0,
 ) -> np.ndarray:
     layer_meta = _layer_metadata(layer_id)
 
@@ -461,6 +643,9 @@ def _render_layer_values(
 
             overviews, desired = _estimate_overview_factor(ds, bounds_wgs84, spec.tile_size)
             chosen_level, chosen_factor = _choose_overview_level(overviews, desired)
+            if overview_bias > 0 and chosen_level is not None and overviews:
+                chosen_level = min(len(overviews) - 1, chosen_level + overview_bias)
+                chosen_factor = overviews[chosen_level]
             overview_factor = max(1, int(chosen_factor or 1))
 
             if not reproject_to_mercator and _is_wgs84(ds):
@@ -935,47 +1120,68 @@ def _render_feature_stack(
     forecast_hours: int,
     *,
     layer_cache: "dict[str, np.ndarray] | None" = None,
+    overview_bias: int = 0,
+    cancel_check: CancelCheck | None = None,
 ) -> np.ndarray:
     """Render a (tile_size, tile_size, C) feature tensor for the given layer list.
 
     If *layer_cache* is provided, already-rendered layers are read from it and
     newly rendered layers are stored back into it so subsequent calls sharing the
     same cache dict skip redundant I/O.
+    Layers not already cached are rendered in parallel using a thread pool.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from util import weather_tiles as _wt
 
     tile_size = spec.tile_size
     stack = np.empty((tile_size, tile_size, len(layer_list)), dtype=np.float32)
+
+    # Populate from cache first; collect indices that still need rendering.
+    to_render: list[tuple[int, str]] = []
     for idx, layer_id in enumerate(layer_list):
+        _check_cancel(cancel_check)
         if layer_cache is not None and layer_id in layer_cache:
             stack[:, :, idx] = layer_cache[layer_id]
-            continue
+        else:
+            to_render.append((idx, layer_id))
+
+    def _render_one(idx_layer: tuple[int, str]) -> tuple[int, str, np.ndarray]:
+        _check_cancel(cancel_check)
+        idx, layer_id = idx_layer
         parsed_temporal = gis_lookup.parse_temporal_layer_id(layer_id)
         if parsed_temporal is not None:
             variable_id, _agg, window_hours = parsed_temporal
             try:
                 arr = _wt.sample_grid_for_tile(variable_id, window_hours, forecast_hours, spec)
-            except Exception as exc:
+            except Exception:
                 arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
-                print(f"[model-tile] WARNING: temporal layer {layer_id} failed: {exc}")
         else:
             try:
                 arr = _render_layer_values(
                     layer_id,
                     spec,
                     reproject_to_mercator=reproject,
+                    overview_bias=overview_bias,
                 )
-            except Exception as exc:
+            except Exception:
                 arr = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
-                print(
-                    f"[model-tile] WARNING: layer {layer_id} read failed for tile "
-                    f"z={spec.z} x={spec.x} y={spec.y} — filling NaN. Error: {exc}"
-                )
-        stack[:, :, idx] = arr
-        if layer_cache is not None:
-            layer_cache[layer_id] = arr
-        if idx == 0 or idx == len(layer_list) - 1 or (idx + 1) % 10 == 0:
-            print(f"[model-tile] rendered layers {idx + 1}/{len(layer_list)} current_layer={layer_id}")
+        _check_cancel(cancel_check)
+        return idx, layer_id, arr
+
+    n_workers = min(len(to_render), 2) if to_render else 1
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [pool.submit(_render_one, idx_layer) for idx_layer in to_render]
+        try:
+            for future in as_completed(futures):
+                _check_cancel(cancel_check)
+                idx, layer_id, arr = future.result()
+                _check_cancel(cancel_check)
+                stack[:, :, idx] = arr
+                if layer_cache is not None:
+                    layer_cache[layer_id] = arr
+        except TileRenderCancelled:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
     return stack
 
 
@@ -990,41 +1196,59 @@ def _compute_model_probs(
     apply_phenology: bool = True,
     phenology_only: bool = False,
     layer_cache: "dict[str, np.ndarray] | None" = None,
+    overview_bias: int = 0,
+    resolved_inputs: _ResolvedModelRenderInputs | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> np.ndarray:
     """Compute per-pixel probabilities for a single taxon. Returns (H, W) float array."""
-    has_phenology = models.has_phenology_model(taxon_id)
-    has_full = models.has_full_model(taxon_id)
-
-    if phenology_only:
-        active_model_id = (
-            models.AUTO_PHENOLOGY_MODEL_ID if has_phenology else models.AUTO_FULL_MODEL_ID if has_full else model_id
-        )
-    elif apply_phenology and has_full and not has_phenology:
-        active_model_id = models.AUTO_FULL_MODEL_ID
-    else:
-        active_model_id = model_id
-
-    active_layers = _load_model_layers(taxon_id, active_model_id, layers if active_model_id == model_id else None)
-    print(
-        f"[model-tile] taxon={taxon_id} model={active_model_id} "
-        f"features={len(active_layers)} forecast_hours={forecast_hours}"
+    resolved = resolved_inputs or _resolve_model_render_inputs(
+        taxon_id,
+        model_id=model_id,
+        layers=layers,
+        apply_phenology=apply_phenology,
+        phenology_only=phenology_only,
     )
-    stack = _render_feature_stack(active_layers, spec, reproject, forecast_hours, layer_cache=layer_cache)
-    probs = models.predict(active_model_id, stack, feature_ids=active_layers, taxon_id=taxon_id)
+    active_model_id = resolved.active_model_id
+    active_layers = resolved.active_layers
+    render_layers = resolved.render_layers
 
-    # Plants with both SDM + phenology: multiply for combined view
-    if apply_phenology and not phenology_only and has_phenology and active_model_id == model_id:
+    _check_cancel(cancel_check)
+    stack = _render_feature_stack(
+        render_layers,
+        spec,
+        reproject,
+        forecast_hours,
+        layer_cache=layer_cache,
+        overview_bias=overview_bias,
+        cancel_check=cancel_check,
+    )
+    # render_layers preserves active_layers as a prefix, so the base model can reuse a view of the same stack.
+    active_stack = stack[:, :, : len(active_layers)] if render_layers != active_layers else stack
+    render_flat = stack.reshape(-1, stack.shape[2]).astype(np.float32, copy=False)
+    render_valid_mask = np.any(np.isfinite(render_flat), axis=1)
+    active_flat = render_flat[:, : len(active_layers)] if render_layers != active_layers else render_flat
+    active_valid_mask = np.any(np.isfinite(active_flat), axis=1)
+    _check_cancel(cancel_check)
+    probs = models.predict(
+        active_model_id,
+        active_stack,
+        feature_ids=active_layers,
+        taxon_id=taxon_id,
+        _preflat=active_flat,
+        _valid_mask=active_valid_mask,
+    )
+
+    # When phenology adds extra feature layers, reuse the already-rendered union stack and multiply it in.
+    if render_layers != active_layers:
         try:
-            pheno_layers = _load_model_layers(taxon_id, models.AUTO_PHENOLOGY_MODEL_ID, None)
-            all_layers = list(dict.fromkeys(active_layers + pheno_layers))
-            if all_layers != active_layers:
-                stack = _render_feature_stack(all_layers, spec, reproject, forecast_hours, layer_cache=layer_cache)
-                probs = models.predict(model_id, stack, feature_ids=all_layers, taxon_id=taxon_id)
+            _check_cancel(cancel_check)
             pheno_probs = models.predict(
                 models.AUTO_PHENOLOGY_MODEL_ID,
                 stack,
-                feature_ids=all_layers,
+                feature_ids=render_layers,
                 taxon_id=taxon_id,
+                _preflat=render_flat,
+                _valid_mask=render_valid_mask,
             )
             probs = probs * pheno_probs
         except ValueError:
@@ -1046,8 +1270,42 @@ def render_model_tile_bytes(
     forecast_hours: int = 0,
     apply_phenology: bool = True,
     phenology_only: bool = False,
+    overview_bias: int = 1,
+    cancel_check: CancelCheck | None = None,
 ) -> bytes:
-    spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
+    _check_cancel(cancel_check)
+    resolved_inputs = _resolve_model_render_inputs(
+        taxon_id,
+        model_id=model_id,
+        layers=layers,
+        apply_phenology=apply_phenology,
+        phenology_only=phenology_only,
+    )
+    temporal_version = _temporal_layers_version_token(resolved_inputs.render_layers, forecast_hours)
+    cache_key = _make_tile_cache_key(
+        namespace=_TILE_CACHE_NAMESPACE,
+        taxon_id=taxon_id,
+        z=z,
+        x=x,
+        y=y,
+        model_id=model_id,
+        forecast_hours=forecast_hours,
+        resolved_model_ids=resolved_inputs.resolved_model_ids,
+        temporal_version=temporal_version,
+        apply_phenology=apply_phenology,
+        phenology_only=phenology_only,
+        tile_size=tile_size,
+        reproject=reproject,
+        overview_bias=overview_bias,
+        layers=tuple(layers) if layers is not None else None,
+    )
+    cached = _read_tile_cache(cache_key)
+    if cached is not None:
+        _check_cancel(cancel_check)
+        return cached
+
+    render_size = tile_size
+    spec = TileSpec(z=z, x=x, y=y, tile_size=render_size)
     probs = _compute_model_probs(
         taxon_id,
         spec,
@@ -1057,12 +1315,21 @@ def render_model_tile_bytes(
         forecast_hours=forecast_hours,
         apply_phenology=apply_phenology,
         phenology_only=phenology_only,
+        overview_bias=overview_bias,
+        resolved_inputs=resolved_inputs,
+        cancel_check=cancel_check,
     )
+    _check_cancel(cancel_check)
     rgba = _colorize_heatmap(probs)
     image = Image.fromarray(rgba, mode="RGBA")
+    if render_size != tile_size:
+        image = image.resize((tile_size, tile_size), Image.BILINEAR)
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
-    return buffer.getvalue()
+    result = buffer.getvalue()
+    _check_cancel(cancel_check)
+    _write_tile_cache(cache_key, result)
+    return result
 
 
 def render_aggregate_tile_bytes(
@@ -1073,6 +1340,8 @@ def render_aggregate_tile_bytes(
     tile_size: int = 256,
     reproject: bool = True,
     forecast_hours: int = 0,
+    overview_bias: int = 1,
+    cancel_check: CancelCheck | None = None,
 ) -> bytes:
     """Render an aggregate heatmap averaged across all species with available models.
 
@@ -1089,6 +1358,7 @@ def render_aggregate_tile_bytes(
     acc: np.ndarray | None = None
     count = 0
     for taxon_id in taxon_ids:
+        _check_cancel(cancel_check)
         try:
             probs = _compute_model_probs(
                 int(taxon_id),
@@ -1097,11 +1367,15 @@ def render_aggregate_tile_bytes(
                 forecast_hours=forecast_hours,
                 apply_phenology=True,
                 layer_cache=layer_cache,
+                overview_bias=overview_bias,
+                cancel_check=cancel_check,
             )
             acc = probs if acc is None else acc + probs
             count += 1
-        except Exception as exc:
-            print(f"[aggregate-tile] skipping taxon={taxon_id}: {exc}")
+        except TileRenderCancelled:
+            raise
+        except Exception:
+            pass
 
     if acc is None or count == 0:
         # No models — return transparent tile
@@ -1112,7 +1386,7 @@ def render_aggregate_tile_bytes(
         return buffer.getvalue()
 
     avg = acc / count
-    print(f"[aggregate-tile] z={z} x={x} y={y} species={count} avg_max={float(avg.max()):.3f}")
+    _check_cancel(cancel_check)
     rgba = _colorize_heatmap(avg)
     image = Image.fromarray(rgba, mode="RGBA")
     buffer = io.BytesIO()
@@ -1164,6 +1438,7 @@ def render_homepage_tile_bytes(
     tile_size: int = 256,
     vmin: float = 0.0,
     vmax: float = 1.0,
+    cancel_check: CancelCheck | None = None,
 ) -> bytes:
     """Serve a tile from the pre-built aggregate SDM GeoTIFF. Fast — no model inference."""
     from pathlib import Path as _Path
@@ -1172,6 +1447,7 @@ def render_homepage_tile_bytes(
     spec = TileSpec(z=z, x=x, y=y, tile_size=tile_size)
 
     dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+    _check_cancel(cancel_check)
     if raster_path.exists():
         with rasterio.open(raster_path) as ds:
             merc_minx, merc_miny, merc_maxx, merc_maxy = tile_bounds_mercator(spec)
@@ -1188,6 +1464,7 @@ def render_homepage_tile_bytes(
             except Exception:
                 pass
 
+    _check_cancel(cancel_check)
     rgba = _colorize_heatmap(dest, vmin=vmin, vmax=vmax)
     image = Image.fromarray(rgba, mode="RGBA")
     buffer = io.BytesIO()

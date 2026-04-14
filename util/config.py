@@ -119,7 +119,9 @@ class GlobalConfig:
     occurrence_list_columns: tuple[str, ...] = ("dp", "rcs", "gall")
 
     # API + aggregation behavior
-    skip_description_outliers: bool = False
+    # Outlier descriptions require load_relative_ranks for every environment variable
+    # on species page load. Disabled for performance; descriptions use direct summaries.
+    skip_description_outliers: bool = True
     sdm_tile_size: int = 256
 
     # ML training

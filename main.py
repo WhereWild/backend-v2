@@ -149,6 +149,12 @@ def list_environment_variables(
     )
 
 
+@app.get("/data-sources")
+def list_data_sources() -> dict[str, Any]:
+    """Returns structured citation metadata for all environmental data sources."""
+    return gis_lookup.load_data_sources()
+
+
 @app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
 async def variable_tile(
     request: Request,

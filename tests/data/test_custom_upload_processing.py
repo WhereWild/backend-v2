@@ -275,7 +275,7 @@ def test_build_index_archive_falls_back_consistently_when_readable_step_fails(mo
             "bio_1",
         ]
         assert metadata["exported_name"].tolist() == ["bio_1"]
-        assert list(metadata.columns) == ["id", "name", "exported_name", "category", "units", "value_type"]
+        assert list(metadata.columns) == ["id", "name", "exported_name", "category", "units", "value_type", "source_ids"]
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 

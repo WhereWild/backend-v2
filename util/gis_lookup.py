@@ -272,6 +272,16 @@ def _get_layer(layer_id: str) -> Dict[str, Any] | None:
 
 
 @lru_cache(maxsize=1)
+def load_data_sources() -> Dict[str, Dict[str, Any]]:
+    """Returns the data_sources section of the GIS catalog.
+
+    Returns:
+        A dict mapping source id to structured citation objects.
+    """
+    return _load_gis_catalog().get("data_sources", {})
+
+
+@lru_cache(maxsize=1)
 def load_layer_metadata() -> Dict[str, Dict[str, Any]]:
     """Builds a mapping of layer id to raw layer metadata.
 
@@ -331,6 +341,7 @@ def _expand_temporal_layers(category: dict[str, Any]) -> list[dict[str, Any]]:
         units = layer.get("units")
         value_type = layer.get("value_type") or "numeric"
         code = layer.get("code") or str(base_id).upper()
+        source_ids = layer.get("source_ids")
         if agg == "snapshot":
             expanded.append(
                 {
@@ -339,6 +350,7 @@ def _expand_temporal_layers(category: dict[str, Any]) -> list[dict[str, Any]]:
                     "display_name": display_name,
                     "units": units,
                     "value_type": value_type,
+                    "source_ids": source_ids,
                     "region_root": "regions",
                     "region_size": 10,
                     "filename_template": "{id}.tif",
@@ -353,6 +365,7 @@ def _expand_temporal_layers(category: dict[str, Any]) -> list[dict[str, Any]]:
                     "display_name": f"{display_name} ({agg.capitalize()}, {hours}h)",
                     "units": units,
                     "value_type": value_type,
+                    "source_ids": source_ids,
                     "region_root": "regions",
                     "region_size": 10,
                     "filename_template": "{id}.tif",
@@ -377,11 +390,13 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
     mapping: dict[str, dict[str, Any]] = {}
     for category in catalog.get("categories", []):
         category_name = category.get("display_name") or category.get("name")
+        category_source_ids: list[str] = category.get("source_ids") or []
         if category.get("name") == "temporal":
             for layer in _expand_temporal_layers(category):
                 layer_id = layer.get("id")
                 if not layer_id:
                     continue
+                effective_source_ids = layer.get("source_ids") or category_source_ids
                 entry = {
                     "id": layer_id,
                     "name": layer.get("display_name") or layer.get("name") or layer_id,
@@ -389,6 +404,7 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
                     "description": layer.get("description"),
                     "value_type": layer.get("value_type"),
                     "category": category_name,
+                    "source_ids": effective_source_ids,
                 }
                 entries.append(entry)
                 mapping[layer_id] = entry
@@ -399,6 +415,7 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
                 continue
             if layer_id in mapping:
                 continue
+            effective_source_ids = layer.get("source_ids") or category_source_ids
             entry = {
                 "id": layer_id,
                 "name": layer.get("display_name") or layer.get("name") or layer_id,
@@ -406,6 +423,7 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
                 "description": layer.get("description"),
                 "value_type": layer.get("value_type"),
                 "category": category_name,
+                "source_ids": effective_source_ids,
             }
             entries.append(entry)
             mapping[layer_id] = entry

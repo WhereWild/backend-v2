@@ -145,6 +145,7 @@ def test_metadata_skips_layers_without_id(stub_env):
                 "description": None,
                 "value_type": None,
                 "category": "physical",
+                "source_ids": [],
             }
         }
     finally:
@@ -184,6 +185,42 @@ def test_expand_temporal_layers_branches():
     }
     expanded = gis_lookup._expand_temporal_layers(category)
     assert [item["id"] for item in expanded] == ["a_avg_6h", "a_avg_12h", "b"]
+
+
+def test_temporal_layer_source_ids_override_category_source_ids(stub_env):
+    config, stub = stub_env
+    catalog = {
+        "categories": [
+            {
+                "name": "temporal",
+                "display_name": "Temporal",
+                "source_ids": ["category_source"],
+                "windows": [24],
+                "layers": [
+                    {
+                        "id": "wind",
+                        "agg": "avg",
+                        "display_name": "Wind",
+                        "source_ids": ["layer_source"],
+                    },
+                    {
+                        "id": "nowcast",
+                        "agg": "snapshot",
+                        "display_name": "Nowcast",
+                    },
+                ],
+            },
+        ]
+    }
+    stub._files[config.gis_catalog_path] = json.dumps(catalog).encode("utf-8")
+
+    expanded = gis_lookup._expand_temporal_layers(catalog["categories"][0])
+    assert expanded[0]["source_ids"] == ["layer_source"]
+    assert expanded[1]["source_ids"] is None
+
+    _entries, mapping = gis_lookup.load_variable_metadata()
+    assert mapping["wind_avg_24h"]["source_ids"] == ["layer_source"]
+    assert mapping["nowcast"]["source_ids"] == ["category_source"]
 
 
 def test_parse_temporal_layer_id_helpers():

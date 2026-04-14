@@ -1712,7 +1712,7 @@ def load_relative_ranks(
                         position += adjusted_total - count
                         count = adjusted_total
             percentile = position / max(count - 1, 1) if count > 1 else 0.0
-            ancestor_label = entry.get("contextLabel")
+            ancestor_label = (entry.get("contextLabel") or "").replace("_", " ") or None
             ancestor_taxon_id = entry.get("contextTaxonId")
             results.append(
                 {
@@ -1823,8 +1823,8 @@ def load_relative_ranks(
                 position / max(count - 1, 1) if count > 1 else 0.0
             )
             ancestor_label = (
-                ancestor["scientific_name"]
-                or ancestor["common_name"]
+                (ancestor["scientific_name"] or "").replace("_", " ").strip()
+                or (ancestor["common_name"] or "").replace("_", " ").strip()
                 or ancestor["taxon_key"]
             )
             entry = {
@@ -2087,7 +2087,7 @@ def child_relative_rankings(
                 "taxonId": taxon_id_value,
                 "taxon_id": taxon_id_value,
                 "taxon_key": taxon["taxon_key"],
-                "scientificName": taxon["scientific_name"],
+                "scientificName": taxon["scientific_name"].replace("_", " ") if taxon.get("scientific_name") else taxon["scientific_name"],
                 "commonName": common_name,
                 "common_names": common_names,
                 "rank": taxon_rank,
@@ -2191,7 +2191,7 @@ def child_relative_rankings(
             "taxonId": taxon_id if taxon_id is not None else taxon["taxon_key"],
             "taxon_id": taxon_id if taxon_id is not None else taxon["taxon_key"],
             "taxon_key": taxon["taxon_key"],
-            "scientificName": taxon["scientific_name"],
+            "scientificName": taxon["scientific_name"].replace("_", " ") if taxon.get("scientific_name") else taxon["scientific_name"],
             "commonName": common_name,
             "common_names": common_names,
             "rank": canonical_taxon_rank,

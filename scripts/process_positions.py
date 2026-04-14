@@ -105,13 +105,21 @@ def _load_column_lengths(index_path: Path) -> dict[str, int]:
     return lengths
 
 
+def _normalize_context_label(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).replace("_", " ").split())
+
+
 def _resolve_context_label(taxon: taxa_navigation.TaxonRecord) -> str:
     scientific = taxon.get("scientific_name")
-    if scientific:
-        return str(scientific)
+    scientific_label = _normalize_context_label(scientific)
+    if scientific_label:
+        return scientific_label
     common = taxon.get("common_name")
-    if common:
-        return str(common)
+    common_label = _normalize_context_label(common)
+    if common_label:
+        return common_label
     return str(taxon["taxon_key"])
 
 
@@ -151,7 +159,7 @@ def _normalize_position_row(row: dict[str, Any]) -> dict[str, Any] | None:
         "count": count,
         "sampleCount": sample_count,
         "contextTaxonId": str(context_taxon_id),
-        "contextLabel": str(context_label) if context_label is not None else "",
+        "contextLabel": _normalize_context_label(context_label),
     }
 
 
@@ -189,7 +197,7 @@ def _write_rows(positions_path: Path, rows: list[dict[str, Any]]) -> None:
             type=pa.string(),
         ),
         "contextLabel": pa.array(
-            [row["contextLabel"] for row in rows],
+            [_normalize_context_label(row["contextLabel"]) for row in rows],
             type=pa.string(),
         ),
     }

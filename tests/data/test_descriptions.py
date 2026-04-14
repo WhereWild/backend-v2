@@ -377,8 +377,8 @@ def test_numeric_and_compare_helpers(monkeypatch, tmp_path):
 
     monkeypatch.setattr(desc.units, "convert_value_for_system", lambda v, _u, _s: (v, ""))
     assert desc._format_scalar_value(3.0) == "3"
-    assert desc._format_scalar_value(3.14) == "3.1"
-    assert desc._format_scalar_value_for_system(12.2, unit="celsius") == "12.2"
+    assert desc._format_scalar_value(3.14) == "3"
+    assert desc._format_scalar_value_for_system(12.2, unit="celsius") == "12"
     assert desc._temperature_location_compare_text(local_mean=10, global_mean=10.2, location_name="X") == "about the same in X"
     assert "warmer" in (desc._temperature_location_compare_text(local_mean=14, global_mean=10, location_name="X") or "")
     assert desc._precip_location_compare_text(local_mean=100, global_mean=100, location_name="X") == "about the same in X"
@@ -401,10 +401,13 @@ def test_status_rows_temperature_precip_terrain(monkeypatch, tmp_path):
         lambda *, variable_id, location_gid=None, **_k: {
             "elevation": {"range": {"min": 100, "max": 900}},
             "slope": {"mean": 18, "10th percentile": 3},
-            "bio_6": {"min": -8},
-            "bio_5": {"max": 33},
+            "bio_6": {"mean": -8},
+            "bio_5": {"mean": 33},
+            "bio_18": {"mean": 30},
+            "bio_19": {"median": 80},
+            "swe": {"median": 0},
             "bio_1": {"mean": 12 if location_gid else 10},
-            "bio_12": {"min": 200, "max": 1800, "mean": 900 if location_gid else 700},
+            "bio_12": {"min": 200, "max": 1800, "median": 900 if location_gid else 700},
         }.get(variable_id, {}),
     )
     monkeypatch.setattr(
@@ -431,7 +434,11 @@ def test_status_rows_temperature_precip_terrain(monkeypatch, tmp_path):
     terrain = desc._terrain_status_rows(taxon, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
     assert terrain is not None and "Found from" in terrain and "slopes" in terrain
     weather = desc._weather_status_rows(taxon, tmp_path, taxon_id=1, location_gid="USA")[0]["detail"]
-    assert weather is not None and "Can tolerate" in weather
+    assert weather == (
+        "Typically hot, xeric summers\n"
+        "Typically cold, semi-arid winters\n"
+        "Prefers moderately wet areas, but can tolerate arid to incredibly wet"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1453,14 +1460,14 @@ def test_last_coverage_push_branches(monkeypatch, tmp_path):
     monkeypatch.setattr(
         desc,
         "_numeric_summary_for_context",
-        lambda *, variable_id, location_gid=None, **_k: {"bio_12": {"min": 100, "max": 100, "mean": 100 if location_gid else 100}}.get(variable_id, {}),
+        lambda *, variable_id, location_gid=None, **_k: {"bio_12": {"min": 100, "max": 100, "median": 100 if location_gid else 100}}.get(variable_id, {}),
     )
     monkeypatch.setattr(gis_lookup, "load_variable_metadata", lambda: ([], {"bio_12": {"units": "mm"}}))
     monkeypatch.setattr(desc.units, "equivalent_unit", lambda u, _s: u)
     monkeypatch.setattr(desc.units, "display_unit", lambda u: u or "")
     monkeypatch.setattr(desc.units, "convert_value_for_system", lambda v, _u, _s: (v, ""))
     p = desc._weather_status_rows({"taxon_key": "1"}, tmp_path, taxon_id=1, location_gid=None)[0]["detail"]
-    assert p is not None and "100-100 mm" in p
+    assert p == "Prefers xeric areas"
 
 
 def test_final_remaining_lines_live_paths(monkeypatch, tmp_path):

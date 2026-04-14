@@ -2208,10 +2208,7 @@ def _format_scalar_value(value: Any) -> Optional[str]:
         return None
     if not math.isfinite(numeric):
         return None
-    rounded = round(numeric)
-    if abs(numeric - rounded) < 1e-6:
-        return str(int(rounded))
-    return f"{numeric:.1f}".rstrip("0").rstrip(".")
+    return str(int(round(numeric)))
 
 
 def _format_scalar_value_for_system(
@@ -2508,11 +2505,8 @@ def _weather_status_rows(
         location_gid=location_gid,
     )
     coldest_winter_raw = bio6.get("mean")
-    coldest_winter_min_raw = bio6.get("min")
     hottest_raw = bio5.get("mean")
-    hottest_max_raw = bio5.get("max")
     temp_raw_units: Optional[str] = None
-    temp_display_units = ""
     try:
         _entries, variable_lookup = gis_lookup.load_variable_metadata()
         temp_raw_units = str((variable_lookup.get("bio_6") or {}).get("units") or "").strip() or None
@@ -2520,13 +2514,7 @@ def _weather_status_rows(
     except Exception:
         temp_raw_units = None
         precip_raw_units_from_meta = None
-    temp_target_unit = units.equivalent_unit(temp_raw_units, unit_system) if temp_raw_units else temp_raw_units
-    temp_display_units = str(units.display_unit(temp_target_unit) or "").strip()
-
-    # Precip units (shared by bio_12, bio_18, bio_19)
     precip_raw_units: Optional[str] = precip_raw_units_from_meta
-    precip_target_unit = units.equivalent_unit(precip_raw_units, unit_system) if precip_raw_units else precip_raw_units
-    precip_display_units = str(units.display_unit(precip_target_unit) or "").strip()
 
     def _safe_float(val: Any) -> Optional[float]:
         try:
@@ -2535,49 +2523,15 @@ def _weather_status_rows(
         except (TypeError, ValueError):
             return None
 
-    def _with_precip_units(value: str) -> str:
-        return f"{value} {precip_display_units}" if precip_display_units else value
+    def _to_celsius(raw_val: Any) -> Optional[float]:
+        v = _safe_float(raw_val)
+        if v is None:
+            return None
+        converted, _ = units.convert_value_for_system(v, temp_raw_units, "metric")
+        return converted if math.isfinite(converted) else None
 
-    def _precip_range(low: str, high: str) -> str:
-        if precip_display_units:
-            return f"{low}-{high} {precip_display_units}"
-        return f"{low}-{high}"
-
-    coldest_winter = _format_scalar_value_for_system(
-        coldest_winter_raw,
-        unit=temp_raw_units,
-        unit_system=unit_system,
-    )
-    coldest_winter_min = _format_scalar_value_for_system(
-        coldest_winter_min_raw,
-        unit=temp_raw_units,
-        unit_system=unit_system,
-    )
-    _TEMP_DIFF_THRESHOLD_C = 10 * 5 / 9  # 10°F expressed in °C
-    _cw_mean = _safe_float(coldest_winter_raw)
-    _cw_min = _safe_float(coldest_winter_min_raw)
-    show_min_low = (
-        _cw_mean is not None
-        and _cw_min is not None
-        and (_cw_mean - _cw_min) >= _TEMP_DIFF_THRESHOLD_C
-    )
-    hottest = _format_scalar_value_for_system(
-        hottest_raw,
-        unit=temp_raw_units,
-        unit_system=unit_system,
-    )
-    hottest_max = _format_scalar_value_for_system(
-        hottest_max_raw,
-        unit=temp_raw_units,
-        unit_system=unit_system,
-    )
-    _h_mean = _safe_float(hottest_raw)
-    _h_max = _safe_float(hottest_max_raw)
-    show_max_high = (
-        _h_mean is not None
-        and _h_max is not None
-        and (_h_max - _h_mean) >= _TEMP_DIFF_THRESHOLD_C
-    )
+    hottest_celsius = _to_celsius(hottest_raw)
+    coldest_celsius = _to_celsius(coldest_winter_raw)
 
     # Summer rain (bio_18 = precipitation of warmest quarter)
     bio18 = _numeric_summary_for_context(
@@ -2587,26 +2541,8 @@ def _weather_status_rows(
         location_gid=location_gid,
     )
     summer_precip_typical_raw = _safe_float(bio18.get("mean"))
-    summer_precip_dry_raw = _safe_float(bio18.get("min"))
     summer_rain_label: Optional[str] = (
         _annual_precip_label(summer_precip_typical_raw * 4) if summer_precip_typical_raw is not None else None
-    )
-    summer_rain_dry_label: Optional[str] = (
-        _annual_precip_label(summer_precip_dry_raw * 4) if summer_precip_dry_raw is not None else None
-    )
-    _PRECIP_DRYNESS_ORDER = [
-        "torrential", "extremely wet", "incredibly wet", "very wet", "wet",
-        "moderately wet", "subhumid", "dry", "semi-arid", "arid", "xeric", "extremely xeric",
-    ]
-    def _precip_rank(label: Optional[str]) -> int:
-        try:
-            return _PRECIP_DRYNESS_ORDER.index(label)
-        except (ValueError, TypeError):
-            return -1
-    show_dry_precip = (
-        summer_rain_dry_label is not None
-        and summer_rain_label is not None
-        and _precip_rank(summer_rain_dry_label) > _precip_rank(summer_rain_label)
     )
 
     # Winter precip (bio_19 = precipitation of coldest quarter) — context when no snow
@@ -2630,54 +2566,27 @@ def _weather_status_rows(
     )
     swe_scale = units.variable_display_scale("swe")
     swe_median_raw = _safe_float(swe_summary.get("median"))
-    swe_max_raw = _safe_float(swe_summary.get("max"))
     swe_median = swe_median_raw * swe_scale if swe_median_raw is not None else None
-    swe_max = swe_max_raw * swe_scale if swe_max_raw is not None else None
 
     median_tier = _swe_tier(swe_median)
-    max_tier = _swe_tier(swe_max)
 
     detail_parts: list[str] = []
-    # --- Summer line: "Typically {rain} summers with highs of {temp}[, but can tolerate {drier} summers with highs up to {max}]" ---
-    if hottest is not None:
-        temp_str = f"{hottest} {temp_display_units}" if temp_display_units else hottest
-        typical_desc = f"{summer_rain_label} summers" if summer_rain_label else "summers"
-        line = f"Typically {typical_desc} with highs of {temp_str}"
-        if show_dry_precip or show_max_high:
-            if show_dry_precip:
-                tolerance = f"but can tolerate {summer_rain_dry_label} summers"
-                if show_max_high and hottest_max:
-                    max_temp_str = f"{hottest_max} {temp_display_units}" if temp_display_units else hottest_max
-                    tolerance += f" with highs up to {max_temp_str}"
-            else:
-                max_temp_str = f"{hottest_max} {temp_display_units}" if temp_display_units else hottest_max
-                tolerance = f"but can tolerate highs up to {max_temp_str}"
-            line += f", {tolerance}"
-        detail_parts.append(line)
+    # --- Summer line: "Typically {heat}, {rain} summers" ---
+    if hottest_celsius is not None:
+        heat_label = _summer_heat_label(hottest_celsius)
+        summer_parts = [p for p in [heat_label, summer_rain_label] if p]
+        typical_desc = ", ".join(summer_parts) + " summers" if summer_parts else "summers"
+        detail_parts.append(f"Typically {typical_desc}")
 
-    # --- Winter line: "Typically {snow}, {precip} winters with lows down to {temp}[, but can tolerate {max}]" ---
-    if coldest_winter is not None:
-        temp_str = f"{coldest_winter} {temp_display_units}" if temp_display_units else coldest_winter
-        if median_tier == "snow-free":
-            winter_desc = f"{median_tier}, {winter_precip_label}" if winter_precip_label else median_tier
-        else:
-            winter_desc = median_tier
-        line = f"Typically {winter_desc} winters with lows of {temp_str}"
-        if median_tier != max_tier:
-            tolerance = f"but can tolerate {max_tier} winters"
-            if show_min_low and coldest_winter_min:
-                min_str = f"{coldest_winter_min} {temp_display_units}" if temp_display_units else coldest_winter_min
-                tolerance += f" with lows down to {min_str}"
-            line += f", {tolerance}"
-        elif show_min_low and coldest_winter_min:
-            min_str = f"{coldest_winter_min} {temp_display_units}" if temp_display_units else coldest_winter_min
-            line += f", but can tolerate lows down to {min_str}"
-        detail_parts.append(line)
+    # --- Winter line: "Typically {cold}, {snow/precip} winters" ---
+    if coldest_celsius is not None:
+        cold_label = _winter_coldness_label(coldest_celsius)
+        snow_or_precip = winter_precip_label if median_tier == "snow-free" else median_tier
+        winter_parts = [p for p in [cold_label, snow_or_precip] if p]
+        typical_desc = ", ".join(winter_parts) + " winters" if winter_parts else "winters"
+        detail_parts.append(f"Typically {typical_desc}")
     elif median_tier != "snow-free":
-        line = f"Typically {median_tier} winters"
-        if median_tier != max_tier:
-            line += f", but can tolerate {max_tier} winters"
-        detail_parts.append(line)
+        detail_parts.append(f"Typically {median_tier} winters")
 
     # --- Precipitation (bio_12 = annual) ---
     bio12 = _numeric_summary_for_context(
@@ -2694,17 +2603,10 @@ def _weather_status_rows(
     wettest = _format_scalar_value_for_system(wettest_raw, unit=precip_raw_units, unit_system=unit_system)
     average = _format_scalar_value_for_system(average_raw, unit=precip_raw_units, unit_system=unit_system)
 
-    def _with_precip_units(value: str) -> str:
-        return f"{value} {precip_display_units}" if precip_display_units else value
-
-    def _precip_range(low: str, high: str) -> str:
-        if precip_display_units:
-            return f"{low}-{high} {precip_display_units}"
-        return f"{low}-{high}"
 
     if average is not None:
         mean_label = _annual_precip_label(float(average_raw))
-        line = f"Prefers {mean_label} areas ({_with_precip_units(average)})"
+        line = f"Prefers {mean_label} areas"
         if driest is not None and wettest is not None:
             low_label = _annual_precip_label(float(driest_raw))
             high_label = _annual_precip_label(float(wettest_raw))
@@ -2713,25 +2615,21 @@ def _weather_status_rows(
             if low_same and high_same:
                 pass  # both ends same as average, say nothing
             elif low_same:
-                line += f", but can tolerate {high_label} ({_with_precip_units(wettest)})"
+                line += f", but can tolerate {high_label}"
             elif high_same:
-                line += f", but can tolerate {low_label} ({_with_precip_units(driest)})"
+                line += f", but can tolerate {low_label}"
             elif low_label == high_label:
-                line += f", but can tolerate {low_label} ({_precip_range(driest, wettest)})"
+                line += f", but can tolerate {low_label}"
             else:
-                line += f", but can tolerate {low_label} ({_with_precip_units(driest)}) to {high_label} ({_with_precip_units(wettest)})"
+                line += f", but can tolerate {low_label} to {high_label}"
         detail_parts.append(line)
     elif driest is not None and wettest is not None:
         low_label = _annual_precip_label(float(driest_raw))
         high_label = _annual_precip_label(float(wettest_raw))
         if low_label == high_label:
-            detail_parts.append(
-                f"Can tolerate {low_label} ({_precip_range(driest, wettest)})"
-            )
+            detail_parts.append(f"Can tolerate {low_label}")
         else:
-            detail_parts.append(
-                f"Can tolerate {low_label} ({_with_precip_units(driest)}) to {high_label} ({_with_precip_units(wettest)})"
-            )
+            detail_parts.append(f"Can tolerate {low_label} to {high_label}")
 
     detail: Optional[str] = "\n".join(detail_parts) if detail_parts else None
     return [

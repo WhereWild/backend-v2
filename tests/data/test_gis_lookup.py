@@ -577,6 +577,22 @@ def test_location_taxon_counts_rollup_and_rollup_failure(monkeypatch):
     assert counts[30] == 3
     assert counts[10] == 2
 
+    ancestor_counts = gis_lookup.location_taxon_counts(
+        "country_scope",
+        "USA",
+        include_ancestor_rollup=True,
+    )
+    assert ancestor_counts[20] == 2
+    assert ancestor_counts[10] == 2
+    assert ancestor_counts[11] == 2
+
+    gis_lookup.location_taxa_for.cache_clear()
+    assert gis_lookup.location_taxa_for(
+        "country_scope",
+        "USA",
+        include_ancestor_rollup=True,
+    ) == frozenset({10, 11, 20, 30})
+
     # Rollup exceptions are swallowed and base mapping still returns.
     monkeypatch.setattr(
         taxa_navigation,
@@ -585,6 +601,8 @@ def test_location_taxon_counts_rollup_and_rollup_failure(monkeypatch):
     )
     fallback = gis_lookup.location_taxon_counts("country_scope", "USA", include_species_rollup=True)
     assert fallback[20] == 2 and fallback[30] == 3
+    ancestor_fallback = gis_lookup.location_taxon_counts("country_scope", "USA", include_ancestor_rollup=True)
+    assert ancestor_fallback[20] == 2 and ancestor_fallback[30] == 3
 
 
 def test_location_counts_for_taxon_species_rollup_and_fallback(monkeypatch):

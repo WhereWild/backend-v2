@@ -494,6 +494,35 @@ def convert_observations(
     return converted_rows
 
 
+def apply_unit_system_to_query_rows(
+    rows: list[dict[str, Any]],
+    unit_system: Optional[str],
+    *,
+    variable_id: Optional[str],
+    unit: Optional[str],
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    converted_rows = [dict(row) for row in rows]
+    scale = variable_display_scale(variable_id)
+    if scale != 1.0:
+        for row in converted_rows:
+            sort_value = row.get("sort_value")
+            if isinstance(sort_value, (int, float)):
+                row["sort_value"] = float(sort_value) * scale
+
+    resolved = normalize_unit_system(unit_system)
+    if not resolved or not unit:
+        return converted_rows, unit
+
+    target_unit = equivalent_unit(unit, resolved) or unit
+    display = display_unit(target_unit)
+    for row in converted_rows:
+        sort_value = row.get("sort_value")
+        if isinstance(sort_value, (int, float)):
+            converted_value, _ = convert_value_for_system(float(sort_value), unit, resolved)
+            row["sort_value"] = converted_value
+    return converted_rows, display
+
+
 def apply_unit_system_to_variables(
     variables: list[dict[str, Any]],
     unit_system: Optional[str],
@@ -564,9 +593,7 @@ def apply_unit_system_to_slice_response(
     resolved = normalize_unit_system(unit_system)
     if not resolved or not unit:
         return updated
-    updated["observations"] = convert_observations(
-        updated.get("observations", []), unit, resolved
-    )
+    updated["observations"] = convert_observations(updated.get("observations", []), unit, resolved)
     min_value = updated.get("range", {}).get("min")
     max_value = updated.get("range", {}).get("max")
     min_value, display = convert_value_for_system(min_value, unit, resolved)
@@ -595,16 +622,12 @@ def apply_unit_system_to_rankings_response(
     entries = []
     for entry in updated.get("entries", []):
         if isinstance(entry, dict) and isinstance(entry.get("value"), (int, float)):
-            converted_value, _ = convert_value_for_system(
-                float(entry["value"]), unit, resolved
-            )
+            converted_value, _ = convert_value_for_system(float(entry["value"]), unit, resolved)
             updated_entry = dict(entry)
             updated_entry["value"] = converted_value
             entries.append(updated_entry)
         else:
             entries.append(entry)
     updated["entries"] = entries
-    updated["distribution"] = convert_density_curve(
-        updated.get("distribution"), unit, resolved
-    )
+    updated["distribution"] = convert_density_curve(updated.get("distribution"), unit, resolved)
     return updated

@@ -1,4 +1,5 @@
 """Shared pytest fixtures for the WhereWild test suite."""
+
 from __future__ import annotations
 
 import resource
@@ -21,16 +22,11 @@ def client():
 # Known-good test data (confirmed present with all precomputed files)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="session")
 def known_taxon_id() -> int:
     """Quercus robur — has occurrence, summary_stats, density_graph, occurrence_index."""
     return 2878688
-
-
-@pytest.fixture(scope="session")
-def known_genus_taxon_id() -> int:
-    """Quercus genus — used for relative-rankings tests."""
-    return 2877951
 
 
 @pytest.fixture(scope="session")
@@ -64,6 +60,7 @@ def known_categorical_class_value() -> str:
 @pytest.fixture(scope="session")
 def data_root():
     from util.config import load_config
+
     return load_config("global").data_root
 
 
@@ -71,6 +68,7 @@ def data_root():
 def parquet_storage():
     from util.config import load_config
     from util.storage import get_parquet_storage
+
     cfg = load_config("global")
     return get_parquet_storage(cfg.data_root, cfg.project_root)
 

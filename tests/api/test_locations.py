@@ -1,15 +1,26 @@
-"""Tests for GET /locations/search and GET /locations/search_hierarchy"""
+"""Tests for location search and hierarchy routes."""
+
 from __future__ import annotations
 
+from fastapi import HTTPException
+import pytest
+
 import main
+from util.request_cancellation import RequestCancelledError
 
 
 # ---------------------------------------------------------------------------
 # /locations/search
 # ---------------------------------------------------------------------------
 
+
 def test_search_locations_returns_200(client):
     r = client.get("/locations/search?q=united+states")
+    assert r.status_code == 200
+
+
+def test_api_search_locations_returns_200(client):
+    r = client.get("/api/locations/search?q=united+states")
     assert r.status_code == 200
 
 
@@ -54,12 +65,60 @@ def test_search_locations_respects_limit(client):
     assert len(body["results"]) <= 3
 
 
+def test_search_locations_returns_499_on_disconnect(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_build_disconnect_checker",
+        lambda _request, poll_every=32: lambda: (_ for _ in ()).throw(RequestCancelledError("Client disconnected")),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        main.search_locations_endpoint(request=object(), q="utah", limit=10)
+
+    assert exc.value.status_code == 499
+
+
+def test_get_location_detail_returns_payload(client, monkeypatch):
+    monkeypatch.setattr(
+        main.gis_lookup,
+        "describe_location",
+        lambda gid: {
+            "gid": gid,
+            "name": "Utah",
+            "level": 1,
+            "parent_gid": "USA",
+            "hierarchy": ["United States"],
+            "ancestors": [{"gid": "USA", "name": "United States", "level": 0}],
+        },
+    )
+
+    body = client.get("/api/locations/UT").json()
+
+    assert body["gid"] == "UT"
+    assert body["parent_gid"] == "USA"
+    assert body["ancestors"][0]["gid"] == "USA"
+
+
+def test_get_location_detail_returns_404(client, monkeypatch):
+    monkeypatch.setattr(main.gis_lookup, "describe_location", lambda _gid: None)
+
+    response = client.get("/api/locations/UNKNOWN")
+
+    assert response.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # /locations/search_hierarchy
 # ---------------------------------------------------------------------------
 
+
 def test_search_hierarchy_returns_200(client):
     r = client.get("/locations/search_hierarchy?q=utah")
+    assert r.status_code == 200
+
+
+def test_api_search_hierarchy_returns_200(client):
+    r = client.get("/api/locations/search_hierarchy?q=utah")
     assert r.status_code == 200
 
 
@@ -142,7 +201,7 @@ def test_search_hierarchy_parent_resolution_and_duplicate_drop(monkeypatch):
             {"gid": "X", "name": "Utah", "level": 1, "hierarchy": ["United States"]},
         ],
     )
-    body = main.search_locations_by_hierarchy(q="utah", level=None, parent="US", limit=10)
+    body = main.search_locations_by_hierarchy(request=None, q="utah", level=None, parent="US", limit=10)
     assert len(body["results"]) == 1
 
 
@@ -152,7 +211,11 @@ def test_search_hierarchy_handles_gid_resolution_exception(monkeypatch):
 
     monkeypatch.setattr(main.gis_lookup, "get_location_by_gid", raise_on_gid, raising=False)
     monkeypatch.setattr(main.gis_lookup, "search_locations", lambda _q, _limit: [])
-    assert main.search_locations_by_hierarchy(q="x", level=None, parent="Y", limit=50) == {"results": []}
+    with pytest.raises(HTTPException) as exc:
+        main.search_locations_by_hierarchy(request=None, q="x", level=None, parent="Y", limit=50)
+
+    assert exc.value.status_code == 500
+    assert exc.value.detail == "Location hierarchy search failed"
 
 
 def test_search_hierarchy_catalog_enum_and_list_children_fallback_errors(monkeypatch):
@@ -175,8 +238,11 @@ def test_search_hierarchy_catalog_enum_and_list_children_fallback_errors(monkeyp
         raise RuntimeError("children failed")
 
     monkeypatch.setattr(main.gis_lookup, "list_children", bad_list_children)
-    out = main.search_locations_by_hierarchy(q="", level="state", parent="US", limit=5)
-    assert "results" in out
+    with pytest.raises(HTTPException) as exc:
+        main.search_locations_by_hierarchy(request=None, q="", level="state", parent="US", limit=5)
+
+    assert exc.value.status_code == 500
+    assert exc.value.detail == "Location hierarchy search failed"
 
 
 def test_search_hierarchy_catalog_enumeration_exception_is_ignored(monkeypatch):
@@ -187,8 +253,11 @@ def test_search_hierarchy_catalog_enumeration_exception_is_ignored(monkeypatch):
         lambda: (_ for _ in ()).throw(RuntimeError("catalog failed")),
     )
     monkeypatch.setattr(main.gis_lookup, "list_children", lambda *_a, **_k: [], raising=False)
-    out = main.search_locations_by_hierarchy(q="", level="state", parent=None, limit=5)
-    assert out == {"results": []}
+    with pytest.raises(HTTPException) as exc:
+        main.search_locations_by_hierarchy(request=None, q="", level="state", parent=None, limit=5)
+
+    assert exc.value.status_code == 500
+    assert exc.value.detail == "Location hierarchy search failed"
 
 
 def test_search_hierarchy_letter_scan_break_and_error_handling(monkeypatch):
@@ -199,7 +268,7 @@ def test_search_hierarchy_letter_scan_break_and_error_handling(monkeypatch):
 
     monkeypatch.setattr(main.gis_lookup, "search_locations", partial)
     monkeypatch.setattr(main.gis_lookup, "list_children", lambda *_a, **_k: [], raising=False)
-    out = main.search_locations_by_hierarchy(q="", level=None, parent="A", limit=1)
+    out = main.search_locations_by_hierarchy(request=None, q="", level=None, parent="A", limit=1)
     assert len(out["results"]) == 1
 
     monkeypatch.setattr(
@@ -207,7 +276,11 @@ def test_search_hierarchy_letter_scan_break_and_error_handling(monkeypatch):
         "search_locations",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert main.search_locations_by_hierarchy(q="abc", level=None, parent=None, limit=50) == {"results": []}
+    with pytest.raises(HTTPException) as exc:
+        main.search_locations_by_hierarchy(request=None, q="abc", level=None, parent=None, limit=50)
+
+    assert exc.value.status_code == 500
+    assert exc.value.detail == "Location hierarchy search failed"
 
 
 def test_search_hierarchy_letter_scan_swallow_partial_errors(monkeypatch):
@@ -217,5 +290,42 @@ def test_search_hierarchy_letter_scan_swallow_partial_errors(monkeypatch):
         "search_locations",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("letter failed")),
     )
-    out = main.search_locations_by_hierarchy(q="", level=None, parent="A", limit=5)
-    assert out == {"results": []}
+    with pytest.raises(HTTPException) as exc:
+        main.search_locations_by_hierarchy(request=None, q="", level=None, parent="A", limit=5)
+
+    assert exc.value.status_code == 500
+    assert exc.value.detail == "Location hierarchy search failed"
+
+
+def test_search_hierarchy_returns_499_on_disconnect(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_build_disconnect_checker",
+        lambda _request, poll_every=32: lambda: (_ for _ in ()).throw(RequestCancelledError("Client disconnected")),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        main.search_locations_by_hierarchy(request=object(), q="utah", level=None, parent=None, limit=10)
+
+    assert exc.value.status_code == 499
+
+
+def test_search_hierarchy_returns_499_on_late_disconnect(monkeypatch):
+    calls = {"count": 0}
+
+    def _cancel_check():
+        calls["count"] += 1
+        if calls["count"] >= 2:
+            raise RequestCancelledError("Client disconnected")
+
+    monkeypatch.setattr(main, "_build_disconnect_checker", lambda _request, poll_every=32: _cancel_check)
+    monkeypatch.setattr(
+        main.gis_lookup,
+        "search_locations",
+        lambda _q, _limit, **_kwargs: [{"gid": "UT", "name": "Utah", "level": 1, "hierarchy": ["United States"]}],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        main.search_locations_by_hierarchy(request=object(), q="utah", level=None, parent=None, limit=10)
+
+    assert exc.value.status_code == 499

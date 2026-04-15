@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from util import indexing as idx
+from util.request_cancellation import RequestCancelledError
 
 
 class _StubParquet:
@@ -66,7 +68,10 @@ def test_temporal_helpers_and_targets(monkeypatch):
     monkeypatch.setattr(
         idx.gis_lookup,
         "load_temporal_registry",
-        lambda: {"windows": [6, "bad", 12], "layers": [{"id": "wind", "agg": "avg"}, {"id": "snap", "agg": "snapshot"}, {"id": ""}]},
+        lambda: {
+            "windows": [6, "bad", 12],
+            "layers": [{"id": "wind", "agg": "avg"}, {"id": "snap", "agg": "snapshot"}, {"id": ""}],
+        },
     )
     expanded, base = idx._temporal_registry_config()
     assert "wind_avg_6h" in expanded and "snap" in expanded
@@ -109,7 +114,9 @@ def test_temporal_and_global_loader_edge_branches(stub_env, monkeypatch, tmp_pat
     d.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(idx.pds, "dataset", lambda *_a, **_k: _BadDS())
     assert idx._load_global_relative_rows("1", "bio_1") is None
-    monkeypatch.setattr(idx.pds, "dataset", lambda *_a, **_k: type("DS", (), {"to_table": lambda self, **kw: pa.table({"x": []})})())
+    monkeypatch.setattr(
+        idx.pds, "dataset", lambda *_a, **_k: type("DS", (), {"to_table": lambda self, **kw: pa.table({"x": []})})()
+    )
     assert idx._load_global_relative_rows("1", "bio_1") is None
 
     out = idx._harmonize_numeric_arrays([pa.array(["a"], type=pa.string()), pa.array(["b"], type=pa.large_string())])
@@ -128,10 +135,21 @@ def test_global_rows_and_descendant_catalog_helpers(stub_env, monkeypatch, tmp_p
 
     class _DS:
         def to_table(self, **_kwargs):
-            return pa.table({"variable": ["bio_1"], "metric": ["mean"], "position": [0], "count": [1], "sampleCount": [1], "contextTaxonId": ["1"], "contextLabel": ["ctx"]})
+            return pa.table(
+                {
+                    "variable": ["bio_1"],
+                    "metric": ["mean"],
+                    "position": [0],
+                    "count": [1],
+                    "sampleCount": [1],
+                    "contextTaxonId": ["1"],
+                    "contextLabel": ["ctx"],
+                }
+            )
 
     monkeypatch.setattr(idx.pds, "dataset", lambda *_a, **_k: _DS())
     out = idx._load_global_relative_rows("1", "bio_1")
+    assert out is not None
     assert out.num_rows == 1
 
     descendants = [{"taxon_key": "2"}, {"taxon_key": "1"}, {"taxon_key": "x"}, {"taxon_key": "1"}]
@@ -177,7 +195,9 @@ def test_descendant_catalog_builders(stub_env, monkeypatch, tmp_path):
         idx.build_descendant_catalog_parquet("1", "")
 
     monkeypatch.setattr(idx, "_descendant_rank_targets", lambda _r: ["SPECIES"])
-    monkeypatch.setattr(idx.taxa_navigation, "iter_descendants", lambda *_a, **_k: [{"taxon_key": "2", "rank": "SPECIES"}])
+    monkeypatch.setattr(
+        idx.taxa_navigation, "iter_descendants", lambda *_a, **_k: [{"taxon_key": "2", "rank": "SPECIES"}]
+    )
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: False)
     called = {}
     monkeypatch.setattr(idx, "_write_descendant_catalog", lambda p, d: called.setdefault("x", (p, d)))
@@ -210,6 +230,28 @@ def test_metric_row_collection_and_rank_index_arrays(monkeypatch, tmp_path):
     assert idx._build_rank_index_arrays({}) == ({}, {}, set(), 0)
 
 
+def test_query_taxa_honors_cancellation_during_match_iteration(monkeypatch):
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda *_a, **_k: [
+            ({"taxon_key": "1", "rank": "SPECIES", "path": "/tmp/1"}, 91.0),
+            ({"taxon_key": "2", "rank": "SPECIES", "path": "/tmp/2"}, 88.0),
+        ],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda value: int(str(value)))
+
+    calls = {"count": 0}
+
+    def cancel_check():
+        calls["count"] += 1
+        if calls["count"] >= 2:
+            raise RequestCancelledError("Client disconnected")
+
+    with pytest.raises(RequestCancelledError, match="Client disconnected"):
+        idx.query_taxa(q="oak", cancel_check=cancel_check)
+
+
 def test_write_rank_index_and_column_helpers(stub_env, monkeypatch, tmp_path):
     _cfg, stub = stub_env
     index_path = tmp_path / "species_index.parquet"
@@ -226,11 +268,6 @@ def test_write_rank_index_and_column_helpers(stub_env, monkeypatch, tmp_path):
     col = idx._load_struct_column(index_path, "bio_1::mean", 1)
     assert len(col) == 1
 
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"path": tmp_path, "rank": "GENUS"})
-    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
-    stub._exists[tmp_path / "species_index.parquet"] = True
-    opts = idx.list_rank_metric_options("1", "species")
-    assert any(o["column"] == "bio_1::mean" for o in opts)
     with pytest.raises(ValueError):
         idx._resolve_column_name(index_path, "missing", "x")
 
@@ -239,21 +276,53 @@ def test_relative_ranks_and_child_rankings(stub_env, monkeypatch, tmp_path):
     _cfg, stub = stub_env
     taxon_dir = tmp_path / "species_1"
     taxon_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: {"taxon_key": str(k), "rank": "SPECIES", "path": taxon_dir, "scientific_name": "S"} if str(k) == "1" else None)
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: (
+            {"taxon_key": str(k), "rank": "SPECIES", "path": taxon_dir, "scientific_name": "S"}
+            if str(k) == "1"
+            else None
+        ),
+    )
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)))
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
-    monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}])
-    monkeypatch.setattr(idx, "_load_global_relative_rows", lambda *_a, **_k: pa.table({"variable": ["bio_1"], "metric": ["mean"], "position": [0], "count": [2], "sampleCount": [5], "contextTaxonId": ["10"], "contextLabel": ["G"]}))
+    monkeypatch.setattr(
+        idx,
+        "_ancestor_contexts",
+        lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}],
+    )
+    monkeypatch.setattr(
+        idx,
+        "_load_global_relative_rows",
+        lambda *_a, **_k: pa.table(
+            {
+                "variable": ["bio_1"],
+                "metric": ["mean"],
+                "position": [0],
+                "count": [2],
+                "sampleCount": [5],
+                "contextTaxonId": ["10"],
+                "contextLabel": ["G"],
+            }
+        ),
+    )
     out = idx.load_relative_ranks(taxon_dir, "bio_1")
     assert out and out[0]["metric"] == "mean"
 
     index_path = taxon_dir / "species_index.parquet"
     arr = pa.StructArray.from_arrays(
         [pa.array(["1"], type=pa.string()), pa.array([1.5], type=pa.float64()), pa.array([5], type=pa.int32())],
-        fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
     )
     table = pa.table({"bio_1::mean": arr})
-    pq.write_table(table.replace_schema_metadata({b"column_lengths": json.dumps({"bio_1::mean": 1}).encode("utf-8")}), index_path)
+    pq.write_table(
+        table.replace_schema_metadata({b"column_lengths": json.dumps({"bio_1::mean": 1}).encode("utf-8")}), index_path
+    )
     stub._exists[index_path] = True
     stub._schemas[index_path] = pq.read_schema(index_path)
     stub._tables[index_path] = pq.read_table(index_path)
@@ -347,6 +416,1044 @@ def test_build_index_parquet_end_to_end_and_incremental(stub_env, monkeypatch, t
     assert "bio_2" in schema2.names
 
 
+def test_query_taxa_text_results_use_full_match_set(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    def _search(_query, limit=10):
+        rows = []
+        for taxon_id in range(1, 121):
+            rows.append(
+                (
+                    {
+                        "taxon_key": str(taxon_id),
+                        "path": tmp_path / f"species_{taxon_id}",
+                        "rank": "SPECIES",
+                        "scientific_name": f"Species {taxon_id}",
+                    },
+                    float(200 - taxon_id),
+                )
+            )
+        if limit is None:
+            return rows
+        return rows[:limit]
+
+    monkeypatch.setattr(idx.taxa_navigation, "search_taxa_by_name", _search)
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+
+    payload = idx.query_taxa(q="oak", limit=5, offset=100)
+
+    assert payload["total"] == 120
+    assert [row["taxon_id"] for row in payload["results"]] == [101, 102, 103, 104, 105]
+
+
+def test_query_taxa_text_results_bound_search_window_after_filtering(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    def _search(_query, limit=None, **_kwargs):
+        rows = []
+        for taxon_id in range(1, 1001):
+            rows.append(
+                (
+                    {
+                        "taxon_key": str(taxon_id),
+                        "path": tmp_path / f"species_{taxon_id}",
+                        "rank": "SPECIES",
+                        "scientific_name": f"Species {taxon_id}",
+                    },
+                    float(2000 - taxon_id),
+                )
+            )
+        if limit is None:
+            return rows
+        return rows[:limit]
+
+    monkeypatch.setattr(idx.taxa_navigation, "search_taxa_by_name", _search)
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(
+        idx,
+        "_filter_matched_taxa",
+        lambda matched_taxa, **_kwargs: [match for match in matched_taxa if match["taxon_id"] % 30 == 0],
+    )
+
+    payload = idx.query_taxa(q="oak", limit=5, offset=20)
+
+    assert payload["matched_total"] == 625
+    assert payload["eligible_total"] == 20
+    assert payload["total"] == 20
+    assert payload["results"] == []
+
+
+def test_query_taxa_scoped_ranked_query_filters_inside_leaderboard_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    captured = {}
+
+    def _ranked(*_args, **kwargs):
+        captured["candidate_taxon_ids"] = kwargs.get("candidate_taxon_ids")
+        captured["name_query"] = kwargs.get("name_query")
+        return ([{"count": 400, "matched_count": 425, "taxon_id": 250, "match_score": 88.0}], None)
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not prefilter scoped ranked queries")),
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx, "child_relative_rankings", _ranked)
+
+    payload = idx.query_taxa(
+        q="oak",
+        within_taxon_id="10",
+        descendant_rank="SPECIES",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        limit=5,
+    )
+
+    assert payload["total"] == 400
+    assert payload["matched_total"] == 425
+    assert captured["candidate_taxon_ids"] is None
+    assert captured["name_query"] == "oak"
+
+
+def test_query_taxa_text_query_uses_bounded_search(monkeypatch):
+    seen: dict[str, Any] = {}
+
+    def _search(_query, limit=10):
+        seen["limit"] = limit
+        return []
+
+    monkeypatch.setattr(idx.taxa_navigation, "search_taxa_by_name", _search)
+
+    payload = idx.query_taxa(q="oak", limit=5, offset=100)
+
+    assert seen["limit"] == 2625
+    assert payload["total"] == 0
+
+
+def test_child_relative_rankings_keeps_location_matches_when_counts_missing_and_no_min_samples(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    ancestor = {"taxon_key": "77", "rank": "GENUS", "path": tmp_path}
+    target = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    target["path"].mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: ancestor if str(key) == "77" else (target if str(key) == "1" else None),
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        idx,
+        "_resolve_column_name",
+        lambda *_args, **_kwargs: "bio_1::mean",
+    )
+    monkeypatch.setattr(idx.PARQUET, "exists", lambda _path: True)
+    monkeypatch.setattr(idx, "_load_column_lengths", lambda _path: {"bio_1::mean": 1})
+    monkeypatch.setattr(
+        idx,
+        "_load_struct_column",
+        lambda *_args, **_kwargs: pa.StructArray.from_arrays(
+            [pa.array(["1"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([7], type=pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
+        ),
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("x", "scope", "target"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda *_args, **_kwargs: frozenset({1}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_args, **_kwargs: {2: 4})
+    monkeypatch.setattr(idx.gis_lookup, "location_counts_for_taxon", lambda _taxon_id: {})
+
+    rows, _distribution = idx.child_relative_rankings(
+        "77",
+        "species",
+        "bio_1",
+        "mean",
+        location_gid="USA",
+        min_samples=0,
+        return_distribution=False,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["taxon_id"] == 1
+    assert rows[0]["sample_count"] == 0
+
+
+def test_query_taxa_rejects_unknown_descendant_rank():
+    with pytest.raises(ValueError, match="Unknown descendant_rank: spcies"):
+        idx.query_taxa(q="oak", descendant_rank="spcies")
+
+
+def test_query_taxa_accepts_standard_higher_descendant_rank(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda *_a, **_k: [
+            (
+                {
+                    "taxon_key": "10",
+                    "path": tmp_path / "genus_10",
+                    "rank": "GENUS",
+                    "scientific_name": "Genus 10",
+                },
+                99.0,
+            )
+        ],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx, "_filter_matched_taxa", lambda matched_taxa, **_kwargs: matched_taxa)
+    monkeypatch.setattr(idx, "child_relative_rankings", lambda *_a, **_k: ([{"count": 1, "taxon_id": 10}], None))
+
+    payload = idx.query_taxa(
+        q="genus",
+        within_taxon_id="1",
+        descendant_rank="GENUS",
+        sort_variable="bio_1",
+        sort_metric="mean",
+    )
+
+    assert payload["total"] == 1
+
+
+def test_query_taxa_ranked_search_uses_full_match_set(monkeypatch, tmp_path):
+    seen: dict[str, Any] = {}
+    ancestor = {
+        "taxon_key": "10",
+        "rank": "GENUS",
+        "path": tmp_path / "genus_10",
+        "scientific_name": "Ancestor Genus",
+    }
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not prefilter scoped ranked queries")),
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_parent_taxon",
+        lambda taxon: ancestor if str(taxon.get("taxon_key")) != "10" else None,
+    )
+
+    def _child_relative_rankings(*_args, candidate_taxon_ids=None, name_query=None, **_kwargs):
+        seen["candidate_count"] = len(candidate_taxon_ids or [])
+        seen["name_query"] = name_query
+        return ([{"count": 300, "matched_count": 300, "taxon_id": 1, "match_score": 91.0}], None)
+
+    monkeypatch.setattr(idx, "child_relative_rankings", _child_relative_rankings)
+
+    payload = idx.query_taxa(
+        q="species",
+        within_taxon_id="10",
+        descendant_rank="SPECIES",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        limit=5,
+        offset=100,
+    )
+
+    assert seen["candidate_count"] == 0
+    assert seen["name_query"] == "species"
+    assert payload["matched_total"] == 300
+    assert payload["total"] == 300
+
+
+def test_query_taxa_direct_ranked_query_uses_bounded_text_search(monkeypatch, tmp_path):
+    seen: dict[str, Any] = {}
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+    for taxon in (species_one, species_two):
+        taxon["path"].mkdir(parents=True, exist_ok=True)
+
+    def _search_taxa_by_name(_query, limit=10, **_kwargs):
+        seen["limit"] = limit
+        return [
+            (species_one, 80.0),
+            (species_two, 95.0),
+        ]
+
+    monkeypatch.setattr(idx.taxa_navigation, "search_taxa_by_name", _search_taxa_by_name)
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+    monkeypatch.setattr(
+        idx,
+        "_load_summary_stats",
+        lambda path: (
+            {"bio_1": {"mean": 10.0, "count": 5}}
+            if str(path).endswith("species_1")
+            else {"bio_1": {"mean": 2.0, "count": 6}}
+        ),
+    )
+    monkeypatch.setattr(idx, "_load_categorical_stats", lambda _path: {})
+
+    payload = idx.query_taxa(
+        q="species",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        sort_order="asc",
+        limit=5,
+        offset=100,
+    )
+
+    assert seen["limit"] == 2625
+    assert payload["total"] == 2
+    assert payload["matched_total"] == 2
+    assert payload["eligible_total"] == 2
+    assert payload["results"] == []
+
+
+def test_query_taxa_text_location_filter_skips_sample_count_when_min_samples_zero(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    species = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+
+    monkeypatch.setattr(idx.taxa_navigation, "search_taxa_by_name", lambda _query, limit=250: [(species, 90.0)])
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("level0Gid", "country_scope", "ETH"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _scope, _gid: frozenset({1}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {1: 3})
+    monkeypatch.setattr(
+        idx,
+        "_matched_taxon_sample_count",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("should not resolve sample_count when min_samples=0")),
+    )
+
+    payload = idx.query_taxa(q="species", location_gid="ETH", min_samples=0)
+
+    assert payload["total"] == 1
+    assert payload["matched_total"] == 1
+    assert payload["eligible_total"] == 1
+    assert [row["taxon_id"] for row in payload["results"]] == [1]
+
+
+def test_rank_candidate_taxa_keeps_missing_counts_when_min_samples_zero(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    species = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species["path"].mkdir(parents=True, exist_ok=True)
+    match_row = {"taxon": species, "taxon_id": 1, "match_score": 80.0}
+
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx, "_taxon_metric_record", lambda *_args, **_kwargs: (5.0, None))
+
+    rows = idx._rank_candidate_taxa(
+        [match_row],
+        "bio_1",
+        "mean",
+        order="asc",
+        min_samples=0,
+        include_species_like=False,
+        within_taxon_id=None,
+        descendant_rank=None,
+        location_gid=None,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["taxon_id"] == 1
+    assert rows[0]["sample_count"] == 0
+
+
+def test_rank_candidate_taxa_descending_uses_rank_position(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+    for taxon in (species_one, species_two):
+        taxon["path"].mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        idx,
+        "_taxon_metric_record",
+        lambda taxon, *_args, **_kwargs: (5.0, 4) if taxon["taxon_key"] == "1" else (10.0, 6),
+    )
+
+    rows = idx._rank_candidate_taxa(
+        [
+            {"taxon": species_one, "taxon_id": 1, "match_score": 80.0},
+            {"taxon": species_two, "taxon_id": 2, "match_score": 70.0},
+        ],
+        "bio_1",
+        "mean",
+        order="desc",
+        min_samples=0,
+        include_species_like=False,
+        within_taxon_id=None,
+        descendant_rank=None,
+        location_gid=None,
+    )
+
+    assert [row["taxon_id"] for row in rows] == [2, 1]
+    assert [row["position"] for row in rows] == [2, 1]
+    assert [row["count"] for row in rows] == [2, 2]
+    assert [row["percentile"] for row in rows] == [1.0, 0.0]
+
+
+def test_query_taxa_location_rollup_keeps_species_matches(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    species = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+
+    monkeypatch.setattr(idx.taxa_navigation, "search_taxa_by_name", lambda _query, limit=None: [(species, 90.0)])
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "iter_descendants",
+        lambda _taxon, include_self=False: [] if include_self else [{"taxon_key": "11", "rank": "SUBSPECIES"}],
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("level0Gid", "country_scope", "ETH"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _scope, _gid: frozenset({11}))
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "location_taxon_counts",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("should not roll up all location taxa when min_samples=0")
+        ),
+    )
+
+    payload = idx.query_taxa(q="species", location_gid="ETH")
+
+    assert payload["total"] == 1
+    assert payload["matched_total"] == 1
+    assert payload["eligible_total"] == 1
+    assert [row["taxon_id"] for row in payload["results"]] == [1]
+
+
+def test_query_taxa_location_filter_keeps_higher_rank_ranked_matches(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    genus = {
+        "taxon_key": "10",
+        "rank": "GENUS",
+        "path": tmp_path / "genus_10",
+        "scientific_name": "Genus Ten",
+    }
+    genus["path"].mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(idx.taxa_navigation, "search_taxa_by_name", lambda _query, limit=None: [(genus, 90.0)])
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+    monkeypatch.setattr(idx, "_load_summary_stats", lambda _path: {"bio_1": {"mean": 2.0, "count": 4}})
+    monkeypatch.setattr(idx, "_load_categorical_stats", lambda _path: {})
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("level0Gid", "country_scope", "USA"))
+
+    def _location_taxa_for(_scope, _gid, include_ancestor_rollup=False):
+        return frozenset({10}) if include_ancestor_rollup else frozenset({1})
+
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", _location_taxa_for)
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "location_taxon_counts",
+        lambda _scope, _gid, include_species_rollup=False, include_ancestor_rollup=False: (
+            {10: 4, 1: 4} if include_ancestor_rollup else {1: 4}
+        ),
+    )
+
+    payload = idx.query_taxa(
+        q="genus",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        sort_order="asc",
+        location_gid="USA",
+    )
+
+    assert payload["total"] == 1
+    assert payload["matched_total"] == 1
+    assert payload["eligible_total"] == 1
+    assert [row["taxon_id"] for row in payload["results"]] == [10]
+    assert payload["results"][0]["sample_count"] == 4
+
+
+def test_query_taxa_text_only_filters_matches_by_location(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=None: [
+            (species_one, 90.0),
+            (species_two, 80.0),
+        ],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("level0Gid", "country_scope", "ETH"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _scope, _gid: frozenset({2}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {2: 3})
+
+    payload = idx.query_taxa(q="species", location_gid="ETH")
+
+    assert payload["total"] == 1
+    assert payload["matched_total"] == 2
+    assert payload["eligible_total"] == 1
+    assert payload["empty_reason"] is None
+    assert [row["taxon_id"] for row in payload["results"]] == [2]
+
+
+def test_query_taxa_text_location_filter_keeps_higher_rank_matches_without_location_rollup(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    genus = {
+        "taxon_key": "10",
+        "rank": "GENUS",
+        "path": tmp_path / "genus_10",
+        "scientific_name": "Genus Ten",
+    }
+    species = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+
+    monkeypatch.setattr(idx.taxa_navigation, "search_taxa_by_name", lambda _query, limit=250: [(genus, 90.0)])
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "iter_descendants",
+        lambda taxon, include_self=False: [species] if str(taxon.get("taxon_key")) == "10" and not include_self else [],
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("level0Gid", "country_scope", "CHN"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _scope, _gid: frozenset({1}))
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "location_taxon_counts",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("should not roll up all location taxa when min_samples=0")
+        ),
+    )
+
+    payload = idx.query_taxa(q="genus", location_gid="CHN", min_samples=0)
+
+    assert payload["total"] == 1
+    assert payload["matched_total"] == 1
+    assert payload["eligible_total"] == 1
+    assert [row["taxon_id"] for row in payload["results"]] == [10]
+
+
+def test_query_taxa_text_only_filters_matches_by_min_samples(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=None: [
+            (species_one, 90.0),
+            (species_two, 80.0),
+        ],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(idx, "_infer_sample_count", lambda taxon: 5 if str(taxon.get("taxon_key")) == "1" else 12)
+
+    payload = idx.query_taxa(q="species", min_samples=10)
+
+    assert payload["total"] == 1
+    assert payload["matched_total"] == 2
+    assert payload["eligible_total"] == 1
+    assert payload["empty_reason"] is None
+    assert [row["taxon_id"] for row in payload["results"]] == [2]
+
+
+def test_query_taxa_returns_no_query_metadata():
+    payload = idx.query_taxa()
+
+    assert payload["total"] == 0
+    assert payload["matched_total"] == 0
+    assert payload["eligible_total"] == 0
+    assert payload["empty_reason"] == "no_query"
+
+
+def test_query_taxa_reports_filtered_out_matches(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=None: [
+            (species_one, 90.0),
+            (species_two, 80.0),
+        ],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(idx, "_infer_sample_count", lambda _taxon: 0)
+
+    payload = idx.query_taxa(q="species", min_samples=1)
+
+    assert payload["matched_total"] == 2
+    assert payload["eligible_total"] == 0
+    assert payload["empty_reason"] == "filtered_out"
+    assert payload["results"] == []
+
+
+def test_child_relative_rankings_location_filter_uses_location_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx,
+        "CONFIG",
+        SimpleNamespace(
+            common_name_language="en",
+            subspecies_equivalents={"SUBSPECIES"},
+            species_rank="SPECIES",
+        ),
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: {
+            "taxon_key": str(key),
+            "rank": "SPECIES",
+            "scientific_name": f"Species {key}",
+            "path": tmp_path,
+        },
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper())
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: [])
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_a, **_k: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_a, **_k: {})
+    monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
+    monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
+    monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 3})
+    monkeypatch.setattr(
+        idx,
+        "_load_struct_column",
+        lambda *_a, **_k: pa.StructArray.from_arrays(
+            [
+                pa.array(["1", "2", "3"], type=pa.string()),
+                pa.array([1.0, 2.0, 3.0], type=pa.float64()),
+                pa.array([10, 10, 10], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
+        ),
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1, 2}))
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "location_taxon_counts",
+        lambda _s, _t, include_species_rollup=False: {1: 1, 2: 3},
+    )
+
+    rows, distribution = idx.child_relative_rankings(
+        "1",
+        "species",
+        "bio_1",
+        "mean",
+        min_samples=2,
+        return_distribution=False,
+        location_gid="USA",
+    )
+
+    assert distribution is None
+    assert len(rows) == 1
+    assert rows[0]["taxon_id"] == 2
+    assert rows[0]["sampleCount"] == 3
+    assert rows[0]["count"] == 1
+    assert rows[0]["percentile"] == 0.0
+
+
+def test_child_relative_rankings_descending_uses_filtered_rank_position(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx,
+        "CONFIG",
+        SimpleNamespace(
+            common_name_language="en",
+            subspecies_equivalents={"SUBSPECIES"},
+            species_rank="SPECIES",
+        ),
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: {
+            "taxon_key": str(key),
+            "rank": "SPECIES",
+            "scientific_name": f"Species {key}",
+            "path": tmp_path,
+        },
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper())
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: [])
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_a, **_k: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_a, **_k: {})
+    monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
+    monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
+    monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 3})
+    monkeypatch.setattr(
+        idx,
+        "_load_struct_column",
+        lambda *_a, **_k: pa.StructArray.from_arrays(
+            [
+                pa.array(["1", "2", "3"], type=pa.string()),
+                pa.array([1.0, 2.0, 3.0], type=pa.float64()),
+                pa.array([2, 5, 7], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
+        ),
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1, 2, 3}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {1: 2, 2: 5, 3: 7})
+
+    rows, distribution = idx.child_relative_rankings(
+        "1",
+        "species",
+        "bio_1",
+        "mean",
+        min_samples=2,
+        order="desc",
+        return_distribution=False,
+        location_gid="USA",
+    )
+
+    assert distribution is None
+    assert [row["taxon_id"] for row in rows] == [3, 2, 1]
+    assert [row["count"] for row in rows] == [3, 3, 3]
+    assert [row["sampleCount"] for row in rows] == [7, 5, 2]
+    assert [row["position"] for row in rows] == [3, 2, 1]
+    assert [row["percentile"] for row in rows] == [1.0, 0.5, 0.0]
+
+
+def test_child_relative_rankings_location_rollup_keeps_species(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx,
+        "CONFIG",
+        SimpleNamespace(
+            common_name_language="en",
+            subspecies_equivalents={"SUBSPECIES"},
+            species_rank="SPECIES",
+        ),
+    )
+    taxa = {
+        "1": {
+            "taxon_key": "1",
+            "rank": "SPECIES",
+            "scientific_name": "Species 1",
+            "path": tmp_path,
+        },
+        "11": {
+            "taxon_key": "11",
+            "rank": "SUBSPECIES",
+            "scientific_name": "Species 1 subsp.",
+            "path": tmp_path,
+        },
+    }
+    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda key: taxa.get(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper())
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: [])
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_a, **_k: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_a, **_k: {})
+    monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
+    monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
+    monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 1})
+    monkeypatch.setattr(
+        idx,
+        "_load_struct_column",
+        lambda *_a, **_k: pa.StructArray.from_arrays(
+            [
+                pa.array(["1"], type=pa.string()),
+                pa.array([2.0], type=pa.float64()),
+                pa.array([1], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
+        ),
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({11}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {1: 4, 11: 4})
+
+    rows, distribution = idx.child_relative_rankings(
+        "1",
+        "species",
+        "bio_1",
+        "mean",
+        min_samples=2,
+        return_distribution=False,
+        location_gid="USA",
+    )
+
+    assert distribution is None
+    assert [row["taxon_id"] for row in rows] == [1]
+    assert rows[0]["sampleCount"] == 4
+
+
+def test_ranked_query_location_filter_falls_back_to_per_taxon_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx,
+        "CONFIG",
+        SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"}),
+    )
+    taxon = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "scientific_name": "Species 1",
+        "path": tmp_path / "species_1",
+    }
+
+    monkeypatch.setattr(idx.taxa_navigation, "search_taxa_by_name", lambda *_a, **_k: [(taxon, 99.0)])
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+    monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: [])
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_a, **_k: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_a, **_k: {})
+    monkeypatch.setattr(idx, "_taxon_metric_record", lambda *_a, **_k: (2.5, 1))
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("x", "scope", "target"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda *_a, **_k: frozenset({1}))
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "location_taxon_counts",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_counts_for_taxon", lambda _taxon_id: {("scope", "target"): 7})
+
+    payload = idx.query_taxa(
+        q="species",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        min_samples=5,
+        location_gid="USA",
+    )
+
+    assert payload["total"] == 1
+    assert payload["results"][0]["sample_count"] == 7
+
+
+def test_child_relative_rankings_falls_back_to_per_taxon_location_counts(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx,
+        "CONFIG",
+        SimpleNamespace(
+            common_name_language="en",
+            subspecies_equivalents={"SUBSPECIES"},
+            species_rank="SPECIES",
+        ),
+    )
+    ancestor = {"taxon_key": "77", "rank": "GENUS", "path": tmp_path}
+    taxon = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "scientific_name": "Species 1",
+        "path": tmp_path,
+    }
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: ancestor if str(key) == "77" else taxon,
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)) if str(key).isdigit() else None
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper())
+    monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: [])
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_a, **_k: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_a, **_k: {})
+    monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
+    monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
+    monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 1})
+    monkeypatch.setattr(
+        idx,
+        "_load_struct_column",
+        lambda *_a, **_k: pa.StructArray.from_arrays(
+            [pa.array(["1"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([1], type=pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
+        ),
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("x", "scope", "target"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda *_a, **_k: frozenset({1}))
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "location_taxon_counts",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_counts_for_taxon", lambda _taxon_id: {("scope", "target"): 7})
+
+    rows, distribution = idx.child_relative_rankings(
+        "77",
+        "species",
+        "bio_1",
+        "mean",
+        min_samples=5,
+        return_distribution=False,
+        location_gid="USA",
+    )
+
+    assert distribution is None
+    assert len(rows) == 1
+    assert rows[0]["sampleCount"] == 7
+
+
 def test_build_index_parquet_error_branches(stub_env, monkeypatch, tmp_path):
     _cfg, stub = stub_env
     node = tmp_path / "species_1"
@@ -361,6 +1468,757 @@ def test_build_index_parquet_error_branches(stub_env, monkeypatch, tmp_path):
         idx.build_index_parquet(node)
 
 
+def test_child_rankings_intersect_candidate_taxa(stub_env, monkeypatch, tmp_path):
+    _cfg, stub = stub_env
+    ancestor_path = tmp_path / "genus_10"
+    ancestor_path.mkdir(parents=True, exist_ok=True)
+    index_path = ancestor_path / "species_index.parquet"
+
+    column = pa.StructArray.from_arrays(
+        [
+            pa.array(["1", "2"], type=pa.string()),
+            pa.array([1.0, 2.0], type=pa.float64()),
+            pa.array([5, 6], type=pa.int32()),
+        ],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
+    )
+    table = pa.table({"bio_1::mean": column})
+    pq.write_table(
+        table.replace_schema_metadata({b"column_lengths": json.dumps({"bio_1::mean": 2}).encode("utf-8")}),
+        index_path,
+    )
+    stub._exists[index_path] = True
+    stub._schemas[index_path] = pq.read_schema(index_path)
+    stub._tables[index_path] = pq.read_table(index_path)
+
+    taxa = {
+        "10": {
+            "taxon_key": "10",
+            "rank": "GENUS",
+            "path": ancestor_path,
+            "scientific_name": "Ancestor",
+        },
+        "1": {
+            "taxon_key": "1",
+            "rank": "SPECIES",
+            "path": tmp_path / "species_1",
+            "scientific_name": "Species One",
+        },
+        "2": {
+            "taxon_key": "2",
+            "rank": "SPECIES",
+            "path": tmp_path / "species_2",
+            "scientific_name": "Species Two",
+        },
+    }
+    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda key: taxa.get(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+
+    ranked, distribution = idx.child_relative_rankings(
+        "10",
+        "species",
+        "bio_1",
+        "mean",
+        candidate_taxon_ids=[2],
+    )
+
+    assert [row["taxonId"] for row in ranked] == [2]
+    assert ranked[0]["count"] == 1
+    assert ranked[0]["position"] == 1
+    assert ranked[0]["percentile"] == 0.0
+    assert distribution == [2.0]
+
+
+def test_query_taxa_sorts_matched_taxa_without_leaderboard_scope(stub_env, monkeypatch, tmp_path):
+    _cfg, _stub = stub_env
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+    for taxon in (species_one, species_two):
+        taxon["path"].mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=100: [
+            (species_one, 80.0),
+            (species_two, 95.0),
+        ][:limit],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+    monkeypatch.setattr(
+        idx,
+        "_load_summary_stats",
+        lambda path: (
+            {"bio_1": {"mean": 10.0, "count": 5}}
+            if str(path).endswith("species_1")
+            else {"bio_1": {"mean": 2.0, "count": 6}}
+        ),
+    )
+    monkeypatch.setattr(idx, "_load_categorical_stats", lambda _path: {})
+
+    out = idx.query_taxa(
+        q="species",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        sort_order="asc",
+    )
+
+    assert out["total"] == 2
+    assert out["matched_total"] == 2
+    assert out["eligible_total"] == 2
+    assert out["empty_reason"] is None
+    assert [row["taxon_id"] for row in out["results"]] == [2, 1]
+    assert out["results"][0]["sort_value"] == 2.0
+    assert out["results"][1]["sort_value"] == 10.0
+    assert "taxonId" not in out["results"][0]
+    assert "sampleCount" not in out["results"][0]
+    assert "value" not in out["results"][0]
+
+
+def test_query_taxa_reports_ranking_ineligible(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_one["path"].mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=100: [(species_one, 80.0)][:limit],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+    monkeypatch.setattr(idx, "_load_summary_stats", lambda _path: {})
+    monkeypatch.setattr(idx, "_load_categorical_stats", lambda _path: {})
+
+    out = idx.query_taxa(
+        q="species",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        sort_order="asc",
+    )
+
+    assert out["total"] == 0
+    assert out["matched_total"] == 1
+    assert out["eligible_total"] == 0
+    assert out["empty_reason"] == "ranking_ineligible"
+    assert out["results"] == []
+
+
+def test_query_taxa_direct_ranked_eligible_total_matches_metric_eligible(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+    for taxon in (species_one, species_two):
+        taxon["path"].mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=100: [
+            (species_one, 80.0),
+            (species_two, 95.0),
+        ][:limit],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+    monkeypatch.setattr(
+        idx,
+        "_load_summary_stats",
+        lambda path: {"bio_1": {"mean": 10.0, "count": 5}} if str(path).endswith("species_1") else {},
+    )
+    monkeypatch.setattr(idx, "_load_categorical_stats", lambda _path: {})
+
+    out = idx.query_taxa(
+        q="species",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        sort_order="asc",
+    )
+
+    assert out["total"] == 1
+    assert out["matched_total"] == 2
+    assert out["eligible_total"] == 1
+    assert [row["taxon_id"] for row in out["results"]] == [1]
+
+
+def test_query_taxa_scope_excludes_ancestor_itself(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    genus = {
+        "taxon_key": "10",
+        "rank": "GENUS",
+        "path": tmp_path / "genus_10",
+        "scientific_name": "Genus Ten",
+    }
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=100: [(genus, 90.0)][:limit],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda key: genus if str(key) == "10" else None)
+    monkeypatch.setattr(idx.taxa_navigation, "iter_descendants", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+
+    out = idx.query_taxa(
+        q="genus",
+        within_taxon_id="10",
+        descendant_rank="GENUS",
+    )
+
+    assert out["total"] == 0
+    assert out["matched_total"] == 0
+    assert out["eligible_total"] == 0
+    assert out["empty_reason"] == "no_text_matches"
+    assert out["results"] == []
+
+
+def test_query_taxa_scoped_text_query_bypasses_global_text_prefilter(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    ancestor = {
+        "taxon_key": "10",
+        "rank": "GENUS",
+        "path": tmp_path / "genus_10",
+        "scientific_name": "Ancestor Genus",
+    }
+    species = {
+        "taxon_key": "11",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_11",
+        "scientific_name": "Scoped Species",
+        "common_name": "American Something",
+    }
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not use global prefilter")),
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: ancestor if str(key) == "10" else None,
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "iter_descendants", lambda *_args, **_kwargs: [species])
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda taxon: ancestor if taxon is species else None)
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "taxon_name_match_score",
+        lambda taxon, query: 92.0 if taxon is species and query == "american" else None,
+    )
+    monkeypatch.setattr(idx, "_filter_matched_taxa", lambda matched_taxa, **_kwargs: matched_taxa)
+
+    out = idx.query_taxa(
+        q="american",
+        within_taxon_id="10",
+    )
+
+    assert out["total"] == 1
+    assert out["matched_total"] == 1
+    assert out["eligible_total"] == 1
+    assert [row["taxon_id"] for row in out["results"]] == [11]
+
+
+def test_query_taxa_scoped_text_query_uses_stable_tie_break_order(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    ancestor = {
+        "taxon_key": "10",
+        "rank": "GENUS",
+        "path": tmp_path / "genus_10",
+        "scientific_name": "Ancestor Genus",
+    }
+    species_b = {
+        "taxon_key": "12",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_12",
+        "scientific_name": "Scoped Species B",
+        "common_name": "American Something Else",
+    }
+    species_a = {
+        "taxon_key": "11",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_11",
+        "scientific_name": "Scoped Species A",
+        "common_name": "American Something",
+    }
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not use global prefilter")),
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: ancestor if str(key) == "10" else None,
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "iter_descendants", lambda *_args, **_kwargs: [species_b, species_a])
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_parent_taxon",
+        lambda taxon: ancestor if taxon is species_a or taxon is species_b else None,
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation, "taxon_name_match_score", lambda _taxon, query: 92.0 if query == "american" else None
+    )
+    monkeypatch.setattr(idx, "_filter_matched_taxa", lambda matched_taxa, **_kwargs: matched_taxa)
+
+    out = idx.query_taxa(
+        q="american",
+        within_taxon_id="10",
+    )
+
+    assert out["total"] == 2
+    assert out["matched_total"] == 2
+    assert out["eligible_total"] == 2
+    assert [row["taxon_id"] for row in out["results"]] == [11, 12]
+
+
+def test_query_taxa_scoped_ranked_query_bypasses_text_prefilter(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not prefilter scoped ranked queries")),
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx,
+        "_filter_matched_taxa",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not prefilter scoped ranked queries")),
+    )
+    monkeypatch.setattr(
+        idx,
+        "child_relative_rankings",
+        lambda *_args, **_kwargs: ([], None),
+    )
+    monkeypatch.setattr(idx, "_count_scoped_query_matches", lambda *_args, **_kwargs: 1)
+
+    out = idx.query_taxa(
+        q="species",
+        within_taxon_id="10",
+        descendant_rank="SPECIES",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        sort_order="asc",
+        min_samples=1,
+    )
+
+    assert out["total"] == 0
+    assert out["matched_total"] == 1
+    assert out["eligible_total"] == 0
+    assert out["empty_reason"] == "ranking_ineligible"
+    assert out["results"] == []
+
+
+def test_child_relative_rankings_scoped_text_query_matches_alias_only_names(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx,
+        "CONFIG",
+        SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"}, species_rank="SPECIES"),
+    )
+    ancestor = {"taxon_key": "10", "rank": "GENUS", "path": tmp_path / "genus_10", "scientific_name": "Genus Ten"}
+    species = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Visible Name",
+        "common_name": "ordinary",
+    }
+    species["path"].mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: ancestor if str(key) == "10" else (species if str(key) == "1" else None),
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)) if str(key).isdigit() else None
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: ["Visible Name"])
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_a, **_k: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_a, **_k: {})
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+    monkeypatch.setattr(idx.taxa_navigation, "load_search_names_by_taxon", lambda: {"1": ("hidden alias",)})
+    monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
+    monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
+    monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 1})
+    monkeypatch.setattr(
+        idx,
+        "_load_struct_column",
+        lambda *_a, **_k: pa.StructArray.from_arrays(
+            [
+                pa.array(["1"], type=pa.string()),
+                pa.array([2.0], type=pa.float64()),
+                pa.array([5], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
+        ),
+    )
+
+    rows, _distribution = idx.child_relative_rankings(
+        "10",
+        "species",
+        "bio_1",
+        "mean",
+        name_query="hidden",
+        return_distribution=False,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["taxon_id"] == 1
+    assert rows[0]["matched_count"] == 1
+
+
+def test_query_taxa_scoped_ranked_query_counts_text_matches_without_metric(monkeypatch, tmp_path, stub_env):
+    _cfg, stub = stub_env
+    ancestor = {
+        "taxon_key": "10",
+        "rank": "GENUS",
+        "path": tmp_path,
+        "scientific_name": "Genus Ten",
+    }
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+
+    index_path = tmp_path / "species_index.parquet"
+    arr = pa.StructArray.from_arrays(
+        [
+            pa.array(["1", "2"], type=pa.string()),
+            pa.array([1.0, None], type=pa.float64()),
+            pa.array([5, 5], type=pa.int32()),
+        ],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
+    )
+    pq.write_table(
+        pa.table({"bio_1::mean": arr}).replace_schema_metadata(
+            {b"column_lengths": json.dumps({"bio_1::mean": 2}).encode("utf-8")}
+        ),
+        index_path,
+    )
+    stub._exists[index_path] = True
+    stub._schemas[index_path] = pq.read_schema(index_path)
+    stub._tables[index_path] = pq.read_table(index_path)
+
+    monkeypatch.setattr(
+        idx,
+        "CONFIG",
+        SimpleNamespace(
+            common_name_language="en",
+            subspecies_equivalents={"SUBSPECIES"},
+            species_rank="SPECIES",
+        ),
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: {
+            "10": ancestor,
+            "1": species_one,
+            "2": species_two,
+        }.get(str(key)),
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "taxon_name_match_score",
+        lambda taxon, query: 90.0 if query == "species" and "Species" in taxon["scientific_name"] else None,
+    )
+
+    out = idx.query_taxa(
+        q="species",
+        within_taxon_id="10",
+        descendant_rank="SPECIES",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        sort_order="asc",
+    )
+
+    assert out["total"] == 1
+    assert out["matched_total"] == 2
+    assert out["eligible_total"] == 1
+    assert [row["taxon_id"] for row in out["results"]] == [1]
+
+
+def test_query_taxa_scoped_ranked_query_fallback_counts_location_scoped_matches(monkeypatch, tmp_path, stub_env):
+    _cfg, stub = stub_env
+    ancestor = {
+        "taxon_key": "10",
+        "rank": "GENUS",
+        "path": tmp_path,
+        "scientific_name": "Genus Ten",
+    }
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+
+    index_path = tmp_path / "species_index.parquet"
+    arr = pa.StructArray.from_arrays(
+        [
+            pa.array(["1", "2"], type=pa.string()),
+            pa.array([None, None], type=pa.float64()),
+            pa.array([5, 5], type=pa.int32()),
+        ],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
+    )
+    pq.write_table(
+        pa.table({"bio_1::mean": arr}).replace_schema_metadata(
+            {b"column_lengths": json.dumps({"bio_1::mean": 2}).encode("utf-8")}
+        ),
+        index_path,
+    )
+    stub._exists[index_path] = True
+    stub._schemas[index_path] = pq.read_schema(index_path)
+    stub._tables[index_path] = pq.read_table(index_path)
+
+    monkeypatch.setattr(
+        idx,
+        "CONFIG",
+        SimpleNamespace(
+            common_name_language="en",
+            subspecies_equivalents={"SUBSPECIES"},
+            species_rank="SPECIES",
+        ),
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: {
+            "10": ancestor,
+            "1": species_one,
+            "2": species_two,
+        }.get(str(key)),
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: ancestor)
+    monkeypatch.setattr(idx.taxa_navigation, "iter_descendants", lambda *_args, **_kwargs: [species_one, species_two])
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "taxon_name_match_score",
+        lambda taxon, query: 90.0 if query == "species" and "Species" in taxon["scientific_name"] else None,
+    )
+    monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("x", "scope", "target"))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda *_args, **_kwargs: frozenset({1}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_args, **_kwargs: {})
+
+    out = idx.query_taxa(
+        q="species",
+        within_taxon_id="10",
+        descendant_rank="SPECIES",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        sort_order="asc",
+        location_gid="USA",
+    )
+
+    assert out["total"] == 0
+    assert out["matched_total"] == 1
+    assert out["eligible_total"] == 0
+    assert out["empty_reason"] == "ranking_ineligible"
+    assert out["results"] == []
+
+
+def test_query_taxa_direct_sort_ties_prefer_better_match_score(stub_env, monkeypatch, tmp_path):
+    _cfg, _stub = stub_env
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+    for taxon in (species_one, species_two):
+        taxon["path"].mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=100: [
+            (species_one, 80.0),
+            (species_two, 95.0),
+        ][:limit],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+    monkeypatch.setattr(idx, "_load_summary_stats", lambda _path: {"bio_1": {"mean": 5.0, "count": 5}})
+    monkeypatch.setattr(idx, "_load_categorical_stats", lambda _path: {})
+
+    out = idx.query_taxa(
+        q="species",
+        sort_variable="bio_1",
+        sort_metric="mean",
+        sort_order="asc",
+    )
+
+    assert [row["taxon_id"] for row in out["results"]] == [2, 1]
+
+
+def test_query_taxa_rejects_invalid_sort_order_without_leaderboard_scope(stub_env, monkeypatch, tmp_path):
+    _cfg, _stub = stub_env
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_one["path"].mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=100: [(species_one, 80.0)][:limit],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+
+    with pytest.raises(ValueError, match="order must be either 'asc' or 'desc'"):
+        idx.query_taxa(
+            q="species",
+            sort_variable="bio_1",
+            sort_metric="mean",
+            sort_order="sideways",
+        )
+
+
 def test_rank_index_builders_more_branches(stub_env, monkeypatch, tmp_path):
     _cfg, stub = stub_env
     anc = {"taxon_key": "1", "rank": "GENUS", "path": tmp_path, "scientific_name": "Anc"}
@@ -373,7 +2231,9 @@ def test_rank_index_builders_more_branches(stub_env, monkeypatch, tmp_path):
     stub._exists[catalog] = True
     stub._tables[catalog] = pq.read_table(catalog)
     called = {}
-    monkeypatch.setattr(idx, "_build_rank_index_parquet", lambda a, r, **_k: called.setdefault("v", (a["taxon_key"], r)))
+    monkeypatch.setattr(
+        idx, "_build_rank_index_parquet", lambda a, r, **_k: called.setdefault("v", (a["taxon_key"], r))
+    )
     idx.build_rank_indexes_for_ancestor("1")
     assert called["v"] == ("1", "SPECIES")
 
@@ -399,7 +2259,11 @@ def test_build_rank_index_parquet_modes(stub_env, monkeypatch, tmp_path):
     index_path = tmp_path / "species_index.parquet"
     arr = pa.StructArray.from_arrays(
         [pa.array(["2"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([3], type=pa.int32())],
-        fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
     )
     pq.write_table(pa.table({"bio_1::mean": arr}), index_path)
     stub._schemas[index_path] = pq.read_schema(index_path)
@@ -412,9 +2276,11 @@ def test_build_rank_index_parquet_modes(stub_env, monkeypatch, tmp_path):
     monkeypatch.setattr(
         idx,
         "_collect_metric_entries_for_taxon",
-        lambda taxon, *_a, **_k: {"bio_2::mean": [{"taxon_key": taxon["taxon_key"], "value": 2.0, "sample_count": 3}]}
-        if taxon["taxon_key"] == "2"
-        else {},
+        lambda taxon, *_a, **_k: (
+            {"bio_2::mean": [{"taxon_key": taxon["taxon_key"], "value": 2.0, "sample_count": 3}]}
+            if taxon["taxon_key"] == "2"
+            else {}
+        ),
     )
     wrote = {}
     monkeypatch.setattr(idx, "_write_rank_index", lambda p, entries, **k: wrote.setdefault("v", (p, entries, k)))
@@ -444,8 +2310,16 @@ def test_child_relative_rankings_fast_and_distribution_paths(stub_env, monkeypat
 
     index_path = tmp_path / "species_index.parquet"
     arr = pa.StructArray.from_arrays(
-        [pa.array(["2", "3"], type=pa.string()), pa.array([1.0, 2.0], type=pa.float64()), pa.array([5, 5], type=pa.int32())],
-        fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+        [
+            pa.array(["2", "3"], type=pa.string()),
+            pa.array([1.0, 2.0], type=pa.float64()),
+            pa.array([5, 5], type=pa.int32()),
+        ],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
     )
     pq.write_table(
         pa.table({"bio_1::mean": arr}).replace_schema_metadata(
@@ -460,6 +2334,7 @@ def test_child_relative_rankings_fast_and_distribution_paths(stub_env, monkeypat
     # fast path: location filtered + no distribution
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({2}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {2: 5})
     out_fast, dist_fast = idx.child_relative_rankings(
         "1", "species", "bio_1", "mean", limit=10, order="asc", return_distribution=False, location_gid="USA"
     )
@@ -485,7 +2360,11 @@ def test_write_rank_index_merge_and_cached_rows_branches(stub_env, monkeypatch, 
     index_path = tmp_path / "rank.parquet"
     existing_arr = pa.StructArray.from_arrays(
         [pa.array(["1"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([2], type=pa.int32())],
-        fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
     )
     pq.write_table(
         pa.table({"bio_1::mean": existing_arr}).replace_schema_metadata(
@@ -509,7 +2388,9 @@ def test_write_rank_index_merge_and_cached_rows_branches(stub_env, monkeypatch, 
     idx._write_rank_index(index_path, entries, merge_existing=True)
 
     # cached metric rows filters and empty result
-    monkeypatch.setattr(idx, "_load_summary_stats", lambda _p: {"bio_1": {"mean": float("inf"), "count": -1, "min": None}})
+    monkeypatch.setattr(
+        idx, "_load_summary_stats", lambda _p: {"bio_1": {"mean": float("inf"), "count": -1, "min": None}}
+    )
     monkeypatch.setattr(idx, "_load_categorical_stats", lambda _p: {"bio_1": {"class_1": "bad"}})
     rows = idx._cached_metric_rows_for_taxon("1", "/tmp/a")
     assert rows == (("bio_1::count", -1.0, None),)
@@ -540,7 +2421,19 @@ def test_load_relative_ranks_location_filtered_branch(stub_env, monkeypatch, tmp
     taxon_dir.mkdir(parents=True, exist_ok=True)
     target = {"taxon_key": "1", "rank": "SPECIES", "path": taxon_dir, "scientific_name": "S"}
     ancestor = {"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: target if str(k) == "1" else (ancestor if str(k) == "10" else {"taxon_key": str(k), "rank": "SPECIES", "path": taxon_dir, "scientific_name": "X"}))
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: (
+            target
+            if str(k) == "1"
+            else (
+                ancestor
+                if str(k) == "10"
+                else {"taxon_key": str(k), "rank": "SPECIES", "path": taxon_dir, "scientific_name": "X"}
+            )
+        ),
+    )
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)))
     monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [ancestor])
@@ -552,8 +2445,16 @@ def test_load_relative_ranks_location_filtered_branch(stub_env, monkeypatch, tmp
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["1", "2"], type=pa.string()), pa.array([1.0, 2.0], type=pa.float64()), pa.array([5, 5], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            [
+                pa.array(["1", "2"], type=pa.string()),
+                pa.array([1.0, 2.0], type=pa.float64()),
+                pa.array([5, 5], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx, "_load_summary_stats", lambda _p: {"bio_1": {"mean": 1.0}})
@@ -571,7 +2472,13 @@ def test_ancestor_contexts_and_relative_ranks_local_fallback(stub_env, monkeypat
     monkeypatch.setattr(idx, "CONFIG", cfg)
 
     # ancestor resolution with missing lookup fallback payload
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: None if str(k) == "10" else {"taxon_key": "1", "rank": "SPECIES", "path": tax_path, "scientific_name": "S"})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: (
+            None if str(k) == "10" else {"taxon_key": "1", "rank": "SPECIES", "path": tax_path, "scientific_name": "S"}
+        ),
+    )
     ctx = idx._ancestor_contexts(tax_path)
     assert ctx and ctx[0]["taxon_key"] == "10"
 
@@ -580,11 +2487,17 @@ def test_ancestor_contexts_and_relative_ranks_local_fallback(stub_env, monkeypat
     monkeypatch.setattr(
         idx.taxa_navigation,
         "get_taxon_by_id",
-        lambda k: {"taxon_key": "1", "rank": "SPECIES", "path": taxon_dir, "scientific_name": "S"} if str(k) == "1" else None,
+        lambda k: (
+            {"taxon_key": "1", "rank": "SPECIES", "path": taxon_dir, "scientific_name": "S"} if str(k) == "1" else None
+        ),
     )
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)))
-    monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}])
+    monkeypatch.setattr(
+        idx,
+        "_ancestor_contexts",
+        lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}],
+    )
     monkeypatch.setattr(idx, "_load_global_relative_rows", lambda *_a, **_k: None)
     pos = taxon_dir / "relative_ranks_positions.parquet"
     pos.touch()
@@ -656,7 +2569,11 @@ def test_rank_catalog_and_options_edge_paths(stub_env, monkeypatch, tmp_path):
     monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: anc)
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx, "_infer_sample_count", lambda _t: 1)
-    monkeypatch.setattr(idx.taxa_navigation, "iter_descendants_by_rank", lambda *_a, **_k: [{"taxon_key": "2"}, {"taxon_key": "2"}, {"taxon_key": ""}])
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "iter_descendants_by_rank",
+        lambda *_a, **_k: [{"taxon_key": "2"}, {"taxon_key": "2"}, {"taxon_key": ""}],
+    )
     idx.build_descendant_catalog_parquet("1", "species")
     assert (tmp_path / "species.parquet").exists()
 
@@ -683,11 +2600,12 @@ def test_rank_catalog_and_options_edge_paths(stub_env, monkeypatch, tmp_path):
     stub._schemas[index_path] = OSError("boom")
     assert idx.list_rank_metric_options("1", "species") == []
 
-    stub._schemas[index_path] = pa.schema([pa.field("x", pa.int64()), pa.field("bio_1::mean", pa.int64())]).with_metadata(
-        {b"column_lengths": json.dumps({"bio_1::mean": 7}).encode("utf-8")}
-    )
-    opts = idx.list_rank_metric_options("1", "species")
-    assert opts == [{"variable": "bio_1", "metric": "mean", "column": "bio_1::mean", "count": 7}]
+    stub._schemas[index_path] = pa.schema(
+        [pa.field("x", pa.int64()), pa.field("bio_1::mean", pa.int64()), pa.field("bio_1::max", pa.int64())]
+    ).with_metadata({b"column_lengths": json.dumps({"bio_1::mean": 7, "bio_1::max": 0}).encode("utf-8")})
+    assert idx.list_rank_metric_options("1", "species") == [
+        {"variable": "bio_1", "metric": "mean", "column": "bio_1::mean", "count": 7}
+    ]
 
 
 def test_relative_and_child_ranking_edge_paths(stub_env, monkeypatch, tmp_path):
@@ -746,7 +2664,11 @@ def test_relative_and_child_ranking_edge_paths(stub_env, monkeypatch, tmp_path):
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["1"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([None], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
@@ -778,8 +2700,16 @@ def test_write_and_build_rank_index_remaining_branches(stub_env, monkeypatch, tm
 
     # merge branch with existing names lacking "::" + padding paths
     existing = pa.StructArray.from_arrays(
-        [pa.array(["1", "2"], type=pa.string()), pa.array([1.0, 2.0], type=pa.float64()), pa.array([2, 2], type=pa.int32())],
-        fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+        [
+            pa.array(["1", "2"], type=pa.string()),
+            pa.array([1.0, 2.0], type=pa.float64()),
+            pa.array([2, 2], type=pa.int32()),
+        ],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
     )
     pq.write_table(pa.table({"nocolon": existing}), p)
     stub._schemas[p] = pq.read_schema(p)
@@ -817,11 +2747,15 @@ def test_write_and_build_rank_index_remaining_branches(stub_env, monkeypatch, tm
 
     # index schema read failure and temporal-column rebuild path
     index.touch()
-    monkeypatch.setattr(idx.PARQUET, "read_table", lambda *_a, **_k: pa.table({"taxon_key": ["x"], "sample_count": [1]}))
+    monkeypatch.setattr(
+        idx.PARQUET, "read_table", lambda *_a, **_k: pa.table({"taxon_key": ["x"], "sample_count": [1]})
+    )
     monkeypatch.setattr(idx.PARQUET, "read_schema", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("x")))
     monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: None)
     idx._build_rank_index_parquet(anc, "SPECIES")
-    monkeypatch.setattr(idx.PARQUET, "read_schema", lambda *_a, **_k: pa.schema([pa.field("wind_avg_6h::mean", pa.int64())]))
+    monkeypatch.setattr(
+        idx.PARQUET, "read_schema", lambda *_a, **_k: pa.schema([pa.field("wind_avg_6h::mean", pa.int64())])
+    )
     monkeypatch.setattr(idx, "_is_temporal_metric_column", lambda c: c.startswith("wind_"))
     monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "x", "path": tmp_path / "x"})
     monkeypatch.setattr(idx, "_collect_metric_entries_for_taxon", lambda *_a, **_k: {})
@@ -831,7 +2765,9 @@ def test_write_and_build_rank_index_remaining_branches(stub_env, monkeypatch, tm
     monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: None)
     with pytest.raises(ValueError):
         idx.build_rank_indexes_for_ancestor("x")
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "GENUS", "path": tmp_path})
+    monkeypatch.setattr(
+        idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "GENUS", "path": tmp_path}
+    )
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx, "_descendant_rank_targets", lambda _r: ["SPECIES"])
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: False)
@@ -841,7 +2777,9 @@ def test_write_and_build_rank_index_remaining_branches(stub_env, monkeypatch, tm
 
 def test_indexing_density_ancestor_and_ranking_branches(stub_env, monkeypatch, tmp_path):
     cfg, stub = stub_env
-    assert idx.build_density_curve([1.0, 2.0, 3.0], point_count=8)["points"]
+    curve = idx.build_density_curve([1.0, 2.0, 3.0], point_count=8)
+    assert curve is not None
+    assert curve["points"]
 
     # _ancestor_contexts branches
     cfg.taxonomy_root = tmp_path / "tax"
@@ -855,7 +2793,11 @@ def test_indexing_density_ancestor_and_ranking_branches(stub_env, monkeypatch, t
     monkeypatch.setattr(
         idx.taxa_navigation,
         "get_taxon_by_id",
-        lambda k: {"taxon_key": str(k), "rank": "GENUS", "path": p.parent, "scientific_name": "Genus"} if str(k) == "10" else None,
+        lambda k: (
+            {"taxon_key": str(k), "rank": "GENUS", "path": p.parent, "scientific_name": "Genus"}
+            if str(k) == "10"
+            else None
+        ),
     )
     ctx = idx._ancestor_contexts(p)
     assert ctx and ctx[0]["taxon_key"] == "10"
@@ -863,7 +2805,11 @@ def test_indexing_density_ancestor_and_ranking_branches(stub_env, monkeypatch, t
     # load_relative_ranks local fallback read path and filtering branches
     target = {"taxon_key": "1", "rank": "SPECIES", "path": p, "scientific_name": "Species", "common_name": None}
     ancestor = {"taxon_key": "10", "rank": "GENUS", "path": p.parent, "scientific_name": "Genus", "common_name": None}
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: target if str(k) == "1" else (ancestor if str(k) == "10" else None))
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: target if str(k) == "1" else (ancestor if str(k) == "10" else None),
+    )
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)) if str(k).isdigit() else None)
     monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [ancestor])
@@ -904,7 +2850,11 @@ def test_indexing_density_ancestor_and_ranking_branches(stub_env, monkeypatch, t
         },
     )
     monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: ["N"])
-    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "resolve_taxon_media",
+        lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]},
+    )
     monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda _t: {})
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)) if str(k).isdigit() else None)
@@ -915,17 +2865,30 @@ def test_indexing_density_ancestor_and_ranking_branches(stub_env, monkeypatch, t
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["2", "3"], type=pa.string()), pa.array([None, 2.0], type=pa.float64()), pa.array([0, 2], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            [
+                pa.array(["2", "3"], type=pa.string()),
+                pa.array([None, 2.0], type=pa.float64()),
+                pa.array([0, 2], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({2, 3}))
-    fast, dist = idx.child_relative_rankings("1", "species", "bio_1", "mean", location_gid="USA", return_distribution=False)
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {3: 2})
+    fast, dist = idx.child_relative_rankings(
+        "1", "species", "bio_1", "mean", location_gid="USA", return_distribution=False
+    )
     assert fast and dist is None
 
     monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda _t: {"image_url": "p"})
-    slow, dist2 = idx.child_relative_rankings("1", "species", "bio_1", "mean", include_species_like=True, return_distribution=True, min_samples=1)
+    slow, dist2 = idx.child_relative_rankings(
+        "1", "species", "bio_1", "mean", include_species_like=True, return_distribution=True, min_samples=1
+    )
     assert dist2 is not None and slow
 
 
@@ -1006,8 +2969,16 @@ def test_indexing_relative_and_child_additional_branches(stub_env, monkeypatch, 
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["2", "1"], type=pa.string()), pa.array([1.0, 1.0], type=pa.float64()), pa.array([1, 1], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            [
+                pa.array(["2", "1"], type=pa.string()),
+                pa.array([1.0, 1.0], type=pa.float64()),
+                pa.array([1, 1], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx, "_load_summary_stats", lambda _p: {"bio_1": {"mean": "bad"}})
@@ -1019,15 +2990,23 @@ def test_indexing_relative_and_child_additional_branches(stub_env, monkeypatch, 
     monkeypatch.setattr(
         idx.taxa_navigation,
         "get_taxon_by_id",
-        lambda k: None if str(k) == "x" else {
-            "taxon_key": str(k),
-            "rank": "SUBSPECIES" if str(k) == "2" else "SPECIES",
-            "scientific_name": f"T{str(k)}",
-            "path": tdir,
-        },
+        lambda k: (
+            None
+            if str(k) == "x"
+            else {
+                "taxon_key": str(k),
+                "rank": "SUBSPECIES" if str(k) == "2" else "SPECIES",
+                "scientific_name": f"T{str(k)}",
+                "path": tdir,
+            }
+        ),
     )
     monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: ["N"])
-    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "resolve_taxon_media",
+        lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]},
+    )
     monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda _t: {})
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
     monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
@@ -1041,12 +3020,19 @@ def test_indexing_relative_and_child_additional_branches(stub_env, monkeypatch, 
                 pa.array([1.0, 2.0, None, 4.0], type=pa.float64()),
                 pa.array([1, 1, 1, None], type=pa.int32()),
             ],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1, 2, 3}))
-    fast, _ = idx.child_relative_rankings("1", "species", "bio_1", "mean", order="desc", return_distribution=False, location_gid="USA")
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {1: 1, 3: 2})
+    fast, _ = idx.child_relative_rankings(
+        "1", "species", "bio_1", "mean", order="desc", return_distribution=False, location_gid="USA"
+    )
     assert fast
 
     # child_relative_rankings slow path empty-eligible then media fallback record creation
@@ -1055,21 +3041,38 @@ def test_indexing_relative_and_child_additional_branches(stub_env, monkeypatch, 
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["2", "3"], type=pa.string()), pa.array([1.0, 2.0], type=pa.float64()), pa.array([None, None], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            [
+                pa.array(["2", "3"], type=pa.string()),
+                pa.array([1.0, 2.0], type=pa.float64()),
+                pa.array([None, None], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
-    assert idx.child_relative_rankings("1", "species", "bio_1", "mean", include_species_like=True, min_samples=1) == ([], None)
+    assert idx.child_relative_rankings("1", "species", "bio_1", "mean", include_species_like=True, min_samples=1) == (
+        [],
+        None,
+    )
 
     monkeypatch.setattr(
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["2"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([2], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
-    slow, _dist = idx.child_relative_rankings("1", "species", "bio_1", "mean", include_species_like=True, return_distribution=False)
+    slow, _dist = idx.child_relative_rankings(
+        "1", "species", "bio_1", "mean", include_species_like=True, return_distribution=False
+    )
     assert slow and slow[0]["image_url"] == "u"
 
 
@@ -1132,14 +3135,23 @@ def test_indexing_misc_helper_branches(stub_env, monkeypatch, tmp_path):
     p = tmp_path / "m.parquet"
     arr = pa.StructArray.from_arrays(
         [pa.array(["1"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([1], type=pa.int32())],
-        fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
     )
     pq.write_table(pa.table({"bio_1::mean": arr}), p)
     stub._schemas[p] = pq.read_schema(p)
     stub._tables[p] = pq.read_table(p)
     idx._write_rank_index(
         p,
-        {"bio_2::mean": [{"taxon_key": "1", "value": 1.0, "sample_count": 1}, {"taxon_key": "2", "value": 2.0, "sample_count": 1}]},
+        {
+            "bio_2::mean": [
+                {"taxon_key": "1", "value": 1.0, "sample_count": 1},
+                {"taxon_key": "2", "value": 2.0, "sample_count": 1},
+            ]
+        },
         merge_existing=True,
     )
     assert p.exists()
@@ -1147,8 +3159,12 @@ def test_indexing_misc_helper_branches(stub_env, monkeypatch, tmp_path):
     # _build_rank_index_parquet prints/skip cases for missing keys and lookups
     anc = {"taxon_key": "1", "path": tmp_path}
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
-    monkeypatch.setattr(idx.PARQUET, "read_table", lambda *_a, **_k: pa.table({"taxon_key": [None, "x"], "sample_count": [1, 1]}))
-    monkeypatch.setattr(idx.PARQUET, "read_schema", lambda *_a, **_k: pa.schema([pa.field("wind_avg_6h::mean", pa.int64())]))
+    monkeypatch.setattr(
+        idx.PARQUET, "read_table", lambda *_a, **_k: pa.table({"taxon_key": [None, "x"], "sample_count": [1, 1]})
+    )
+    monkeypatch.setattr(
+        idx.PARQUET, "read_schema", lambda *_a, **_k: pa.schema([pa.field("wind_avg_6h::mean", pa.int64())])
+    )
     monkeypatch.setattr(idx, "_is_temporal_metric_column", lambda c: c.startswith("wind_"))
     monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: None)
     monkeypatch.setattr(idx, "_collect_metric_entries_for_taxon", lambda *_a, **_k: {})
@@ -1184,7 +3200,11 @@ def test_indexing_descendant_and_relative_remaining_branches(stub_env, monkeypat
     monkeypatch.setattr(
         idx.taxa_navigation,
         "iter_descendants",
-        lambda *_a, **_k: [{"taxon_key": "a", "rank": None}, {"taxon_key": "b", "rank": "SUBSPECIES"}, {"taxon_key": "c", "rank": "SPECIES"}],
+        lambda *_a, **_k: [
+            {"taxon_key": "a", "rank": None},
+            {"taxon_key": "b", "rank": "SUBSPECIES"},
+            {"taxon_key": "c", "rank": "SPECIES"},
+        ],
     )
     monkeypatch.setattr(stub, "exists", lambda p: p.name in {"subspecies.parquet", "species.parquet", "genus.parquet"})
     idx.build_descendant_catalogs_for_ancestor("1")
@@ -1221,30 +3241,116 @@ def test_indexing_descendant_and_relative_remaining_branches(stub_env, monkeypat
     monkeypatch.setattr(idx, "_load_summary_stats", lambda _p: {"bio_1": {"mean": float("inf")}})
     assert idx.load_relative_ranks(tdir, "bio_1", location_gid="USA") == []
 
+
+def test_list_rank_metric_options_uses_subspecies_storage_for_alias(stub_env, monkeypatch, tmp_path):
+    _cfg, stub = stub_env
     monkeypatch.setattr(
         idx,
-        "_load_struct_column",
-        lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["2"], type=pa.string()), pa.array([2.0], type=pa.float64()), pa.array([1], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+        "CONFIG",
+        SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES", "VARIETY", "FORM"}),
+    )
+    ancestor = {"taxon_key": "1", "rank": "GENUS", "path": tmp_path}
+    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: ancestor)
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+
+    index_path = tmp_path / "subspecies_index.parquet"
+    stub._exists[index_path] = True
+    stub._schemas[index_path] = pa.schema([pa.field("bio_1::mean", pa.int64())]).with_metadata(
+        {b"column_lengths": json.dumps({"bio_1::mean": 3}).encode("utf-8")}
+    )
+
+    assert idx.list_rank_metric_options("1", "variety") == [
+        {"variable": "bio_1", "metric": "mean", "column": "bio_1::mean", "count": 3}
+    ]
+
+
+def test_child_relative_rankings_uses_subspecies_storage_for_alias(stub_env, monkeypatch, tmp_path):
+    _cfg, stub = stub_env
+    monkeypatch.setattr(
+        idx,
+        "CONFIG",
+        SimpleNamespace(
+            common_name_language="en",
+            subspecies_equivalents={"SUBSPECIES", "VARIETY", "FORM"},
+            species_rank="SPECIES",
         ),
     )
-    monkeypatch.setattr(idx, "_load_summary_stats", lambda _p: {"bio_1": {"mean": 1.0}})
-    assert idx.load_relative_ranks(tdir, "bio_1", location_gid="USA") == []
+    ancestor = {"taxon_key": "1", "rank": "GENUS", "path": tmp_path}
+    variety = {"taxon_key": "2", "rank": "VARIETY", "scientific_name": "Variety Two", "path": tmp_path / "v2"}
+    form = {"taxon_key": "3", "rank": "FORM", "scientific_name": "Form Three", "path": tmp_path / "f3"}
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: (
+            ancestor if str(key) == "1" else (variety if str(key) == "2" else (form if str(key) == "3" else None))
+        ),
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: ["N"])
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_a, **_k: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_a, **_k: {})
+
+    index_path = tmp_path / "subspecies_index.parquet"
+    arr = pa.StructArray.from_arrays(
+        [
+            pa.array(["2", "3"], type=pa.string()),
+            pa.array([1.0, 2.0], type=pa.float64()),
+            pa.array([5, 5], type=pa.int32()),
+        ],
+        fields=[
+            pa.field("taxonKey", pa.string()),
+            pa.field("value", pa.float64()),
+            pa.field("sampleCount", pa.int32()),
+        ],
+    )
+    pq.write_table(
+        pa.table({"bio_1::mean": arr}).replace_schema_metadata(
+            {b"column_lengths": json.dumps({"bio_1::mean": 2}).encode("utf-8")}
+        ),
+        index_path,
+    )
+    stub._exists[index_path] = True
+    stub._schemas[index_path] = pq.read_schema(index_path)
+    stub._tables[index_path] = pq.read_table(index_path)
+
+    rows, distribution = idx.child_relative_rankings("1", "variety", "bio_1", "mean", limit=10, order="asc")
+
+    assert distribution == [1.0]
+    assert [row["taxon_id"] for row in rows] == [2]
+    assert all(row["rank"] == "VARIETY" for row in rows)
 
 
 def test_indexing_child_ranking_remaining_branches(stub_env, monkeypatch, tmp_path):
     _cfg, _stub = stub_env
     anc = {"taxon_key": "1", "rank": "GENUS", "path": tmp_path}
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: anc if str(k) == "1" else {"taxon_key": str(k), "rank": "SUBSPECIES" if str(k) == "2" else "SPECIES", "scientific_name": "T", "path": tmp_path})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: (
+            anc
+            if str(k) == "1"
+            else {
+                "taxon_key": str(k),
+                "rank": "SUBSPECIES" if str(k) == "2" else "SPECIES",
+                "scientific_name": "T",
+                "path": tmp_path,
+            }
+        ),
+    )
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)) if str(k).isdigit() else None)
     monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: ["N"])
-    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "resolve_taxon_media",
+        lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]},
+    )
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
     monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({2, 3}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {2: 2, 3: 2})
 
     # fast path parse-exception + preferred-image + media fallback
     monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 2})
@@ -1252,12 +3358,24 @@ def test_indexing_child_ranking_remaining_branches(stub_env, monkeypatch, tmp_pa
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["2", "3"], type=pa.string()), pa.array([None, 3.0], type=pa.float64()), pa.array([2, 2], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            [
+                pa.array(["2", "3"], type=pa.string()),
+                pa.array([None, 3.0], type=pa.float64()),
+                pa.array([2, 2], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
-    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda t: {"image_url": "p"} if t["taxon_key"] == "3" else {})
-    fast, _ = idx.child_relative_rankings("1", "species", "bio_1", "mean", return_distribution=False, location_gid="USA")
+    monkeypatch.setattr(
+        idx.taxa_navigation, "preferred_image_payload", lambda t: {"image_url": "p"} if t["taxon_key"] == "3" else {}
+    )
+    fast, _ = idx.child_relative_rankings(
+        "1", "species", "bio_1", "mean", return_distribution=False, location_gid="USA"
+    )
     assert fast and fast[0].get("image_url")
 
     # slow path taxon-none, allowed skip, species-like skip
@@ -1265,16 +3383,34 @@ def test_indexing_child_ranking_remaining_branches(stub_env, monkeypatch, tmp_pa
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["x", "2", "3"], type=pa.string()), pa.array([1.0, 2.0, 3.0], type=pa.float64()), pa.array([1, 1, 1], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            [
+                pa.array(["x", "2", "3"], type=pa.string()),
+                pa.array([1.0, 2.0, 3.0], type=pa.float64()),
+                pa.array([1, 1, 1], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(
         idx.taxa_navigation,
         "get_taxon_by_id",
-        lambda k: None if str(k) == "x" else (anc if str(k) == "1" else {"taxon_key": str(k), "rank": "SUBSPECIES", "scientific_name": "T", "path": tmp_path}),
+        lambda k: (
+            None
+            if str(k) == "x"
+            else (
+                anc
+                if str(k) == "1"
+                else {"taxon_key": str(k), "rank": "SUBSPECIES", "scientific_name": "T", "path": tmp_path}
+            )
+        ),
     )
-    out, _ = idx.child_relative_rankings("1", "species", "bio_1", "mean", include_species_like=False, return_distribution=True, location_gid="USA")
+    out, _ = idx.child_relative_rankings(
+        "1", "species", "bio_1", "mean", include_species_like=False, return_distribution=True, location_gid="USA"
+    )
     assert out == []
 
 
@@ -1318,7 +3454,11 @@ def test_build_index_parquet_origin_map_and_pending_skip(stub_env, monkeypatch, 
     index_path = node / "occurrence_index.parquet"
     arr = pa.StructArray.from_arrays(
         [pa.array(["a"], type=pa.string()), pa.array([0], type=pa.int32()), pa.array([1.0], type=pa.float64())],
-        fields=[pa.field("catalogNumber", pa.string()), pa.field("originId", pa.int32()), pa.field("value", pa.float64())],
+        fields=[
+            pa.field("catalogNumber", pa.string()),
+            pa.field("originId", pa.int32()),
+            pa.field("value", pa.float64()),
+        ],
     )
     meta = {
         b"origin_map": json.dumps(
@@ -1337,14 +3477,22 @@ def test_build_index_parquet_origin_map_and_pending_skip(stub_env, monkeypatch, 
 
     monkeypatch.setattr(stub, "read_table", lambda p, **k: pq.read_table(p, **k))
     monkeypatch.setattr(idx.gis_lookup, "load_layer_metadata", lambda: {"bio_1": {"value_type": "numeric"}})
-    monkeypatch.setattr(idx.taxa_navigation, "taxon_key_from_path", lambda p: Path(p).name.split("_")[-1] if "_" in Path(p).name else "1")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "taxon_key_from_path",
+        lambda p: Path(p).name.split("_")[-1] if "_" in Path(p).name else "1",
+    )
     monkeypatch.setattr(
         idx.taxa_navigation,
         "get_children",
         lambda _k: [{"taxon_key": "2", "path": missing_child}, {"taxon_key": "4", "path": nocat_child}],
     )
     real_read = idx.pq.read_table
-    monkeypatch.setattr(idx.pq, "read_table", lambda p, **k: (_ for _ in ()).throw(RuntimeError("x")) if Path(p) == bad_occ else real_read(p, **k))
+    monkeypatch.setattr(
+        idx.pq,
+        "read_table",
+        lambda p, **k: (_ for _ in ()).throw(RuntimeError("x")) if Path(p) == bad_occ else real_read(p, **k),
+    )
     idx.build_index_parquet(node)
 
 
@@ -1377,7 +3525,11 @@ def test_build_index_parquet_categorical_cast_and_merge_paths(stub_env, monkeypa
     # merge-existing path with missing column_lengths metadata
     existing = pa.StructArray.from_arrays(
         [pa.array(["old"], type=pa.string()), pa.array([0], type=pa.int32()), pa.array([0.5], type=pa.float64())],
-        fields=[pa.field("catalogNumber", pa.string()), pa.field("originId", pa.int32()), pa.field("value", pa.float64())],
+        fields=[
+            pa.field("catalogNumber", pa.string()),
+            pa.field("originId", pa.int32()),
+            pa.field("value", pa.float64()),
+        ],
     )
     idx_path = node / "occurrence_index.parquet"
     pq.write_table(pa.table({"old_col": existing}), idx_path)
@@ -1407,7 +3559,11 @@ def test_indexing_remaining_branch_targets(stub_env, monkeypatch, tmp_path):
     child = node / "subspecies_2"
     child.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.table({"catalogNumber": [1], "bio_2": [3.5]}), child / "occurrence.parquet")
-    monkeypatch.setattr(idx.gis_lookup, "load_layer_metadata", lambda: {"bio_1": {"value_type": "numeric"}, "bio_2": {"value_type": "categorical"}})
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "load_layer_metadata",
+        lambda: {"bio_1": {"value_type": "numeric"}, "bio_2": {"value_type": "categorical"}},
+    )
     monkeypatch.setattr(idx.taxa_navigation, "get_children", lambda _k: [{"taxon_key": "2", "path": child}])
     monkeypatch.setattr(stub, "read_table", lambda p, **k: pq.read_table(p, **k))
     idx.build_index_parquet(node)
@@ -1439,7 +3595,9 @@ def test_indexing_remaining_branch_targets(stub_env, monkeypatch, tmp_path):
     # _build_rank_index_parquet temporal rebuild + missing taxon_key(None) message path
     anc = {"taxon_key": "1", "path": tmp_path}
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
-    monkeypatch.setattr(idx.PARQUET, "read_schema", lambda *_a, **_k: pa.schema([pa.field("wind_avg_6h::mean", pa.int64())]))
+    monkeypatch.setattr(
+        idx.PARQUET, "read_schema", lambda *_a, **_k: pa.schema([pa.field("wind_avg_6h::mean", pa.int64())])
+    )
     monkeypatch.setattr(
         idx.PARQUET,
         "read_table",
@@ -1457,12 +3615,18 @@ def test_indexing_remaining_branch_targets(stub_env, monkeypatch, tmp_path):
     assert idx._ancestor_contexts(_cfg.taxonomy_root / "species_1") == []
 
     # load_relative_ranks contexts-empty and empty-location branches
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": tmp_path})
+    monkeypatch.setattr(
+        idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": tmp_path}
+    )
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)))
     monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [])
     assert idx.load_relative_ranks(tmp_path / "species_1", "bio_1") == []
-    monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}])
+    monkeypatch.setattr(
+        idx,
+        "_ancestor_contexts",
+        lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}],
+    )
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset())
     assert idx.load_relative_ranks(tmp_path / "species_1", "bio_1", location_gid="USA") == []
@@ -1480,20 +3644,34 @@ def test_indexing_remaining_branch_targets(stub_env, monkeypatch, tmp_path):
     monkeypatch.setattr(
         idx.PARQUET,
         "read_table",
-        lambda *_a, **_k: pa.table({"variable": [1], "metric": ["mean"], "position": [0], "count": [0], "sampleCount": [1], "contextTaxonId": ["10"], "contextLabel": ["G"]}),
+        lambda *_a, **_k: pa.table(
+            {
+                "variable": [1],
+                "metric": ["mean"],
+                "position": [0],
+                "count": [0],
+                "sampleCount": [1],
+                "contextTaxonId": ["10"],
+                "contextLabel": ["G"],
+            }
+        ),
     )
-    orig_cast = idx.pc.cast
-    orig_equal = idx.pc.equal
-    monkeypatch.setattr(idx.pc, "cast", lambda *_a, **_k: (_ for _ in ()).throw(pa.ArrowInvalid("x")))
-    monkeypatch.setattr(idx.pc, "equal", lambda *_a, **_k: pa.array([True]))
+    orig_cast = idx.PC.cast
+    orig_equal = idx.PC.equal
+    monkeypatch.setattr(idx.PC, "cast", lambda *_a, **_k: (_ for _ in ()).throw(pa.ArrowInvalid("x")))
+    monkeypatch.setattr(idx.PC, "equal", lambda *_a, **_k: pa.array([True]))
     assert idx.load_relative_ranks(tmp_path / "species_1", "bio_1") == []
 
     # location-filtered deeper continuation branches
-    monkeypatch.setattr(idx.pc, "cast", orig_cast)
-    monkeypatch.setattr(idx.pc, "equal", orig_equal)
+    monkeypatch.setattr(idx.PC, "cast", orig_cast)
+    monkeypatch.setattr(idx.PC, "equal", orig_equal)
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1}))
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
-    monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}])
+    monkeypatch.setattr(
+        idx,
+        "_ancestor_contexts",
+        lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}],
+    )
     monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 1})
     monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
     monkeypatch.setattr(idx, "_load_summary_stats", lambda _p: {"bio_1": {"mean": 1.0}})
@@ -1503,18 +3681,34 @@ def test_indexing_remaining_branch_targets(stub_env, monkeypatch, tmp_path):
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["2"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([1], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: {"taxon_key": "1", "rank": "SPECIES", "path": tmp_path} if str(k) == "1" else None)
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: {"taxon_key": "1", "rank": "SPECIES", "path": tmp_path} if str(k) == "1" else None,
+    )
     assert idx.load_relative_ranks(tmp_path / "species_1", "bio_1", location_gid="USA") == []
 
     # child_relative_rankings fast parse fail + media fallback and slow allowed skip
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": tmp_path})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": tmp_path},
+    )
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)))
     monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: ["N"])
-    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "resolve_taxon_media",
+        lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]},
+    )
     monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda _t: {})
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
     monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
@@ -1523,22 +3717,42 @@ def test_indexing_remaining_branch_targets(stub_env, monkeypatch, tmp_path):
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["1", "2"], type=pa.string()), pa.array([None, 2.0], type=pa.float64()), pa.array([2, 2], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            [
+                pa.array(["1", "2"], type=pa.string()),
+                pa.array([None, 2.0], type=pa.float64()),
+                pa.array([2, 2], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1, 2}))
-    fast, _ = idx.child_relative_rankings("1", "species", "bio_1", "mean", return_distribution=False, location_gid="USA")
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {1: 2, 2: 2})
+    fast, _ = idx.child_relative_rankings(
+        "1", "species", "bio_1", "mean", return_distribution=False, location_gid="USA"
+    )
     assert fast and fast[0]["image_url"] == "u"
 
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {1: 2})
     monkeypatch.setattr(
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["1", "2"], type=pa.string()), pa.array([2.0, 3.0], type=pa.float64()), pa.array([2, 2], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            [
+                pa.array(["1", "2"], type=pa.string()),
+                pa.array([2.0, 3.0], type=pa.float64()),
+                pa.array([2, 2], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     slow, _ = idx.child_relative_rankings("1", "species", "bio_1", "mean", return_distribution=True, location_gid="USA")
@@ -1554,8 +3768,16 @@ def test_indexing_last_missing_branches(stub_env, monkeypatch, tmp_path):
     occ = node / "occurrence.parquet"
     pq.write_table(pa.table({"catalogNumber": ["a", "b"], "koppen": [1, 2]}), occ)
     old = pa.StructArray.from_arrays(
-        [pa.array(["x", "y"], type=pa.string()), pa.array([0, 0], type=pa.int32()), pa.array([1.0, 2.0], type=pa.float64())],
-        fields=[pa.field("catalogNumber", pa.string()), pa.field("originId", pa.int32()), pa.field("value", pa.float64())],
+        [
+            pa.array(["x", "y"], type=pa.string()),
+            pa.array([0, 0], type=pa.int32()),
+            pa.array([1.0, 2.0], type=pa.float64()),
+        ],
+        fields=[
+            pa.field("catalogNumber", pa.string()),
+            pa.field("originId", pa.int32()),
+            pa.field("value", pa.float64()),
+        ],
     )
     pq.write_table(pa.table({"old_col": old}), node / "occurrence_index.parquet")
     monkeypatch.setattr(stub, "read_table", lambda p, **k: pq.read_table(p, **k))
@@ -1588,7 +3810,9 @@ def test_indexing_last_missing_branches(stub_env, monkeypatch, tmp_path):
 
     # 1179 + 1201-1205 in rank-index builder
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
-    monkeypatch.setattr(idx.PARQUET, "read_schema", lambda *_a, **_k: pa.schema([pa.field("wind_avg_6h::mean", pa.int64())]))
+    monkeypatch.setattr(
+        idx.PARQUET, "read_schema", lambda *_a, **_k: pa.schema([pa.field("wind_avg_6h::mean", pa.int64())])
+    )
 
     class _T:
         def to_pandas(self):
@@ -1615,7 +3839,11 @@ def test_indexing_last_missing_branches(stub_env, monkeypatch, tmp_path):
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)) if str(k).isdigit() else None)
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1}))
-    monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}])
+    monkeypatch.setattr(
+        idx,
+        "_ancestor_contexts",
+        lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}],
+    )
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
     original_load_column_lengths = idx._load_column_lengths
     original_resolve_column_name = idx._resolve_column_name
@@ -1626,13 +3854,19 @@ def test_indexing_last_missing_branches(stub_env, monkeypatch, tmp_path):
 
     monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: None)
     assert idx.load_relative_ranks(tdir, "bio_1", location_gid="USA") == []
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": tdir})
+    monkeypatch.setattr(
+        idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": tdir}
+    )
     monkeypatch.setattr(
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["2"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([1], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     assert idx.load_relative_ranks(tdir, "bio_1", location_gid="USA") == []
@@ -1651,9 +3885,17 @@ def test_indexing_last_missing_branches(stub_env, monkeypatch, tmp_path):
         idx._resolve_column_name(bad, "bio_1", "mean")
 
     # 1844 in child fast-path media fallback payload
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": tmp_path})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": tmp_path},
+    )
     monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: ["N"])
-    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "resolve_taxon_media",
+        lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]},
+    )
     monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda _t: {})
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
     monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
@@ -1663,11 +3905,16 @@ def test_indexing_last_missing_branches(stub_env, monkeypatch, tmp_path):
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["1"], type=pa.string()), pa.array([2.0], type=pa.float64()), pa.array([2], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1}))
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {1: 2})
     out, _ = idx.child_relative_rankings("1", "species", "bio_1", "mean", return_distribution=False, location_gid="USA")
     assert out and out[0]["image_license"] == "l"
 
@@ -1684,7 +3931,11 @@ def test_indexing_truly_last_lines(stub_env, monkeypatch, tmp_path):
     # 545-546: existing index + only-null new layer => no new layers
     old = pa.StructArray.from_arrays(
         [pa.array(["x"], type=pa.string()), pa.array([0], type=pa.int32()), pa.array([1.0], type=pa.float64())],
-        fields=[pa.field("catalogNumber", pa.string()), pa.field("originId", pa.int32()), pa.field("value", pa.float64())],
+        fields=[
+            pa.field("catalogNumber", pa.string()),
+            pa.field("originId", pa.int32()),
+            pa.field("value", pa.float64()),
+        ],
     )
     pq.write_table(pa.table({"old_col": old}), node / "occurrence_index.parquet")
     pq.write_table(pa.table({"catalogNumber": ["a"], "bio_new": [None]}), occ)
@@ -1711,7 +3962,11 @@ def test_indexing_truly_last_lines(stub_env, monkeypatch, tmp_path):
     # 1519 / 1563 / 1568
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({2}))
-    monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}])
+    monkeypatch.setattr(
+        idx,
+        "_ancestor_contexts",
+        lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}],
+    )
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
     monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 1})
     monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
@@ -1733,33 +3988,58 @@ def test_indexing_truly_last_lines(stub_env, monkeypatch, tmp_path):
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)) if str(k).isdigit() else None)
     assert idx.load_relative_ranks(p, "bio_1", location_gid="USA") == []
 
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": p})
+    monkeypatch.setattr(
+        idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": p}
+    )
     monkeypatch.setattr(
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["1"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([1], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     assert idx.load_relative_ranks(p, "bio_1", location_gid="USA") == []
 
     # 1844: fast path break on limit
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": p})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": p},
+    )
     monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: ["N"])
-    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "resolve_taxon_media",
+        lambda _k: {"url": "u", "license": "l", "creator": "c", "rightsHolder": "r", "references": ["ref"]},
+    )
     monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda _t: {})
     monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 2})
     monkeypatch.setattr(
         idx,
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
-            [pa.array(["1", "2"], type=pa.string()), pa.array([2.0, 3.0], type=pa.float64()), pa.array([2, 2], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            [
+                pa.array(["1", "2"], type=pa.string()),
+                pa.array([2.0, 3.0], type=pa.float64()),
+                pa.array([2, 2], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1, 2}))
-    rows, _ = idx.child_relative_rankings("1", "species", "bio_1", "mean", return_distribution=False, location_gid="USA", limit=1)
+    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {1: 2, 2: 2})
+    rows, _ = idx.child_relative_rankings(
+        "1", "species", "bio_1", "mean", return_distribution=False, location_gid="USA", limit=1
+    )
     assert len(rows) == 1
 
 
@@ -1806,12 +4086,16 @@ def test_indexing_targeted_uncovered_branches(stub_env, monkeypatch, tmp_path):
         "read_table",
         lambda *_a, **_k: pa.table({"taxon_key": ["bad", "2", "3"], "sample_count": ["x", "0", "4"]}),
     )
-    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)) if str(key).isdigit() else None)
+    monkeypatch.setattr(
+        idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)) if str(key).isdigit() else None
+    )
     assert idx._descendant_catalog_sample_counts("ok", "species") == {3: 4}
 
     # _eligible_context_taxon_ids branches.
     monkeypatch.setattr(idx, "_descendant_catalog_sample_counts", lambda *_a, **_k: {1: 5, 2: 2, 3: 7})
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"rank": "GENUS", "taxon_key": "1", "path": tmp_path})
+    monkeypatch.setattr(
+        idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"rank": "GENUS", "taxon_key": "1", "path": tmp_path}
+    )
     assert idx._eligible_context_taxon_ids(
         ancestor_taxon_id="1",
         target_rank="SPECIES",
@@ -1858,7 +4142,11 @@ def test_indexing_targeted_uncovered_branches(stub_env, monkeypatch, tmp_path):
     monkeypatch.setattr(
         idx.taxa_navigation,
         "get_taxon_by_id",
-        lambda k: target if str(k) == "1" else (ancestor_ctx if str(k) == "10" else {"taxon_key": str(k), "rank": "SPECIES", "path": taxon_dir}),
+        lambda k: (
+            target
+            if str(k) == "1"
+            else (ancestor_ctx if str(k) == "10" else {"taxon_key": str(k), "rank": "SPECIES", "path": taxon_dir})
+        ),
     )
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)) if str(k).isdigit() else None)
     monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [ancestor_ctx])
@@ -1874,7 +4162,11 @@ def test_indexing_targeted_uncovered_branches(stub_env, monkeypatch, tmp_path):
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["1"], type=pa.string()), pa.array([0.4], type=pa.float64()), pa.array([1], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx, "_eligible_context_taxon_ids", lambda **_k: {1, 2, 3})
@@ -1883,7 +4175,15 @@ def test_indexing_targeted_uncovered_branches(stub_env, monkeypatch, tmp_path):
 
     # child_relative_rankings location-counts fallback + class metric adjustment branch.
     anc = {"taxon_key": "99", "rank": "GENUS", "path": tmp_path}
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: anc if str(k) == "99" else {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": tmp_path})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: (
+            anc
+            if str(k) == "99"
+            else {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": tmp_path}
+        ),
+    )
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda r: str(r).upper())
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)) if str(k).isdigit() else None)
     monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: [])
@@ -1897,14 +4197,21 @@ def test_indexing_targeted_uncovered_branches(stub_env, monkeypatch, tmp_path):
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["1"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([2], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _s, _t: frozenset({1}))
     monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {1: None})
+    monkeypatch.setattr(idx.gis_lookup, "location_counts_for_taxon", lambda _taxon_id: {("scope", "target"): 2})
     monkeypatch.setattr(idx, "_eligible_context_taxon_ids", lambda **_k: {1, 2, 3})
-    ranked, dist = idx.child_relative_rankings("99", "species", "bio_1", "class_1", return_distribution=True, location_gid="USA")
+    ranked, dist = idx.child_relative_rankings(
+        "99", "species", "bio_1", "class_1", return_distribution=True, location_gid="USA"
+    )
     assert ranked and ranked[0]["count"] == 3 and dist == [1.0]
 
 
@@ -1929,22 +4236,30 @@ def test_indexing_remaining_defensive_edges(stub_env, monkeypatch, tmp_path):
 
     # _eligible_context_taxon_ids guard branches.
     monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: None)
-    assert idx._eligible_context_taxon_ids(
-        ancestor_taxon_id="missing",
-        target_rank="SPECIES",
-        storage_rank="SPECIES",
-        include_species_like=False,
-        allowed_taxa=None,
-    ) == set()
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"rank": "GENUS", "path": tmp_path, "taxon_key": "1"})
+    assert (
+        idx._eligible_context_taxon_ids(
+            ancestor_taxon_id="missing",
+            target_rank="SPECIES",
+            storage_rank="SPECIES",
+            include_species_like=False,
+            allowed_taxa=None,
+        )
+        == set()
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"rank": "GENUS", "path": tmp_path, "taxon_key": "1"}
+    )
     monkeypatch.setattr(idx, "_descendant_catalog_sample_counts", lambda *_a, **_k: {})
-    assert idx._eligible_context_taxon_ids(
-        ancestor_taxon_id="1",
-        target_rank="SPECIES",
-        storage_rank="SPECIES",
-        include_species_like=False,
-        allowed_taxa=None,
-    ) == set()
+    assert (
+        idx._eligible_context_taxon_ids(
+            ancestor_taxon_id="1",
+            target_rank="SPECIES",
+            storage_rank="SPECIES",
+            include_species_like=False,
+            allowed_taxa=None,
+        )
+        == set()
+    )
 
     monkeypatch.setattr(idx, "_descendant_catalog_sample_counts", lambda *_a, **_k: {1: 1, 2: 3})
     ranks = {"1": "SPECIES", "2": "GENUS"}
@@ -1954,37 +4269,56 @@ def test_indexing_remaining_defensive_edges(stub_env, monkeypatch, tmp_path):
         "get_taxon_by_id",
         lambda key: {"taxon_key": str(key), "rank": ranks.get(str(key), "SPECIES"), "path": tmp_path},
     )
-    assert idx._eligible_context_taxon_ids(
-        ancestor_taxon_id="1",
-        target_rank="SPECIES",
-        storage_rank="SPECIES",
-        include_species_like=False,
-        allowed_taxa=frozenset({2}),
-    ) == set()
-    assert idx._eligible_context_taxon_ids(
-        ancestor_taxon_id="1",
-        target_rank="SPECIES",
-        storage_rank="SPECIES",
-        include_species_like=False,
-        allowed_taxa=None,
-        min_samples=5,
-    ) == set()
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda key: None if str(key) == "1" else {"taxon_key": "2", "rank": "GENUS", "path": tmp_path})
-    assert idx._eligible_context_taxon_ids(
-        ancestor_taxon_id="1",
-        target_rank="SPECIES",
-        storage_rank="SPECIES",
-        include_species_like=False,
-        allowed_taxa=None,
-    ) == set()
+    assert (
+        idx._eligible_context_taxon_ids(
+            ancestor_taxon_id="1",
+            target_rank="SPECIES",
+            storage_rank="SPECIES",
+            include_species_like=False,
+            allowed_taxa=frozenset({2}),
+        )
+        == set()
+    )
+    assert (
+        idx._eligible_context_taxon_ids(
+            ancestor_taxon_id="1",
+            target_rank="SPECIES",
+            storage_rank="SPECIES",
+            include_species_like=False,
+            allowed_taxa=None,
+            min_samples=5,
+        )
+        == set()
+    )
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda key: None if str(key) == "1" else {"taxon_key": "2", "rank": "GENUS", "path": tmp_path},
+    )
+    assert (
+        idx._eligible_context_taxon_ids(
+            ancestor_taxon_id="1",
+            target_rank="SPECIES",
+            storage_rank="SPECIES",
+            include_species_like=False,
+            allowed_taxa=None,
+        )
+        == set()
+    )
 
     # load_relative_ranks: filtered combine_chunks empty + requested metric mismatch + invalid counts.
     taxon_dir = tmp_path / "species_1"
     taxon_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": taxon_dir})
+    monkeypatch.setattr(
+        idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": taxon_dir}
+    )
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)))
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper())
-    monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}])
+    monkeypatch.setattr(
+        idx,
+        "_ancestor_contexts",
+        lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}],
+    )
     monkeypatch.setattr(idx, "_load_global_relative_rows", lambda *_a, **_k: None)
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
 
@@ -1992,7 +4326,17 @@ def test_indexing_remaining_defensive_edges(stub_env, monkeypatch, tmp_path):
         num_rows = 1
 
         def combine_chunks(self):
-            return pa.table({"variable": [], "metric": [], "position": [], "count": [], "sampleCount": [], "contextTaxonId": [], "contextLabel": []})
+            return pa.table(
+                {
+                    "variable": [],
+                    "metric": [],
+                    "position": [],
+                    "count": [],
+                    "sampleCount": [],
+                    "contextTaxonId": [],
+                    "contextLabel": [],
+                }
+            )
 
     monkeypatch.setattr(idx.PARQUET, "read_table", lambda *_a, **_k: _Table())
     assert idx.load_relative_ranks(taxon_dir, "bio_1") == []
@@ -2014,9 +4358,17 @@ def test_indexing_remaining_defensive_edges(stub_env, monkeypatch, tmp_path):
     )
     assert idx.load_relative_ranks(taxon_dir, "bio_1", metric_names=["mean"]) == []
 
-    # child_relative_rankings: location_taxon_counts exception and filtered-to-empty dict branch.
+    # child_relative_rankings: filtered-to-empty dict branch.
     anc = {"taxon_key": "77", "rank": "GENUS", "path": tmp_path}
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda k: anc if str(k) == "77" else {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": tmp_path})
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "get_taxon_by_id",
+        lambda k: (
+            anc
+            if str(k) == "77"
+            else {"taxon_key": str(k), "rank": "SPECIES", "scientific_name": "T", "path": tmp_path}
+        ),
+    )
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda k: int(str(k)) if str(k).isdigit() else None)
     monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: [])
     monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_a, **_k: None)
@@ -2029,18 +4381,76 @@ def test_indexing_remaining_defensive_edges(stub_env, monkeypatch, tmp_path):
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["1"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([1], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _g: ("x", "scope", "target"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda *_a, **_k: frozenset({1}))
-    monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom")))
-    out, _dist = idx.child_relative_rankings("77", "species", "bio_1", "mean", location_gid="USA")
-    assert out
-
     monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {2: 4})
+    monkeypatch.setattr(idx.gis_lookup, "location_counts_for_taxon", lambda _taxon_id: {("scope", "target"): 1})
     out2, _dist2 = idx.child_relative_rankings("77", "species", "bio_1", "mean", location_gid="USA")
     assert out2
+
+
+def test_child_relative_rankings_applies_candidate_filter_before_taxon_lookup(monkeypatch, tmp_path):
+    ancestor = {"taxon_key": "77", "rank": "GENUS", "path": tmp_path}
+    looked_up: list[str] = []
+
+    def fake_get_taxon_by_id(key):
+        normalized = str(key)
+        looked_up.append(normalized)
+        if normalized == "77":
+            return ancestor
+        return {
+            "taxon_key": normalized,
+            "rank": "SPECIES",
+            "scientific_name": f"Taxon {normalized}",
+            "path": tmp_path,
+        }
+
+    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", fake_get_taxon_by_id)
+    monkeypatch.setattr(
+        idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)) if str(key).isdigit() else None
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(idx.taxa_navigation, "extract_common_names_for_language", lambda *_a, **_k: [])
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_a, **_k: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_a, **_k: {})
+    monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
+    monkeypatch.setattr(idx, "_resolve_column_name", lambda *_a, **_k: "bio_1::mean")
+    monkeypatch.setattr(idx, "_load_column_lengths", lambda _p: {"bio_1::mean": 3})
+    monkeypatch.setattr(
+        idx,
+        "_load_struct_column",
+        lambda *_a, **_k: pa.StructArray.from_arrays(
+            [
+                pa.array(["1", "2", "3"], type=pa.string()),
+                pa.array([1.0, 2.0, 3.0], type=pa.float64()),
+                pa.array([5, 5, 5], type=pa.int32()),
+            ],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
+        ),
+    )
+
+    rows, _dist = idx.child_relative_rankings(
+        "77",
+        "species",
+        "bio_1",
+        "mean",
+        candidate_taxon_ids=["2"],
+        return_distribution=False,
+    )
+
+    assert [row["taxon_id"] for row in rows] == [2]
+    assert looked_up == ["77", "2"]
 
 
 def test_indexing_final_remaining_lines(stub_env, monkeypatch, tmp_path):
@@ -2052,25 +4462,36 @@ def test_indexing_final_remaining_lines(stub_env, monkeypatch, tmp_path):
     monkeypatch.setattr(
         idx.taxa_navigation,
         "get_taxon_by_id",
-        lambda key: {"taxon_key": "root", "rank": "GENUS", "path": tmp_path}
-        if str(key) == "root"
-        else (None if str(key) == "1" else {"taxon_key": str(key), "rank": "GENUS", "path": tmp_path}),
+        lambda key: (
+            {"taxon_key": "root", "rank": "GENUS", "path": tmp_path}
+            if str(key) == "root"
+            else (None if str(key) == "1" else {"taxon_key": str(key), "rank": "GENUS", "path": tmp_path})
+        ),
     )
-    assert idx._eligible_context_taxon_ids(
-        ancestor_taxon_id="root",
-        target_rank="SPECIES",
-        storage_rank="SPECIES",
-        include_species_like=False,
-        allowed_taxa=None,
-    ) == set()
+    assert (
+        idx._eligible_context_taxon_ids(
+            ancestor_taxon_id="root",
+            target_rank="SPECIES",
+            storage_rank="SPECIES",
+            include_species_like=False,
+            allowed_taxa=None,
+        )
+        == set()
+    )
 
     # load_relative_ranks: requested_metrics mismatch and malformed count/position rows.
     taxon_dir = tmp_path / "species_1"
     taxon_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": taxon_dir})
+    monkeypatch.setattr(
+        idx.taxa_navigation, "get_taxon_by_id", lambda _k: {"taxon_key": "1", "rank": "SPECIES", "path": taxon_dir}
+    )
     monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper())
     monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
-    monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}])
+    monkeypatch.setattr(
+        idx,
+        "_ancestor_contexts",
+        lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}],
+    )
     monkeypatch.setattr(idx, "_load_global_relative_rows", lambda *_a, **_k: None)
     monkeypatch.setattr(idx.PARQUET, "exists", lambda _p: True)
     monkeypatch.setattr(
@@ -2125,7 +4546,11 @@ def test_indexing_final_relative_rank_continuation_lines(monkeypatch, tmp_path):
         "_load_struct_column",
         lambda *_a, **_k: pa.StructArray.from_arrays(
             [pa.array(["1"], type=pa.string()), pa.array([1.0], type=pa.float64()), pa.array([1], type=pa.int32())],
-            fields=[pa.field("taxonKey", pa.string()), pa.field("value", pa.float64()), pa.field("sampleCount", pa.int32())],
+            fields=[
+                pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int32()),
+            ],
         ),
     )
     assert idx.load_relative_ranks(taxon_dir, "bio_1", location_gid="USA") == []
@@ -2140,17 +4565,22 @@ def test_indexing_last_uncovered_defensive_paths(stub_env, monkeypatch, tmp_path
     monkeypatch.setattr(
         idx.taxa_navigation,
         "get_taxon_by_id",
-        lambda key: {"taxon_key": "root", "rank": "GENUS", "path": tmp_path}
-        if str(key) == "root"
-        else {"taxon_key": str(key), "rank": "SPECIES", "path": tmp_path},
+        lambda key: (
+            {"taxon_key": "root", "rank": "GENUS", "path": tmp_path}
+            if str(key) == "root"
+            else {"taxon_key": str(key), "rank": "SPECIES", "path": tmp_path}
+        ),
     )
-    assert idx._eligible_context_taxon_ids(
-        ancestor_taxon_id="root",
-        target_rank="GENUS",
-        storage_rank="GENUS",
-        include_species_like=False,
-        allowed_taxa=None,
-    ) == set()
+    assert (
+        idx._eligible_context_taxon_ids(
+            ancestor_taxon_id="root",
+            target_rank="GENUS",
+            storage_rank="GENUS",
+            include_species_like=False,
+            allowed_taxa=None,
+        )
+        == set()
+    )
 
     # load_relative_ranks: requested metric mismatch, invalid row values, and class metric adjustment.
     taxon_dir = tmp_path / "species_1"
@@ -2175,7 +4605,11 @@ def test_indexing_last_uncovered_defensive_paths(stub_env, monkeypatch, tmp_path
         "_descendant_catalog_sample_counts",
         lambda *_a, **_k: {101: 5, 102: 5, 103: 5},
     )
-    monkeypatch.setattr(idx, "_ancestor_contexts", lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}])
+    monkeypatch.setattr(
+        idx,
+        "_ancestor_contexts",
+        lambda _p: [{"taxon_key": "10", "rank": "GENUS", "path": tmp_path, "scientific_name": "G"}],
+    )
     monkeypatch.setattr(idx, "_load_global_relative_rows", lambda *_a, **_k: None)
     positions_path = taxon_dir / "relative_ranks_positions.parquet"
     stub._exists[positions_path] = True

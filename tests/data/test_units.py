@@ -171,3 +171,42 @@ def test_apply_unit_system_helpers():
     assert converted_rankings["entries"][0]["value"] == pytest.approx(50.0)
     assert converted_rankings["entries"][1]["value"] == "x"
     assert converted_rankings["distribution"]["points"] == pytest.approx([32.0])
+
+    query_rows = [
+        {
+            "taxon_id": 1,
+            "sort_value": 10.0,
+            "sort_variable": "bio_1",
+            "sort_metric": "mean",
+            "sample_count": 2,
+            "position": 1,
+            "percentile": 0.0,
+        },
+        {
+            "taxon_id": 2,
+            "sort_value": None,
+            "sort_variable": "bio_1",
+            "sort_metric": "mean",
+            "sample_count": 3,
+            "position": 2,
+            "percentile": 1.0,
+        },
+    ]
+    same_rows, same_units = units.apply_unit_system_to_query_rows(
+        query_rows,
+        None,
+        variable_id="bio_1",
+        unit="C",
+    )
+    assert same_units == "C"
+    assert same_rows[0]["sort_value"] == pytest.approx(10.0)
+
+    converted_rows, converted_units = units.apply_unit_system_to_query_rows(
+        query_rows,
+        "imperial",
+        variable_id="bio_1",
+        unit="C",
+    )
+    assert converted_units == "°F"
+    assert converted_rows[0]["sort_value"] == pytest.approx(50.0)
+    assert converted_rows[1]["sort_value"] is None

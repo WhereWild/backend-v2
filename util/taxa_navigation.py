@@ -1,39 +1,56 @@
-'''
+"""
 This file functions as a library, providing functions that perform standard operations one might use when traversing the taxonomy tree.
 It aims to accomplish more generic things on the tree and its parquets that other areas of the code can use.
-'''
+"""
 
 import pickle
 from functools import lru_cache
+import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, TypedDict
+import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TypedDict, cast
 
 import pyarrow as pa
 import pyarrow.compute as pc
 from rapidfuzz import fuzz, process
 
 from util.config import load_config
+from util.request_cancellation import CancelCheck
 from util.storage import ParquetStorageProxy
 from util import gis_lookup
 
 CONFIG = load_config("global")
 PARQUET = ParquetStorageProxy(CONFIG.data_root, CONFIG.project_root)
+LOGGER = logging.getLogger("uvicorn.error")
+PC = cast(Any, pc)
+
+STANDARD_DESCENDANT_RANKS: tuple[str, ...] = (
+    "KINGDOM",
+    "PHYLUM",
+    "CLASS",
+    "ORDER",
+    "FAMILY",
+    "GENUS",
+    "SPECIES",
+    "SUBSPECIES",
+)
 
 base_occurrence_columns = frozenset(
-            {
-                "catalogNumber",
-                "decimalLatitude",
-                "decimalLongitude",
-                "obscured",
-                "coordinateUncertaintyInMeters",
-                "level0Gid",
-                "level1Gid",
-                "level2Gid",
-                "gbifRegion",
-            }
-        )
+    {
+        "catalogNumber",
+        "decimalLatitude",
+        "decimalLongitude",
+        "obscured",
+        "coordinateUncertaintyInMeters",
+        "level0Gid",
+        "level1Gid",
+        "level2Gid",
+        "gbifRegion",
+    }
+)
 
 combined_parquet_filename = "combined.parquet"
+
 
 class TaxonRecord(TypedDict):
     taxon_key: str
@@ -65,6 +82,14 @@ def normalize_name(value: str) -> str:
     if not value:
         return ""
     return " ".join(value.replace("_", " ").lower().split())
+
+
+def taxon_slug(value: str | None) -> str:
+    """Build the canonical API slug for a taxon scientific name."""
+    normalized = normalize_name(value or "")
+    if not normalized:
+        return ""
+    return "-".join(part for part in normalized.split(" ") if part)
 
 
 def get_parent_taxon(taxon: TaxonRecord) -> TaxonRecord | None:
@@ -205,16 +230,6 @@ def extract_common_names_for_language(taxon: TaxonRecord, language: str = "en") 
     return []
 
 
-def resolve_matched_common_name(common_names: list[str], matched_key: str | None) -> str | None:
-    """Matches a normalized name-index key to a cased common name."""
-    if not matched_key:
-        return None
-    for name in common_names:
-        if normalize_name(name) == matched_key:
-            return name
-    return None
-
-
 def iter_descendants_dfs(taxon: TaxonRecord) -> Iterable[TaxonRecord]:
     """Iterates descendants in depth-first order."""
     stack: list[TaxonRecord] = list(get_children(taxon["taxon_key"]))
@@ -272,10 +287,10 @@ def resolve_taxon_media(taxon_key: str) -> dict | None:
 @lru_cache(maxsize=1)
 def _load_payload() -> dict:
     """Loads the taxon catalog payload pickle.
-    
+
     Args:
         None.
-    
+
     Returns:
         A dict containing the catalog and lookup indices.
     """
@@ -291,39 +306,104 @@ def load_catalog() -> Dict[str, TaxonRecord]:
     per-record access, which keeps cold-start load time low.
     """
     payload = _load_payload()
-    return payload["catalog"]
+    return {str(key): value for key, value in payload["catalog"].items()}
+
+
+def _iter_search_index_names(taxon: TaxonRecord) -> Iterable[str]:
+    preferred_name = str(taxon.get("inat_preferred_common_name") or "").strip()
+    if preferred_name:
+        yield preferred_name
+
+    raw_common_name = taxon.get("common_name")
+    if isinstance(raw_common_name, list):
+        if raw_common_name and isinstance(raw_common_name[0], dict):
+            for entry in raw_common_name:
+                if not isinstance(entry, dict):
+                    continue
+                value = str(entry.get("name") or "").strip()
+                if value:
+                    yield value
+        else:
+            for value in raw_common_name:
+                if isinstance(value, str):
+                    cleaned = value.strip()
+                    if cleaned:
+                        yield cleaned
+    elif isinstance(raw_common_name, str):
+        for value in raw_common_name.split(","):
+            cleaned = value.strip()
+            if cleaned:
+                yield cleaned
+
+    scientific_name = str(taxon.get("scientific_name") or "").strip()
+    if scientific_name:
+        yield scientific_name
 
 
 @lru_cache(maxsize=1)
 def load_name_index() -> dict:
     """Load name index and expand it to include all comma-separated common names."""
+    start = time.perf_counter()
     payload = _load_payload()
-    name_index = payload["combined_name_index"]
+    name_index = {
+        normalized_name: list(dict.fromkeys(str(key) for key in keys))
+        for raw_name, keys in payload["combined_name_index"].items()
+        if (normalized_name := normalize_name(str(raw_name or "")))
+    }
+    keys_by_name = {name: set(keys) for name, keys in name_index.items()}
     catalog = payload["catalog"]
 
-    # Enhance index with all common names and updated scientific names.
+    # Expand the precomputed index with raw catalog names without paying the
+    # full common-name formatting cost on first typeahead request.
     for taxon_key, taxon in catalog.items():
-        names = extract_common_names(taxon)
-
-        for name in names:
-            if not name:
+        taxon_key = str(taxon_key)
+        for raw_name in _iter_search_index_names(taxon):
+            normalized_name = normalize_name(raw_name)
+            if not normalized_name:
                 continue
-            normalized = name.lower()
-            if normalized not in name_index:
-                name_index[normalized] = []
-            if taxon_key not in name_index[normalized]:
-                name_index[normalized].append(taxon_key)
+            if normalized_name not in name_index:
+                name_index[normalized_name] = []
+                keys_by_name[normalized_name] = set()
+            known_keys = keys_by_name[normalized_name]
+            if taxon_key in known_keys:
+                continue
+            known_keys.add(taxon_key)
+            name_index[normalized_name].append(taxon_key)
 
-        scientific_name = taxon.get("scientific_name")
-        if isinstance(scientific_name, str) and scientific_name.strip():
-            normalized_scientific = normalize_name(scientific_name)
-            if normalized_scientific:
-                if normalized_scientific not in name_index:
-                    name_index[normalized_scientific] = []
-                if taxon_key not in name_index[normalized_scientific]:
-                    name_index[normalized_scientific].append(taxon_key)
+    LOGGER.info(
+        "[taxa.load-name-index] elapsed=%.3fs names=%s taxa=%s",
+        time.perf_counter() - start,
+        len(name_index),
+        len(catalog),
+    )
 
     return name_index
+
+
+@lru_cache(maxsize=1)
+def load_search_names_by_taxon() -> dict[str, tuple[str, ...]]:
+    """Invert the expanded name index to normalized search names per taxon."""
+    names_by_taxon: dict[str, list[str]] = {}
+    for normalized_name, taxon_keys in load_name_index().items():
+        if not normalized_name:
+            continue
+        for taxon_key in taxon_keys:
+            bucket = names_by_taxon.setdefault(str(taxon_key), [])
+            if normalized_name not in bucket:
+                bucket.append(normalized_name)
+    return {taxon_key: tuple(names) for taxon_key, names in names_by_taxon.items()}
+
+
+@lru_cache(maxsize=1)
+def load_slug_index() -> dict[str, tuple[str, ...]]:
+    """Load a scientific-name slug to taxon id index."""
+    slug_index: dict[str, list[str]] = {}
+    for taxon_key, taxon in load_catalog().items():
+        slug = taxon_slug(str(taxon.get("scientific_name") or ""))
+        if not slug:
+            continue
+        slug_index.setdefault(slug, []).append(str(taxon_key))
+    return {slug: tuple(taxon_keys) for slug, taxon_keys in slug_index.items()}
 
 
 @lru_cache(maxsize=65536)
@@ -335,7 +415,7 @@ def _normalized_taxon_record(lookup_key: Any) -> TaxonRecord | None:
         return None
     updated = dict(record)
     updated["path"] = _normalize_taxon_path(updated["path"])
-    return updated
+    return cast(TaxonRecord, updated)
 
 
 @lru_cache(maxsize=1)
@@ -350,38 +430,71 @@ def load_taxon_media() -> dict[str, dict]:
     with PARQUET.open_input_file(CONFIG.taxon_media_path) as handle:
         return pickle.load(handle)
 
+
 # ---- Public API ----
-def get_taxon_by_id(taxon_id: str) -> TaxonRecord | None:
+def get_taxon_by_id(taxon_id: Any) -> TaxonRecord | None:
     """Simply returns the taxon record for a given taxon id.
-    
+
     Args:
         taxon_id: The taxon id in question.
-    
+
     Returns:
         The taxon record for the corresponding id.
     """
-    record = _normalized_taxon_record(taxon_id)
-    if record is not None:
-        return record
-    # Fallbacks for catalogs keyed by int/str inconsistently.
-    try:
-        numeric_id = int(taxon_id)
-    except (TypeError, ValueError):
-        numeric_id = None
-    if numeric_id is not None:
-        record = _normalized_taxon_record(numeric_id)
-        if record is not None:
-            return record
-    if isinstance(taxon_id, int):
-        return _normalized_taxon_record(str(taxon_id))
+    normalized_key = str(taxon_id).strip() if taxon_id is not None else ""
+    if not normalized_key:
+        return None
+    return _normalized_taxon_record(normalized_key)
+
+
+def get_taxon_by_slug(slug: str) -> TaxonRecord | None:
+    """Return a taxon record for a canonical scientific-name slug."""
+    normalized_slug = taxon_slug(slug)
+    if not normalized_slug:
+        return None
+    taxon_keys = load_slug_index().get(normalized_slug)
+    if not taxon_keys:
+        return None
+    if len(taxon_keys) > 1:
+        raise ValueError(f"Ambiguous taxon slug: {normalized_slug}")
+    taxon_key = cast(tuple[str], taxon_keys)[0]
+    return get_taxon_by_id(taxon_key)
+
+
+def resolve_taxon_reference(value: str | None) -> TaxonRecord | None:
+    """Resolve a taxon from a numeric id or canonical scientific-name slug."""
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return None
+
+    exact = get_taxon_by_id(raw_value)
+    if exact is not None:
+        return exact
+
+    if any(ch.isspace() for ch in raw_value):
+        return None
+
+    by_slug = get_taxon_by_slug(raw_value)
+    if by_slug is not None:
+        return by_slug
     return None
+
+
+def is_valid_descendant_rank(value: str | None) -> bool:
+    """Return whether a descendant rank is recognized by the API."""
+    canonical = canonical_rank(value)
+    if not canonical:
+        return False
+    valid_ranks = set(STANDARD_DESCENDANT_RANKS) | set(CONFIG.rank_synonyms) | set(CONFIG.subspecies_equivalents)
+    return canonical in valid_ranks
+
 
 def get_children(taxon_id: str) -> List[TaxonRecord]:
     """Returns a list of taxon records for all direct children of the taxon defined by the passed taxon id.
-    
+
     Args:
         taxon_id: The taxon id in question.
-    
+
     Returns:
         A list of taxon records for all direct children of the argument taxon.
     """
@@ -401,11 +514,12 @@ def get_children(taxon_id: str) -> List[TaxonRecord]:
     if PARQUET.is_remote:
         return []
 
-    if not parent["path"].exists():
+    parent_path = _normalize_taxon_path(parent["path"])
+    if not parent_path.exists():
         return []
 
     children: list[TaxonRecord] = []
-    for child_dir in parent["path"].iterdir():
+    for child_dir in parent_path.iterdir():
         if child_dir.is_dir():
             # match child by taxonKey suffix in folder name
             key = taxon_key_from_path(child_dir)
@@ -417,10 +531,10 @@ def get_children(taxon_id: str) -> List[TaxonRecord]:
 
 def taxon_key_from_path(path: Path) -> str:
     """Implicitly gets the taxon key from the filepath of a taxon. Used in areas where it's convenient.
-    
+
     Args:
         path: The path to the taxon in the filesystem.
-    
+
     Returns:
         The taxon key which is implicitly stored in the path.
     """
@@ -429,77 +543,166 @@ def taxon_key_from_path(path: Path) -> str:
         return name.split("_")[-1]
     return name
 
-def search_taxa_by_name(name_query: str, limit: int = 10) -> list[Tuple[TaxonRecord, float, str]]:
+
+def search_taxa_by_name(
+    name_query: str,
+    limit: int | None = 10,
+    cancel_check: CancelCheck | None = None,
+) -> list[Tuple[TaxonRecord, float]]:
     """Performs fuzzy search to get a list of taxa with a name that matches the query.
-    
+
     Args:
         name_query: The name of the taxon being searched for. Can be common or scientific.
-        limit: How many taxa to return. Defaults to 10.
-    
+        limit: How many taxa to return. When None, return all matches.
+
     Returns:
-        A list of tuples of (TaxonRecord, float) where the float denotes how strong the match was.
+        A list of tuples of (TaxonRecord, score).
     """
-    name_index = load_name_index()
-    if not name_index:
-        return []
+    start = time.perf_counter()
     normalized_query = normalize_name(name_query)
     tokens = normalized_query.split()
-    if not tokens:
-        return []
+    try:
+        name_index = load_name_index()
+        if not name_index:
+            return []
+        if not tokens:
+            return []
 
-    matches = process.extract(
-        normalized_query,
-        name_index.keys(),
-        scorer=fuzz.token_set_ratio,
-        limit=max(limit * 25, 100),
-    )
-
-    min_score = 60 if len(tokens) > 1 else 70
-    best_by_taxon: dict[str, Tuple[TaxonRecord, float, str]] = {}
-    for name, score, _ in matches:
-        name_tokens = name.split()
-        if len(tokens) > 1:
-            token_matches = all(
-                any(nt.startswith(token) for nt in name_tokens)
-                for token in tokens
-            )
-            if not token_matches:
-                continue
+        result_limit = max(int(limit), 1) if limit is not None else None
+        if limit is None:
+            extract_iter = getattr(process, "extract_iter", None)
+            if extract_iter is not None:
+                matches = extract_iter(
+                    normalized_query,
+                    name_index.keys(),
+                    scorer=fuzz.token_set_ratio,
+                )
+            else:
+                matches = process.extract(
+                    normalized_query,
+                    name_index.keys(),
+                    scorer=fuzz.token_set_ratio,
+                    limit=max(len(name_index), 1),
+                )
         else:
-            token = tokens[0]
-            if not any(nt.startswith(token) for nt in name_tokens):
+            bounded_limit = max(int(limit), 1)
+            # RapidFuzz needs a wider candidate pool than the final API page
+            # because score adjustment and taxon deduplication happen after the
+            # fuzzy match step. Keep this bounded to avoid scanning the entire
+            # shared name index for every broad text query.
+            extract_limit = max(bounded_limit * 25, 100)
+            matches = process.extract(
+                normalized_query,
+                name_index.keys(),
+                scorer=fuzz.token_set_ratio,
+                limit=extract_limit,
+            )
+
+        best_by_taxon: dict[str, Tuple[TaxonRecord, float]] = {}
+        for name, score, _ in matches:
+            if cancel_check is not None:
+                cancel_check()
+            adjusted_score = _adjust_search_name_score(name, normalized_query, tokens, float(score))
+            if adjusted_score is None:
                 continue
 
-        adjusted_score = score
-        if name == normalized_query:
-            adjusted_score += 20
-        token_penalty = max(0, len(name_tokens) - len(tokens)) * 2
-        adjusted_score -= token_penalty
+            keys = name_index.get(name, [])
+            for key in keys:
+                if cancel_check is not None:
+                    cancel_check()
+                taxon_key = str(key)
+                taxon = get_taxon_by_id(taxon_key)
+                if not taxon:
+                    continue
+                existing = best_by_taxon.get(taxon_key)
+                if existing is None or adjusted_score > existing[1]:
+                    best_by_taxon[taxon_key] = (taxon, adjusted_score)
 
-        if adjusted_score < min_score:
+        results = list(best_by_taxon.values())
+        results.sort(key=lambda entry: entry[1], reverse=True)
+        return results if result_limit is None else results[:result_limit]
+    finally:
+        LOGGER.info(
+            "[taxa.search-by-name] elapsed=%.3fs query=%r normalized=%r token_count=%s limit=%r",
+            time.perf_counter() - start,
+            name_query,
+            normalized_query,
+            len(tokens),
+            limit,
+        )
+
+
+def _adjust_search_name_score(
+    normalized_name: str,
+    normalized_query: str,
+    query_tokens: list[str],
+    raw_score: float,
+) -> float | None:
+    if not normalized_query or not query_tokens:
+        return None
+
+    name_tokens = normalized_name.split()
+    if len(query_tokens) > 1:
+        token_matches = all(any(name_token.startswith(token) for name_token in name_tokens) for token in query_tokens)
+        if not token_matches:
+            return None
+    else:
+        token = query_tokens[0]
+        if not any(name_token.startswith(token) for name_token in name_tokens):
+            return None
+
+    adjusted_score = float(raw_score)
+    if normalized_name == normalized_query:
+        adjusted_score += 20.0
+    token_penalty = max(0, len(name_tokens) - len(query_tokens)) * 2
+    adjusted_score -= float(token_penalty)
+    min_score = 60 if len(query_tokens) > 1 else 70
+    if adjusted_score < min_score:
+        return None
+    return adjusted_score
+
+
+def taxon_name_match_score(taxon: TaxonRecord, name_query: str) -> float | None:
+    """Return the best search-match score for a single taxon against a query.
+
+    This mirrors the score adjustments used by search_taxa_by_name but evaluates
+    only the names attached to a single taxon. It is intended for scoped ranked
+    queries where the leaderboard already constrains the candidate universe.
+    """
+    normalized_query = normalize_name(name_query)
+    query_tokens = normalized_query.split()
+    if not query_tokens:
+        return None
+
+    best_score: float | None = None
+    seen_names: set[str] = set()
+    taxon_key = str(taxon.get("taxon_key") or "").strip()
+    search_names = list(load_search_names_by_taxon().get(taxon_key, ()))
+    if not search_names:
+        search_names = [normalize_name(raw_name) for raw_name in _iter_search_index_names(taxon)]
+    for normalized_name in search_names:
+        if not normalized_name or normalized_name in seen_names:
             continue
-
-        keys = name_index.get(name, [])
-        for key in keys:
-            taxon_key = str(key)
-            taxon = get_taxon_by_id(taxon_key)
-            if not taxon:
-                continue
-            existing = best_by_taxon.get(taxon_key)
-            if existing is None or adjusted_score > existing[1]:
-                best_by_taxon[taxon_key] = (taxon, adjusted_score, name)
-
-    results = list(best_by_taxon.values())
-    results.sort(key=lambda entry: entry[1], reverse=True)
-    return results[:limit]
+        seen_names.add(normalized_name)
+        adjusted_score = _adjust_search_name_score(
+            normalized_name,
+            normalized_query,
+            query_tokens,
+            float(fuzz.token_set_ratio(normalized_query, normalized_name)),
+        )
+        if adjusted_score is None:
+            continue
+        if best_score is None or adjusted_score > best_score:
+            best_score = adjusted_score
+    return best_score
 
 
 def canonical_rank(value: str | None) -> str:
     """Normalizes a rank string using configured synonyms, e.g. sp. maps to SPECIES.
-    
+
     Args:
         value: The rank string to normalize.
-    
+
     Returns:
         The canonical rank string.
     """
@@ -514,11 +717,11 @@ def canonical_rank(value: str | None) -> str:
 
 def iter_descendants(taxon: TaxonRecord, include_self: bool = False) -> List[TaxonRecord]:
     """Iterates all descendants of a taxon to essentially get an iterable of the subtree at its node.
-    
+
     Args:
         taxon: The taxon record in question.
         include_self: Whether or not to include the taxon in question in the iterable.
-    
+
     Returns:
         An iterable of all descendants of the taxon, e.g. its subtree.
     """
@@ -543,12 +746,12 @@ def iter_descendants_by_rank(
     include_self: bool = False,
 ) -> List[TaxonRecord]:
     """Iterates all descendants of a taxon, filtering results to a given rank.
-    
+
     Args:
         taxon: The taxon record in question.
         target_rank: The target rank to only include in the iterable.
         include_self: Whether to include the starting taxon if it matches.
-    
+
     Returns:
         An iterable including all descendants of the given taxon, filtered to the target rank.
     """
@@ -573,10 +776,10 @@ def iter_descendants_by_rank(
 
 def taxon_id_as_int(taxon_key: str | None) -> int | None:
     """Converts a taxon key to an integer when possible.
-    
+
     Args:
         taxon_key: The taxon key string to parse.
-    
+
     Returns:
         The integer taxon id, or None when parsing fails.
     """
@@ -594,6 +797,38 @@ def preferred_image_url(taxon: TaxonRecord | None) -> str | None:
         return None
     value = str(taxon.get("inat_preferred_image") or "").strip()
     return value or None
+
+
+def normalize_image_reference(value: Any) -> str | None:
+    """Normalize image references to a single primary API string.
+
+    Upstream catalog and media payloads may store references as a single
+    string, a list of strings, or richer dict records. The public API only
+    uses one primary attribution link today, so collapse these variants to the
+    first usable string value.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned or None
+    if isinstance(value, list):
+        for entry in value:
+            if isinstance(entry, str):
+                cleaned = entry.strip()
+                if cleaned:
+                    return cleaned
+            elif isinstance(entry, dict):
+                normalized = normalize_image_reference(entry)
+                if normalized:
+                    return normalized
+        return None
+    if isinstance(value, dict):
+        for key in ("url", "href", "reference", "references"):
+            normalized = normalize_image_reference(value.get(key))
+            if normalized:
+                return normalized
+    return None
 
 
 @lru_cache(maxsize=4096)
@@ -615,7 +850,7 @@ def resolve_preferred_image_taxon_key(taxon_key: str) -> str | None:
     return None
 
 
-def preferred_image_payload(taxon: TaxonRecord | None) -> dict[str, str]:
+def preferred_image_payload(taxon: TaxonRecord | None) -> dict[str, Any]:
     """Returns API image fields derived from catalog-stored preferred image metadata."""
     if not taxon:
         return {}
@@ -624,11 +859,11 @@ def preferred_image_payload(taxon: TaxonRecord | None) -> dict[str, str]:
     image_url = preferred_image_url(source_taxon)
     if not image_url:
         return {}
-    payload = {"image_url": image_url}
+    payload: dict[str, Any] = {"image_url": image_url}
     image_license = str((source_taxon or {}).get("inat_preferred_image_license") or "").strip()
     image_creator = str((source_taxon or {}).get("inat_preferred_image_creator") or "").strip()
     image_attribution = str((source_taxon or {}).get("inat_preferred_image_attribution") or "").strip()
-    image_references = str((source_taxon or {}).get("inat_preferred_image_references") or "").strip()
+    image_references = normalize_image_reference((source_taxon or {}).get("inat_preferred_image_references"))
     if image_license:
         payload["image_license"] = image_license
     if image_creator:
@@ -648,10 +883,10 @@ def preferred_image_payload(taxon: TaxonRecord | None) -> dict[str, str]:
 
 def count_taxon_rows(taxon: TaxonRecord) -> int | None:
     """Returns the numnber of rows within the occurrence parquet of a taxon.
-    
+
     Args:
         taxon: The taxon record in question.
-    
+
     Returns:
         The number of rows within the taxon's occurrence parquet.
     """
@@ -679,7 +914,7 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
     common_name = common_names[0] if common_names else scientific_name
 
     rank = (taxon.get("rank") or "").upper()
-    slug = "-".join(part for part in scientific_name.lower().split() if part)
+    slug = taxon_slug(scientific_name)
     # Avoid per-result metadata reads during search serialization.
     occurrences: int | None = None
     description = f"{scientific_name}. Rank: {rank.title()}."
@@ -726,27 +961,27 @@ def serialize_taxon(taxon: TaxonRecord) -> dict[str, Any] | None:
         result["image_license"] = media_record.get("license")
         result["image_creator"] = media_record.get("creator")
         result["image_rights_holder"] = media_record.get("rightsHolder")
-        result["image_references"] = media_record.get("references")
+        result["image_references"] = normalize_image_reference(media_record.get("references"))
 
     return result
 
 
 def base_observation_mask(table: pa.Table) -> pa.Array:
     """Adds a mask over a parquet to only return rows that are not obscured and are positionally accurate.
-    
+
     Args:
         table: The input table.
-    
+
     Returns:
         A pyarrow boolean array mask that can be used to filter the table.
     """
-    mask = pc.equal(table["obscured"], "No")
-    precision_mask = pc.less_equal(table["coordinateUncertaintyInMeters"], 500)
-    mask = pc.and_(mask, precision_mask)
+    mask = PC.equal(table["obscured"], "No")
+    precision_mask = PC.less_equal(table["coordinateUncertaintyInMeters"], 500)
+    mask = PC.and_(mask, precision_mask)
     lat_col = table["decimalLatitude"]
     lon_col = table["decimalLongitude"]
-    mask = pc.and_(mask, pc.invert(pc.is_null(lat_col)))
-    mask = pc.and_(mask, pc.invert(pc.is_null(lon_col)))
+    mask = PC.and_(mask, PC.invert(PC.is_null(lat_col)))
+    mask = PC.and_(mask, PC.invert(PC.is_null(lon_col)))
     return mask
 
 
@@ -756,12 +991,12 @@ def iter_filtered_occurrence_tables(
     location_gid: Optional[str] = None,
 ) -> Iterable[pa.Table]:
     """Yields filtered occurrence tables for a taxon and its descendants.
-    
+
     Args:
         taxon_id: Taxon id whose subtree should be scanned for occurrence tables.
         extra_columns: Additional column names to include in the yielded tables.
         location_gid: Optional location GID to filter observations by location membership.
-    
+
     Returns:
         An iterator of pyarrow tables filtered to non-obscured, precise observations.
     """
@@ -793,7 +1028,7 @@ def iter_filtered_occurrence_tables(
                 loc_mask = gis_lookup.build_location_mask(table, normalized_location)
                 if loc_mask is None:
                     continue
-                mask = pc.and_(mask, loc_mask)
+                mask = PC.and_(mask, loc_mask)
             filtered = table.filter(mask).combine_chunks()
             if filtered.num_rows:
                 yield filtered
@@ -804,11 +1039,11 @@ def load_occurrence_points(
     location_gid: Optional[str] = None,
 ) -> list[dict[str, float | str]]:
     """Loads occurrence coordinates for a taxon and its descendants.
-    
+
     Args:
         taxon_id: Taxon id whose occurrence points should be loaded.
         location_gid: Optional location GID to filter occurrences by location membership.
-    
+
     Returns:
         A list of unique occurrence points with catalog number and coordinates. As a dict so it can easily be serialized for the API.
     """

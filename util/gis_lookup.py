@@ -20,6 +20,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.fs as pafs
 from util.config import load_config
+from util.request_cancellation import CancelCheck
 from util.storage import ParquetStorageProxy, get_parquet_storage_with_mode
 import unicodedata
 
@@ -711,7 +712,12 @@ def location_taxa_membership() -> Dict[tuple[str, str], frozenset[int]]:
 
 
 @lru_cache(maxsize=4096)
-def location_taxa_for(scope: str, gid: str) -> frozenset[int]:
+def location_taxa_for(
+    scope: str,
+    gid: str,
+    *,
+    include_ancestor_rollup: bool = False,
+) -> frozenset[int]:
     """Returns taxon ids known to occur for a single (scope, gid) location key.
 
     This avoids loading the full location->taxa map on first location query.
@@ -720,6 +726,14 @@ def location_taxa_for(scope: str, gid: str) -> frozenset[int]:
     normalized_gid = str(gid or "").strip()
     if not normalized_scope or not is_valid_location_gid(normalized_gid):
         return frozenset()
+    if include_ancestor_rollup:
+        return frozenset(
+            location_taxon_counts(
+                normalized_scope,
+                normalized_gid,
+                include_ancestor_rollup=True,
+            )
+        )
     if not PARQUET.exists(CONFIG.location_catalog_path):
         return frozenset()
 
@@ -756,6 +770,46 @@ def location_taxa_for(scope: str, gid: str) -> frozenset[int]:
         except (TypeError, ValueError):
             continue
     return frozenset(resolved)
+
+
+def _rollup_location_taxon_counts(
+    mapping: Dict[int, int],
+    *,
+    include_species_rollup: bool = False,
+    include_ancestor_rollup: bool = False,
+) -> Dict[int, int]:
+    if not mapping or (not include_species_rollup and not include_ancestor_rollup):
+        return dict(mapping)
+
+    try:
+        from util import taxa_navigation
+
+        rolled: dict[int, int] = defaultdict(int)
+        for numeric_taxon_id, numeric_count in mapping.items():
+            rolled[numeric_taxon_id] += numeric_count
+            taxon = taxa_navigation.get_taxon_by_id(str(numeric_taxon_id))
+            if taxon is None:
+                continue
+            rank = taxa_navigation.canonical_rank(taxon.get("rank"))
+            parent = taxa_navigation.get_parent_taxon(taxon)
+            while parent is not None:
+                parent_rank = taxa_navigation.canonical_rank(parent.get("rank"))
+                if include_ancestor_rollup or (
+                    include_species_rollup and rank in CONFIG.subspecies_equivalents and parent_rank == "SPECIES"
+                ):
+                    parent_id = taxa_navigation.taxon_id_as_int(parent.get("taxon_key"))
+                    if parent_id is not None:
+                        rolled[int(parent_id)] += numeric_count
+                if include_ancestor_rollup:
+                    parent = taxa_navigation.get_parent_taxon(parent)
+                    continue
+                if include_species_rollup and rank in CONFIG.subspecies_equivalents and parent_rank != "SPECIES":
+                    parent = taxa_navigation.get_parent_taxon(parent)
+                    continue
+                break
+        return dict(rolled)
+    except Exception:
+        return dict(mapping)
 
 
 @lru_cache(maxsize=1)
@@ -845,11 +899,13 @@ def location_taxon_counts(
     gid: str,
     *,
     include_species_rollup: bool = False,
+    include_ancestor_rollup: bool = False,
 ) -> Dict[int, int]:
     """Returns taxon->observation count mapping for a specific location key.
 
     When include_species_rollup=True, infraspecific counts are also added to
-    their parent species taxon id.
+    their parent species taxon id. When include_ancestor_rollup=True, counts
+    are also propagated up the full ancestor chain.
     """
     normalized_scope = str(scope or "").strip()
     normalized_gid = str(gid or "").strip()
@@ -882,32 +938,11 @@ def location_taxon_counts(
         if numeric_count <= 0:
             continue
         mapping[numeric_taxon_id] += numeric_count
-    if include_species_rollup and mapping:
-        try:
-            from util import taxa_navigation
-
-            rolled: dict[int, int] = defaultdict(int)
-            for numeric_taxon_id, numeric_count in mapping.items():
-                rolled[numeric_taxon_id] += numeric_count
-                taxon = taxa_navigation.get_taxon_by_id(str(numeric_taxon_id))
-                if taxon is None:
-                    continue
-                rank = taxa_navigation.canonical_rank(taxon.get("rank"))
-                if rank not in CONFIG.subspecies_equivalents:
-                    continue
-                parent = taxa_navigation.get_parent_taxon(taxon)
-                while parent is not None:
-                    parent_rank = taxa_navigation.canonical_rank(parent.get("rank"))
-                    if parent_rank == "SPECIES":
-                        parent_id = taxa_navigation.taxon_id_as_int(parent.get("taxon_key"))
-                        if parent_id is not None:
-                            rolled[int(parent_id)] += numeric_count
-                        break
-                    parent = taxa_navigation.get_parent_taxon(parent)
-            mapping = rolled
-        except Exception:
-            pass
-    return dict(mapping)
+    return _rollup_location_taxon_counts(
+        mapping,
+        include_species_rollup=include_species_rollup,
+        include_ancestor_rollup=include_ancestor_rollup,
+    )
 
 
 def resolve_location_context(
@@ -935,7 +970,66 @@ def resolve_location_context(
     return context
 
 
-"Helper method to strip diacritics"
+def _lookup_location_record(gid: str) -> tuple[LocationRecord | None, dict[str, LocationRecord]]:
+    normalized_gid = str(gid or "").strip()
+    if not normalized_gid:
+        _entries, mapping = load_location_catalog()
+        return None, mapping
+
+    _entries, mapping = load_location_catalog()
+    record = mapping.get(normalized_gid)
+    if record is None and normalized_gid.upper() != normalized_gid:
+        record = mapping.get(normalized_gid.upper())
+    return record, mapping
+
+
+def get_location_by_gid(gid: str) -> dict[str, Any] | None:
+    """Return canonical metadata for a location gid when present in the catalog."""
+    record, mapping = _lookup_location_record(gid)
+    if record is None:
+        return None
+    return {
+        "gid": record.gid,
+        "name": record.name,
+        "level": record.level,
+        "parent_gid": record.parent_gid,
+        "hierarchy": resolve_location_context(record, mapping),
+    }
+
+
+def describe_location(gid: str) -> dict[str, Any] | None:
+    """Return a location payload with explicit ancestor metadata."""
+    record, mapping = _lookup_location_record(gid)
+    if record is None:
+        return None
+
+    ancestors: list[dict[str, Any]] = []
+    parent_gid = record.parent_gid
+    while parent_gid:
+        parent_record = mapping.get(parent_gid)
+        if parent_record is None:
+            break
+        ancestors.append(
+            {
+                "gid": parent_record.gid,
+                "name": parent_record.name,
+                "level": parent_record.level,
+            }
+        )
+        parent_gid = parent_record.parent_gid
+    ancestors.reverse()
+
+    return {
+        "gid": record.gid,
+        "name": record.name,
+        "level": record.level,
+        "parent_gid": record.parent_gid,
+        "hierarchy": [ancestor["name"] for ancestor in ancestors],
+        "ancestors": ancestors,
+    }
+
+
+# Helper method to strip diacritics.
 
 
 def strip_diacritics(text: str) -> str:
@@ -946,7 +1040,11 @@ def strip_diacritics(text: str) -> str:
     return stripped.lower().strip()
 
 
-def search_locations(query: str, limit: int) -> List[dict[str, Any]]:
+def search_locations(
+    query: str,
+    limit: int,
+    cancel_check: CancelCheck | None = None,
+) -> List[dict[str, Any]]:
     """Searches location records by name substring.
 
     Args:
@@ -963,6 +1061,8 @@ def search_locations(query: str, limit: int) -> List[dict[str, Any]]:
     entries, mapping = load_location_catalog()
     results: List[dict[str, Any]] = []
     for record in entries:
+        if cancel_check is not None:
+            cancel_check()
         name_norm = strip_diacritics(record.name or "")
         if search_norm not in name_norm:
             continue

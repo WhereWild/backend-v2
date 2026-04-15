@@ -1,17 +1,20 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import anyio
 import io
+import logging
 import math
 import re
 import shutil
+import time
 import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass as _dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 import numpy as _np_global
 
@@ -20,13 +23,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from starlette.concurrency import run_in_threadpool
 import pandas as pd
+from pydantic import BaseModel, Field
 
 from util.config import load_config
-from util import custom_upload_processing, descriptions, gis_lookup, indexing, models, summary_stats, taxa_navigation, units, tiles, weather_tiles
+from util.request_cancellation import CancelCheck, RequestCancelledError
+from util import (
+    custom_upload_processing,
+    descriptions,
+    gis_lookup,
+    indexing,
+    models,
+    summary_stats,
+    taxa_navigation,
+    units,
+    tiles,
+    weather_tiles,
+)
 from util.tile_request import log_tile_cancellation, render_species_deep_zoom_tile, run_tile_render_with_cancellation
 from util.storage import get_parquet_storage
 
 CONFIG = load_config("global")
+LOGGER = logging.getLogger("uvicorn.error")
 
 api_title = "WhereWild API"
 
@@ -60,6 +77,50 @@ no_summary_stats_variables = frozenset({"aspect_deg"})
 _SPECIES_DEEP_ZOOM_RENDER_SEMAPHORE = asyncio.Semaphore(species_deep_zoom_render_limit)
 
 
+def _warm_taxa_name_index() -> None:
+    try:
+        taxa_navigation.load_name_index()
+    except (FileNotFoundError, OSError) as exc:
+        LOGGER.warning("[taxa.load-name-index] startup warm skipped: %s", exc)
+    except Exception:
+        LOGGER.exception("[taxa.load-name-index] startup warm failed")
+
+
+def _build_disconnect_checker(request: Request | None, *, poll_every: int = 32) -> CancelCheck:
+    if request is None:
+        return lambda: None
+
+    checks = 0
+    disconnected = False
+
+    def check() -> None:
+        nonlocal checks, disconnected
+        if disconnected:
+            raise RequestCancelledError("Client disconnected")
+        if checks == 0 or checks % poll_every == 0:
+            try:
+                disconnected = bool(anyio.from_thread.run(request.is_disconnected))
+            except RuntimeError:
+                disconnected = False
+            if disconnected:
+                raise RequestCancelledError("Client disconnected")
+        checks += 1
+
+    return check
+
+
+def _search_locations_with_optional_cancel(
+    query: str,
+    limit: int,
+    cancel_check: CancelCheck,
+) -> list[dict[str, Any]]:
+    try:
+        return gis_lookup.search_locations(query, limit, cancel_check=cancel_check)
+    except TypeError as exc:
+        if "cancel_check" not in str(exc):
+            raise
+        return gis_lookup.search_locations(query, limit)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -72,7 +133,10 @@ async def lifespan(app: FastAPI):
         # Remote/object storage might be unavailable at startup; defer to first request.
         pass
     import threading
+
     threading.Thread(target=weather_tiles.load_cache, daemon=True, name="weather-cache").start()
+    threading.Thread(target=_get_homepage_cache, daemon=True, name="homepage-cache").start()
+    threading.Thread(target=_warm_taxa_name_index, daemon=True, name="taxa-name-index").start()
     yield
 
 
@@ -83,6 +147,87 @@ app.add_middleware(
     allow_methods=list(cors_allow_methods),
     allow_headers=list(cors_allow_headers),
 )
+
+
+class TaxaQueryScope(BaseModel):
+    within_taxon: int | str | None = Field(
+        default=None,
+        description="Resolved `within_taxon` scope as an integer id when possible, otherwise the normalized value.",
+    )
+    descendant_rank: str | None = Field(default=None, description="Canonical descendant rank applied to the query.")
+    location: str | None = Field(default=None, description="Normalized location GID filter.")
+    min_samples: int = Field(description="Minimum sample-count threshold applied to the query.")
+    include_species_like: bool = Field(
+        description="Whether species-like descendant ranks such as subspecies were included for species queries."
+    )
+
+
+class TaxaQuerySort(BaseModel):
+    variable: str | None = Field(default=None, description="Variable id used for sorting ranked results.")
+    metric: str | None = Field(default=None, description="Metric name used for sorting ranked results.")
+    order: str = Field(description="Normalized sort order.")
+    units: str | None = Field(default=None, description="Display units for ranked values when applicable.")
+
+
+class TaxaQueryResult(BaseModel):
+    taxon_id: int | str | None = Field(default=None, description="Canonical taxon id for the result row.")
+    scientific_name: str | None = Field(default=None, description="Scientific name for the matched or ranked taxon.")
+    common_name: str | None = Field(default=None, description="Preferred common name for the taxon.")
+    common_names: list[str] | None = Field(default=None, description="Available localized common names.")
+    rank: str | None = Field(default=None, description="Canonical taxonomic rank for the taxon.")
+    slug: str | None = Field(default=None, description="Slug identifier when available.")
+    description: str | None = Field(default=None, description="Localized description text when available.")
+    image_url: str | None = Field(default=None, description="Primary image URL when available.")
+    image_license: str | None = Field(default=None, description="Image license string when available.")
+    image_creator: str | None = Field(default=None, description="Image creator attribution when available.")
+    image_rights_holder: str | None = Field(default=None, description="Image rights holder when available.")
+    image_references: str | None = Field(default=None, description="Primary image source reference.")
+    match_score: float | None = Field(default=None, description="Text match score for search-based results.")
+    sample_count: int | None = Field(default=None, description="Sample count used for eligibility and display.")
+    sort_value: float | None = Field(default=None, description="Ranked metric value when sorting is applied.")
+    sort_variable: str | None = Field(default=None, description="Variable id associated with `sort_value`.")
+    sort_metric: str | None = Field(default=None, description="Metric name associated with `sort_value`.")
+    position: int | None = Field(default=None, description="1-based rank position for ranked results.")
+    percentile: float | None = Field(default=None, description="Normalized percentile for ranked results.")
+
+
+class TaxaQueryResponse(BaseModel):
+    query: str | None = Field(default=None, description="Normalized query string, or null when no text query was used.")
+    scope: TaxaQueryScope
+    sort: TaxaQuerySort
+    total: int = Field(description="Total number of result rows after all ranking and filtering rules are applied.")
+    matched_total: int = Field(
+        description="Number of taxa that matched the text query before scoped ranked intersection or text-only filtering."
+    )
+    eligible_total: int = Field(
+        description=(
+            "Number of eligible rows before pagination. For scoped ranked queries this is the post-ranking eligible count "
+            "from the leaderboard index, not a separate text-prefilter count."
+        )
+    )
+    empty_reason: Literal["no_query", "no_text_matches", "filtered_out", "ranking_ineligible"] | None = Field(
+        default=None,
+        description=(
+            "Null when results are present. Empty text responses may use `no_query`, `no_text_matches`, or "
+            "`filtered_out`. Empty ranked responses use `ranking_ineligible`."
+        ),
+    )
+    limit: int = Field(description="Page size requested by the client.")
+    offset: int = Field(description="Pagination offset requested by the client.")
+    results: list[TaxaQueryResult] = Field(description="Result rows for the current page.")
+
+
+class TaxaRankingOption(BaseModel):
+    variable: str = Field(description="Variable id available for ranking in the requested scope.")
+    metric: str = Field(description="Metric name available for the variable in the requested scope.")
+    count: int | None = Field(default=None, description="Indexed row count for the option when available.")
+    column: str | None = Field(default=None, description="Backing parquet column name for the option.")
+
+
+class TaxaRankingOptionsResponse(BaseModel):
+    ancestor_taxon_id: int | str = Field(description="Resolved ancestor taxon id for the requested scope.")
+    rank: str = Field(description="Canonical descendant rank used for the scope.")
+    options: list[TaxaRankingOption] = Field(description="Available ranking options for the requested scope.")
 
 
 def _path_exists(path: Path) -> bool:
@@ -145,7 +290,7 @@ def weather_cache_status() -> dict:
 @app.get("/health", summary="Simple liveness probe")
 def health_check() -> dict[str, str]:
     """Returns a simple liveness payload.
-    
+
     Returns:
         A status string and UTC timestamp.
     """
@@ -154,12 +299,10 @@ def health_check() -> dict[str, str]:
 
 @app.get("/variables")
 def list_environment_variables(
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> List[dict[str, Any]]:
     """Lists available environmental variables.
-    
+
     Returns:
         A list of variable metadata entries.
     """
@@ -206,7 +349,11 @@ async def variable_tile(
     if layer_id in weather_tiles.LIVE_WEATHER_VARIABLES:
         payload = await run_in_threadpool(
             weather_tiles.render_weather_tile_bytes,
-            variable_id=layer_id, z=z, x=x, y=y, tile_size=tile_size,
+            variable_id=layer_id,
+            z=z,
+            x=x,
+            y=y,
+            tile_size=tile_size,
         )
         if payload is None:
             # Cache not yet populated — return transparent tile
@@ -226,7 +373,7 @@ async def variable_tile(
 
     if z > max_native_zoom:
         zoom_diff = z - max_native_zoom
-        scale = 2 ** zoom_diff
+        scale = 2**zoom_diff
         parent_x = x // scale
         parent_y = y // scale
         subtile_x = x % scale
@@ -350,6 +497,8 @@ async def species_heatmap_tile(
             )
             if payload is None:
                 return Response(status_code=204)
+        except tiles.TileRenderCancelled:
+            return Response(status_code=204)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     else:
@@ -504,21 +653,25 @@ def _scores_cache_namespace() -> str:
     )
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
+
 @_dataclass
 class _HomepageCache:
     meta: dict
     taxon_probs: dict  # str(taxon_id) -> np.ndarray
-    gis_arrays: dict   # layer_id -> np.ndarray (only labeled layers)
+    gis_arrays: dict  # layer_id -> np.ndarray (only labeled layers)
     vmin: float
     vmax: float
     mtime: float
+
 
 _VALID_GROUPS = {"birds", "animals", "arthropods", "fungi", "plants", "other"}
 
 _homepage_cache: "_HomepageCache | None" = None
 
+
 def _get_homepage_cache() -> "_HomepageCache | None":
     import json as _json
+
     global _homepage_cache
     if not _TAXON_PROBS_PATH.exists():
         return None
@@ -540,14 +693,19 @@ def _get_homepage_cache() -> "_HomepageCache | None":
         stats_path = _HOMEPAGE_RASTER.parent / "aggregate_sdm_stats.json"
         if stats_path.exists():
             import json as _json2
+
             _stats = _json2.loads(stats_path.read_text())
             vmin, vmax = float(_stats.get("vmin", 0.0)), float(_stats.get("vmax", 1.0))
-        _homepage_cache = _HomepageCache(meta=meta, taxon_probs=taxon_probs, gis_arrays=gis_arrays, vmin=vmin, vmax=vmax, mtime=mtime)
+        _homepage_cache = _HomepageCache(
+            meta=meta, taxon_probs=taxon_probs, gis_arrays=gis_arrays, vmin=vmin, vmax=vmax, mtime=mtime
+        )
     return _homepage_cache
+
 
 def _raster_for_group(group: str | None) -> tuple[Path, float, float]:
     """Return (raster_path, vmin, vmax) for a given group (None = overall)."""
     import json as _json
+
     if group and group in _VALID_GROUPS:
         path = _HOMEPAGE_RASTER.parent / f"aggregate_sdm_{group}.tif"
         if path.exists():
@@ -593,11 +751,13 @@ async def homepage_heatmap_tile(
         payload = await run_tile_render_with_cancellation(
             request,
             tiles.render_homepage_tile_bytes,
-        z=z, x=x, y=y,
-        raster_path=raster_path,
-        tile_size=tile_size,
-        vmin=vmin,
-        vmax=vmax,
+            z=z,
+            x=x,
+            y=y,
+            raster_path=raster_path,
+            tile_size=tile_size,
+            vmin=vmin,
+            vmax=vmax,
         )
     except tiles.TileRenderCancelled:
         log_tile_cancellation("homepage", "during_render", z=z, x=x, y=y, group=group)
@@ -612,47 +772,63 @@ async def homepage_heatmap_tile(
 
 _TEMPORAL_REASON_LABELS: dict[str, tuple[str, str]] = {
     # (high-value label, low-value label)
-    "temperature_2m":           ("warm temperatures",       "cool temperatures"),
-    "precipitation":            ("recent rainfall",          "dry conditions"),
-    "soil_moisture_0_to_7cm":   ("moist soils",             "dry soils"),
-    "soil_moisture_0_to_10cm":  ("moist soils",             "dry soils"),
-    "soil_temperature_0_to_7cm":  ("warm soils",            "cool soils"),
-    "soil_temperature_0_to_10cm": ("warm soils",            "cool soils"),
-    "cloud_cover":              ("overcast skies",           "clear skies"),
-    "snowfall_water_equivalent":("snow cover",              "snow-free ground"),
-    "relative_humidity_2m":     ("high humidity",           "low humidity"),
-    "vapor_pressure_deficit":   ("high evaporation demand", "low evaporation demand"),
-    "dew_point_2m":             ("humid air",               "dry air"),
+    "temperature_2m": ("warm temperatures", "cool temperatures"),
+    "precipitation": ("recent rainfall", "dry conditions"),
+    "soil_moisture_0_to_7cm": ("moist soils", "dry soils"),
+    "soil_moisture_0_to_10cm": ("moist soils", "dry soils"),
+    "soil_temperature_0_to_7cm": ("warm soils", "cool soils"),
+    "soil_temperature_0_to_10cm": ("warm soils", "cool soils"),
+    "cloud_cover": ("overcast skies", "clear skies"),
+    "snowfall_water_equivalent": ("snow cover", "snow-free ground"),
+    "relative_humidity_2m": ("high humidity", "low humidity"),
+    "vapor_pressure_deficit": ("high evaporation demand", "low evaporation demand"),
+    "dew_point_2m": ("humid air", "dry air"),
 }
 
 _LANDCOVER_CLASS_TO_GROUP: dict[int, str] = {
-    10: "cropland", 11: "cropland", 12: "cropland", 20: "cropland",
-    51: "forest", 52: "forest", 61: "forest", 62: "forest",
-    71: "forest", 72: "forest", 81: "forest", 82: "forest",
-    91: "forest", 92: "forest",
-    120: "shrubland", 121: "shrubland", 122: "shrubland",
+    10: "cropland",
+    11: "cropland",
+    12: "cropland",
+    20: "cropland",
+    51: "forest",
+    52: "forest",
+    61: "forest",
+    62: "forest",
+    71: "forest",
+    72: "forest",
+    81: "forest",
+    82: "forest",
+    91: "forest",
+    92: "forest",
+    120: "shrubland",
+    121: "shrubland",
+    122: "shrubland",
     130: "grassland",
     140: "lichens_mosses",
-    150: "sparse_vegetation", 152: "sparse_vegetation", 153: "sparse_vegetation",
+    150: "sparse_vegetation",
+    152: "sparse_vegetation",
+    153: "sparse_vegetation",
     180: "wetlands",
     190: "urban",
-    200: "bare_areas", 201: "bare_areas", 202: "bare_areas",
+    200: "bare_areas",
+    201: "bare_areas",
+    202: "bare_areas",
     210: "water",
     220: "ice_snow",
 }
 
 _LANDCOVER_GROUP_LABELS: dict[str, str] = {
-    "cropland":          "agricultural areas",
-    "forest":            "forested areas",
-    "shrubland":         "shrubland habitat",
-    "grassland":         "open grasslands",
-    "lichens_mosses":    "tundra habitat",
+    "cropland": "agricultural areas",
+    "forest": "forested areas",
+    "shrubland": "shrubland habitat",
+    "grassland": "open grasslands",
+    "lichens_mosses": "tundra habitat",
     "sparse_vegetation": "sparse vegetation",
-    "wetlands":          "wetland habitat",
-    "urban":             "urban areas",
-    "bare_areas":        "open bare ground",
-    "water":             "aquatic habitat",
-    "ice_snow":          "alpine habitat",
+    "wetlands": "wetland habitat",
+    "urban": "urban areas",
+    "bare_areas": "open bare ground",
+    "water": "aquatic habitat",
+    "ice_snow": "alpine habitat",
 }
 
 
@@ -743,12 +919,12 @@ def _compute_single_tile_scores(z: int, x: int, y: int) -> dict:
             fv, pv = feat_flat[valid], prob_flat[valid]
             if fv.std() == 0 or pv.std() == 0:
                 continue
-            with _np.errstate(invalid='ignore'):
+            with _np.errstate(invalid="ignore"):
                 corr = float(_np.corrcoef(fv, pv)[0, 1])
             if not _np.isfinite(corr):
                 continue
             parsed = gis_lookup.parse_temporal_layer_id(feat_id)
-            var_name = parsed[0] if parsed else re.sub(r'_\d+[hd]$', '', feat_id)
+            var_name = parsed[0] if parsed else re.sub(r"_\d+[hd]$", "", feat_id)
             label_pair = _TEMPORAL_REASON_LABELS.get(var_name)
             if not label_pair:
                 continue
@@ -828,11 +1004,7 @@ def homepage_tile_scores(
 
     scores = {tid: float(sum(vals) / len(vals)) for tid, vals in all_scores.items()}
     # Pick the top 2 most-agreed-upon reasons across tiles
-    reasons = {
-        tid: sorted(counts, key=lambda r: -counts[r])[:2]
-        for tid, counts in all_reasons.items()
-        if counts
-    }
+    reasons = {tid: sorted(counts, key=lambda r: -counts[r])[:2] for tid, counts in all_reasons.items() if counts}
     return {"scores": scores, "reasons": reasons}
 
 
@@ -851,57 +1023,300 @@ def list_species_with_models() -> List[dict[str, Any]]:
     return result
 
 
-@app.get("/api/species")
-def list_species(
-    q: str = Query(..., min_length=1, description="Search term (scientific name or common name)"),
-    limit: int = Query(default_species_limit, ge=1, le=max_species_limit),
-) -> List[dict[str, Any]]:
-    """Searches taxa by name and returns serialized results.
-    
-    Args:
-        q: Search term for scientific or common names.
-        limit: Maximum number of matches to return.
-    
-    Returns:
-        A list of serialized taxon payloads.
-    """
-    records = taxa_navigation.search_taxa_by_name(q, limit=limit)
+def _serialize_taxon_query_result(
+    taxon: taxa_navigation.TaxonRecord,
+    *,
+    match_score: Optional[float] = None,
+    sample_count: Optional[int] = None,
+    sort_value: Optional[float] = None,
+    sort_variable: Optional[str] = None,
+    sort_metric: Optional[str] = None,
+    position: Optional[int] = None,
+    percentile: Optional[float] = None,
+) -> dict[str, Any] | None:
+    payload = taxa_navigation.serialize_taxon(taxon)
+    if payload is None:
+        return None
+    payload["image_references"] = taxa_navigation.normalize_image_reference(payload.get("image_references"))
+    payload.update(
+        {
+            "match_score": match_score,
+            "sample_count": sample_count,
+            "sort_value": sort_value,
+            "sort_variable": sort_variable,
+            "sort_metric": sort_metric,
+            "position": position,
+            "percentile": percentile,
+        }
+    )
+    return payload
 
+
+def _serialize_taxon_query_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
-    for record, _score, matched_name in records:
-        payload = taxa_navigation.serialize_taxon(record)
-        if payload:
-            common_names = payload.get("common_names") or []
-            matched_common_name = taxa_navigation.resolve_matched_common_name(
-                common_names,
-                matched_name,
-            )
-            payload["matched_common_name"] = matched_common_name
+    for row in rows:
+        taxon = row.get("taxon")
+        taxon_id = row.get("taxon_id")
+        if taxon is None and taxon_id is not None:
+            taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+        if taxon is None:
+            continue
+        payload = _serialize_taxon_query_result(
+            taxon,
+            match_score=float(row["match_score"]) if row.get("match_score") is not None else None,
+            sample_count=row.get("sample_count"),
+            sort_value=row.get("sort_value"),
+            sort_variable=row.get("sort_variable"),
+            sort_metric=row.get("sort_metric"),
+            position=row.get("position"),
+            percentile=row.get("percentile"),
+        )
+        if payload is not None:
             payloads.append(payload)
     return payloads
+
+
+def _resolve_within_taxon_id(
+    *,
+    within_taxon: Optional[str],
+) -> str | None:
+    raw_value = str(within_taxon or "").strip()
+    if not raw_value:
+        return None
+    if raw_value.isdigit():
+        if taxa_navigation.get_taxon_by_id(raw_value) is None:
+            raise HTTPException(status_code=400, detail=f"Unknown within_taxon value: {raw_value}")
+        return raw_value
+
+    resolved = taxa_navigation.resolve_taxon_reference(raw_value)
+    if resolved is None:
+        raise HTTPException(status_code=400, detail=f"Unknown within_taxon value: {raw_value}")
+    return str(resolved.get("taxon_key") or "").strip() or None
+
+
+@app.get("/api/taxa/ranking-options", response_model=TaxaRankingOptionsResponse)
+def list_taxa_ranking_options(
+    within_taxon: str = Query(
+        ...,
+        description="Ancestor taxon reference. Prefer taxon id; scientific-name slugs are a convenience path only when unambiguous.",
+    ),
+    descendant_rank: str = Query(..., description="Descendant rank to inspect within the ancestor scope"),
+) -> TaxaRankingOptionsResponse:
+    """List valid ranking variable/metric combinations for a scoped taxon context."""
+    raw_within_taxon = str(within_taxon or "").strip()
+    if not raw_within_taxon:
+        raise HTTPException(status_code=400, detail="within_taxon is required")
+
+    try:
+        resolved_within_taxon_id = _resolve_within_taxon_id(within_taxon=raw_within_taxon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not resolved_within_taxon_id:
+        raise HTTPException(status_code=400, detail="within_taxon is required")
+
+    try:
+        options = indexing.list_rank_metric_options(resolved_within_taxon_id, descendant_rank)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    resolved_taxon_id = taxa_navigation.taxon_id_as_int(resolved_within_taxon_id)
+    canonical_rank = taxa_navigation.canonical_rank(descendant_rank)
+    return TaxaRankingOptionsResponse(
+        ancestor_taxon_id=resolved_taxon_id if resolved_taxon_id is not None else resolved_within_taxon_id,
+        rank=canonical_rank,
+        options=options,
+    )
+
+
+@app.get("/api/taxa/query", response_model=TaxaQueryResponse)
+def query_taxa(
+    request: Request,
+    q: Optional[str] = Query(None, min_length=1, description="Optional search term"),
+    within_taxon: Optional[str] = Query(
+        None,
+        description=(
+            "Optional ancestor taxon reference. Prefer taxon id; scientific-name slugs are a convenience "
+            "path only when unambiguous."
+        ),
+    ),
+    descendant_rank: Optional[str] = Query(
+        None,
+        description="Descendant rank to include when using ranked results",
+    ),
+    sort_variable: Optional[str] = Query(
+        None,
+        description="Optional variable id used to sort matched taxa",
+    ),
+    sort_metric: Optional[str] = Query(
+        None,
+        description="Optional metric used to sort matched taxa",
+    ),
+    sort_order: str = Query("asc", description="Sort order: asc or desc"),
+    limit: int = Query(default_species_limit, ge=1, le=max_species_limit),
+    offset: int = Query(0, ge=0),
+    min_samples: int = Query(0, ge=0),
+    include_species_like: bool = Query(
+        False,
+        description="When descendant_rank=SPECIES, include subspecies/varieties/forms",
+    ),
+    location: Optional[str] = Query(
+        None,
+        description="Optional location GID to filter query results",
+    ),
+    unit_system: Optional[str] = Query(
+        None,
+        description="Unit system for ranked values (metric or imperial)",
+    ),
+) -> TaxaQueryResponse:
+    """Return canonical taxon search results for both text and ranked queries.
+
+    Text-only requests use `q` and return matched taxa with `match_score` plus
+    any applicable `sample_count`. Ranked requests add `sort_variable` and
+    `sort_metric`, and may also scope to a subtree via `within_taxon` and
+    `descendant_rank`.
+
+    Args:
+        q: Optional scientific or common-name query string.
+        within_taxon: Optional ancestor taxon reference. Prefer taxon id; scientific-name slugs are a convenience path only when unambiguous.
+        descendant_rank: Optional descendant rank when scoping ranked results.
+        sort_variable: Optional variable id used for ordering ranked results.
+        sort_metric: Optional metric used for ordering ranked results.
+        sort_order: Ranking direction, either `asc` or `desc`.
+        limit: Maximum number of results to return.
+        offset: Result offset for pagination.
+        min_samples: Optional sample-count threshold applied to query results.
+        include_species_like: Include subspecies-like ranks when ranking species.
+        location: Optional location GID to filter query results.
+        unit_system: Unit system for ranked values.
+
+    Returns:
+        A paginated response containing normalized query metadata and results.
+        Empty ranked responses use `ranking_ineligible`; empty text responses
+        may use `no_query`, `no_text_matches`, or `filtered_out`. Scoped ranked
+        searches use the leaderboard index directly instead of a text-prefilter
+        eligibility pass.
+    """
+    start = time.perf_counter()
+    normalized_query = (q or "").strip() or None
+    normalized_location = location.strip() if location else None
+    normalized_sort_order = (sort_order or "asc").strip().lower() or "asc"
+    request_mode = "ranked" if sort_variable and sort_metric else "text"
+    cancel_check = _build_disconnect_checker(request)
+
+    try:
+        cancel_check()
+        try:
+            resolved_within_taxon_id = _resolve_within_taxon_id(
+                within_taxon=within_taxon,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            query_payload = indexing.query_taxa(
+                q=q,
+                within_taxon_id=resolved_within_taxon_id,
+                descendant_rank=descendant_rank,
+                sort_variable=sort_variable,
+                sort_metric=sort_metric,
+                sort_order=normalized_sort_order,
+                limit=limit,
+                offset=offset,
+                min_samples=min_samples,
+                include_species_like=include_species_like,
+                location_gid=location,
+                cancel_check=cancel_check,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        cancel_check()
+        variable_entry = None
+        if sort_variable:
+            variable_entry = gis_lookup.load_variable_metadata()[1].get(sort_variable)
+        raw_units = variable_entry.get("units") if variable_entry else None
+        sort_units = raw_units
+
+        if sort_variable and sort_metric:
+            response_rows, sort_units = units.apply_unit_system_to_query_rows(
+                query_payload["results"],
+                unit_system=unit_system,
+                variable_id=sort_variable,
+                unit=raw_units,
+            )
+        else:
+            response_rows = query_payload["results"]
+
+        cancel_check()
+        results = _serialize_taxon_query_results(response_rows)
+
+        return {
+            "query": normalized_query,
+            "scope": {
+                "within_taxon": taxa_navigation.taxon_id_as_int(resolved_within_taxon_id) or resolved_within_taxon_id,
+                "descendant_rank": taxa_navigation.canonical_rank(descendant_rank) if descendant_rank else None,
+                "location": normalized_location,
+                "min_samples": min_samples,
+                "include_species_like": include_species_like,
+            },
+            "sort": {
+                "variable": sort_variable,
+                "metric": sort_metric,
+                "order": normalized_sort_order,
+                "units": sort_units,
+            },
+            "total": query_payload["total"],
+            "matched_total": query_payload["matched_total"],
+            "eligible_total": query_payload["eligible_total"],
+            "empty_reason": query_payload["empty_reason"],
+            "limit": limit,
+            "offset": offset,
+            "results": results,
+        }
+    except RequestCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
+    finally:
+        LOGGER.info(
+            "[api.taxa.query] elapsed=%.3fs mode=%s q=%r within_taxon=%r descendant_rank=%r sort=%r/%r "
+            "location=%r min_samples=%s include_species_like=%s limit=%s offset=%s",
+            time.perf_counter() - start,
+            request_mode,
+            normalized_query,
+            within_taxon,
+            descendant_rank,
+            sort_variable,
+            sort_metric,
+            normalized_location,
+            min_samples,
+            include_species_like,
+            limit,
+            offset,
+        )
 
 
 @app.get("/api/species/{taxon_id}")
 def get_species_detail(
     taxon_id: int,
-    location: Optional[str] = Query(
-        None, description="Optional location GID to tailor description text."
-    ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for description values (metric or imperial)"
-    ),
+    location: Optional[str] = Query(None, description="Optional location GID to tailor description text."),
+    unit_system: Optional[str] = Query(None, description="Unit system for description values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Loads a single taxon record by id.
-    
+
     Args:
         taxon_id: Taxon id to look up.
         location: Optional location GID filter for location text context.
-    
+
     Returns:
         A serialized taxon payload.
     """
     taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
-    payload = taxa_navigation.serialize_taxon(taxon) if taxon else None
+    if taxon is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Species with taxon_id {taxon_id} not found",
+        )
+    payload = taxa_navigation.serialize_taxon(taxon)
     if not payload:
         raise HTTPException(
             status_code=404,
@@ -910,7 +1325,7 @@ def get_species_detail(
     location_gid = location.strip() if location else None
     try:
         description_profile = descriptions.build_taxon_description(
-            taxon,
+            dict(taxon),
             location_gid=location_gid,
             unit_system=unit_system,
         )
@@ -924,21 +1339,28 @@ def get_species_detail(
     return payload
 
 
-@app.get("/locations/search")
+@app.get("/api/locations/search")
+@app.get("/locations/search", include_in_schema=False)
 def search_locations_endpoint(
+    request: Request,
     q: str = Query(..., min_length=1, description="Location name or partial match"),
     limit: int = Query(10, ge=1, le=50),
 ) -> dict[str, Any]:
     """Searches locations by name substring.
-    
+
     Args:
         q: Search term for location names.
         limit: Maximum number of matches to return.
-    
+
     Returns:
         A dict containing location match results.
     """
-    matches = gis_lookup.search_locations(q, limit)
+    cancel_check = _build_disconnect_checker(request)
+    try:
+        cancel_check()
+        matches = _search_locations_with_optional_cancel(q, limit, cancel_check)
+    except RequestCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
     return {"results": matches}
 
 
@@ -948,11 +1370,11 @@ def species_occurrences(
     location: Optional[str] = Query(None, description="Filter observations by location gid"),
 ) -> dict[str, Any]:
     """Returns occurrence points for a taxon, optionally filtered by location.
-    
+
     Args:
         taxon_id: Taxon id to query.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict with occurrence count and point records.
     """
@@ -977,6 +1399,7 @@ def species_occurrences(
         "count": len(rows),
         "occurrences": rows,
     }
+
 
 @app.get("/species/{taxon_id}/locations")
 def species_locations(
@@ -1007,10 +1430,7 @@ def species_locations(
     if not entries:
         return []
 
-    level_by_scope = {
-        str(scope): int(level_idx)
-        for level_idx, scope in CONFIG.location_scope_by_level.items()
-    }
+    level_by_scope = {str(scope): int(level_idx) for level_idx, scope in CONFIG.location_scope_by_level.items()}
     level_by_scope["gbif_region"] = -1
 
     parent_tokens = [token.strip() for token in (parent or "").split("|") if token.strip()]
@@ -1065,10 +1485,7 @@ def species_locations(
         cand_name = name.lower()
         hierarchy_name_set = {item.lower() for item in hierarchy_names}
         for name_options, gid_options in parent_matchers:
-            name_match = (
-                bool(name_options & hierarchy_name_set)
-                or cand_name in name_options
-            )
+            name_match = bool(name_options & hierarchy_name_set) or cand_name in name_options
             gid_match = cand_gid in gid_options or bool(gid_options & hierarchy_gids)
             if not (name_match or gid_match):
                 return False
@@ -1127,13 +1544,19 @@ def species_locations(
         return results[:limit]
     return results
 
-@app.get("/locations/search_hierarchy")
+
+@app.get("/api/locations/search_hierarchy")
+@app.get("/locations/search_hierarchy", include_in_schema=False)
 def search_locations_by_hierarchy(
+    request: Request,
     q: str = Query("", description="Location name or partial match (optional if parent provided)"),
     level: Optional[str] = Query(None, description="continent|country|state|county or numeric level code"),
-    parent: Optional[str] = Query(None, description="Parent name or gid. For counties pass 'United States|Utah' or a gid."),
+    parent: Optional[str] = Query(
+        None, description="Parent name or gid. For counties pass 'United States|Utah' or a gid."
+    ),
     limit: int = Query(50, ge=1, le=1000),
 ) -> dict[str, Any]:
+    cancel_check = _build_disconnect_checker(request)
 
     q = (q or "").strip()
 
@@ -1152,16 +1575,20 @@ def search_locations_by_hierarchy(
     resolved_parent_names: list[str] = []
     resolved_parent_gids: list[str] = []
     for tok in parent_tokens:
-        resolved_name = tok
-        resolved_gid = tok
         try:
+            cancel_check()
+            resolved_name = tok
+            resolved_gid = tok
             if hasattr(gis_lookup, "get_location_by_gid"):
                 maybe = gis_lookup.get_location_by_gid(tok)
                 if maybe:
                     resolved_name = maybe.get("name", tok)
                     resolved_gid = maybe.get("gid", tok)
-        except Exception:
-            pass
+        except RequestCancelledError:
+            raise HTTPException(status_code=499, detail="Client disconnected")
+        except Exception as exc:
+            LOGGER.exception("[locations.search_hierarchy] parent resolution failed token=%r", tok)
+            raise HTTPException(status_code=500, detail="Location hierarchy search failed") from exc
         resolved_parent_names.append(str(resolved_name).lower())
         resolved_parent_gids.append(str(resolved_gid).lower())
 
@@ -1185,6 +1612,7 @@ def search_locations_by_hierarchy(
         return True
 
     def push_candidate_if_valid(cand: dict[str, Any]):
+        cancel_check()
         gid = str(cand.get("gid") or "")
         if not gid or gid in seen_gids:
             return
@@ -1196,7 +1624,7 @@ def search_locations_by_hierarchy(
 
     try:
         if q:
-            raw = gis_lookup.search_locations(q, limit)
+            raw = _search_locations_with_optional_cancel(q, limit, cancel_check)
             for cand in raw:
                 push_candidate_if_valid(cand)
 
@@ -1206,6 +1634,7 @@ def search_locations_by_hierarchy(
                 try:
                     entries, mapping = gis_lookup.load_location_catalog()
                     for rec in entries:
+                        cancel_check()
                         if getattr(rec, "level", None) != expected_level:
                             continue
 
@@ -1228,12 +1657,20 @@ def search_locations_by_hierarchy(
                         push_candidate_if_valid(cand)
                         if len(candidates) >= limit:
                             break
+                except RequestCancelledError:
+                    raise
                 except Exception:
-                    pass
+                    LOGGER.exception(
+                        "[locations.search_hierarchy] catalog enumeration failed level=%r parent=%r",
+                        expected_level,
+                        parent,
+                    )
+                    raise
 
             # 2) list_children if available
             if not candidates and hasattr(gis_lookup, "list_children"):
                 for parent_tok in parent_tokens or []:
+                    cancel_check()
                     try:
                         parent_gid = None
                         if hasattr(gis_lookup, "get_location_by_gid"):
@@ -1245,43 +1682,79 @@ def search_locations_by_hierarchy(
                             push_candidate_if_valid(cand)
                         if len(candidates) >= limit:
                             break
+                    except RequestCancelledError:
+                        raise
                     except Exception:
-                        continue
+                        LOGGER.exception(
+                            "[locations.search_hierarchy] child enumeration failed parent=%r level=%r",
+                            parent_tok,
+                            expected_level,
+                        )
+                        raise
 
             # 3) letter-scan fallback — keep scanning letters until we have enough valid matches
             if not candidates:
                 letters = "abcdefghijklmnopqrstuvwxyz"
                 per_letter_limit = max(50, min(200, limit))
                 for ch in letters:
+                    cancel_check()
                     if len(candidates) >= limit:
                         break
                     try:
-                        partial = gis_lookup.search_locations(ch, per_letter_limit)
+                        partial = _search_locations_with_optional_cancel(ch, per_letter_limit, cancel_check)
+                    except RequestCancelledError:
+                        raise
                     except Exception:
-                        continue
+                        LOGGER.exception("[locations.search_hierarchy] letter scan failed prefix=%r", ch)
+                        raise
                     for cand in partial:
                         push_candidate_if_valid(cand)
                         if len(candidates) >= limit:
                             break
 
-    except Exception:
-        return {"results": []}
+    except RequestCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
+    except Exception as exc:
+        LOGGER.exception(
+            "[locations.search_hierarchy] failed q=%r level=%r parent=%r limit=%s",
+            q,
+            level,
+            parent,
+            limit,
+        )
+        raise HTTPException(status_code=500, detail="Location hierarchy search failed") from exc
 
     # final strict filter by level (redundant but safe)
-    results: list[dict[str, Any]] = []
-    for cand in candidates:
-        if expected_level is not None and cand.get("level") != expected_level:
-            continue
-        results.append({
-            "gid": str(cand.get("gid") or ""),
-            "name": cand.get("name") or "",
-            "level": cand.get("level", -999),
-            "hierarchy": cand.get("hierarchy") or [],
-        })
-        if len(results) >= limit:
-            break
+    try:
+        results: list[dict[str, Any]] = []
+        for cand in candidates:
+            cancel_check()
+            if expected_level is not None and cand.get("level") != expected_level:
+                continue
+            results.append(
+                {
+                    "gid": str(cand.get("gid") or ""),
+                    "name": cand.get("name") or "",
+                    "level": cand.get("level", -999),
+                    "hierarchy": cand.get("hierarchy") or [],
+                }
+            )
+            if len(results) >= limit:
+                break
+    except RequestCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
 
     return {"results": results}
+
+
+@app.get("/api/locations/{gid}")
+def get_location_detail(gid: str) -> dict[str, Any]:
+    """Return canonical hierarchy metadata for a location gid."""
+    payload = gis_lookup.describe_location(gid)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"Unknown location {gid}")
+    return payload
+
 
 @app.get("/species/{taxon_id}/environment/{variable_id}")
 def species_environment_stats(
@@ -1290,17 +1763,15 @@ def species_environment_stats(
     location: Optional[str] = Query(
         None, description="Optional location gid (GADM or GBIF region) to filter observations."
     ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Returns environment stats for a taxon and variable.
-    
+
     Args:
         taxon_id: Taxon id to query.
         variable_id: Environmental variable id.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict containing summary stats, distributions, and rankings.
     """
@@ -1375,39 +1846,42 @@ def species_environment_stats(
             ranks = []
         else:
             ranks = indexing.load_relative_ranks(taxon_dir, variable_id)
-        response = _with_env_observation_count({
-            "speciesId": taxon_id,
-            "species_id": taxon_id,
-            "variable": variable_id,
-            "variableName": variable_entry.get("name"),
-            "variable_metadata": {
-                "name": variable_entry.get("name"),
+        response = _with_env_observation_count(
+            {
+                "speciesId": taxon_id,
+                "species_id": taxon_id,
+                "variable": variable_id,
+                "variableName": variable_entry.get("name"),
+                "variable_metadata": {
+                    "name": variable_entry.get("name"),
+                    "units": raw_units,
+                    "value_type": "categorical",
+                },
                 "units": raw_units,
-                "value_type": "categorical",
+                "variableType": "categorical",
+                "generatedAt": generated_at,
+                "generated_at": generated_at,
+                "summary": summary,
+                "histogram": None,
+                "densityCurve": None,
+                "binSamples": [],
+                "bin_samples": [],
+                "density_curve": None,
+                "categoricalDistribution": categorical_payload.get("distribution", []),
+                "categorical_distribution": categorical_payload.get("distribution", []),
+                "dominantCategories": categorical_payload.get("dominant", []),
+                "dominant_categories": categorical_payload.get("dominant", []),
+                "baselineCategoricalDistribution": baseline_categorical_distribution,
+                "baseline_categorical_distribution": baseline_categorical_distribution,
+                "baselineCategoricalTotals": baseline_categorical_totals,
+                "baseline_categorical_totals": baseline_categorical_totals,
+                "baselineSummary": baseline_numeric_summary,
+                "baseline_summary": baseline_numeric_summary,
+                "relativeRanks": ranks,
+                "relative_ranks": ranks,
             },
-            "units": raw_units,
-            "variableType": "categorical",
-            "generatedAt": generated_at,
-            "generated_at": generated_at,
-            "summary": summary,
-            "histogram": None,
-            "densityCurve": None,
-            "binSamples": [],
-            "bin_samples": [],
-            "density_curve": None,
-            "categoricalDistribution": categorical_payload.get("distribution", []),
-            "categorical_distribution": categorical_payload.get("distribution", []),
-            "dominantCategories": categorical_payload.get("dominant", []),
-            "dominant_categories": categorical_payload.get("dominant", []),
-            "baselineCategoricalDistribution": baseline_categorical_distribution,
-            "baseline_categorical_distribution": baseline_categorical_distribution,
-            "baselineCategoricalTotals": baseline_categorical_totals,
-            "baseline_categorical_totals": baseline_categorical_totals,
-            "baselineSummary": baseline_numeric_summary,
-            "baseline_summary": baseline_numeric_summary,
-            "relativeRanks": ranks,
-            "relative_ranks": ranks,
-        }, observation_count)
+            observation_count,
+        )
         return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
     if not location_gid:
@@ -1417,8 +1891,12 @@ def species_environment_stats(
             _samples = summary_stats.gather_numeric_records(taxon_id, taxon_dir, variable_id)
             _values = [s["value"] for s in _samples]
             observation_count = len(_values)
-            summary = None if skip_summary else (summary_stats.summarize_values(_values, circular=True) if _values else None)
-            density_curve = indexing.build_density_curve(_values, point_count=density_points, circular=True) if _values else None
+            summary = (
+                None if skip_summary else (summary_stats.summarize_values(_values, circular=True) if _values else None)
+            )
+            density_curve = (
+                indexing.build_density_curve(_values, point_count=density_points, circular=True) if _values else None
+            )
         else:
             summary = summary_stats.load_numeric_summary(str(taxon_dir), variable_id)
             if isinstance(summary, dict) and summary.get("count") is not None:
@@ -1438,17 +1916,75 @@ def species_environment_stats(
                 ),
             )
         ranks = [] if skip_summary else indexing.load_relative_ranks(taxon_dir, variable_id)
-        response = _with_env_observation_count({
+        response = _with_env_observation_count(
+            {
+                "speciesId": taxon_id,
+                "species_id": taxon_id,
+                "variable": variable_id,
+                "variableName": variable_entry.get("name"),
+                "variable_metadata": {
+                    "name": variable_entry.get("name"),
+                    "units": variable_entry.get("units"),
+                    "value_type": value_type or "numeric",
+                },
+                "units": variable_entry.get("units"),
+                "variableType": value_type or "numeric",
+                "generatedAt": generated_at,
+                "generated_at": generated_at,
+                "summary": summary,
+                "histogram": None,
+                "densityCurve": density_curve,
+                "binSamples": [],
+                "bin_samples": [],
+                "density_curve": density_curve,
+                "baselineSummary": baseline_numeric_summary,
+                "baseline_summary": baseline_numeric_summary,
+                "baselineCategoricalDistribution": [],
+                "baseline_categorical_distribution": [],
+                "baselineCategoricalTotals": {},
+                "baseline_categorical_totals": {},
+                "categoricalDistribution": [],
+                "categorical_distribution": [],
+                "dominantCategories": [],
+                "dominant_categories": [],
+                "relativeRanks": ranks,
+                "relative_ranks": ranks,
+            },
+            observation_count,
+        )
+        return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
+
+    samples = summary_stats.gather_numeric_records(
+        taxon_id,
+        taxon_dir,
+        variable_id,
+        location_gid=location_gid,
+    )
+    values = [sample["value"] for sample in samples]
+    if not values:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}'.",
+        )
+    observation_count = len(values)
+    skip_summary = variable_id in no_summary_stats_variables
+    summary = None if skip_summary else summary_stats.summarize_values(values, circular=(value_type == "circular"))
+    density_curve = indexing.build_density_curve(
+        values, point_count=density_points, circular=(value_type == "circular")
+    )
+    ranks = []
+    response = _with_env_observation_count(
+        {
             "speciesId": taxon_id,
             "species_id": taxon_id,
             "variable": variable_id,
             "variableName": variable_entry.get("name"),
             "variable_metadata": {
                 "name": variable_entry.get("name"),
-                "units": variable_entry.get("units"),
+                "units": raw_units,
                 "value_type": value_type or "numeric",
             },
-            "units": variable_entry.get("units"),
+            "units": raw_units,
             "variableType": value_type or "numeric",
             "generatedAt": generated_at,
             "generated_at": generated_at,
@@ -1470,59 +2006,9 @@ def species_environment_stats(
             "dominant_categories": [],
             "relativeRanks": ranks,
             "relative_ranks": ranks,
-        }, observation_count)
-        return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
-
-    samples = summary_stats.gather_numeric_records(
-        taxon_id,
-        taxon_dir,
-        variable_id,
-        location_gid=location_gid,
-    )
-    values = [sample["value"] for sample in samples]
-    if not values:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}'.",
-        )
-    observation_count = len(values)
-    skip_summary = variable_id in no_summary_stats_variables
-    summary = None if skip_summary else summary_stats.summarize_values(values, circular=(value_type == "circular"))
-    density_curve = indexing.build_density_curve(values, point_count=density_points, circular=(value_type == "circular"))
-    ranks = []
-    response = _with_env_observation_count({
-        "speciesId": taxon_id,
-        "species_id": taxon_id,
-        "variable": variable_id,
-        "variableName": variable_entry.get("name"),
-        "variable_metadata": {
-            "name": variable_entry.get("name"),
-            "units": raw_units,
-            "value_type": value_type or "numeric",
         },
-        "units": raw_units,
-        "variableType": value_type or "numeric",
-        "generatedAt": generated_at,
-        "generated_at": generated_at,
-        "summary": summary,
-        "histogram": None,
-        "densityCurve": density_curve,
-        "binSamples": [],
-        "bin_samples": [],
-        "density_curve": density_curve,
-        "baselineSummary": baseline_numeric_summary,
-        "baseline_summary": baseline_numeric_summary,
-        "baselineCategoricalDistribution": [],
-        "baseline_categorical_distribution": [],
-        "baselineCategoricalTotals": {},
-        "baseline_categorical_totals": {},
-        "categoricalDistribution": [],
-        "categorical_distribution": [],
-        "dominantCategories": [],
-        "dominant_categories": [],
-        "relativeRanks": ranks,
-        "relative_ranks": ranks,
-    }, observation_count)
+        observation_count,
+    )
     return units.apply_unit_system_to_env_response(response, unit_system, raw_units)
 
 
@@ -1537,14 +2023,14 @@ def species_environment_class_samples(
     ),
 ) -> dict[str, Any]:
     """Returns categorical class samples for a taxon and variable.
-    
+
     Args:
         taxon_id: Taxon id to query.
         variable_id: Categorical variable id.
         class_value: Class value to match.
         limit: Maximum number of samples to return.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict containing matching observation samples.
     """
@@ -1612,12 +2098,10 @@ def species_environment_slice(
     location: Optional[str] = Query(
         None, description="Optional location gid (GADM or GBIF region) to filter observations."
     ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
+    unit_system: Optional[str] = Query(None, description="Unit system for response values (metric or imperial)"),
 ) -> dict[str, Any]:
     """Returns numeric samples within a value range for a taxon/variable.
-    
+
     Args:
         taxon_id: Taxon id to query.
         variable_id: Numeric variable id.
@@ -1625,7 +2109,7 @@ def species_environment_slice(
         max_value: Maximum value to include.
         limit: Maximum number of samples to return.
         location: Optional location GID to filter observations.
-    
+
     Returns:
         A dict containing range parameters and matching observations.
     """
@@ -1673,10 +2157,20 @@ def species_environment_slice(
     if location_gid:
         if circular_wrap:
             rows_a = summary_stats.numeric_range_samples_for_location(
-                taxon_id, variable_id, min_value, 360.0, location_gid=location_gid, limit=limit,
+                taxon_id,
+                variable_id,
+                min_value,
+                360.0,
+                location_gid=location_gid,
+                limit=limit,
             )
             rows_b = summary_stats.numeric_range_samples_for_location(
-                taxon_id, variable_id, 0.0, max_value, location_gid=location_gid, limit=limit,
+                taxon_id,
+                variable_id,
+                0.0,
+                max_value,
+                location_gid=location_gid,
+                limit=limit,
             )
             seen: set[str] = set()
             for row in rows_a + rows_b:
@@ -1698,10 +2192,18 @@ def species_environment_slice(
         try:
             if circular_wrap:
                 rows_a = summary_stats.get_sorted_layer_records_in_value_range(
-                    index_path, variable_id, value_min=min_value, value_max=360.0, limit=limit,
+                    index_path,
+                    variable_id,
+                    value_min=min_value,
+                    value_max=360.0,
+                    limit=limit,
                 )
                 rows_b = summary_stats.get_sorted_layer_records_in_value_range(
-                    index_path, variable_id, value_min=0.0, value_max=max_value, limit=limit,
+                    index_path,
+                    variable_id,
+                    value_min=0.0,
+                    value_max=max_value,
+                    limit=limit,
                 )
                 seen = set()
                 for row in rows_a + rows_b:
@@ -1744,123 +2246,6 @@ def species_environment_slice(
     return units.apply_unit_system_to_slice_response(response, unit_system, raw_units)
 
 
-@app.get("/relative-rankings/{taxon_id}")
-def get_relative_rankings(
-    taxon_id: int,
-    rank: str = Query(..., description="Descendant rank to include (e.g., SPECIES)"),
-    variable: str = Query(..., description="Environmental variable / layer id"),
-    metric: str = Query(..., description="Metric to rank by (min, mean, max, std, 1-99 range)"),
-    limit: int = Query(50, ge=1, le=200),
-    order: str = Query("asc", description="Sort order: asc or desc"),
-    min_samples: int = Query(0, ge=0, description="Minimum samples required to appear"),
-    include_species_like: bool = Query(
-        False, description="When rank=SPECIES, include subspecies/varieties/forms"
-    ),
-    include_distribution: bool = Query(
-        False,
-        description=(
-            "Include the kernel density distribution for all eligible descendants. "
-            "This can be expensive for large taxa."
-        ),
-    ),
-    location: Optional[str] = Query(
-        None,
-        description="Optional location GID (GADM) or GBIF region to filter descendants by",
-    ),
-    unit_system: Optional[str] = Query(
-        None, description="Unit system for response values (metric or imperial)"
-    ),
-) -> dict[str, Any]:
-    """Returns descendant rankings for a taxon by variable/metric.
-    
-    Args:
-        taxon_id: Ancestor taxon id to rank descendants under.
-        rank: Descendant rank to include.
-        variable: Environmental variable id to rank by.
-        metric: Metric name to rank by.
-        limit: Maximum number of results to return.
-        order: Sort order ("asc" or "desc").
-        min_samples: Minimum sample count required to appear.
-        include_species_like: Whether to include subspecies-like ranks for species.
-        include_distribution: Whether to return raw values for density curves.
-        location: Optional location GID to filter descendants by occurrence membership.
-    
-    Returns:
-        A dict containing ranking entries and optional distribution data.
-    """
-    location_gid = location.strip() if location else None
-    if variable in no_summary_stats_variables:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Variable '{variable}' does not support relative rankings.",
-        )
-    try:
-        entries, distribution_values = indexing.child_relative_rankings(
-            str(taxon_id),
-            rank,
-            variable,
-            metric,
-            limit=limit,
-            order=order,
-            min_samples=min_samples,
-            include_species_like=include_species_like,
-            return_distribution=include_distribution,
-            location_gid=location_gid,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    total = entries[0]["count"] if entries else 0
-    distribution_curve = None
-    if include_distribution and distribution_values:
-        distribution_curve = indexing.build_density_curve(
-            distribution_values,
-            point_count=density_points,
-        )
-    raw_units = None
-    variable_entry = gis_lookup.load_variable_metadata()[1].get(variable)
-    if variable_entry:
-        raw_units = variable_entry.get("units")
-    response = {
-        "ancestor_taxon_id": taxon_id,
-        "rank": rank.upper(),
-        "variable": variable,
-        "metric": metric,
-        "units": raw_units,
-        "total": total,
-        "limit": limit,
-        "order": order.lower(),
-        "min_samples": min_samples,
-        "include_species_like": include_species_like,
-        "entries": entries,
-        "distribution": distribution_curve,
-    }
-    return units.apply_unit_system_to_rankings_response(response, unit_system, raw_units)
-
-
-@app.get("/relative-rankings/{taxon_id}/options")
-def list_relative_ranking_options(
-    taxon_id: int,
-    rank: str = Query(..., description="Descendant rank to inspect (e.g., SPECIES)"),
-) -> dict[str, Any]:
-    """Lists available ranking metrics for an ancestor/rank.
-    
-    Args:
-        taxon_id: Ancestor taxon id to inspect.
-        rank: Descendant rank to inspect.
-    
-    Returns:
-        A dict containing available variable/metric options.
-    """
-    try:
-        options = indexing.list_rank_metric_options(str(taxon_id), rank)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    options = [opt for opt in options if opt.get("variable") not in no_summary_stats_variables]
-    return {
-        "ancestor_taxon_id": taxon_id,
-        "rank": rank.upper(),
-        "options": options,
-    }
 @app.get("/gis/point")
 def gis_point_value(
     lat: float = Query(..., description="Latitude"),
@@ -1934,6 +2319,7 @@ def gis_point_value(
                 response["class_name"] = entry.get("name")
     return response
 
+
 @app.post("/upload/raw-observations")
 async def upload_raw_observations(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> FileResponse:
     filename = file.filename or ""
@@ -1945,7 +2331,7 @@ async def upload_raw_observations(background_tasks: BackgroundTasks, file: Uploa
             status_code=400,
             detail=f"Unsupported file type '{suffix}'. Accepted: CSV, TSV, Parquet.",
         )
-    
+    print("Received file, converting to parquet...")
     contents = await file.read()
     buf = io.BytesIO(contents)
 

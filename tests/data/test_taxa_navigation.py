@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 from util import taxa_navigation as nav
+from util.request_cancellation import RequestCancelledError
 
 
 class _StubParquet:
@@ -45,6 +46,8 @@ def _clear_caches():
     nav._load_payload.cache_clear()
     nav.load_catalog.cache_clear()
     nav.load_name_index.cache_clear()
+    nav.load_search_names_by_taxon.cache_clear()
+    nav.load_slug_index.cache_clear()
     nav._normalized_taxon_record.cache_clear()
     nav.load_taxon_media.cache_clear()
     nav.resolve_preferred_image_taxon_key.cache_clear()
@@ -78,9 +81,28 @@ def _catalog_payload(cfg: SimpleNamespace):
     ss1 = s1 / "sub_12"
     return {
         "catalog": {
-            "10": {"taxon_key": "10", "path": g1, "scientific_name": "Alpha_genus", "common_name": "alpha", "rank": "GENUS"},
-            "11": {"taxon_key": "11", "path": s1, "scientific_name": "Alpha_species", "common_name": [{"name": "alpha bird", "language": "en", "lexicon": "english", "source": "inat"}], "rank": "SPECIES", "inat_preferred_image": "http://img/species.jpg"},
-            "12": {"taxon_key": "12", "path": ss1, "scientific_name": "Alpha_sub", "common_name": [], "rank": "SUBSPECIES"},
+            "10": {
+                "taxon_key": "10",
+                "path": g1,
+                "scientific_name": "Alpha_genus",
+                "common_name": "alpha",
+                "rank": "GENUS",
+            },
+            "11": {
+                "taxon_key": "11",
+                "path": s1,
+                "scientific_name": "Alpha_species",
+                "common_name": [{"name": "alpha bird", "language": "en", "lexicon": "english", "source": "inat"}],
+                "rank": "SPECIES",
+                "inat_preferred_image": "http://img/species.jpg",
+            },
+            "12": {
+                "taxon_key": "12",
+                "path": ss1,
+                "scientific_name": "Alpha_sub",
+                "common_name": [],
+                "rank": "SUBSPECIES",
+            },
         },
         "combined_name_index": {"alpha genus": ["10"]},
     }
@@ -115,10 +137,23 @@ def test_common_name_helpers_and_extract_language_fallback(stub_env, monkeypatch
     assert nav._format_common_name("o'connor tree") == "O'connor Tree"
     assert nav._format_common_name("") == ""
 
-    t1 = {"common_name": [{"name": "chene", "language": "fr", "lexicon": "french", "source": "x"}, {"name": "oak", "language": "en", "lexicon": "english", "source": "inat"}], "inat_preferred_common_name": "red oak"}
+    t1 = {
+        "common_name": [
+            {"name": "chene", "language": "fr", "lexicon": "french", "source": "x"},
+            {"name": "oak", "language": "en", "lexicon": "english", "source": "inat"},
+        ],
+        "inat_preferred_common_name": "red oak",
+    }
     assert nav._extract_common_names(t1, "en")[0] == "Red Oak"
     assert "Oak" in nav._extract_common_names(t1, "en")
-    t1b = {"common_name": [{"name": "oak", "language": "en", "lexicon": "english", "source": "inat"}, 123, {"name": "", "language": "en"}], "inat_preferred_common_name": "oak"}
+    t1b = {
+        "common_name": [
+            {"name": "oak", "language": "en", "lexicon": "english", "source": "inat"},
+            123,
+            {"name": "", "language": "en"},
+        ],
+        "inat_preferred_common_name": "oak",
+    }
     assert nav._extract_common_names(t1b, "en")[0] == "Oak"
 
     t2 = {"common_name": ["alpha", " beta "], "inat_preferred_common_name": "alpha"}
@@ -136,8 +171,6 @@ def test_common_name_helpers_and_extract_language_fallback(stub_env, monkeypatch
     names = nav.extract_common_names_for_language({"rank": "subspecies", "common_name": []}, "en")
     assert names == ["Parent Name"]
     assert nav.extract_common_names_for_language({"rank": "species", "common_name": "alpha"}, "en") == ["Alpha"]
-    assert nav.resolve_matched_common_name(["Red Oak"], "red oak") == "Red Oak"
-    assert nav.resolve_matched_common_name(["Red Oak"], None) is None
 
 
 def test_catalog_payload_and_lookup_paths(stub_env):
@@ -152,7 +185,6 @@ def test_catalog_payload_and_lookup_paths(stub_env):
     idx = nav.load_name_index()
     assert "alpha bird" in idx and "alpha species" in idx
     assert nav.get_taxon_by_id("10")["taxon_key"] == "10"
-    assert nav.get_taxon_by_id(10)["taxon_key"] == "10"
     assert nav.get_taxon_by_id("bad") is None
     assert nav.load_taxon_media()["11"]["url"] == "u"
 
@@ -165,15 +197,52 @@ def test_catalog_payload_and_lookup_paths(stub_env):
     nav._load_payload.cache_clear()
     nav._normalized_taxon_record.cache_clear()
     nav.load_name_index.cache_clear()
+    nav.load_slug_index.cache_clear()
     payload2 = {
         "catalog": {
-            20: {"taxon_key": "20", "path": cfg.taxonomy_root / "g_20", "scientific_name": " ", "common_name": ["", "x"], "rank": "SPECIES"},
+            20: {
+                "taxon_key": "20",
+                "path": cfg.taxonomy_root / "g_20",
+                "scientific_name": " ",
+                "common_name": ["", "x"],
+                "rank": "SPECIES",
+            },
         },
         "combined_name_index": {},
     }
     stub._files[cfg.taxon_catalog_path] = pickle.dumps(payload2)
     assert nav.get_taxon_by_id("20")["taxon_key"] == "20"
+    assert nav.get_taxon_by_id(20)["taxon_key"] == "20"
     assert "x" in nav.load_name_index()
+
+
+def test_resolve_taxon_reference_supports_slug_only(stub_env):
+    cfg, stub = stub_env
+    payload = _catalog_payload(cfg)
+    stub._files[cfg.taxon_catalog_path] = pickle.dumps(payload)
+
+    by_slug = nav.resolve_taxon_reference("alpha-species")
+    by_name = nav.resolve_taxon_reference("alpha genus")
+
+    assert by_slug is not None
+    assert by_slug["taxon_key"] == "11"
+    assert by_name is None
+
+
+def test_resolve_taxon_reference_rejects_ambiguous_slug(stub_env):
+    cfg, stub = stub_env
+    payload = _catalog_payload(cfg)
+    payload["catalog"]["21"] = {
+        "taxon_key": "21",
+        "path": cfg.taxonomy_root / "other_21",
+        "scientific_name": "Alpha species",
+        "common_name": "other alpha",
+        "rank": "SPECIES",
+    }
+    stub._files[cfg.taxon_catalog_path] = pickle.dumps(payload)
+
+    with pytest.raises(ValueError, match="Ambiguous taxon slug"):
+        nav.resolve_taxon_reference("alpha-species")
 
 
 def test_children_descendants_and_rank_iteration(stub_env, monkeypatch):
@@ -191,17 +260,26 @@ def test_children_descendants_and_rank_iteration(stub_env, monkeypatch):
     assert nav.canonical_rank("sp") == "SPECIES"
     assert nav.canonical_rank("other") == "OTHER"
     assert nav.canonical_rank(None) == ""
+    assert nav.is_valid_descendant_rank("sp")
+    assert nav.is_valid_descendant_rank("ORDER")
+    assert not nav.is_valid_descendant_rank("other")
 
 
 def test_search_taxa_by_name_and_limits(stub_env, monkeypatch):
     _cfg, _stub = stub_env
-    monkeypatch.setattr(nav, "load_name_index", lambda: {"alpha bird": ["11"], "alpha species": ["11"], "beta fox": ["20"]})
+    monkeypatch.setattr(
+        nav, "load_name_index", lambda: {"alpha bird": ["11"], "alpha species": ["11"], "beta fox": ["20"]}
+    )
     monkeypatch.setattr(
         nav.process,
         "extract",
         lambda *_a, **_k: [("alpha bird", 90, 0), ("alpha species", 80, 0), ("beta fox", 75, 0)],
     )
-    monkeypatch.setattr(nav, "get_taxon_by_id", lambda key: {"taxon_key": str(key), "rank": "SPECIES"} if str(key) in {"11", "20"} else None)
+    monkeypatch.setattr(
+        nav,
+        "get_taxon_by_id",
+        lambda key: {"taxon_key": str(key), "rank": "SPECIES"} if str(key) in {"11", "20"} else None,
+    )
     out = nav.search_taxa_by_name("alpha", limit=2)
     assert out and out[0][0]["taxon_key"] == "11"
     assert nav.search_taxa_by_name("  ", limit=2) == []
@@ -215,9 +293,11 @@ def test_search_taxa_by_name_and_limits(stub_env, monkeypatch):
         "extract",
         lambda *_a, **_k: [("alpha bird", 65, 0), ("alpha species", 40, 0), ("other", 99, 0)],
     )
-    monkeypatch.setattr(nav, "get_taxon_by_id", lambda key: {"taxon_key": "11", "rank": "SPECIES"} if str(key) == "11" else None)
+    monkeypatch.setattr(
+        nav, "get_taxon_by_id", lambda key: {"taxon_key": "11", "rank": "SPECIES"} if str(key) == "11" else None
+    )
     out2 = nav.search_taxa_by_name("alpha bird", limit=3)
-    assert len(out2) == 1 and out2[0][2] == "alpha bird"
+    assert len(out2) == 1 and out2[0][0]["taxon_key"] == "11"
 
     # Single-token candidate that fails token-prefix check.
     monkeypatch.setattr(nav, "load_name_index", lambda: {"zebra fish": ["11"]})
@@ -229,6 +309,102 @@ def test_search_taxa_by_name_and_limits(stub_env, monkeypatch):
     monkeypatch.setattr(nav.process, "extract", lambda *_a, **_k: [("alpha", 10, 0), ("alpha", 80, 0)])
     monkeypatch.setattr(nav, "get_taxon_by_id", lambda _k: None)
     assert nav.search_taxa_by_name("alpha", limit=3) == []
+
+
+def test_search_taxa_by_name_none_limit_uses_index_size(stub_env, monkeypatch):
+    _cfg, _stub = stub_env
+    name_index = {
+        "alpha bird": ["11"],
+        "alpha species": ["12"],
+        "beta fox": ["20"],
+    }
+    seen = {"used_extract_iter": False}
+
+    def _extract_iter(*_args, **_kwargs):
+        seen["used_extract_iter"] = True
+        return iter([("alpha bird", 90, 0), ("alpha species", 80, 0), ("beta fox", 75, 0)])
+
+    monkeypatch.setattr(nav, "load_name_index", lambda: name_index)
+    monkeypatch.setattr(nav.process, "extract_iter", _extract_iter)
+    monkeypatch.setattr(
+        nav,
+        "get_taxon_by_id",
+        lambda key: {"taxon_key": str(key), "rank": "SPECIES"} if str(key) in {"11", "12", "20"} else None,
+    )
+
+    out = nav.search_taxa_by_name("alpha", limit=None)
+
+    assert seen["used_extract_iter"] is True
+    assert [row[0]["taxon_key"] for row in out] == ["11", "12"]
+
+
+def test_taxon_name_match_score_uses_aliases_from_combined_name_index(stub_env, monkeypatch):
+    _cfg, _stub = stub_env
+    monkeypatch.setattr(nav, "load_name_index", lambda: {"hidden alias": ["11"]})
+    nav.load_search_names_by_taxon.cache_clear()
+    monkeypatch.setattr(nav.fuzz, "token_set_ratio", lambda *_a, **_k: 95.0)
+
+    score = nav.taxon_name_match_score(
+        {"taxon_key": "11", "scientific_name": "Alpha species", "common_name": "oak", "rank": "SPECIES"},
+        "hidden",
+    )
+
+    assert score is not None
+    assert score > 0
+
+
+def test_search_taxa_by_name_honors_cancellation(stub_env, monkeypatch):
+    _cfg, _stub = stub_env
+    monkeypatch.setattr(nav, "load_name_index", lambda: {"alpha bird": ["11"], "alpha species": ["12"]})
+    monkeypatch.setattr(nav.process, "extract", lambda *_a, **_k: [("alpha bird", 95, 0), ("alpha species", 90, 1)])
+    monkeypatch.setattr(
+        nav,
+        "get_taxon_by_id",
+        lambda key: {"taxon_key": str(key), "rank": "SPECIES"} if str(key) in {"11", "12"} else None,
+    )
+
+    calls = {"count": 0}
+
+    def cancel_check():
+        calls["count"] += 1
+        if calls["count"] >= 2:
+            raise RequestCancelledError("Client disconnected")
+
+    with pytest.raises(RequestCancelledError, match="Client disconnected"):
+        nav.search_taxa_by_name("alpha", limit=10, cancel_check=cancel_check)
+
+
+def test_search_taxa_by_name_matches_reordered_multiword_queries(stub_env, monkeypatch):
+    _cfg, _stub = stub_env
+    monkeypatch.setattr(nav, "load_name_index", lambda: {"red oak": ["11"]})
+    monkeypatch.setattr(nav.process, "extract", lambda *_a, **_k: [("red oak", 100, 0)])
+    monkeypatch.setattr(
+        nav,
+        "get_taxon_by_id",
+        lambda key: {"taxon_key": str(key), "rank": "SPECIES"} if str(key) == "11" else None,
+    )
+
+    out = nav.search_taxa_by_name("oak red", limit=3)
+
+    assert len(out) == 1
+    assert out[0][0]["taxon_key"] == "11"
+
+
+def test_search_taxa_by_name_prefers_exact_short_match(stub_env, monkeypatch):
+    _cfg, _stub = stub_env
+    monkeypatch.setattr(nav, "load_name_index", lambda: {"oak": ["11"], "oak tree": ["12"]})
+    monkeypatch.setattr(nav.process, "extract", lambda *_a, **_k: [("oak tree", 90, 0), ("oak", 80, 1)])
+    monkeypatch.setattr(
+        nav,
+        "get_taxon_by_id",
+        lambda key: {"taxon_key": str(key), "rank": "SPECIES"} if str(key) in {"11", "12"} else None,
+    )
+
+    out = nav.search_taxa_by_name("oak", limit=2)
+
+    assert len(out) == 2
+    assert out[0][0]["taxon_key"] == "11"
+    assert out[0][1] > out[1][1]
 
 
 def test_resolve_taxon_media_and_preferred_image_payload(stub_env, monkeypatch):
@@ -259,6 +435,7 @@ def test_resolve_taxon_media_and_preferred_image_payload(stub_env, monkeypatch):
     payload = nav.preferred_image_payload(root)
     assert payload["image_url"] == "http://img/spec.jpg"
     assert payload["image_creator"] == "Creator"
+    assert payload["image_references"] == "Ref"
     assert nav.preferred_image_payload(None) == {}
 
     # payload fallback to attribution for creator/rights-holder
@@ -278,7 +455,11 @@ def test_resolve_taxon_media_and_preferred_image_payload(stub_env, monkeypatch):
     sparse = {"taxon_key": "30", "rank": "GENUS"}
     monkeypatch.setattr(nav, "get_taxon_by_id", lambda _k: sparse)
     monkeypatch.setattr(nav, "load_taxon_media", lambda: {"31": {"url": "d1"}})
-    monkeypatch.setattr(nav, "iter_descendants_dfs", lambda _t: [{"taxon_key": "32", "rank": "GENUS"}, {"taxon_key": "31", "rank": "GENUS"}])
+    monkeypatch.setattr(
+        nav,
+        "iter_descendants_dfs",
+        lambda _t: [{"taxon_key": "32", "rank": "GENUS"}, {"taxon_key": "31", "rank": "GENUS"}],
+    )
     monkeypatch.setattr(nav, "get_parent_taxon", lambda _t: None)
     nav.resolve_taxon_media.cache_clear()
     assert nav.resolve_taxon_media("30") == {"url": "d1"}
@@ -288,7 +469,9 @@ def test_resolve_taxon_media_and_preferred_image_payload(stub_env, monkeypatch):
     monkeypatch.setattr(nav, "get_taxon_by_id", lambda _k: {"taxon_key": "35", "rank": "GENUS"})
     monkeypatch.setattr(nav, "iter_descendants_dfs", lambda _t: [])
     monkeypatch.setattr(nav, "get_parent_taxon", lambda _t: {"taxon_key": "p"})
-    monkeypatch.setattr(nav, "get_children", lambda _k: [{"taxon_key": "35", "rank": "GENUS"}, {"taxon_key": "40", "rank": "GENUS"}])
+    monkeypatch.setattr(
+        nav, "get_children", lambda _k: [{"taxon_key": "35", "rank": "GENUS"}, {"taxon_key": "40", "rank": "GENUS"}]
+    )
     nav.resolve_taxon_media.cache_clear()
     assert nav.resolve_taxon_media("35") == {"url": "sib"}
 
@@ -304,7 +487,9 @@ def test_resolve_taxon_media_and_preferred_image_payload(stub_env, monkeypatch):
     monkeypatch.setattr(nav, "get_taxon_by_id", lambda _k: {"taxon_key": "60", "rank": "GENUS"})
     monkeypatch.setattr(nav, "load_taxon_media", lambda: {"62": {"url": "from-desc"}})
     monkeypatch.setattr(nav, "get_parent_taxon", lambda _t: {"taxon_key": "p"})
-    monkeypatch.setattr(nav, "get_children", lambda _k: [{"taxon_key": "61", "rank": "GENUS"}, {"taxon_key": "60", "rank": "GENUS"}])
+    monkeypatch.setattr(
+        nav, "get_children", lambda _k: [{"taxon_key": "61", "rank": "GENUS"}, {"taxon_key": "60", "rank": "GENUS"}]
+    )
     monkeypatch.setattr(
         nav,
         "iter_descendants_dfs",
@@ -336,7 +521,12 @@ def test_resolve_taxon_media_and_preferred_image_payload(stub_env, monkeypatch):
 
 def test_count_serialize_and_occurrence_filters(stub_env, monkeypatch, tmp_path):
     cfg, stub = stub_env
-    taxon = {"taxon_key": "11", "path": tmp_path / "genus_10/species_11", "scientific_name": "Alpha_species", "rank": "SPECIES"}
+    taxon = {
+        "taxon_key": "11",
+        "path": tmp_path / "genus_10/species_11",
+        "scientific_name": "Alpha_species",
+        "rank": "SPECIES",
+    }
     occ_path = Path(taxon["path"]) / cfg.occurrence_parquet_filename
     stub._exists[occ_path] = True
     stub._metadata[occ_path] = SimpleNamespace(num_rows=7)
@@ -355,10 +545,21 @@ def test_count_serialize_and_occurrence_filters(stub_env, monkeypatch, tmp_path)
 
     # media fallback when preferred image payload is empty
     monkeypatch.setattr(nav, "preferred_image_payload", lambda _t: {})
-    monkeypatch.setattr(nav, "resolve_taxon_media", lambda _k: {"url": "mu", "license": "ml", "creator": "mc", "rightsHolder": "mr", "references": "mref"})
+    monkeypatch.setattr(
+        nav,
+        "resolve_taxon_media",
+        lambda _k: {
+            "url": "mu",
+            "license": "ml",
+            "creator": "mc",
+            "rightsHolder": "mr",
+            "references": ["mref", "ignored"],
+        },
+    )
     serialized2 = nav.serialize_taxon(taxon)
     assert serialized2["image_url"] == "mu"
     assert serialized2["image_license"] == "ml"
+    assert serialized2["image_references"] == "mref"
 
     table = pa.table(
         {
@@ -375,7 +576,9 @@ def test_count_serialize_and_occurrence_filters(stub_env, monkeypatch, tmp_path)
     child = {"taxon_key": "11", "path": tmp_path / "taxa/11"}
     for p in (Path(root["path"]), Path(child["path"])):
         p.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(nav, "get_taxon_by_id", lambda key: root if str(key) == "10" else (child if str(key) == "11" else None))
+    monkeypatch.setattr(
+        nav, "get_taxon_by_id", lambda key: root if str(key) == "10" else (child if str(key) == "11" else None)
+    )
     monkeypatch.setattr(nav, "iter_descendants", lambda _t, include_self=True: [root, child])
     monkeypatch.setattr(nav.gis_lookup, "build_location_mask", lambda t, _g: pa.array([True] * t.num_rows))
 
@@ -400,7 +603,10 @@ def test_count_serialize_and_occurrence_filters(stub_env, monkeypatch, tmp_path)
     chunks = list(nav.iter_filtered_occurrence_tables(10, extra_columns=("x",), location_gid="USA"))
     assert len(chunks) == 1 and chunks[0].num_rows == 3
     points = nav.load_occurrence_points(10, location_gid="USA")
-    assert points == [{"catalogNumber": "a", "latitude": 1.0, "longitude": 3.0}, {"catalogNumber": "b", "latitude": 2.0, "longitude": 4.0}]
+    assert points == [
+        {"catalogNumber": "a", "latitude": 1.0, "longitude": 3.0},
+        {"catalogNumber": "b", "latitude": 2.0, "longitude": 4.0},
+    ]
 
     # taxon not found branch
     monkeypatch.setattr(nav, "get_taxon_by_id", lambda _k: None)
@@ -420,8 +626,7 @@ def test_misc_remaining_branches(stub_env, monkeypatch, tmp_path):
     names = nav._extract_common_names({"common_name": "alpha, beta", "inat_preferred_common_name": "alpha"}, "en")
     assert names[0] == "Alpha"
 
-    # no-name match branch
-    assert nav.resolve_matched_common_name(["One"], "two") is None
+    # no fallback common names for empty subspecies data
     assert nav.extract_common_names_for_language({"rank": "SUBSPECIES", "common_name": []}, "en") == []
 
     # resolve_taxon_media fallback paths
@@ -529,18 +734,28 @@ def test_child_index_and_get_children_branches(stub_env, monkeypatch, tmp_path):
     # uncached local filesystem iteration branch
     monkeypatch.setattr(nav, "_child_index", lambda: {})
     parent = {"taxon_key": "1", "path": root}
-    monkeypatch.setattr(nav, "get_taxon_by_id", lambda key: parent if str(key) == "1" else (payload["catalog"]["2"] if str(key) == "2" else None))
+    monkeypatch.setattr(
+        nav,
+        "get_taxon_by_id",
+        lambda key: parent if str(key) == "1" else (payload["catalog"]["2"] if str(key) == "2" else None),
+    )
     assert [k["taxon_key"] for k in nav.get_children("1")] == ["2"]
 
 
 def test_load_name_index_skips_empty_name(stub_env, monkeypatch):
     cfg, stub = stub_env
     payload = {
-        "catalog": {"1": {"taxon_key": "1", "path": cfg.taxonomy_root / "a", "scientific_name": "Alpha", "common_name": []}},
+        "catalog": {
+            "1": {
+                "taxon_key": "1",
+                "path": cfg.taxonomy_root / "a",
+                "scientific_name": "Alpha",
+                "common_name": ["", "Visible"],
+            }
+        },
         "combined_name_index": {},
     }
     stub._files[cfg.taxon_catalog_path] = pickle.dumps(payload)
-    monkeypatch.setattr(nav, "extract_common_names", lambda _t: ["", "Visible"])
     out = nav.load_name_index()
     assert "visible" in out
 
@@ -550,6 +765,8 @@ def test_resolve_taxon_media_returns_none_when_no_candidates(stub_env, monkeypat
     monkeypatch.setattr(nav, "load_taxon_media", lambda: {})
     monkeypatch.setattr(nav, "iter_descendants_dfs", lambda _t: [])
     monkeypatch.setattr(nav, "get_parent_taxon", lambda _t: {"taxon_key": "p"})
-    monkeypatch.setattr(nav, "get_children", lambda _k: [{"taxon_key": "500", "rank": "GENUS"}, {"taxon_key": "501", "rank": "GENUS"}])
+    monkeypatch.setattr(
+        nav, "get_children", lambda _k: [{"taxon_key": "500", "rank": "GENUS"}, {"taxon_key": "501", "rank": "GENUS"}]
+    )
     nav.resolve_taxon_media.cache_clear()
     assert nav.resolve_taxon_media("500") is None

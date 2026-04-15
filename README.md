@@ -24,10 +24,13 @@ If you are inside the `wherewild` repo, you can run:
 ./gt.sh
 ```
 
-The script is portable across macOS/Linux/WSL and uses the repo root to locate the
-`wherewild` Docker Compose project.
+The script is portable across macOS/Linux/WSL and uses its own location to find the
+repo's Docker Compose project, so it does not depend on the repo folder being named
+`wherewild`.
 If you get a permission error, run `chmod +x ./gt.sh` once.
 It also runs `b2-mount` automatically before opening the shell, so you usually do not need to call it manually.
+
+If you keep multiple local clones of the back-end repo, set per-copy Docker values in a local `.env` file next to `docker-compose.yml`. Docker Compose loads this automatically for both `./gt.sh` and direct `docker compose` commands, which avoids collisions in image tags, host ports, host data paths, and Compose project names. Start from `.env.example` and adjust the values for each clone.
 
 The downside to this is that using Docker can require lots of typing to use simple commands. A great way around this is to use bash aliases. Inside `gt`, these helpers are already available via the container image, so there is nothing to copy into your `~/.bashrc`.
 
@@ -41,6 +44,16 @@ The downside to this is that using Docker can require lots of typing to use simp
 docker compose up -d gdal
 docker compose exec -it gdal /bin/bash
 ```
+
+The local `gdal` service now supports these optional Compose variables:
+
+- `WHEREWILD_COMPOSE_NAME` for the Compose project name
+- `WHEREWILD_IMAGE` for the local image tag
+- `WHEREWILD_HOST_DATA_DIR` for the host path mounted at `/workspace/data`
+- `WHEREWILD_API_PORT` for the host port mapped to container port `8000`
+- `WHEREWILD_DOCS_PORT` for the host port mapped to container port `9101`
+
+If these are unset, Compose falls back to the historical defaults.
 
 #### For Deployment
 

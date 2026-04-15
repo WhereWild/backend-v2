@@ -1,7 +1,8 @@
 .venv/
-.env.local
+.build_tmp
+.cache/
 .python-version
-data/
+/data
 !tests/data/
 processed/
 cache/
@@ -43,7 +44,5 @@ logs/
 
 # Local secrets
 docker/rclone.conf
-
+.env
 .env.local
-.build_tmp
-.cache/

@@ -392,6 +392,8 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
     for category in catalog.get("categories", []):
         category_name = category.get("display_name") or category.get("name")
         category_source_ids: list[str] = category.get("source_ids") or []
+        if category.get("name") == "live_weather":
+            continue
         if category.get("name") == "temporal":
             for layer in _expand_temporal_layers(category):
                 layer_id = layer.get("id")
@@ -428,7 +430,14 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
             }
             entries.append(entry)
             mapping[layer_id] = entry
-    entries.sort(key=lambda item: item["id"])
+    def _sort_key(item: dict[str, Any]) -> tuple:
+        parsed = parse_temporal_layer_id(item["id"])
+        if parsed:
+            base_id, _agg, window_hours = parsed
+            return (base_id, window_hours)
+        return (item["id"], 0)
+
+    entries.sort(key=_sort_key)
     return entries, mapping
 
 

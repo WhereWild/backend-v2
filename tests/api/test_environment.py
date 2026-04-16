@@ -488,9 +488,41 @@ def test_environment_forced_categorical_and_missing_numeric_precompute(monkeypat
 
     monkeypatch.setattr(main.summary_stats, "load_numeric_summary", lambda *_a, **_k: None)
     monkeypatch.setattr(main.summary_stats, "load_density_graph", lambda *_a, **_k: None)
+    monkeypatch.setattr(main.taxa_navigation, "count_obscured_observations", lambda *_a, **_k: (0, 0))
     with pytest.raises(HTTPException) as exc:
         main.species_environment_stats(1, "bio_1", location=None, unit_system=None)
     assert exc.value.status_code == 503
+
+
+def test_environment_numeric_missing_precompute_returns_all_obscured(monkeypatch):
+    variable = {
+        "bio_1": {"value_type": "numeric", "name": "Bio 1", "units": "c"},
+    }
+    monkeypatch.setattr(main.gis_lookup, "load_variable_metadata", lambda: ([], variable))
+    monkeypatch.setattr(main.taxa_navigation, "get_taxon_by_id", lambda _tid: {"path": "/tmp/ok", "taxon_key": "1"})
+    monkeypatch.setattr(main.taxa_navigation, "count_obscured_observations", lambda *_a, **_k: (5, 0))
+    monkeypatch.setattr(main, "_path_exists", lambda _p: True)
+    monkeypatch.setattr(main.summary_stats, "load_numeric_summary", lambda *_a, **_k: None)
+    monkeypatch.setattr(main.summary_stats, "load_density_graph", lambda *_a, **_k: None)
+
+    out = main.species_environment_stats(1, "bio_1", location=None, unit_system=None)
+
+    assert out == {"all_obscured": True, "speciesId": 1, "variable": "bio_1"}
+
+
+def test_environment_location_filtered_missing_samples_returns_all_obscured(monkeypatch):
+    variable = {
+        "bio_1": {"value_type": "numeric", "name": "Bio 1", "units": "c"},
+    }
+    monkeypatch.setattr(main.gis_lookup, "load_variable_metadata", lambda: ([], variable))
+    monkeypatch.setattr(main.taxa_navigation, "get_taxon_by_id", lambda _tid: {"path": "/tmp/ok", "taxon_key": "1"})
+    monkeypatch.setattr(main.taxa_navigation, "count_obscured_observations", lambda *_a, **_k: (3, 0))
+    monkeypatch.setattr(main, "_path_exists", lambda _p: True)
+    monkeypatch.setattr(main.summary_stats, "gather_numeric_records", lambda *_a, **_k: [])
+
+    out = main.species_environment_stats(1, "bio_1", location="USA.UT", unit_system=None)
+
+    assert out == {"all_obscured": True, "speciesId": 1, "variable": "bio_1"}
 
 
 def test_class_samples_missing_index_raises_503(monkeypatch):

@@ -15,6 +15,7 @@ Example — all species in Utah with ≥100 occurrences:
 
   ML_LOCATION_GID=USA.45_1 pd train_location_models.py
 """
+
 from __future__ import annotations
 
 import os
@@ -35,9 +36,7 @@ CONFIG = load_config("global")
 LOCATION_GID: str = CONFIG.ml_location_gid.strip()
 # State/province (1 dot) gets a lower threshold than country (0 dots)
 MIN_SAMPLES: int = (
-    CONFIG.ml_location_min_samples_state
-    if LOCATION_GID.count(".") >= 1
-    else CONFIG.ml_location_min_samples_country
+    CONFIG.ml_location_min_samples_state if LOCATION_GID.count(".") >= 1 else CONFIG.ml_location_min_samples_country
 )
 TRAIN_PHENOLOGY: bool = CONFIG.ml_train_phenology
 TRAIN_FULL: bool = CONFIG.ml_train_full
@@ -104,7 +103,7 @@ def main() -> None:
 
     # Per-taxon occurrence counts in the location for min_samples filtering
     try:
-        location_counts = gis_lookup.location_taxon_counts(scope, target, include_species_rollup=True)
+        location_counts = gis_lookup.location_taxon_counts(scope, target)
     except Exception as e:
         print(f"WARNING: could not load location counts ({e}), skipping min_samples filter")
         location_counts = None
@@ -150,10 +149,13 @@ def main() -> None:
             print(f"{prefix} → SDM (already trained, skipping)")
         else:
             print(f"{prefix} → SDM")
-            ok, err = _run_pass(taxon_id, {
-                "ML_PHENOLOGY_MODE": "false",
-                "ML_SDM_INCLUDE_TEMPORAL": "false",
-            })
+            ok, err = _run_pass(
+                taxon_id,
+                {
+                    "ML_PHENOLOGY_MODE": "false",
+                    "ML_SDM_INCLUDE_TEMPORAL": "false",
+                },
+            )
             if not ok:
                 print(f"{prefix}   SDM FAILED: {err}")
                 results["failed"].append(f"{taxon_id} sdm: {err}")
@@ -165,10 +167,13 @@ def main() -> None:
                 print(f"{prefix} → phenology (already trained, skipping)")
             else:
                 print(f"{prefix} → phenology")
-                ok, err = _run_pass(taxon_id, {
-                    "ML_PHENOLOGY_MODE": "true",
-                    "ML_PHENOLOGY_TEMPORAL_ONLY": "true",
-                })
+                ok, err = _run_pass(
+                    taxon_id,
+                    {
+                        "ML_PHENOLOGY_MODE": "true",
+                        "ML_PHENOLOGY_TEMPORAL_ONLY": "true",
+                    },
+                )
                 if not ok:
                     print(f"{prefix}   phenology skipped/failed: {err}")
                     results["skipped"].append(f"{taxon_id} phenology: {err}")
@@ -179,10 +184,13 @@ def main() -> None:
                 print(f"{prefix} → full (already trained, skipping)")
             else:
                 print(f"{prefix} → full")
-                ok, err = _run_pass(taxon_id, {
-                    "ML_PHENOLOGY_MODE": "false",
-                    "ML_SDM_INCLUDE_TEMPORAL": "true",
-                })
+                ok, err = _run_pass(
+                    taxon_id,
+                    {
+                        "ML_PHENOLOGY_MODE": "false",
+                        "ML_SDM_INCLUDE_TEMPORAL": "true",
+                    },
+                )
                 if not ok:
                     print(f"{prefix}   full skipped/failed: {err}")
                     results["skipped"].append(f"{taxon_id} full: {err}")

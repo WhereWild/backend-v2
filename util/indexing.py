@@ -1397,8 +1397,25 @@ def _ancestor_contexts(taxon_path: Path) -> List[Any]:
     return contexts
 
 
+_STANDARD_STAT_METRICS: frozenset[str] = frozenset({
+    "mean", "median", "min", "max", "std", "stddev",
+    "total_samples", "unique_classes", "significant_unique_classes", "count",
+})
+
+
 def _is_categorical_class_metric(metric_name: str) -> bool:
     return str(metric_name or "").strip().lower().startswith("class_")
+
+
+def _is_named_categorical_fraction_metric(metric_name: str, variable_is_categorical: bool = False) -> bool:
+    """Returns True for named class metrics (e.g. 'bare_areas') that store fraction values (0–1).
+
+    Only applies when the variable is categorical and the metric is not a count-type metric.
+    """
+    if not variable_is_categorical:
+        return False
+    normalized = str(metric_name or "").strip().lower()
+    return normalized not in _STANDARD_STAT_METRICS and not _is_categorical_class_metric(normalized)
 
 
 def _all_requested_metrics_are_class_metrics(
@@ -1869,10 +1886,13 @@ def list_rank_metric_options(
         if count <= 0:
             continue
         variable, metric = column_name.split("::", 1)
+        if _is_categorical_class_metric(metric):
+            continue
         options.append(
             {
                 "variable": variable,
                 "metric": metric,
+                "label": metric.replace("_", " ").capitalize(),
                 "column": column_name,
                 "count": count,
             }
@@ -1935,6 +1955,10 @@ def child_relative_rankings(
         index_path = ancestor_path / f"{storage_rank.lower()}_index.parquet"
         if not PARQUET.exists(index_path):
             return [], None
+
+        _layer_meta = gis_lookup.load_layer_metadata().get(str(layer or "").strip().lower())
+        _layer_value_type = str(_layer_meta.get("value_type") or "").lower() if _layer_meta else ""
+        variable_is_categorical = _layer_value_type == "categorical"
 
         try:
             column_name = _resolve_column_name(index_path, layer, metric)
@@ -2075,6 +2099,10 @@ def child_relative_rankings(
             common_name = common_names[0] if common_names else None
             media_record = taxa_navigation.resolve_taxon_media(taxon["taxon_key"])
             preferred_image = taxa_navigation.preferred_image_payload(taxon)
+            display_value = numeric_value * 100.0 if (
+                numeric_value is not None
+                and _is_named_categorical_fraction_metric(metric, variable_is_categorical)
+            ) else numeric_value
             record = {
                 "taxonId": taxon_id if taxon_id is not None else taxon["taxon_key"],
                 "taxon_id": taxon_id if taxon_id is not None else taxon["taxon_key"],
@@ -2085,8 +2113,8 @@ def child_relative_rankings(
                 "common_name": common_name,
                 "common_names": common_names,
                 "rank": canonical_taxon_rank,
-                "value": numeric_value,
-                "sort_value": numeric_value,
+                "value": display_value,
+                "sort_value": display_value,
                 "sampleCount": sample_count,
                 "sample_count": sample_count,
                 "count": filtered_total,

@@ -1,10 +1,19 @@
-api() {
-  local data_root
+ww_prepare_api_log() {
   local log_dir="/workspace/logs"
-  local pid_dir="/workspace/logs/pids"
-  local pid_file="${pid_dir}/api.pid"
+  local log_file="${log_dir}/api.log"
+  local backup_file="${log_dir}/api.previous.log"
+
+  mkdir -p "$log_dir"
+  if [[ -f "$log_file" ]]; then
+    mv -f "$log_file" "$backup_file"
+  fi
+}
+
+ww_prepare_api_runtime() {
+  local data_root
   local storage_mode="${WHEREWILD_PARQUET_STORAGE:-b2}"
   local raster_mode="${WHEREWILD_RASTER_STORAGE:-auto}"
+
   ww_load_b2_env
   data_root="$(ww_data_root "$@")"
   if [[ "${1:-}" == "--local" || "${1:-}" == "--remote" ]]; then
@@ -15,43 +24,37 @@ api() {
       storage_mode="b2"
       raster_mode="b2"
     fi
-    shift
   fi
+
   export WHEREWILD_PARQUET_STORAGE="$storage_mode"
   export WHEREWILD_RASTER_STORAGE="$raster_mode"
+  export WHEREWILD_DATA_ROOT="$data_root"
+  printf '%s\n' "$data_root"
+}
+
+api() {
+  local data_root
+  local log_dir="/workspace/logs"
+  local pid_dir="/workspace/logs/pids"
+  local pid_file="${pid_dir}/api.pid"
+  ww_prepare_api_runtime "$@" >/dev/null
+  data_root="$WHEREWILD_DATA_ROOT"
   mkdir -p "$log_dir" "$pid_dir"
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
     echo "api: already running (pid $(cat "$pid_file"))"
     return 0
   fi
-  WHEREWILD_DATA_ROOT="$data_root" \
-    setsid uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
-    --workers 6 \
+  ww_prepare_api_log
+  setsid uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
+    --workers 2 \
     > /workspace/logs/api.log 2>&1 &
   echo "$!" > "$pid_file"
   echo "api started: http://localhost:8000/docs (data: $data_root)"
 }
 
 api-fg() {
-  local data_root
-  local storage_mode="${WHEREWILD_PARQUET_STORAGE:-b2}"
-  local raster_mode="${WHEREWILD_RASTER_STORAGE:-auto}"
-  ww_load_b2_env
-  data_root="$(ww_data_root "$@")"
-  if [[ "${1:-}" == "--local" || "${1:-}" == "--remote" ]]; then
-    if [[ "${1:-}" == "--local" ]]; then
-      storage_mode="local"
-      raster_mode="local"
-    else
-      storage_mode="b2"
-      raster_mode="b2"
-    fi
-    shift
-  fi
-  export WHEREWILD_PARQUET_STORAGE="$storage_mode"
-  export WHEREWILD_RASTER_STORAGE="$raster_mode"
-  WHEREWILD_DATA_ROOT="$data_root" \
-    uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
+  ww_prepare_api_runtime "$@" >/dev/null
+  uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
     --workers 2
 }
 alias docs='mkdir -p /workspace/logs && cd /workspace && setsid -f mkdocs serve --dev-addr 0.0.0.0:9101 > /workspace/logs/docs.log 2>&1 && echo "docs started: http://localhost:9101/"'

@@ -1339,6 +1339,19 @@ def get_species_detail(
     return payload
 
 
+@app.get("/api/species/{taxon_id}/obscured")
+def get_species_obscured(taxon_id: int) -> dict[str, Any]:
+    """Returns whether all observations for a taxon are obscured (coordinates hidden).
+
+    Intended for use on the species page to show a banner when no usable stats exist.
+    """
+    taxon = taxa_navigation.get_taxon_by_id(str(taxon_id))
+    if taxon is None:
+        raise HTTPException(status_code=404, detail=f"Species with taxon_id {taxon_id} not found")
+    _total, _non_obs = taxa_navigation.count_obscured_observations(taxon_id)
+    return {"taxon_id": taxon_id, "all_obscured": _total > 0 and _non_obs == 0}
+
+
 @app.get("/api/locations/search")
 @app.get("/locations/search", include_in_schema=False)
 def search_locations_endpoint(
@@ -1802,6 +1815,9 @@ def species_environment_stats(
                 sample_limit=category_sample_limit,
             )
             if categorical_payload is None:
+                _total, _non_obs = taxa_navigation.count_obscured_observations(taxon_id, location_gid)
+                if _total > 0 and _non_obs == 0:
+                    return {"all_obscured": True, "speciesId": taxon_id, "variable": variable_id}
                 raise HTTPException(
                     status_code=404,
                     detail=(
@@ -1906,6 +1922,9 @@ def species_environment_stats(
                     observation_count = 0
             density_curve = summary_stats.load_density_graph(str(taxon_dir), variable_id)
         if (not skip_summary and not summary) or not density_curve:
+            _total, _non_obs = taxa_navigation.count_obscured_observations(taxon_id)
+            if _total > 0 and _non_obs == 0:
+                return {"all_obscured": True, "speciesId": taxon_id, "variable": variable_id}
             raise HTTPException(
                 status_code=503,
                 # We COULD compute on-demand here but I think it's better to fail loudly as the data *should* be here for performance reasons.
@@ -1962,6 +1981,9 @@ def species_environment_stats(
     )
     values = [sample["value"] for sample in samples]
     if not values:
+        _total, _non_obs = taxa_navigation.count_obscured_observations(taxon_id, location_gid)
+        if _total > 0 and _non_obs == 0:
+            return {"all_obscured": True, "speciesId": taxon_id, "variable": variable_id}
         raise HTTPException(
             status_code=404,
             detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}'.",

@@ -698,6 +698,58 @@ def test_misc_remaining_branches(stub_env, monkeypatch, tmp_path):
     assert nav.taxon_id_as_int("") is None
 
 
+def test_count_obscured_observations_counts_total_and_visible(stub_env, monkeypatch, tmp_path):
+    cfg, stub = stub_env
+    root = {"taxon_key": "10", "path": tmp_path / "taxa/10"}
+    child = {"taxon_key": "11", "path": tmp_path / "taxa/11"}
+    for path in (Path(root["path"]), Path(child["path"])):
+        path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        nav,
+        "get_taxon_by_id",
+        lambda key: root if str(key) == "10" else (child if str(key) == "11" else None),
+    )
+    monkeypatch.setattr(nav, "iter_descendants", lambda *_a, **_k: [root, child])
+    monkeypatch.setattr(nav.gis_lookup, "build_location_mask", lambda table, _gid: pa.array([True] * table.num_rows))
+
+    root_occurrence_path = Path(root["path"]) / cfg.occurrence_parquet_filename
+    child_combined_path = Path(child["path"]) / nav.combined_parquet_filename
+    stub._exists[root_occurrence_path] = True
+    stub._exists[child_combined_path] = True
+    stub._tables[root_occurrence_path] = pa.table(
+        {
+            "catalogNumber": ["a", "b"],
+            "decimalLatitude": [1.0, 2.0],
+            "decimalLongitude": [3.0, 4.0],
+            "obscured": ["No", "Yes"],
+            "coordinateUncertaintyInMeters": [10, 10],
+            "level0Gid": ["USA", "USA"],
+            "level1Gid": ["USA.UT", "USA.UT"],
+            "level2Gid": ["USA.UT.001", "USA.UT.001"],
+            "gbifRegion": ["NA", "NA"],
+        }
+    )
+    stub._tables[child_combined_path] = pa.table(
+        {
+            "catalogNumber": ["c"],
+            "decimalLatitude": [5.0],
+            "decimalLongitude": [6.0],
+            "obscured": ["No"],
+            "coordinateUncertaintyInMeters": [10],
+            "level0Gid": ["USA"],
+            "level1Gid": ["USA.UT"],
+            "level2Gid": ["USA.UT.001"],
+            "gbifRegion": ["NA"],
+        }
+    )
+
+    total, non_obscured = nav.count_obscured_observations(10, location_gid="USA")
+
+    assert total == 3
+    assert non_obscured == 2
+
+
 def test_child_index_and_get_children_branches(stub_env, monkeypatch, tmp_path):
     cfg, stub = stub_env
     root = cfg.taxonomy_root / "genus_1"

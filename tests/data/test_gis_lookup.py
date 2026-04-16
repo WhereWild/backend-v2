@@ -544,98 +544,46 @@ def test_region_and_cog_path_helpers(stub_env, monkeypatch):
     assert gis_lookup.get_cog_path("bio_1", 0.4, 0.2) == expected
 
 
-def test_location_taxon_counts_rollup_and_rollup_failure(monkeypatch):
+def test_location_taxon_counts_use_precomputed_ancestor_rows(stub_env, monkeypatch):
+    config, stub = stub_env
     table = pa.table(
         {
-            "scope": ["country_scope", "country_scope", "country_scope", "country_scope"],
-            "gid": ["USA", "USA", "USA", "USA"],
-            "taxon_id": ["20", "30", "bad", "40"],
-            "count": [2, 3, 1, 0],
+            "scope": ["country_scope", "country_scope", "country_scope", "country_scope", "country_scope"],
+            "gid": ["USA", "USA", "USA", "USA", "USA"],
+            "taxon_id": ["20", "30", "10", "11", "bad"],
+            "count": [2, 3, 2, 2, 1],
         }
     )
     monkeypatch.setattr(gis_lookup, "_load_location_taxa_table", lambda: table)
     monkeypatch.setattr(gis_lookup, "is_valid_location_gid", lambda _gid: True)
 
-    from util import taxa_navigation
-
-    subspecies = {"taxon_key": "20", "rank": "SUBSPECIES"}
-    genus = {"taxon_key": "11", "rank": "GENUS"}
-    species = {"taxon_key": "10", "rank": "SPECIES"}
-    species_30 = {"taxon_key": "30", "rank": "SPECIES"}
-    by_key = {"20": subspecies, "30": species_30}
-    monkeypatch.setattr(taxa_navigation, "get_taxon_by_id", lambda key: by_key.get(str(key)))
-    monkeypatch.setattr(taxa_navigation, "canonical_rank", lambda rank: str(rank).upper())
-    monkeypatch.setattr(
-        taxa_navigation,
-        "get_parent_taxon",
-        lambda taxon: genus if taxon is subspecies else (species if taxon is genus else None),
-    )
-    monkeypatch.setattr(taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
-
-    counts = gis_lookup.location_taxon_counts("country_scope", "USA", include_species_rollup=True)
+    counts = gis_lookup.location_taxon_counts("country_scope", "USA")
     assert counts[20] == 2
     assert counts[30] == 3
     assert counts[10] == 2
-
-    ancestor_counts = gis_lookup.location_taxon_counts(
-        "country_scope",
-        "USA",
-        include_ancestor_rollup=True,
-    )
-    assert ancestor_counts[20] == 2
-    assert ancestor_counts[10] == 2
-    assert ancestor_counts[11] == 2
+    assert counts[11] == 2
 
     gis_lookup.location_taxa_for.cache_clear()
-    assert gis_lookup.location_taxa_for(
-        "country_scope",
-        "USA",
-        include_ancestor_rollup=True,
-    ) == frozenset({10, 11, 20, 30})
-
-    # Rollup exceptions are swallowed and base mapping still returns.
-    monkeypatch.setattr(
-        taxa_navigation,
-        "get_taxon_by_id",
-        lambda _key: (_ for _ in ()).throw(RuntimeError("rollup failed")),
+    stub._exists[config.location_catalog_path] = True
+    stub._read_table = lambda _path, **kwargs: (
+        pa.table({"taxon_id": ["20", "30", "10", "11", "bad"]}) if kwargs.get("filters") else table
     )
-    fallback = gis_lookup.location_taxon_counts("country_scope", "USA", include_species_rollup=True)
-    assert fallback[20] == 2 and fallback[30] == 3
-    ancestor_fallback = gis_lookup.location_taxon_counts("country_scope", "USA", include_ancestor_rollup=True)
-    assert ancestor_fallback[20] == 2 and ancestor_fallback[30] == 3
+    assert gis_lookup.location_taxa_for("country_scope", "USA") == frozenset({10, 11, 20, 30})
 
 
-def test_location_counts_for_taxon_species_rollup_and_fallback(monkeypatch):
+def test_location_counts_for_taxon_uses_precomputed_species_rows(monkeypatch):
     table = pa.table(
         {
             "scope": ["country_scope", "country_scope", "country_scope"],
             "gid": ["USA", "USA", "USA"],
             "taxon_id": [1, 2, 3],
-            "count": [1, 1, 1],
+            "count": [2, 1, 1],
         }
     )
     monkeypatch.setattr(gis_lookup, "_load_location_taxa_table", lambda: table)
     monkeypatch.setattr(gis_lookup, "is_valid_location_gid", lambda _gid: True)
-
-    from util import taxa_navigation
-
-    species = {"taxon_key": "1", "rank": "SPECIES"}
-    sub = {"taxon_key": "2", "rank": "SUBSPECIES"}
-    genus = {"taxon_key": "3", "rank": "GENUS"}
-    monkeypatch.setattr(taxa_navigation, "get_taxon_by_id", lambda key: species if str(key) == "1" else None)
-    monkeypatch.setattr(taxa_navigation, "canonical_rank", lambda rank: str(rank).upper())
-    monkeypatch.setattr(taxa_navigation, "iter_descendants", lambda _taxon: [sub, genus])
-    monkeypatch.setattr(taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
     out = gis_lookup.location_counts_for_taxon(1)
     assert out[("country_scope", "USA")] == 2
-
-    monkeypatch.setattr(
-        taxa_navigation,
-        "iter_descendants",
-        lambda _taxon: (_ for _ in ()).throw(RuntimeError("taxonomy exploded")),
-    )
-    fallback = gis_lookup.location_counts_for_taxon(1)
-    assert fallback[("country_scope", "USA")] == 1
 
 
 def test_location_taxon_counts_remaining_branches(monkeypatch):
@@ -661,20 +609,6 @@ def test_location_taxon_counts_remaining_branches(monkeypatch):
     monkeypatch.setattr(gis_lookup, "_load_location_taxa_table", lambda: table)
     gis_lookup.location_taxon_counts.cache_clear()
     assert gis_lookup.location_taxon_counts("country_scope", "USA") == {1: 1}
-
-    from util import taxa_navigation
-
-    monkeypatch.setattr(taxa_navigation, "get_taxon_by_id", lambda _k: None)
-    gis_lookup.location_taxon_counts.cache_clear()
-    assert gis_lookup.location_taxon_counts("country_scope", "USA", include_species_rollup=True) == {1: 1}
-
-    monkeypatch.setattr(
-        taxa_navigation,
-        "get_taxon_by_id",
-        lambda _k: (_ for _ in ()).throw(RuntimeError("rollup")),
-    )
-    gis_lookup.location_taxon_counts.cache_clear()
-    assert gis_lookup.location_taxon_counts("country_scope", "USA", include_species_rollup=True) == {1: 1}
 
 
 def test_get_layer_tile_info_success_and_errors(stub_env, monkeypatch, tmp_path):

@@ -1583,7 +1583,7 @@ def load_relative_ranks(
     normalized_location = location_gid.strip() if location_gid else None
     if normalized_location:
         _column, scope, target = gis_lookup.location_lookup_for_gid(normalized_location)
-        allowed_taxa = _location_taxa_with_optional_ancestor_rollup(scope, target)
+        allowed_taxa = _location_taxa(scope, target)
         if not allowed_taxa:
             return []
         if target_taxon_id is not None and target_taxon_id not in allowed_taxa:
@@ -1984,10 +1984,7 @@ def child_relative_rankings(
             candidate_count = len(candidate_ids)
             if not candidate_ids:
                 return [], None
-        location_filter = _resolve_location_filter(
-            location_gid,
-            include_species_rollup=(canonical_rank == "SPECIES"),
-        )
+        location_filter = _resolve_location_filter(location_gid)
         location_applied = location_filter.applied
         allowed_taxa = location_filter.allowed_taxa
         location_counts = location_filter.location_counts
@@ -2228,36 +2225,15 @@ class LocationFilterResult(NamedTuple):
     scope_target: Optional[tuple[str, str]]
 
 
-def _location_taxa_with_optional_ancestor_rollup(scope: str, target: str) -> frozenset[int]:
-    try:
-        return gis_lookup.location_taxa_for(scope, target, include_ancestor_rollup=True)
-    except TypeError as exc:
-        if "include_ancestor_rollup" not in str(exc):
-            raise
-        return gis_lookup.location_taxa_for(scope, target)
+def _location_taxa(scope: str, target: str) -> frozenset[int]:
+    return gis_lookup.location_taxa_for(scope, target)
 
 
-def _location_counts_with_optional_ancestor_rollup(
+def _location_counts(
     scope: str,
     target: str,
-    *,
-    include_species_rollup: bool,
 ) -> Optional[dict[int, int]]:
-    try:
-        return gis_lookup.location_taxon_counts(
-            scope,
-            target,
-            include_species_rollup=include_species_rollup,
-            include_ancestor_rollup=True,
-        )
-    except TypeError as exc:
-        if "include_ancestor_rollup" not in str(exc):
-            raise
-        return gis_lookup.location_taxon_counts(
-            scope,
-            target,
-            include_species_rollup=include_species_rollup,
-        )
+    return gis_lookup.location_taxon_counts(scope, target)
 
 
 def _location_sample_count_for_taxon(
@@ -2351,12 +2327,7 @@ def _filter_matched_taxa(
         if not direct_location_taxa:
             return []
     else:
-        location_filter = _resolve_location_filter(
-            location_gid,
-            include_species_rollup=(
-                descendant_rank is None or taxa_navigation.canonical_rank(descendant_rank) == "SPECIES"
-            ),
-        )
+        location_filter = _resolve_location_filter(location_gid)
         allowed_taxa = location_filter.allowed_taxa
         location_counts = location_filter.location_counts
         if location_filter.applied and not allowed_taxa:
@@ -2410,17 +2381,12 @@ def _filter_matched_taxa(
 
 def _resolve_location_filter(
     location_gid: Optional[str],
-    *,
-    include_species_rollup: bool,
 ) -> LocationFilterResult:
     """Resolve location-scoped taxa membership and optional sample counts.
 
     Args:
         location_gid: Location identifier used to scope taxa membership. When
             empty, no location filtering is applied.
-        include_species_rollup: Whether location counts should roll subspecies-
-            like occurrences up to species totals.
-
     Returns:
         A named result describing whether filtering was applied, which taxon ids
         are allowed for the location, and any per-taxon location sample counts.
@@ -2431,16 +2397,12 @@ def _resolve_location_filter(
 
     _column, scope, target = gis_lookup.location_lookup_for_gid(normalized_location)
     scope_target = (scope, target)
-    allowed_taxa = _location_taxa_with_optional_ancestor_rollup(scope, target)
+    allowed_taxa = _location_taxa(scope, target)
     if not allowed_taxa:
         return LocationFilterResult(True, frozenset(), None, scope_target)
 
     try:
-        location_counts = _location_counts_with_optional_ancestor_rollup(
-            scope,
-            target,
-            include_species_rollup=include_species_rollup,
-        )
+        location_counts = _location_counts(scope, target)
     except Exception:
         location_counts = None
 
@@ -2563,12 +2525,7 @@ def _rank_candidate_taxa(
     location_gid: Optional[str],
     cancel_check: CancelCheck | None = None,
 ) -> list[dict[str, Any]]:
-    location_filter = _resolve_location_filter(
-        location_gid,
-        include_species_rollup=(
-            descendant_rank is None or taxa_navigation.canonical_rank(descendant_rank) == "SPECIES"
-        ),
-    )
+    location_filter = _resolve_location_filter(location_gid)
     allowed_taxa = location_filter.allowed_taxa
     location_counts = location_filter.location_counts
     location_scope_target = location_filter.scope_target
@@ -2683,7 +2640,7 @@ def _count_scoped_query_matches(
     normalized_location = (location_gid or "").strip()
     if normalized_location:
         _column, scope, target = gis_lookup.location_lookup_for_gid(normalized_location)
-        allowed_taxa = _location_taxa_with_optional_ancestor_rollup(scope, target)
+        allowed_taxa = _location_taxa(scope, target)
         if not allowed_taxa:
             return 0
     matched_total = 0

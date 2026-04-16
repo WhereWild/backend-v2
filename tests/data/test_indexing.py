@@ -941,16 +941,14 @@ def test_query_taxa_location_filter_keeps_higher_rank_ranked_matches(monkeypatch
     monkeypatch.setattr(idx, "_load_categorical_stats", lambda _path: {})
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("level0Gid", "country_scope", "USA"))
 
-    def _location_taxa_for(_scope, _gid, include_ancestor_rollup=False):
-        return frozenset({10}) if include_ancestor_rollup else frozenset({1})
+    def _location_taxa_for(_scope, _gid):
+        return frozenset({10})
 
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", _location_taxa_for)
     monkeypatch.setattr(
         idx.gis_lookup,
         "location_taxon_counts",
-        lambda _scope, _gid, include_species_rollup=False, include_ancestor_rollup=False: (
-            {10: 4, 1: 4} if include_ancestor_rollup else {1: 4}
-        ),
+        lambda _scope, _gid: {10: 4},
     )
 
     payload = idx.query_taxa(
@@ -1189,7 +1187,7 @@ def test_child_relative_rankings_location_filter_uses_location_counts(monkeypatc
     monkeypatch.setattr(
         idx.gis_lookup,
         "location_taxon_counts",
-        lambda _s, _t, include_species_rollup=False: {1: 1, 2: 3},
+        lambda _s, _t: {1: 1, 2: 3},
     )
 
     rows, distribution = idx.child_relative_rankings(

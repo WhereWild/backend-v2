@@ -220,6 +220,7 @@ class TaxaQueryResponse(BaseModel):
 class TaxaRankingOption(BaseModel):
     variable: str = Field(description="Variable id available for ranking in the requested scope.")
     metric: str = Field(description="Metric name available for the variable in the requested scope.")
+    label: str | None = Field(default=None, description="Display label for the metric.")
     count: int | None = Field(default=None, description="Indexed row count for the option when available.")
     column: str | None = Field(default=None, description="Backing parquet column name for the option.")
 
@@ -1238,6 +1239,13 @@ def query_taxa(
         raw_units = variable_entry.get("units") if variable_entry else None
         sort_units = raw_units
 
+        _METRIC_UNIT_OVERRIDES: dict[str, str | None] = {
+            "total_samples": "samples",
+            "count": "samples",
+            "unique_classes": "classes",
+            "significant_unique_classes": "classes",
+        }
+
         if sort_variable and sort_metric:
             response_rows, sort_units = units.apply_unit_system_to_query_rows(
                 query_payload["results"],
@@ -1247,6 +1255,11 @@ def query_taxa(
             )
         else:
             response_rows = query_payload["results"]
+
+        if sort_metric:
+            normalized_metric = str(sort_metric).strip().lower()
+            if normalized_metric in _METRIC_UNIT_OVERRIDES:
+                sort_units = _METRIC_UNIT_OVERRIDES[normalized_metric]
 
         cancel_check()
         results = _serialize_taxon_query_results(response_rows)

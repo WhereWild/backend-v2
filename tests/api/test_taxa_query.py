@@ -413,8 +413,8 @@ def test_taxa_ranking_options_returns_scoped_options(client, monkeypatch):
         "ancestor_taxon_id": 77,
         "rank": "SPECIES",
         "options": [
-            {"variable": "bio_12", "metric": "max", "count": 14, "column": "bio_12::max"},
-            {"variable": "bio_12", "metric": "min", "count": 14, "column": "bio_12::min"},
+            {"variable": "bio_12", "metric": "max", "label": None, "count": 14, "column": "bio_12::max"},
+            {"variable": "bio_12", "metric": "min", "label": None, "count": 14, "column": "bio_12::min"},
         ],
     }
 

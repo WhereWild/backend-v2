@@ -999,6 +999,7 @@ def test_query_taxa_text_only_filters_matches_by_location(monkeypatch, tmp_path)
     monkeypatch.setattr(idx.gis_lookup, "location_lookup_for_gid", lambda _gid: ("level0Gid", "country_scope", "ETH"))
     monkeypatch.setattr(idx.gis_lookup, "location_taxa_for", lambda _scope, _gid: frozenset({2}))
     monkeypatch.setattr(idx.gis_lookup, "location_taxon_counts", lambda *_a, **_k: {2: 3})
+    monkeypatch.setattr(idx.taxa_navigation, "iter_descendants", lambda _taxon, include_self=False: iter([]))
 
     payload = idx.query_taxa(q="species", location_gid="ETH")
 
@@ -2604,7 +2605,7 @@ def test_rank_catalog_and_options_edge_paths(stub_env, monkeypatch, tmp_path):
         [pa.field("x", pa.int64()), pa.field("bio_1::mean", pa.int64()), pa.field("bio_1::max", pa.int64())]
     ).with_metadata({b"column_lengths": json.dumps({"bio_1::mean": 7, "bio_1::max": 0}).encode("utf-8")})
     assert idx.list_rank_metric_options("1", "species") == [
-        {"variable": "bio_1", "metric": "mean", "column": "bio_1::mean", "count": 7}
+        {"variable": "bio_1", "metric": "mean", "label": "Mean", "column": "bio_1::mean", "count": 7}
     ]
 
 
@@ -3260,7 +3261,7 @@ def test_list_rank_metric_options_uses_subspecies_storage_for_alias(stub_env, mo
     )
 
     assert idx.list_rank_metric_options("1", "variety") == [
-        {"variable": "bio_1", "metric": "mean", "column": "bio_1::mean", "count": 3}
+        {"variable": "bio_1", "metric": "mean", "label": "Mean", "column": "bio_1::mean", "count": 3}
     ]
 
 

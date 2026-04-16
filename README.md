@@ -77,13 +77,16 @@ docker run --rm -it \
   -e RCLONE_CONFIG=/workspace/docker/rclone.conf \
   -p 8000:8000 \
   -v <HOST_DATA_DIR>:/workspace/data \
+  -v <HOST_LOG_DIR>:/workspace/logs \
   -v <HOST_RCLONE_CONF_FILE>:/workspace/docker/rclone.conf:ro \
   wherewild-backend:latest
 ```
 
 - This image expects a mounted `/workspace/data` folder. You will need to mount a **host directory**. It works like this: `-v /absolute/host/path:/container/path` mounts the absolute directory path on your machine (the host) to the directory path within the container. Remove the angle brackets and replace them with your actual host paths.
+- If you want API log files to survive container replacement, also mount a host directory at `/workspace/logs` as shown above. Without that mount, `/workspace/logs/api.log` and `/workspace/logs/api.previous.log` exist only in the container filesystem.
 - If you want the container to use a different local data directory than `/workspace/data`, set `WHEREWILD_LOCAL_DATA_ROOT`.
-- When `WHEREWILD_MODE=api` **and** the image includes `/etc/wherewild_aliases.sh` **and** `ww_data_root` resolves to the local data root, the entrypoint runs `b2-pull-all` in the background on startup when serving from local data. If those conditions are not met (for example, aliases are not baked into the image), `b2-pull-all` will **not** be invoked automatically, and you must run it (or other `b2-pull` commands) manually inside the container if you want data to sync from B2. For any of these uses to work, you must provide an rclone config file and point `RCLONE_CONFIG` at it (as shown above). The second `-v` flag in the example is a **file-to-file bind mount**: the left-hand side must be the path to a single rclone config file on the host (for example `/home/me/.config/rclone/rclone.conf`), and the right-hand side is the file path `/workspace/docker/rclone.conf` inside the container. Do not mount a directory there, or rclone will not read the config.
+- When `WHEREWILD_MODE=api`, the entrypoint runs the API as the foreground container process for deployment. On startup it rotates `/workspace/logs/api.log` to `/workspace/logs/api.previous.log`, then mirrors fresh API logs to both container stdout/stderr and `/workspace/logs/api.log` using `tee`, so `docker logs` and the file stay in sync.
+- When `WHEREWILD_MODE=api` **and** `ww_data_root` resolves to the local data root, the entrypoint also runs `b2-pull-all` in the background on startup while serving from local data. If those alias helpers are not available in the image, `b2-pull-all` will **not** be invoked automatically, and you must run it (or other `b2-pull` commands) manually inside the container if you want data to sync from B2. For any of these uses to work, you must provide an rclone config file and point `RCLONE_CONFIG` at it (as shown above). The second `-v` flag in the example is a **file-to-file bind mount**: the left-hand side must be the path to a single rclone config file on the host (for example `/home/me/.config/rclone/rclone.conf`), and the right-hand side is the file path `/workspace/docker/rclone.conf` inside the container. Do not mount a directory there, or rclone will not read the config.
 
 Example minimal `rclone.conf` for B2:
 

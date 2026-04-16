@@ -10,6 +10,19 @@ if [[ -f "$template" && ! -f "$target" ]]; then
 fi
 
 MODE="${WHEREWILD_MODE:-dev}"
+AUTO_PULL_ENABLED="${WHEREWILD_AUTO_PULL_ENABLED:-true}"
+
+start_auto_pull_scheduler() {
+  case "${AUTO_PULL_ENABLED,,}" in
+    1|true|yes|on)
+      echo "Starting in-container auto-pull scheduler"
+      /usr/local/bin/wherewild-auto-pull-service &
+      ;;
+    *)
+      echo "In-container auto-pull scheduler disabled (WHEREWILD_AUTO_PULL_ENABLED=${AUTO_PULL_ENABLED})"
+      ;;
+  esac
+}
 
 case "$MODE" in
   api)
@@ -29,6 +42,7 @@ case "$MODE" in
         echo "Starting b2-pull-all to populate $local_root"
         # b2-pull-all manages its own rclone log at /workspace/logs/rclone/clone.log
         b2-pull-all
+        start_auto_pull_scheduler
       fi
 
       ww_prepare_api_log

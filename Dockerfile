@@ -30,6 +30,7 @@ RUN echo '\n# WhereWild dev aliases\n[ -f /etc/wherewild_aliases.sh ] && . /etc/
     && echo '\n# Enable bash completion\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr/share/bash-completion/bash_completion\nfi' >> /etc/bash.bashrc
 
 COPY docker/entrypoint.sh /usr/local/bin/wherewild-entrypoint
-RUN chmod +x /usr/local/bin/wherewild-entrypoint
+COPY docker/auto_pull_service.sh /usr/local/bin/wherewild-auto-pull-service
+RUN chmod +x /usr/local/bin/wherewild-entrypoint /usr/local/bin/wherewild-auto-pull-service
 ENTRYPOINT ["/usr/local/bin/wherewild-entrypoint"]
 CMD ["bash"]

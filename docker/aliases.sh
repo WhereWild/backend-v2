@@ -153,22 +153,32 @@ b2-pull-all() {
   mkdir -p "$log_dir"
   mkdir -p "$pid_dir"
 
-  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-    echo "b2-pull-all: already running (pid $(cat "$pid_file"))"
-    return 0
+  if [[ -f "$pid_file" ]]; then
+    local existing_pid
+    existing_pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+      echo "b2-pull-all: already running (pid ${existing_pid})"
+      return 0
+    fi
+    rm -f "$pid_file"
   fi
 
   : > "$log_file"
-  rclone copy "${remote}:${remote_path}" "$data_root" \
-    --fast-list \
-    --transfers "$transfers" \
-    --checkers "$checkers" \
-    --multi-thread-streams "$mt_streams" \
-    --buffer-size "$buffer_size" \
-    --stats "$stats_interval" \
-    --stats-log-level INFO \
-    --log-file "$log_file" \
-    --log-level INFO > /dev/null 2>&1 &
+  (
+    # Only remove the pid file if it still points to this background subshell.
+    # That avoids deleting a newer pid file written by a later b2-pull-all run.
+    trap 'if [[ -f "$pid_file" ]] && [[ "$(cat "$pid_file" 2>/dev/null || true)" == "$BASHPID" ]]; then rm -f "$pid_file"; fi' EXIT
+    rclone copy "${remote}:${remote_path}" "$data_root" \
+      --fast-list \
+      --transfers "$transfers" \
+      --checkers "$checkers" \
+      --multi-thread-streams "$mt_streams" \
+      --buffer-size "$buffer_size" \
+      --stats "$stats_interval" \
+      --stats-log-level INFO \
+      --log-file "$log_file" \
+      --log-level INFO > /dev/null 2>&1
+  ) &
   local pid="$!"
   echo "$pid" > "$pid_file"
   echo "b2-pull-all started (pid ${pid}); log: ${log_file}"

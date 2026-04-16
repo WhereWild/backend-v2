@@ -1567,7 +1567,7 @@ def species_locations(
         )
     )
     if limit and len(results) > limit:
-        return results[:limit]
+        results = results[:limit]
     return results
 
 

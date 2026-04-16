@@ -724,8 +724,6 @@ def location_taxa_membership() -> Dict[tuple[str, str], frozenset[int]]:
 def location_taxa_for(
     scope: str,
     gid: str,
-    *,
-    include_ancestor_rollup: bool = False,
 ) -> frozenset[int]:
     """Returns taxon ids known to occur for a single (scope, gid) location key.
 
@@ -735,14 +733,6 @@ def location_taxa_for(
     normalized_gid = str(gid or "").strip()
     if not normalized_scope or not is_valid_location_gid(normalized_gid):
         return frozenset()
-    if include_ancestor_rollup:
-        return frozenset(
-            location_taxon_counts(
-                normalized_scope,
-                normalized_gid,
-                include_ancestor_rollup=True,
-            )
-        )
     if not PARQUET.exists(CONFIG.location_catalog_path):
         return frozenset()
 
@@ -781,46 +771,6 @@ def location_taxa_for(
     return frozenset(resolved)
 
 
-def _rollup_location_taxon_counts(
-    mapping: Dict[int, int],
-    *,
-    include_species_rollup: bool = False,
-    include_ancestor_rollup: bool = False,
-) -> Dict[int, int]:
-    if not mapping or (not include_species_rollup and not include_ancestor_rollup):
-        return dict(mapping)
-
-    try:
-        from util import taxa_navigation
-
-        rolled: dict[int, int] = defaultdict(int)
-        for numeric_taxon_id, numeric_count in mapping.items():
-            rolled[numeric_taxon_id] += numeric_count
-            taxon = taxa_navigation.get_taxon_by_id(str(numeric_taxon_id))
-            if taxon is None:
-                continue
-            rank = taxa_navigation.canonical_rank(taxon.get("rank"))
-            parent = taxa_navigation.get_parent_taxon(taxon)
-            while parent is not None:
-                parent_rank = taxa_navigation.canonical_rank(parent.get("rank"))
-                if include_ancestor_rollup or (
-                    include_species_rollup and rank in CONFIG.subspecies_equivalents and parent_rank == "SPECIES"
-                ):
-                    parent_id = taxa_navigation.taxon_id_as_int(parent.get("taxon_key"))
-                    if parent_id is not None:
-                        rolled[int(parent_id)] += numeric_count
-                if include_ancestor_rollup:
-                    parent = taxa_navigation.get_parent_taxon(parent)
-                    continue
-                if include_species_rollup and rank in CONFIG.subspecies_equivalents and parent_rank != "SPECIES":
-                    parent = taxa_navigation.get_parent_taxon(parent)
-                    continue
-                break
-        return dict(rolled)
-    except Exception:
-        return dict(mapping)
-
-
 @lru_cache(maxsize=1)
 def _load_location_taxa_table() -> pa.Table | None:
     if not PARQUET.exists(CONFIG.location_catalog_path):
@@ -841,11 +791,7 @@ def _load_location_taxa_table() -> pa.Table | None:
 
 
 def location_counts_for_taxon(taxon_id: int) -> Dict[tuple[str, str], int]:
-    """Returns per-location observation counts for a taxon.
-
-    For species taxa, counts include infraspecific descendants
-    (subspecies/variety/form) so species presence reflects child observations.
-    """
+    """Returns per-location observation counts for a taxon."""
     try:
         normalized_taxon_id = int(taxon_id)
     except (TypeError, ValueError):
@@ -853,32 +799,10 @@ def location_counts_for_taxon(taxon_id: int) -> Dict[tuple[str, str], int]:
     table = _load_location_taxa_table()
     if table is None or not table.num_rows:
         return {}
-    target_taxon_ids: set[int] = {normalized_taxon_id}
-    try:
-        from util import taxa_navigation
-
-        target_taxon = taxa_navigation.get_taxon_by_id(str(normalized_taxon_id))
-        if target_taxon is not None:
-            target_rank = taxa_navigation.canonical_rank(target_taxon.get("rank"))
-            if target_rank == "SPECIES":
-                for descendant in taxa_navigation.iter_descendants(target_taxon):
-                    descendant_rank = taxa_navigation.canonical_rank(descendant.get("rank"))
-                    if descendant_rank not in CONFIG.subspecies_equivalents:
-                        continue
-                    descendant_id = taxa_navigation.taxon_id_as_int(descendant.get("taxon_key"))
-                    if descendant_id is not None:
-                        target_taxon_ids.add(int(descendant_id))
-    except Exception:
-        # Fall back to direct-only counts if taxonomy lookups fail.
-        target_taxon_ids = {normalized_taxon_id}
     try:
         taxon_col = table["taxon_id"]
-        if len(target_taxon_ids) == 1:
-            scalar = pa.scalar(normalized_taxon_id, type=taxon_col.type)
-            mask = pc.equal(taxon_col, scalar)
-        else:
-            value_set = pa.array(sorted(target_taxon_ids), type=taxon_col.type)
-            mask = pc.is_in(taxon_col, value_set=value_set)
+        scalar = pa.scalar(normalized_taxon_id, type=taxon_col.type)
+        mask = pc.equal(taxon_col, scalar)
         filtered = table.filter(mask).combine_chunks()
     except Exception:
         return {}
@@ -906,16 +830,8 @@ def location_counts_for_taxon(taxon_id: int) -> Dict[tuple[str, str], int]:
 def location_taxon_counts(
     scope: str,
     gid: str,
-    *,
-    include_species_rollup: bool = False,
-    include_ancestor_rollup: bool = False,
 ) -> Dict[int, int]:
-    """Returns taxon->observation count mapping for a specific location key.
-
-    When include_species_rollup=True, infraspecific counts are also added to
-    their parent species taxon id. When include_ancestor_rollup=True, counts
-    are also propagated up the full ancestor chain.
-    """
+    """Returns taxon->observation count mapping for a specific location key."""
     normalized_scope = str(scope or "").strip()
     normalized_gid = str(gid or "").strip()
     if not normalized_scope or not is_valid_location_gid(normalized_gid):
@@ -947,11 +863,7 @@ def location_taxon_counts(
         if numeric_count <= 0:
             continue
         mapping[numeric_taxon_id] += numeric_count
-    return _rollup_location_taxon_counts(
-        mapping,
-        include_species_rollup=include_species_rollup,
-        include_ancestor_rollup=include_ancestor_rollup,
-    )
+    return dict(mapping)
 
 
 def resolve_location_context(

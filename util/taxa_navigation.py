@@ -1034,6 +1034,55 @@ def iter_filtered_occurrence_tables(
                 yield filtered
 
 
+def count_obscured_observations(
+    taxon_id: int,
+    location_gid: Optional[str] = None,
+) -> Tuple[int, int]:
+    """Counts total and non-obscured observations for a taxon and its descendants.
+
+    Args:
+        taxon_id: Taxon id to count observations for.
+        location_gid: Optional location GID to filter by.
+
+    Returns:
+        A tuple of (total_observations, non_obscured_observations).
+    """
+    taxon = get_taxon_by_id(str(taxon_id))
+    if taxon is None:
+        return (0, 0)
+
+    total = 0
+    non_obscured = 0
+    normalized_location = location_gid.strip() if location_gid else None
+    count_columns = list(base_occurrence_columns)
+
+    for taxon_record in iter_descendants(taxon, include_self=True):
+        taxon_dir = Path(taxon_record["path"])
+        for candidate in (CONFIG.occurrence_parquet_filename, combined_parquet_filename):
+            path = taxon_dir / candidate
+            if not PARQUET.exists(path):
+                continue
+            try:
+                table = PARQUET.read_table(path, columns=count_columns).combine_chunks()
+            except Exception:
+                continue
+
+            if normalized_location:
+                loc_mask = gis_lookup.build_location_mask(table, normalized_location)
+                if loc_mask is None:
+                    continue
+                table = table.filter(loc_mask).combine_chunks()
+
+            total += table.num_rows
+            if "obscured" in table.schema.names:
+                obs_mask = pc.equal(table["obscured"], "No")
+                non_obscured += pc.sum(obs_mask.cast(pa.int32())).as_py() or 0
+            else:
+                non_obscured += table.num_rows
+
+    return (total, non_obscured)
+
+
 def load_occurrence_points(
     taxon_id: int,
     location_gid: Optional[str] = None,

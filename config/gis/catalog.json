@@ -236,7 +236,7 @@
         { "id": "bio_17", "source_ids": ["worldclim_2_1"], "code": "BIO17", "display_name": "Precipitation of Driest Quarter",       "units": "mm",                    "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
         { "id": "bio_18", "source_ids": ["worldclim_2_1"], "code": "BIO18", "display_name": "Precipitation of Warmest Quarter",      "units": "mm",                    "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
         { "id": "bio_19", "source_ids": ["worldclim_2_1"], "code": "BIO19", "display_name": "Precipitation of Coldest Quarter",      "units": "mm",                    "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
-        { "id": "koppen_geiger", "source_ids": ["koppen_geiger_beck_2023"], "code": "KOPPEN_GEIGER", "display_name": "Köppen-Geiger Classes", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "koppen_geiger.tif", "value_type": "categorical" },
+        { "id": "koppen_geiger", "source_ids": ["koppen_geiger_beck_2023"], "code": "KOPPEN_GEIGER", "display_name": "Köppen-Geiger Classes", "units": "%", "region_root": "regions", "region_size": 10, "filename_template": "koppen_geiger.tif", "value_type": "categorical" },
         { "id": "clt",  "source_ids": ["chelsa_bioclim_plus"], "code": "CLT",      "display_name": "Cloud Area Fraction",                             "units": "%",       "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
         { "id": "rsds", "source_ids": ["chelsa_bioclim_plus"], "code": "RSDS",     "display_name": "Surface Downwelling Shortwave Radiation",         "units": "W/m^2",   "region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
         { "id": "scd",  "source_ids": ["chelsa_bioclim_plus"], "code": "SCD",      "display_name": "Snow Cover Days",                                 "units": "days/year","region_root": "regions", "region_size": 10, "filename_template": "{id}.tif", "value_type": "numeric" },
@@ -251,8 +251,8 @@
       "description": "Global land cover, lithology, and static soil property/classification layers.",
       "source_ids": ["glc_fcs30_2020", "hengl_landform_2018", "soilgrids_2_0"],
       "layers": [
-        { "id": "landcover",  "source_ids": ["glc_fcs30_2020"],      "code": "GLC_FCS30_2020", "display_name": "Land Cover Classes",                 "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "landcover.tif",  "value_type": "categorical" },
-        { "id": "lithology",  "source_ids": ["hengl_landform_2018"], "code": "LITHOLOGY",      "display_name": "Lithology Classes",                  "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "lithology.tif",  "value_type": "categorical" },
+        { "id": "landcover",  "source_ids": ["glc_fcs30_2020"],      "code": "GLC_FCS30_2020", "display_name": "Land Cover Classes",                 "units": "%",        "region_root": "regions", "region_size": 10, "filename_template": "landcover.tif",  "value_type": "categorical" },
+        { "id": "lithology",  "source_ids": ["hengl_landform_2018"], "code": "LITHOLOGY",      "display_name": "Lithology Classes",                  "units": "%",        "region_root": "regions", "region_size": 10, "filename_template": "lithology.tif",  "value_type": "categorical" },
         { "id": "clay",       "source_ids": ["soilgrids_2_0"],       "code": "CLAY_0_5CM",     "display_name": "Clay (0-5cm)",                       "units": "%",        "region_root": "regions", "region_size": 10, "filename_template": "clay.tif",       "value_type": "numeric" },
         { "id": "sand",       "source_ids": ["soilgrids_2_0"],       "code": "SAND_0_5CM",     "display_name": "Sand (0-5cm)",                       "units": "%",        "region_root": "regions", "region_size": 10, "filename_template": "sand.tif",       "value_type": "numeric" },
         { "id": "silt",       "source_ids": ["soilgrids_2_0"],       "code": "SILT_0_5CM",     "display_name": "Silt (0-5cm)",                       "units": "%",        "region_root": "regions", "region_size": 10, "filename_template": "silt.tif",       "value_type": "numeric" },
@@ -260,7 +260,7 @@
         { "id": "nitrogen",   "source_ids": ["soilgrids_2_0"],       "code": "NITROGEN_0_5CM", "display_name": "Nitrogen (0-5cm)",                   "units": "%",        "region_root": "regions", "region_size": 10, "filename_template": "nitrogen.tif",   "value_type": "numeric" },
         { "id": "soc",        "source_ids": ["soilgrids_2_0"],       "code": "SOC_0_5CM",      "display_name": "Soil Organic Carbon (0-5cm)",        "units": "%",        "region_root": "regions", "region_size": 10, "filename_template": "soc.tif",        "value_type": "numeric" },
         { "id": "phh2o",      "source_ids": ["soilgrids_2_0"],       "code": "PHH2O_0_5CM",    "display_name": "pH (Water, 0-5cm)",                  "units": "pH",       "region_root": "regions", "region_size": 10, "filename_template": "phh20.tif",      "value_type": "numeric" },
-        { "id": "wrb",        "source_ids": ["soilgrids_2_0"],       "code": "WRB_2006",       "display_name": "World Reference Base (2006) Soil Groups","units": "class id","region_root": "regions","region_size": 10,"filename_template": "wrb.tif",       "value_type": "categorical" }
+        { "id": "wrb",        "source_ids": ["soilgrids_2_0"],       "code": "WRB_2006",       "display_name": "World Reference Base (2006) Soil Groups","units": "%",    "region_root": "regions","region_size": 10,"filename_template": "wrb.tif",       "value_type": "categorical" }
       ]
     },
     {
@@ -271,9 +271,9 @@
       "layers": [
         { "id": "elevation",  "code": "ELEVATION",  "display_name": "Elevation",          "units": "m",        "region_root": "regions", "region_size": 10, "filename_template": "dem.tif",      "value_type": "numeric" },
         { "id": "slope",      "code": "SLOPE",       "display_name": "Slope",              "units": "degrees",  "region_root": "regions", "region_size": 10, "filename_template": "dem.tif",      "value_type": "numeric",    "derived": true },
-        { "id": "aspect",     "code": "ASPECT",      "display_name": "Aspect (binned)",    "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "dem.tif",      "value_type": "categorical","derived": true },
+        { "id": "aspect",     "code": "ASPECT",      "display_name": "Aspect (binned)",    "units": "%",        "region_root": "regions", "region_size": 10, "filename_template": "dem.tif",      "value_type": "categorical","derived": true },
         { "id": "aspect_deg", "code": "ASPECT_DEG",  "display_name": "Aspect",             "units": "degrees",  "region_root": "regions", "region_size": 10, "filename_template": "dem.tif",      "value_type": "circular",   "derived": true },
-        { "id": "landform",   "source_ids": ["hengl_landform_2018"], "code": "LANDFORM", "display_name": "Landform Classes", "units": "class id", "region_root": "regions", "region_size": 10, "filename_template": "landform.tif", "value_type": "categorical" }
+        { "id": "landform",   "source_ids": ["hengl_landform_2018"], "code": "LANDFORM", "display_name": "Landform Classes", "units": "%", "region_root": "regions", "region_size": 10, "filename_template": "landform.tif", "value_type": "categorical" }
       ]
     },
     {
@@ -292,7 +292,7 @@
         { "id": "soil_temperature_0_to_7cm",  "code": "SOIL_TEMPERATURE_0_7CM","display_name": "Soil Temperature (0–7cm)","units": "°C",    "value_type": "numeric",      "agg": "avg" },
         { "id": "temperature_2m",             "code": "TEMPERATURE_2M",       "display_name": "Air Temperature (2m)",     "units": "°C",     "value_type": "numeric",      "agg": "avg" },
         { "id": "snow_depth",                 "code": "SNOW_DEPTH",           "display_name": "Snow Depth",               "units": "m",      "value_type": "numeric",      "agg": "avg", "windows": [1] },
-        { "id": "weather_code_simple",        "code": "WEATHER_CODE_SIMPLE",  "display_name": "Weather Code (Simple)",    "units": "class id","value_type": "categorical", "agg": "snapshot", "windows": [1] }
+        { "id": "weather_code_simple",        "code": "WEATHER_CODE_SIMPLE",  "display_name": "Weather Code (Simple)",    "units": "%",      "value_type": "categorical",  "agg": "snapshot", "windows": [1] }
       ]
     },
     {
@@ -309,7 +309,7 @@
         { "id": "soil_temperature_0_to_7cm",  "code": "SOIL_TEMPERATURE_0_7CM","display_name": "Soil Temperature (0–7cm)", "units": "°C",     "value_type": "numeric" },
         { "id": "dew_point_2m",               "code": "DEW_POINT_2M",          "display_name": "Dew Point (2m)",           "units": "°C",     "value_type": "numeric", "derived": true },
         { "id": "vapor_pressure_deficit",     "code": "VPD",                   "display_name": "Vapor Pressure Deficit",   "units": "kPa",    "value_type": "numeric", "derived": true },
-        { "id": "weather_code_simple",        "code": "WEATHER_CODE_SIMPLE",   "display_name": "Weather Code",             "units": "class id","value_type": "categorical", "derived": true }
+        { "id": "weather_code_simple",        "code": "WEATHER_CODE_SIMPLE",   "display_name": "Weather Code",             "units": "%",      "value_type": "categorical", "derived": true }
       ]
     }
   ]

@@ -238,6 +238,62 @@ def test_taxa_query_ranked_results_apply_unit_system(client, monkeypatch):
     assert body["results"][0]["sort_value"] == 32.0
 
 
+def test_taxa_query_categorical_ranked_results_preserve_scaled_percent_values(client, monkeypatch):
+    monkeypatch.setattr(
+        main.indexing,
+        "query_taxa",
+        lambda **_kwargs: {
+            "total": 1,
+            "matched_total": 1,
+            "eligible_total": 1,
+            "empty_reason": None,
+            "results": [
+                {
+                    "taxon_id": 22,
+                    "match_score": 97.0,
+                    "sample_count": 18,
+                    "sort_variable": "landcover",
+                    "sort_metric": "bare_areas",
+                    "sort_value": 37.5,
+                    "position": 1,
+                    "percentile": 0.0,
+                    "taxon": {"taxon_key": "22"},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        main.taxa_navigation,
+        "get_taxon_by_id",
+        lambda _taxon_id: {"taxon_key": "22"},
+    )
+    monkeypatch.setattr(
+        main.taxa_navigation,
+        "serialize_taxon",
+        lambda _taxon: {
+            "taxon_id": 22,
+            "scientific_name": "Pediocactus simpsonii",
+            "common_name": "Mountain ball cactus",
+            "common_names": ["Mountain ball cactus"],
+            "rank": "SPECIES",
+            "slug": "pediocactus-simpsonii",
+        },
+    )
+    monkeypatch.setattr(
+        main.gis_lookup,
+        "load_variable_metadata",
+        lambda: ([], {"landcover": {"value_type": "categorical", "units": None}}),
+    )
+
+    body = client.get(
+        "/api/taxa/query?q=mountain%20ball%20cactus&within_taxon=10"
+        "&descendant_rank=SPECIES&sort_variable=landcover&sort_metric=bare_areas"
+    ).json()
+
+    assert body["sort"]["units"] == "% in Bare areas"
+    assert body["results"][0]["sort_value"] == 37.5
+
+
 def test_taxa_query_normalizes_sort_order_in_response(client, monkeypatch):
     monkeypatch.setattr(
         main.indexing,
@@ -397,8 +453,8 @@ def test_taxa_ranking_options_returns_scoped_options(client, monkeypatch):
         "list_rank_metric_options",
         lambda ancestor_taxon_id, descendant_rank: (
             [
-                {"variable": "bio_12", "metric": "max", "count": 14, "column": "bio_12::max"},
-                {"variable": "bio_12", "metric": "min", "count": 14, "column": "bio_12::min"},
+                {"variable": "bio_12", "metric": "max", "label": "Maximum", "count": 14, "column": "bio_12::max"},
+                {"variable": "bio_12", "metric": "min", "label": "Minimum", "count": 14, "column": "bio_12::min"},
             ]
             if ancestor_taxon_id == "77" and descendant_rank == "SPECIES"
             else []
@@ -413,8 +469,8 @@ def test_taxa_ranking_options_returns_scoped_options(client, monkeypatch):
         "ancestor_taxon_id": 77,
         "rank": "SPECIES",
         "options": [
-            {"variable": "bio_12", "metric": "max", "label": None, "count": 14, "column": "bio_12::max"},
-            {"variable": "bio_12", "metric": "min", "label": None, "count": 14, "column": "bio_12::min"},
+            {"variable": "bio_12", "metric": "max", "label": "Maximum", "count": 14, "column": "bio_12::max"},
+            {"variable": "bio_12", "metric": "min", "label": "Minimum", "count": 14, "column": "bio_12::min"},
         ],
     }
 

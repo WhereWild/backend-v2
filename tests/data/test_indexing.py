@@ -2602,9 +2602,104 @@ def test_rank_catalog_and_options_edge_paths(stub_env, monkeypatch, tmp_path):
     stub._schemas[index_path] = pa.schema(
         [pa.field("x", pa.int64()), pa.field("bio_1::mean", pa.int64()), pa.field("bio_1::max", pa.int64())]
     ).with_metadata({b"column_lengths": json.dumps({"bio_1::mean": 7, "bio_1::max": 0}).encode("utf-8")})
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "load_variable_metadata",
+        lambda: ([{"id": "bio_12"}, {"id": "bio_1"}], {"bio_12": {"id": "bio_12"}, "bio_1": {"id": "bio_1"}}),
+    )
     assert idx.list_rank_metric_options("1", "species") == [
-        {"variable": "bio_1", "metric": "mean", "label": "Mean", "column": "bio_1::mean", "count": 7}
+        {"variable": "bio_1", "metric": "mean", "label": "Average", "column": "bio_1::mean", "count": 7}
     ]
+
+
+def test_list_rank_metric_options_uses_variable_metadata_order(stub_env, monkeypatch, tmp_path):
+    _cfg, stub = stub_env
+    ancestor = {"taxon_key": "1", "rank": "GENUS", "path": tmp_path}
+    monkeypatch.setattr(idx.taxa_navigation, "get_taxon_by_id", lambda _k: ancestor)
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "load_variable_metadata",
+        lambda: (
+            [{"id": "bio_12"}, {"id": "bio_1"}],
+            {"bio_12": {"id": "bio_12"}, "bio_1": {"id": "bio_1"}},
+        ),
+    )
+
+    index_path = tmp_path / "species_index.parquet"
+    stub._exists[index_path] = True
+    stub._schemas[index_path] = pa.schema(
+        [pa.field("bio_1::mean", pa.int64()), pa.field("bio_12::mean", pa.int64())]
+    ).with_metadata(
+        {b"column_lengths": json.dumps({"bio_1::mean": 3, "bio_12::mean": 4}).encode("utf-8")}
+    )
+
+    assert idx.list_rank_metric_options("1", "species") == [
+        {"variable": "bio_12", "metric": "mean", "label": "Average", "column": "bio_12::mean", "count": 4},
+        {"variable": "bio_1", "metric": "mean", "label": "Average", "column": "bio_1::mean", "count": 3},
+    ]
+
+
+def test_query_taxa_scales_named_categorical_fraction_metrics(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        idx, "CONFIG", SimpleNamespace(common_name_language="en", subspecies_equivalents={"SUBSPECIES"})
+    )
+    species_one = {
+        "taxon_key": "1",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_1",
+        "scientific_name": "Species One",
+    }
+    species_two = {
+        "taxon_key": "2",
+        "rank": "SPECIES",
+        "path": tmp_path / "species_2",
+        "scientific_name": "Species Two",
+    }
+    for taxon in (species_one, species_two):
+        taxon["path"].mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "search_taxa_by_name",
+        lambda _query, limit=100: [(species_one, 80.0), (species_two, 95.0)][:limit],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "taxon_id_as_int", lambda key: int(str(key)))
+    monkeypatch.setattr(idx.taxa_navigation, "canonical_rank", lambda rank: str(rank).upper() if rank else "")
+    monkeypatch.setattr(
+        idx.taxa_navigation,
+        "extract_common_names_for_language",
+        lambda taxon, **_kwargs: [taxon["scientific_name"]],
+    )
+    monkeypatch.setattr(idx.taxa_navigation, "resolve_taxon_media", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(idx.taxa_navigation, "preferred_image_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(idx.taxa_navigation, "get_parent_taxon", lambda _taxon: None)
+    monkeypatch.setattr(
+        idx.gis_lookup,
+        "load_variable_metadata",
+        lambda: ([], {"landcover": {"value_type": "categorical"}}),
+    )
+    monkeypatch.setattr(idx, "_load_summary_stats", lambda _path: {})
+    monkeypatch.setattr(
+        idx,
+        "_load_categorical_stats",
+        lambda path: (
+            {"landcover": {"bare_areas": 0.125, "count": 5}}
+            if str(path).endswith("species_1")
+            else {"landcover": {"bare_areas": 0.375, "count": 6}}
+        ),
+    )
+
+    out = idx.query_taxa(
+        q="species",
+        sort_variable="landcover",
+        sort_metric="bare_areas",
+        sort_order="asc",
+    )
+
+    assert [row["taxon_id"] for row in out["results"]] == [1, 2]
+    assert out["results"][0]["sort_value"] == 12.5
+    assert out["results"][1]["sort_value"] == 37.5
 
 
 def test_relative_and_child_ranking_edge_paths(stub_env, monkeypatch, tmp_path):
@@ -3259,7 +3354,7 @@ def test_list_rank_metric_options_uses_subspecies_storage_for_alias(stub_env, mo
     )
 
     assert idx.list_rank_metric_options("1", "variety") == [
-        {"variable": "bio_1", "metric": "mean", "label": "Mean", "column": "bio_1::mean", "count": 3}
+        {"variable": "bio_1", "metric": "mean", "label": "Average", "column": "bio_1::mean", "count": 3}
     ]
 
 

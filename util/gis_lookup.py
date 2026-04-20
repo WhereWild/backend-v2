@@ -430,12 +430,33 @@ def load_variable_metadata() -> tuple[List[dict[str, Any]], dict[str, dict[str, 
             }
             entries.append(entry)
             mapping[layer_id] = entry
+    _VARIABLE_ORDER = [
+        # Bioclimatic — headline
+        "bio_1", "bio_12", "bio_5", "bio_6", "bio_13", "bio_14", "koppen_geiger",
+        # Bioclimatic — snow
+        "swe", "scd",
+        # Bioclimatic — quarterly temperatures
+        "bio_8", "bio_9", "bio_10", "bio_11",
+        # Bioclimatic — quarterly precipitation
+        "bio_16", "bio_17", "bio_18", "bio_19",
+        # Bioclimatic — CHELSA/radiation/wind
+        "vpd", "clt", "rsds", "sfc",
+        # Bioclimatic — derived/seasonality oddities
+        "bio_3", "bio_4", "bio_15", "bio_2", "bio_7",
+        # Earth Surface
+        "landcover", "lithology", "wrb",
+        "phh2o", "cfvo", "sand", "clay", "silt", "nitrogen", "soc",
+        # Terrain
+        "elevation", "slope", "aspect", "aspect_deg", "landform",
+    ]
+    _order_index = {v: i for i, v in enumerate(_VARIABLE_ORDER)}
+
     def _sort_key(item: dict[str, Any]) -> tuple:
         parsed = parse_temporal_layer_id(item["id"])
         if parsed:
             base_id, _agg, window_hours = parsed
-            return (base_id, window_hours)
-        return (item["id"], 0)
+            return (_order_index.get(base_id, len(_VARIABLE_ORDER)), base_id, window_hours)
+        return (_order_index.get(item["id"], len(_VARIABLE_ORDER)), item["id"], 0)
 
     entries.sort(key=_sort_key)
     return entries, mapping

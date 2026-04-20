@@ -1878,6 +1878,14 @@ def list_rank_metric_options(
         return []
 
     column_lengths = _load_column_lengths(index_path)
+    _METRIC_LABELS: dict[str, str] = {
+        "mean": "Average",
+        "median": "Median",
+        "min": "Minimum",
+        "max": "Maximum",
+        "std": "Standard deviation",
+        "stddev": "Standard deviation",
+    }
     options: list[dict[str, Any]] = []
     for column_name in schema.names:
         if "::" not in column_name:
@@ -1892,12 +1900,30 @@ def list_rank_metric_options(
             {
                 "variable": variable,
                 "metric": metric,
-                "label": metric.replace("_", " ").capitalize(),
+                "label": _METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize()),
                 "column": column_name,
                 "count": count,
             }
         )
-    options.sort(key=lambda entry: (entry["variable"], entry["metric"]))
+    _METRIC_ORDER = [
+        "mean", "median", "min", "max", "std",
+        "1st percentile", "10th percentile", "25th percentile",
+        "75th percentile", "90th percentile", "99th percentile",
+        "10-90 range", "1-99 range", "interquartile range", "range",
+        "count",
+    ]
+    _metric_rank = {m: i for i, m in enumerate(_METRIC_ORDER)}
+    variable_rank = {
+        str(entry.get("id")): index
+        for index, entry in enumerate(gis_lookup.load_variable_metadata()[0])
+        if entry.get("id")
+    }
+    options.sort(key=lambda entry: (
+        variable_rank.get(entry["variable"], len(variable_rank)),
+        entry["variable"],
+        _metric_rank.get(entry["metric"], len(_METRIC_ORDER)),
+        entry["metric"],
+    ))
     return options
 
 
@@ -2529,6 +2555,8 @@ def _rank_candidate_taxa(
     allowed_taxa = location_filter.allowed_taxa
     location_counts = location_filter.location_counts
     location_scope_target = location_filter.scope_target
+    variable_entry = gis_lookup.load_variable_metadata()[1].get(variable_id)
+    variable_is_categorical = bool(variable_entry and variable_entry.get("value_type") == "categorical")
     if location_filter.applied and not allowed_taxa:
         return []
 
@@ -2591,6 +2619,9 @@ def _rank_candidate_taxa(
         else:
             rank_index = position - 1
         percentile = rank_index / denominator if filtered_total > 1 else 0.0
+        display_value = numeric_value * 100.0 if (
+            _is_named_categorical_fraction_metric(metric_name, variable_is_categorical)
+        ) else numeric_value
         record = {
             "taxon_id": taxon_id if taxon_id is not None else taxon.get("taxon_key"),
             "taxon_key": taxon.get("taxon_key"),
@@ -2598,7 +2629,7 @@ def _rank_candidate_taxa(
             "common_name": common_name,
             "common_names": common_names,
             "rank": taxa_navigation.canonical_rank(taxon.get("rank")),
-            "sort_value": numeric_value,
+            "sort_value": display_value,
             "sample_count": sample_count,
             "count": filtered_total,
             "position": rank_index + 1,

@@ -1252,6 +1252,7 @@ def query_taxa(
                 unit_system=unit_system,
                 variable_id=sort_variable,
                 unit=raw_units,
+                sort_metric=sort_metric,
             )
         else:
             response_rows = query_payload["results"]

@@ -190,10 +190,14 @@ _SUMMARY_CONVERTIBLE_KEYS = {
     "75th percentile",
     "90th percentile",
     "99th percentile",
+    "interquartile range",
     "10-90 range",
     "1-99 range",
     "range",
 }
+
+# Spread metrics measure differences, not positions — apply factor only, never offset.
+_SUMMARY_SPREAD_KEYS = {"std", "stddev", "interquartile range", "10-90 range", "1-99 range", "range"}
 
 
 def variable_display_scale(variable_id: Optional[str]) -> float:
@@ -414,9 +418,21 @@ def convert_summary(
 ) -> Optional[dict[str, Any]]:
     if not summary or not target_system or not unit:
         return summary
+    canonical = normalize_unit(unit)
+    target_unit = equivalent_unit(canonical, target_system) if canonical else None
+    params = (
+        conversion_params(canonical, target_unit) if (canonical and target_unit and canonical != target_unit) else None
+    )
     converted: dict[str, Any] = dict(summary)
     for key, value in summary.items():
-        if isinstance(value, (int, float)) and str(key).strip().lower() in _SUMMARY_CONVERTIBLE_KEYS:
+        if not isinstance(value, (int, float)):
+            continue
+        normalized_key = str(key).strip().lower()
+        if normalized_key not in _SUMMARY_CONVERTIBLE_KEYS:
+            continue
+        if normalized_key in _SUMMARY_SPREAD_KEYS and params is not None:
+            converted[key] = float(value) * params.factor
+        else:
             converted[key], _ = convert_value_for_system(float(value), unit, target_system)
     return converted
 
@@ -500,6 +516,7 @@ def apply_unit_system_to_query_rows(
     *,
     variable_id: Optional[str],
     unit: Optional[str],
+    sort_metric: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
     converted_rows = [dict(row) for row in rows]
     scale = variable_display_scale(variable_id)
@@ -513,13 +530,21 @@ def apply_unit_system_to_query_rows(
     if not resolved or not unit:
         return converted_rows, unit
 
+    canonical = normalize_unit(unit)
     target_unit = equivalent_unit(unit, resolved) or unit
     display = display_unit(target_unit)
+    is_spread = sort_metric is not None and str(sort_metric).strip().lower() in _SUMMARY_SPREAD_KEYS
+    params = (
+        conversion_params(canonical, target_unit) if (is_spread and canonical and target_unit != canonical) else None
+    )
     for row in converted_rows:
         sort_value = row.get("sort_value")
         if isinstance(sort_value, (int, float)):
-            converted_value, _ = convert_value_for_system(float(sort_value), unit, resolved)
-            row["sort_value"] = converted_value
+            if is_spread and params is not None:
+                row["sort_value"] = float(sort_value) * params.factor
+            else:
+                converted_value, _ = convert_value_for_system(float(sort_value), unit, resolved)
+                row["sort_value"] = converted_value
     return converted_rows, display
 
 

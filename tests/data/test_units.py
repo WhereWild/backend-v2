@@ -90,6 +90,23 @@ def test_convert_summary_density_values_and_observations(monkeypatch):
     assert converted_summary["mean"] == pytest.approx(50.0)
     assert converted_summary["label"] == "x"
 
+    # spread metrics: factor only, no +32 offset
+    spread_summary = {
+        "std": 5.0,
+        "stddev": 5.0,
+        "interquartile range": 15.0,
+        "10-90 range": 20.0,
+        "1-99 range": 40.0,
+        "range": 10.0,
+    }
+    converted_spread = units.convert_summary(spread_summary, "c", "imperial")
+    assert converted_spread["std"] == pytest.approx(9.0)  # 5 * 9/5
+    assert converted_spread["stddev"] == pytest.approx(9.0)
+    assert converted_spread["interquartile range"] == pytest.approx(27.0)  # 15 * 9/5
+    assert converted_spread["10-90 range"] == pytest.approx(36.0)  # 20 * 9/5
+    assert converted_spread["1-99 range"] == pytest.approx(72.0)  # 40 * 9/5
+    assert converted_spread["range"] == pytest.approx(18.0)  # 10 * 9/5
+
     # convert_density_curve early returns
     assert units.convert_density_curve(None, "c", "imperial") is None
     curve = {"points": [0.0, 10.0], "density": [1.0, 2.0], "min": 0.0, "max": 10.0, "bandwidth": 2.0}
@@ -210,3 +227,25 @@ def test_apply_unit_system_helpers():
     assert converted_units == "°F"
     assert converted_rows[0]["sort_value"] == pytest.approx(50.0)
     assert converted_rows[1]["sort_value"] is None
+
+    # spread metric: factor only, no +32
+    spread_rows = [{"sort_value": 0.0}, {"sort_value": 10.0}]
+    spread_converted, _ = units.apply_unit_system_to_query_rows(
+        spread_rows,
+        "imperial",
+        variable_id="bio_1",
+        unit="c",
+        sort_metric="10-90 range",
+    )
+    assert spread_converted[0]["sort_value"] == pytest.approx(0.0)  # 0 * 9/5, no +32
+    assert spread_converted[1]["sort_value"] == pytest.approx(18.0)  # 10 * 9/5
+
+    iqr_converted, _ = units.apply_unit_system_to_query_rows(
+        spread_rows,
+        "imperial",
+        variable_id="bio_1",
+        unit="c",
+        sort_metric="interquartile range",
+    )
+    assert iqr_converted[0]["sort_value"] == pytest.approx(0.0)
+    assert iqr_converted[1]["sort_value"] == pytest.approx(18.0)

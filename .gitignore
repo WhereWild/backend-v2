@@ -1,48 +1,4 @@
 .venv/
-.build_tmp
-.cache/
-.python-version
-/data
-!tests/data/
-processed/
-cache/
-
-# Ignore macOS Finder metadata
-.DS_Store
-
-# Python cache and bytecode
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Build artifacts
-build/
-dist/
-*.egg-info/
-.eggs/
-pip-wheel-metadata/
-python_packages/
-
-# Test and coverage output
-.pytest_cache/
-.testmondata
-.testmondata*
-.mypy_cache/
-.ruff_cache/
-.tox/
-.nox/
-.coverage
-coverage.xml
-htmlcov/
-
-# Astral uv package manager cache
-.uv/
-
-# Logs
-logs/
-*.log*
-
-# Local secrets
-docker/rclone.conf
+*.pyc
 .env
-.env.local

@@ -1,0 +1,13 @@
+services:
+  gdal:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/workspace
+      - root-home:/root
+    stdin_open: true
+    tty: true
+
+volumes:
+  root-home:

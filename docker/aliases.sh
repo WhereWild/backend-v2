@@ -43,3 +43,27 @@ api-stop() {
     echo "api-stop: no running api process found"
   fi
 }
+
+pt() {
+  uv run pytest --cov=main --cov-report=term-missing "$@"
+}
+
+pl() {
+  uv run ruff check .
+}
+
+pp() {
+  pl && pt
+}
+
+ww-help() {
+  cat <<'EOF'
+api        start api in background
+api-fg     start api in foreground (with reload)
+api-stop   stop api
+
+pt         run tests with coverage
+pl         lint (ruff)
+pp         lint + test (pipeline approximation)
+EOF
+}

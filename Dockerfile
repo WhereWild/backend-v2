@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM ghcr.io/osgeo/gdal:ubuntu-full-latest
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
@@ -18,6 +18,7 @@ RUN echo '\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr
  && git config --global --add safe.directory /workspace
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV UV_LINK_MODE=copy
 
 WORKDIR /workspace
 

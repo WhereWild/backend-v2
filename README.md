@@ -1,5 +1,7 @@
 # WhereWild Backend v2
 
+![CI](https://github.com/WhereWild/backend-v2/actions/workflows/ci.yml/badge.svg)
+
 ## Getting started
 
 ```bash

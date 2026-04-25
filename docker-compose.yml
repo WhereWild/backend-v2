@@ -1,28 +1,13 @@
-name: ${WHEREWILD_COMPOSE_NAME:-wherewild}
-
 services:
   gdal:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ${WHEREWILD_IMAGE:-wherewild-gdal}
-    working_dir: /workspace
-    user: "${DOCKER_UID}:${DOCKER_GID}"
+    build: .
+    ports:
+      - "8000:8000"
     volumes:
       - .:/workspace
-      - ${WHEREWILD_HOST_DATA_DIR:-./data}:/workspace/data
-    ports:
-      - "${WHEREWILD_API_PORT:-8000}:8000"
-      - "${WHEREWILD_DOCS_PORT:-9101}:9101"
-    environment:
-      - RCLONE_CONFIG=/workspace/docker/rclone.conf
-    devices:
-      - /dev/fuse
-    cap_add:
-      - SYS_ADMIN
-    security_opt:
-      - apparmor:unconfined
-    mem_limit: 16g
-    init: true
+      - root-home:/root
     stdin_open: true
     tty: true
+
+volumes:
+  root-home:

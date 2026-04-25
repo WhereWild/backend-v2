@@ -1,36 +1,32 @@
-FROM ghcr.io/osgeo/gdal:ubuntu-full-latest
+FROM python:3.12-slim
 
-WORKDIR /app
-
-RUN sed -i 's|archive.ubuntu.com|us.archive.ubuntu.com|g' /etc/apt/sources.list
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 RUN apt-get update \
- && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    python3-pip \
-    python3-venv \
-    python3-dev \
+ && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    wget \
+    vim \
+    less \
+    htop \
+    bash-completion \
     build-essential \
-        bash-completion \
-    fuse \
-    psmisc \
-    rclone \
- && rm -rf /var/lib/apt/lists/* \
- && python3 -m venv /opt/venv
+ && rm -rf /var/lib/apt/lists/*
 
-ENV PATH="/opt/venv/bin:${PATH}"
+RUN echo '\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr/share/bash-completion/bash_completion\nfi' >> /etc/bash.bashrc \
+ && git config --global --add safe.directory /workspace
 
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /tmp/requirements.txt
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 
-COPY . /app
+WORKDIR /workspace
 
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project
+
+COPY . .
+
+RUN echo '\n[ -f /etc/wherewild_aliases.sh ] && . /etc/wherewild_aliases.sh' >> /etc/bash.bashrc
 COPY docker/aliases.sh /etc/wherewild_aliases.sh
-RUN echo '\n# WhereWild dev aliases\n[ -f /etc/wherewild_aliases.sh ] && . /etc/wherewild_aliases.sh' >> /etc/bash.bashrc \
-    && echo '\n# Enable bash completion\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr/share/bash-completion/bash_completion\nfi' >> /etc/bash.bashrc
 
-COPY docker/entrypoint.sh /usr/local/bin/wherewild-entrypoint
-COPY docker/auto_pull_service.sh /usr/local/bin/wherewild-auto-pull-service
-RUN chmod +x /usr/local/bin/wherewild-entrypoint /usr/local/bin/wherewild-auto-pull-service
-ENTRYPOINT ["/usr/local/bin/wherewild-entrypoint"]
 CMD ["bash"]

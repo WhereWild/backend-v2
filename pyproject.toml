@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.136.1",
+    "httpx>=0.28.1",
     "uvicorn[standard]>=0.46.0",
 ]
 
@@ -17,10 +18,18 @@ select = ["E", "F", "I", "N", "UP", "PT"]
 testpaths = ["tests"]
 pythonpath = ["."]
 
+[tool.coverage.run]
+source = ["main", "scripts"]
+omit = ["*/tests/*", "*/test_*"]
+
+[tool.coverage.report]
+skip_empty = true
+show_missing = true
+
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
+    "pytest-httpx>=0.35.0",
     "ruff>=0.15.12",
 ]

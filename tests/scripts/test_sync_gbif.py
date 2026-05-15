@@ -71,7 +71,9 @@ def test_latest_crawl_finished_skips_non_normal(httpx_mock: HTTPXMock):
 
 
 def test_latest_crawl_finished_none_normal(httpx_mock: HTTPXMock):
-    httpx_mock.add_response(json={"results": [{"finishReason": "ABORT", "finishedCrawling": CRAWL_TS}]})
+    httpx_mock.add_response(
+        json={"results": [{"finishReason": "ABORT", "finishedCrawling": CRAWL_TS}]}
+    )
     with pytest.raises(RuntimeError, match="No successful crawl"):
         sync_gbif.latest_crawl_finished()
 
@@ -159,7 +161,7 @@ def test_extract():
 
 def test_main_missing_creds(monkeypatch):
     monkeypatch.setattr(sync_gbif, "GBIF_USER", "")
-    with pytest.raises(EnvironmentError):
+    with pytest.raises(OSError, match="GBIF_USER"):
         sync_gbif.main()
 
 

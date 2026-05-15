@@ -11,7 +11,7 @@ import json
 import os
 import time
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -84,7 +84,7 @@ def _build_citation(gbif_meta: dict) -> str:
     doi = gbif_meta.get("doi", "")
     created = gbif_meta.get("created", "")
     try:
-        dt = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(timezone.utc)
+        dt = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone(UTC)
         date_str = dt.strftime("%-d %B %Y")
     except (ValueError, AttributeError):
         date_str = created
@@ -113,7 +113,9 @@ def download_zip(url: str) -> None:
     print(f"Downloading {url}...")
     CATALOG_DIR.mkdir(parents=True, exist_ok=True)
     dest = CATALOG_DIR / "download.zip"
-    with httpx.stream("GET", url, auth=(GBIF_USER, GBIF_PASSWORD), timeout=300, follow_redirects=True) as r:
+    with httpx.stream(
+        "GET", url, auth=(GBIF_USER, GBIF_PASSWORD), timeout=300, follow_redirects=True
+    ) as r:
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_bytes(chunk_size=8192):
@@ -131,7 +133,7 @@ def extract() -> None:
 
 def main() -> None:
     if not all([GBIF_USER, GBIF_PASSWORD, GBIF_EMAIL]):
-        raise EnvironmentError("GBIF_USER, GBIF_PASSWORD, and GBIF_EMAIL must be set")
+        raise OSError("GBIF_USER, GBIF_PASSWORD, and GBIF_EMAIL must be set")
 
     print("Checking GBIF iNat crawl history...")
     crawl_finished = latest_crawl_finished()

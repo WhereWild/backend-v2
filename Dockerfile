@@ -23,7 +23,8 @@ ENV UV_LINK_MODE=copy
 WORKDIR /workspace
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project
+RUN uv sync --frozen --no-install-project \
+ && chmod -R a+w /opt/venv
 
 COPY . .
 

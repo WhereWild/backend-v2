@@ -19,7 +19,7 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.coverage.run]
-source = ["main", "scripts"]
+source = ["main", "scripts", "config"]
 omit = ["*/tests/*", "*/test_*"]
 
 [tool.coverage.report]

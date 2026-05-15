@@ -52,7 +52,7 @@ api-stop() {
 }
 
 pt() {
-  uv run pytest --cov=main --cov=scripts --cov-report=term-missing "$@"
+  uv run pytest --cov=main --cov=scripts --cov=config --cov-report=term-missing "$@"
 }
 
 pl() {

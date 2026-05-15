@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Sync GBIF species list for Plantae (full taxonomy, all ranks).
 
@@ -16,13 +15,16 @@ from pathlib import Path
 
 import httpx
 
+from config.config import load_config
+
 GBIF_USER = os.environ.get("GBIF_USER", "")
 GBIF_PASSWORD = os.environ.get("GBIF_PASSWORD", "")
 GBIF_EMAIL = os.environ.get("GBIF_EMAIL", "")
 
 BASE_URL = "https://api.gbif.org/v1"
 INAT_DATASET_KEY = "50c9509d-22c7-4a22-a47d-8c48425ef4a7"
-PLANTAE_KEY = 6
+
+CONFIG = load_config("global")
 
 CATALOG_DIR = Path("data/taxonomy/catalog")
 
@@ -63,7 +65,7 @@ def request_download() -> str:
         "predicate": {
             "type": "equals",
             "key": "TAXON_KEY",
-            "value": str(PLANTAE_KEY),
+            "value": str(CONFIG.plantae_key),
         },
     }
     resp = httpx.post(

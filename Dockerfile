@@ -17,14 +17,16 @@ RUN apt-get update \
 RUN echo '\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr/share/bash-completion/bash_completion\nfi' >> /etc/bash.bashrc \
  && git config --global --add safe.directory /workspace
 
-ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+RUN mkdir -p /opt/venvs && chmod 777 /opt/venvs
+
+ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/venv
 ENV UV_LINK_MODE=copy
 
 WORKDIR /workspace
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project \
- && chmod -R a+w /opt/venv
+ && chmod -R a+w /opt/venvs
 
 COPY . .
 

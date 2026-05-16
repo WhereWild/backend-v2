@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from util import taxa
-from util.taxa import normalize_name, taxon_slug
+from util.taxa import format_common_name, normalize_name, taxon_slug
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
@@ -55,9 +55,9 @@ def query_taxa(
         results.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
-            "common_name": (
-                taxon.get("inat_preferred_common_name") or taxon.get("common_name") or None
-            ),
+            "common_name": format_common_name(
+                taxon.get("inat_preferred_common_name") or taxon.get("common_name") or ""
+            ) or None,
             "common_names": None,
             "rank": taxon.get("rank"),
             "slug": taxon_slug(taxon.get("scientific_name")),

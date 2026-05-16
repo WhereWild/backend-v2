@@ -492,6 +492,72 @@ def test_run_inat_preferred_error_continues(monkeypatch):
     assert im == 0
 
 
+# --- rebuild_index ---
+
+def test_rebuild_index(monkeypatch, tmp_path):
+    monkeypatch.setattr(an, "CATALOG_PATH", tmp_path / "taxon_catalog.pkl")
+    payload = {
+        "catalog": {"2923970": {"common_name": "Prickly Pear", "inat_preferred_common_name": ""}},
+        "combined_name_index": {},
+    }
+    with open(tmp_path / "taxon_catalog.pkl", "wb") as f:
+        pickle.dump(payload, f)
+    an.rebuild_index()
+    with open(tmp_path / "taxon_catalog.pkl", "rb") as f:
+        result = pickle.load(f)
+    assert "2923970" in result["combined_name_index"]["prickly pear"]
+
+
+# --- update_name_index ---
+
+def test_update_name_index_adds_common_name():
+    payload = {
+        "catalog": {"2923970": {"common_name": "Prickly Pear", "inat_preferred_common_name": ""}},
+        "combined_name_index": {},
+    }
+    added = an.update_name_index(payload)
+    assert added == 1
+    assert "2923970" in payload["combined_name_index"]["prickly pear"]
+
+
+def test_update_name_index_adds_preferred_name():
+    payload = {
+        "catalog": {
+            "2923970": {"common_name": "", "inat_preferred_common_name": "Eastern Prickly Pear"},
+        },
+        "combined_name_index": {},
+    }
+    added = an.update_name_index(payload)
+    assert added == 1
+    assert "2923970" in payload["combined_name_index"]["eastern prickly pear"]
+
+
+def test_update_name_index_skips_existing():
+    payload = {
+        "catalog": {"2923970": {"common_name": "Prickly Pear", "inat_preferred_common_name": ""}},
+        "combined_name_index": {"prickly pear": ["2923970"]},
+    }
+    added = an.update_name_index(payload)
+    assert added == 0
+
+
+def test_update_name_index_skips_empty():
+    payload = {
+        "catalog": {"2923970": {"common_name": "", "inat_preferred_common_name": ""}},
+        "combined_name_index": {},
+    }
+    assert an.update_name_index(payload) == 0
+
+
+def test_update_name_index_skips_normalizes_to_empty():
+    # "_" passes the raw strip check but normalizes to "" via replace("_", " ").split()
+    payload = {
+        "catalog": {"2923970": {"common_name": "_", "inat_preferred_common_name": ""}},
+        "combined_name_index": {},
+    }
+    assert an.update_name_index(payload) == 0
+
+
 # --- main ---
 
 def test_main(monkeypatch, tmp_path):
@@ -515,3 +581,4 @@ def test_main(monkeypatch, tmp_path):
     with open(tmp_path / "taxon_catalog.pkl", "rb") as f:
         result = pickle.load(f)
     assert result["catalog"]["2923970"]["common_name"] == "Prickly Pear"
+    assert "2923970" in result["combined_name_index"]["prickly pear"]

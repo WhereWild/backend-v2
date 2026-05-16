@@ -300,6 +300,198 @@ def test_fetch_backbone_vernacular_download(monkeypatch, tmp_path):
     assert state["gbif_backbone"]["etag"] == '"new-etag"'
 
 
+# --- fetch_taxa_batch ---
+
+def test_fetch_taxa_batch(monkeypatch):
+    payload = {"results": [{"id": "55555", "preferred_common_name": "Prickly Pear"}]}
+
+    def mock_urlopen(req, timeout=30):
+        resp = MagicMock()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        resp.read.return_value = json.dumps(payload).encode("utf-8")
+        return resp
+
+    monkeypatch.setattr(an, "urlopen", mock_urlopen)
+    result = an.fetch_taxa_batch(["55555"])
+    assert result == [{"id": "55555", "preferred_common_name": "Prickly Pear"}]
+
+
+def test_fetch_taxa_batch_empty_results(monkeypatch):
+    def mock_urlopen(req, timeout=30):
+        resp = MagicMock()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        resp.read.return_value = json.dumps({"results": []}).encode("utf-8")
+        return resp
+
+    monkeypatch.setattr(an, "urlopen", mock_urlopen)
+    assert an.fetch_taxa_batch(["99999"]) == []
+
+
+# --- extract_preferred_image_metadata ---
+
+_PHOTO = {
+    "id": "123",
+    "medium_url": "https://inaturalist-open-data.s3.amazonaws.com/photos/123/medium.jpg",
+    "license_code": "cc-by-nc",
+    "attribution_name": "Alice",
+    "attribution": "(c) Alice, some rights reserved",
+}
+
+
+def test_extract_preferred_image_metadata_full():
+    result = an.extract_preferred_image_metadata({"default_photo": _PHOTO})
+    assert result["inat_preferred_image"] == _PHOTO["medium_url"]
+    assert result["inat_preferred_image_license"] == "cc-by-nc"
+    assert result["inat_preferred_image_creator"] == "Alice"
+    assert result["inat_preferred_image_references"] == "https://www.inaturalist.org/photos/123"
+
+
+def test_extract_preferred_image_metadata_no_photo():
+    assert an.extract_preferred_image_metadata({}) == {}
+
+
+def test_extract_preferred_image_metadata_no_url():
+    assert an.extract_preferred_image_metadata({"default_photo": {"id": "1"}}) == {}
+
+
+def test_extract_preferred_image_metadata_prefers_original():
+    photo = {**_PHOTO, "original_url": "https://example.com/original.jpg"}
+    result = an.extract_preferred_image_metadata({"default_photo": photo})
+    assert result["inat_preferred_image"] == "https://example.com/original.jpg"
+
+
+def test_extract_preferred_image_metadata_no_photo_id():
+    photo = {k: v for k, v in _PHOTO.items() if k != "id"}
+    result = an.extract_preferred_image_metadata({"default_photo": photo})
+    assert result["inat_preferred_image_references"] == ""
+
+
+# --- apply_inat_preferred ---
+
+_EMPTY_ENTRY = {"inat_id": "55555", "inat_preferred_common_name": "", "inat_preferred_image": ""}
+
+
+def test_apply_inat_preferred_name():
+    catalog = {"2923970": dict(_EMPTY_ENTRY)}
+    inat_to_taxa = {"55555": ["2923970"]}
+    results = [{"id": "55555", "preferred_common_name": "Prickly Pear"}]
+    n, im = an.apply_inat_preferred(catalog, inat_to_taxa, results)
+    assert n == 1
+    assert catalog["2923970"]["inat_preferred_common_name"] == "Prickly Pear"
+    assert im == 0
+
+
+def test_apply_inat_preferred_image():
+    catalog = {"2923970": {"inat_preferred_common_name": "", "inat_preferred_image": ""}}
+    inat_to_taxa = {"55555": ["2923970"]}
+    results = [{"id": "55555", "preferred_common_name": "", "default_photo": _PHOTO}]
+    n, im = an.apply_inat_preferred(catalog, inat_to_taxa, results)
+    assert im == 1
+    assert catalog["2923970"]["inat_preferred_image"] == _PHOTO["medium_url"]
+
+
+def test_apply_inat_preferred_skips_existing_name():
+    catalog = {"2923970": {"inat_preferred_common_name": "Existing", "inat_preferred_image": ""}}
+    inat_to_taxa = {"55555": ["2923970"]}
+    results = [{"id": "55555", "preferred_common_name": "New Name"}]
+    n, _ = an.apply_inat_preferred(catalog, inat_to_taxa, results)
+    assert n == 0
+    assert catalog["2923970"]["inat_preferred_common_name"] == "Existing"
+
+
+def test_apply_inat_preferred_skips_existing_image():
+    catalog = {"2923970": {
+        "inat_preferred_common_name": "",
+        "inat_preferred_image": "https://example.com/img.jpg",
+    }}
+    inat_to_taxa = {"55555": ["2923970"]}
+    results = [{"id": "55555", "preferred_common_name": "", "default_photo": _PHOTO}]
+    _, im = an.apply_inat_preferred(catalog, inat_to_taxa, results)
+    assert im == 0
+
+
+def test_apply_inat_preferred_no_inat_id():
+    catalog = {}
+    inat_to_taxa = {}
+    results = [{"preferred_common_name": "Name"}]  # no "id"
+    n, im = an.apply_inat_preferred(catalog, inat_to_taxa, results)
+    assert n == 0
+    assert im == 0
+
+
+def test_apply_inat_preferred_missing_catalog_entry():
+    catalog = {}  # taxon_key not in catalog
+    inat_to_taxa = {"55555": ["2923970"]}
+    results = [{"id": "55555", "preferred_common_name": "Name"}]
+    n, im = an.apply_inat_preferred(catalog, inat_to_taxa, results)
+    assert n == 0
+    assert im == 0
+
+
+# --- run_inat_preferred ---
+
+def test_run_inat_preferred_nothing_to_do():
+    catalog = {"1": {"inat_id": "", "inat_preferred_common_name": "", "inat_preferred_image": ""}}
+    n, im = an.run_inat_preferred(catalog)
+    assert n == 0
+    assert im == 0
+
+
+def test_run_inat_preferred_skips_complete():
+    catalog = {"1": {
+        "inat_id": "55555",
+        "inat_preferred_common_name": "Prickly Pear",
+        "inat_preferred_image": "https://example.com/img.jpg",
+    }}
+    n, im = an.run_inat_preferred(catalog)
+    assert n == 0
+    assert im == 0
+
+
+def test_run_inat_preferred_fetches_and_applies(monkeypatch):
+    catalog = {"2923970": dict(_EMPTY_ENTRY)}
+    monkeypatch.setattr(an, "fetch_taxa_batch", lambda ids, timeout=30: [
+        {"id": "55555", "preferred_common_name": "Prickly Pear", "default_photo": _PHOTO}
+    ])
+    monkeypatch.setattr(an.time, "sleep", lambda _: None)
+    n, im = an.run_inat_preferred(catalog)
+    assert n == 1
+    assert im == 1
+    assert catalog["2923970"]["inat_preferred_common_name"] == "Prickly Pear"
+
+
+def test_run_inat_preferred_progress_print(monkeypatch, capsys):
+    catalog = {
+        str(i): {"inat_id": str(i), "inat_preferred_common_name": "", "inat_preferred_image": ""}
+        for i in range(1, 2002)
+    }
+    monkeypatch.setattr(an, "INAT_BATCH_SIZE", 200)
+    monkeypatch.setattr(an, "fetch_taxa_batch", lambda ids, timeout=30: [])
+    monkeypatch.setattr(an.time, "sleep", lambda _: None)
+    an.run_inat_preferred(catalog)
+    out = capsys.readouterr().out
+    assert "[10/" in out
+
+
+def test_run_inat_preferred_error_continues(monkeypatch):
+    catalog = {"2923970": dict(_EMPTY_ENTRY)}
+    call_count = 0
+
+    def bad_fetch(ids, timeout=30):
+        nonlocal call_count
+        call_count += 1
+        raise OSError("network error")
+
+    monkeypatch.setattr(an, "fetch_taxa_batch", bad_fetch)
+    monkeypatch.setattr(an.time, "sleep", lambda _: None)
+    n, im = an.run_inat_preferred(catalog)
+    assert call_count == 1
+    assert n == 0
+    assert im == 0
+
+
 # --- main ---
 
 def test_main(monkeypatch, tmp_path):
@@ -316,6 +508,7 @@ def test_main(monkeypatch, tmp_path):
     tsv = _make_tsv([])
     monkeypatch.setattr(an, "fetch_inat_dwca", lambda: dwca)
     monkeypatch.setattr(an, "fetch_backbone_vernacular", lambda: tsv)
+    monkeypatch.setattr(an, "run_inat_preferred", lambda catalog: (0, 0))
 
     an.main()
 

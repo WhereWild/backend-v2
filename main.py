@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from util import taxa
+from util import citations, taxa
 from util.taxa import format_common_name, normalize_name, taxon_slug
 
 app = FastAPI()
@@ -11,6 +11,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], a
 @app.get("/")
 def root():
     return {"status": "ok"}
+
+
+@app.get("/data-sources")
+def data_sources():
+    return citations.load_data_sources()
 
 
 @app.get("/api/taxon/{taxon_id}")

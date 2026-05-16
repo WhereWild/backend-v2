@@ -20,10 +20,11 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.coverage.run]
-source = ["main", "scripts", "config", "util"]
-omit = ["*/tests/*", "*/test_*"]
+source = ["."]
+omit = [".venv/*", "*/tests/*", "*/test_*"]
 
 [tool.coverage.report]
+include = ["main.py", "scripts/*.py", "config/*.py", "util/*.py"]
 skip_empty = true
 show_missing = true
 

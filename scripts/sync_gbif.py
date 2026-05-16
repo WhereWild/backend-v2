@@ -63,9 +63,12 @@ def request_download() -> str:
         "sendNotification": True,
         "format": "SPECIES_LIST",
         "predicate": {
-            "type": "equals",
-            "key": "TAXON_KEY",
-            "value": str(CONFIG.plantae_key),
+            "type": "and",
+            "predicates": [
+                {"type": "equals", "key": "DATASET_KEY", "value": INAT_DATASET_KEY},
+                {"type": "equals", "key": "TAXON_KEY", "value": str(CONFIG.plantae_key)},
+                {"type": "equals", "key": "OCCURRENCE_STATUS", "value": "PRESENT"},
+            ],
         },
     }
     resp = httpx.post(
@@ -129,6 +132,10 @@ def extract() -> None:
     zip_file = CATALOG_DIR / "download.zip"
     with zipfile.ZipFile(zip_file, "r") as z:
         z.extractall(CATALOG_DIR)
+    for f in CATALOG_DIR.glob("*.csv"):
+        if f.name != "species_list.csv":
+            f.rename(CATALOG_DIR / "species_list.csv")
+            break
     files = [f.name for f in CATALOG_DIR.iterdir()]
     print(f"Extracted to {CATALOG_DIR}/: {files}")
 

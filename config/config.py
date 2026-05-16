@@ -24,3 +24,11 @@ def load_config(name: str) -> Any:
 @register_config("global")
 class GlobalConfig:
     plantae_key: int = 6
+    leaf_ranks: tuple[str, ...] = ("SPECIES", "SUBSPECIES", "VARIETY", "FORM")
+    subspecies_equivalents: tuple[str, ...] = ("SUBSPECIES", "VARIETY", "FORM")
+    species_rank: str = "SPECIES"
+    do_write_dirs: bool = True  # writes taxonomy folder tree to data/taxonomy/tree/
+
+    @property
+    def leaf_rank_set(self) -> frozenset[str]:
+        return frozenset(self.leaf_ranks)

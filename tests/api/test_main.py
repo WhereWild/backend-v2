@@ -17,6 +17,17 @@ TAXON = {
 }
 
 
+def test_data_sources():
+    from unittest.mock import patch as _patch
+
+    import util.citations as cit
+    fake = {"gbif_backbone": {"name": "GBIF Backbone Taxonomy"}}
+    with _patch.object(cit, "load_data_sources", return_value=fake):
+        response = client.get("/data-sources")
+    assert response.status_code == 200
+    assert "gbif_backbone" in response.json()
+
+
 def test_health():
     response = client.get("/")
     assert response.status_code == 200

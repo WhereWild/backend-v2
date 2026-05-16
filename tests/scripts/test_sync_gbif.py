@@ -198,5 +198,6 @@ def test_main_new_crawl(httpx_mock: HTTPXMock):
     assert state["gbif_taxonomy"]["crawl_finished"] == CRAWL_TS
     assert state["gbif_taxonomy"]["download_key"] == DOWNLOAD_KEY
     assert state["gbif_taxonomy"]["doi"] == "10.15468/dl.7xvnxe"
+    assert state["gbif_taxonomy"]["download_link"] == DOWNLOAD_LINK
     assert state["gbif_taxonomy"]["total_records"] == 1122173
     assert "GBIF.org" in state["gbif_taxonomy"]["citation"]

@@ -1,8 +1,12 @@
+import pickle
 from unittest.mock import patch
 
 import pytest
 
 import util.taxa as taxa
+
+# Captured before any test mocking applies
+_real_load_payload = taxa._load_payload.__wrapped__
 
 CATALOG = {
     "2923970": {
@@ -47,6 +51,14 @@ def clear_lru_caches():
 def mock_payload():
     with patch.object(taxa, "_load_payload", return_value=PAYLOAD):
         yield
+
+
+# --- _load_payload ---
+
+def test_load_payload_reads_pickle(tmp_path, monkeypatch):
+    (tmp_path / "taxon_catalog.pkl").write_bytes(pickle.dumps(PAYLOAD))
+    monkeypatch.setattr(taxa, "CATALOG_DIR", tmp_path)
+    assert _real_load_payload() == PAYLOAD
 
 
 # --- normalize_name ---

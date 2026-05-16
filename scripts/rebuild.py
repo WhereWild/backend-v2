@@ -64,7 +64,13 @@ def _set_stage(name: str, status: str) -> None:
     pipeline = state.get("pipeline", {})
     pipeline["stage"] = name
     stages = pipeline.get("stages", {})
-    stages[name] = status
+    entry = stages.get(name, {}) if isinstance(stages.get(name), dict) else {}
+    entry["status"] = status
+    if status == "in_progress":
+        entry["started_at"] = _now()
+    elif status == "completed":
+        entry["finished_at"] = _now()
+    stages[name] = entry
     pipeline["stages"] = stages
     state["pipeline"] = pipeline
     _write_sync_state(state)
@@ -193,7 +199,14 @@ def main() -> None:
         polish_tree.main()
         _set_stage("polish_tree", "completed")
 
-        _update_pipeline({"status": "completed", "stage": None, "finished_at": _now()})
+        finished_at = _now()
+        _update_pipeline({"status": "completed", "stage": None, "finished_at": finished_at})
+        final_state = _read_sync_state()
+        notify("completed", {
+            "started_at": final_state.get("pipeline", {}).get("started_at"),
+            "finished_at": finished_at,
+            "stages": final_state.get("pipeline", {}).get("stages", {}),
+        })
         print("\nRebuild complete.")
 
     except Exception as e:

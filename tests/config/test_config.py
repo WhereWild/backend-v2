@@ -9,6 +9,9 @@ def test_load_config_global():
     cfg = load_config("global")
     assert isinstance(cfg, GlobalConfig)
     assert cfg.plantae_key == 6
+    assert cfg.species_rank == "SPECIES"
+    assert "SUBSPECIES" in cfg.leaf_rank_set
+    assert cfg.do_write_dirs is True
 
 
 def test_load_config_cached():

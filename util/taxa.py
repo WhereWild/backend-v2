@@ -22,6 +22,24 @@ def normalize_name(value: str) -> str:
     return " ".join(value.replace("_", " ").lower().split())
 
 
+def format_common_name(value: str) -> str:
+    """Title-case a common name, preserving short all-caps acronyms (e.g. 'NW', 'USA')."""
+    if not value:
+        return ""
+    words = []
+    for word in value.split(" "):
+        if len(word) <= 4 and word.isupper():
+            words.append(word)
+        elif "'" in word:
+            parts = word.lower().split("'", 1)
+            first = (parts[0][0].upper() + parts[0][1:]) if parts[0] else ""
+            words.append(f"{first}'{parts[1]}" if parts[1] else first)
+        else:
+            w = word.lower()
+            words.append(w[:1].upper() + w[1:])
+    return " ".join(words).strip()
+
+
 def taxon_slug(value: str | None) -> str:
     normalized = normalize_name(value or "")
     if not normalized:

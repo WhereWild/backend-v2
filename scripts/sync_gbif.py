@@ -27,6 +27,7 @@ INAT_DATASET_KEY = "50c9509d-22c7-4a22-a47d-8c48425ef4a7"
 CONFIG = load_config("global")
 
 CATALOG_DIR = Path("data/taxonomy/catalog")
+SYNC_STATE_PATH = Path("data/sync_state.json")
 
 
 def latest_crawl_finished() -> str:
@@ -44,16 +45,15 @@ def latest_crawl_finished() -> str:
     raise RuntimeError("No successful crawl found in recent history")
 
 
-def load_meta() -> dict:
-    meta_file = CATALOG_DIR / "meta.json"
-    if meta_file.exists():
-        return json.loads(meta_file.read_text())
+def load_sync_state() -> dict:
+    if SYNC_STATE_PATH.exists():
+        return json.loads(SYNC_STATE_PATH.read_text())
     return {}
 
 
-def save_meta(data: dict) -> None:
-    CATALOG_DIR.mkdir(parents=True, exist_ok=True)
-    (CATALOG_DIR / "meta.json").write_text(json.dumps(data, indent=2))
+def save_sync_state(state: dict) -> None:
+    SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SYNC_STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
 def request_download() -> str:
@@ -146,9 +146,9 @@ def main() -> None:
 
     print("Checking GBIF iNat crawl history...")
     crawl_finished = latest_crawl_finished()
-    meta = load_meta()
+    state = load_sync_state()
 
-    if meta.get("crawl_finished") == crawl_finished:
+    if state.get("gbif_taxonomy", {}).get("crawl_finished") == crawl_finished:
         print(f"Already up to date (last crawl: {crawl_finished})")
         return
 
@@ -159,7 +159,7 @@ def main() -> None:
     download_zip(gbif_meta["downloadLink"])
     extract()
 
-    save_meta({
+    state["gbif_taxonomy"] = {
         "crawl_finished": crawl_finished,
         "download_key": download_key,
         "doi": gbif_meta.get("doi"),
@@ -169,7 +169,8 @@ def main() -> None:
         "total_records": gbif_meta.get("totalRecords"),
         "number_datasets": gbif_meta.get("numberDatasets"),
         "size_bytes": gbif_meta.get("size"),
-    })
+    }
+    save_sync_state(state)
     print("Done.")
 
 

@@ -16,6 +16,7 @@ DOWNLOAD_LINK = "https://api.gbif.org/v1/occurrence/download/request/0020579-260
 @pytest.fixture(autouse=True)
 def patch_catalog_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(sync_gbif, "CATALOG_DIR", tmp_path / "catalog")
+    monkeypatch.setattr(sync_gbif, "SYNC_STATE_PATH", tmp_path / "sync_state.json")
 
 
 @pytest.fixture(autouse=True)
@@ -78,23 +79,25 @@ def test_latest_crawl_finished_none_normal(httpx_mock: HTTPXMock):
         sync_gbif.latest_crawl_finished()
 
 
-# --- load_meta / save_meta ---
+# --- load_sync_state / save_sync_state ---
 
-def test_load_meta_missing():
-    assert sync_gbif.load_meta() == {}
-
-
-def test_load_meta_existing():
-    sync_gbif.CATALOG_DIR.mkdir(parents=True)
-    (sync_gbif.CATALOG_DIR / "meta.json").write_text(json.dumps({"crawl_finished": CRAWL_TS}))
-    assert sync_gbif.load_meta() == {"crawl_finished": CRAWL_TS}
+def test_load_sync_state_missing():
+    assert sync_gbif.load_sync_state() == {}
 
 
-def test_save_meta():
-    sync_gbif.save_meta({"crawl_finished": CRAWL_TS, "download_key": DOWNLOAD_KEY})
-    saved = json.loads((sync_gbif.CATALOG_DIR / "meta.json").read_text())
-    assert saved["crawl_finished"] == CRAWL_TS
-    assert saved["download_key"] == DOWNLOAD_KEY
+def test_load_sync_state_existing():
+    data = {"gbif_taxonomy": {"crawl_finished": CRAWL_TS}}
+    sync_gbif.SYNC_STATE_PATH.write_text(json.dumps(data))
+    assert sync_gbif.load_sync_state() == data
+
+
+def test_save_sync_state():
+    sync_gbif.save_sync_state({
+        "gbif_taxonomy": {"crawl_finished": CRAWL_TS, "download_key": DOWNLOAD_KEY},
+    })
+    saved = json.loads(sync_gbif.SYNC_STATE_PATH.read_text())
+    assert saved["gbif_taxonomy"]["crawl_finished"] == CRAWL_TS
+    assert saved["gbif_taxonomy"]["download_key"] == DOWNLOAD_KEY
 
 
 # --- request_download ---
@@ -177,7 +180,7 @@ def test_main_missing_creds(monkeypatch):
 
 def test_main_already_up_to_date(httpx_mock: HTTPXMock, capsys):
     httpx_mock.add_response(json=_crawl_response())
-    sync_gbif.save_meta({"crawl_finished": CRAWL_TS})
+    sync_gbif.save_sync_state({"gbif_taxonomy": {"crawl_finished": CRAWL_TS}})
     sync_gbif.main()
     assert "Already up to date" in capsys.readouterr().out
 
@@ -191,9 +194,9 @@ def test_main_new_crawl(httpx_mock: HTTPXMock):
          patch("scripts.sync_gbif.extract"):
         sync_gbif.main()
 
-    meta = json.loads((sync_gbif.CATALOG_DIR / "meta.json").read_text())
-    assert meta["crawl_finished"] == CRAWL_TS
-    assert meta["download_key"] == DOWNLOAD_KEY
-    assert meta["doi"] == "10.15468/dl.7xvnxe"
-    assert meta["total_records"] == 1122173
-    assert "GBIF.org" in meta["citation"]
+    state = json.loads(sync_gbif.SYNC_STATE_PATH.read_text())
+    assert state["gbif_taxonomy"]["crawl_finished"] == CRAWL_TS
+    assert state["gbif_taxonomy"]["download_key"] == DOWNLOAD_KEY
+    assert state["gbif_taxonomy"]["doi"] == "10.15468/dl.7xvnxe"
+    assert state["gbif_taxonomy"]["total_records"] == 1122173
+    assert "GBIF.org" in state["gbif_taxonomy"]["citation"]

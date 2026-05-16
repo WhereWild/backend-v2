@@ -5,7 +5,7 @@ import pickle
 import zipfile
 from unittest.mock import MagicMock
 
-import scripts.get_preferred as an
+import scripts.polish_tree as an
 
 CATALOG = {
     "2923970": {"taxon_key": "2923970", "scientific_name": "Opuntia_humifusa",

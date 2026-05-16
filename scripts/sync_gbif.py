@@ -140,7 +140,8 @@ def extract() -> None:
     print(f"Extracted to {CATALOG_DIR}/: {files}")
 
 
-def main() -> None:
+def main() -> bool:
+    """Return True if new data was downloaded, False if already up to date."""
     if not all([GBIF_USER, GBIF_PASSWORD, GBIF_EMAIL]):
         raise OSError("GBIF_USER, GBIF_PASSWORD, and GBIF_EMAIL must be set")
 
@@ -150,7 +151,7 @@ def main() -> None:
 
     if state.get("gbif_taxonomy", {}).get("crawl_finished") == crawl_finished:
         print(f"Already up to date (last crawl: {crawl_finished})")
-        return
+        return False
 
     print(f"New crawl detected: {crawl_finished}")
 
@@ -173,6 +174,7 @@ def main() -> None:
     }
     save_sync_state(state)
     print("Done.")
+    return True
 
 
 if __name__ == "__main__":  # pragma: no cover

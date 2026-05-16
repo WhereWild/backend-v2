@@ -128,6 +128,7 @@ def main() -> None:
         raise FileNotFoundError(f"Species list not found: {csv_path} — run sync_gbif first")
 
     print(f"Building catalog from {csv_path}...")
+    CONFIG.do_write_dirs = True
     catalog, combined_index = build_catalog(csv_path)
 
     out_path = CATALOG_DIR / "taxon_catalog.pkl"

@@ -155,15 +155,20 @@ def test_main_full_pipeline_completes(tmp_path):
          patch("scripts.build_id_maps.main", side_effect=lambda: call_order.append("maps")), \
          patch("scripts.polish_tree.main", side_effect=lambda: call_order.append("polish")), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
-         patch("scripts.rebuild._release_inhibitor"):
+         patch("scripts.rebuild._release_inhibitor"), \
+         patch("scripts.rebuild.notify") as mock_notify:
         rebuild.main()
 
     assert call_order == ["wipe", "tree", "maps", "polish"]
     p = _pipeline(tmp_path)
     assert p["status"] == "completed"
-    assert all(p["stages"][s] == "completed"
+    assert all(p["stages"][s]["status"] == "completed"
                for s in ["sync_gbif", "build_tree", "build_id_maps", "polish_tree"])
     assert p["error"] is None
+    mock_notify.assert_called_once()
+    event, payload = mock_notify.call_args[0]
+    assert event == "completed"
+    assert "stages" in payload
 
 
 def test_main_wipe_happens_before_sync_download(tmp_path):
@@ -201,7 +206,7 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
          patch("scripts.rebuild._release_inhibitor"):
         rebuild.main()
 
-    assert seen[0] == "in_progress"
+    assert seen[0]["status"] == "in_progress"
 
 
 def test_main_errored_on_exception(tmp_path):

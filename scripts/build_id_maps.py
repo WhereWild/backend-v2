@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import pickle
 import zipfile
 from collections import Counter, defaultdict
@@ -19,9 +20,13 @@ from urllib.request import Request, urlopen
 CATALOG_DIR = Path("data/taxonomy/catalog")
 CATALOG_PATH = CATALOG_DIR / "taxon_catalog.pkl"
 MAPPING_PATH = CATALOG_DIR / "inat_gbif_mapping.csv"
+CACHE_DIR = Path("data/taxonomy/cache")
+INAT_DWCA_CACHE = CACHE_DIR / "inat_dwca.zip"
+SYNC_STATE_PATH = Path("data/sync_state.json")
 
 INAT_DWCA_URL = "https://www.inaturalist.org/taxa/inaturalist-taxonomy.dwca.zip"
 INAT_TAXA_FILENAME = "taxa.csv"
+_UA = "wherewild-build-id-maps/1.0"
 
 MAPPING_RANKS = frozenset({"SPECIES", "SUBSPECIES", "VARIETY", "FORM"})
 INFRA_RANKS = frozenset({"SUBSPECIES", "VARIETY", "FORM"})
@@ -68,11 +73,31 @@ def build_gbif_indexes(
 
 
 def download_dwca() -> bytes:
+    state = json.loads(SYNC_STATE_PATH.read_text()) if SYNC_STATE_PATH.exists() else {}
+    cached_etag = state.get("inat_taxonomy", {}).get("etag", "")
+
+    print(f"Checking {INAT_DWCA_URL} ...")
+    req = Request(INAT_DWCA_URL, method="HEAD", headers={"User-Agent": _UA})
+    with urlopen(req, timeout=30) as r:
+        remote_etag = r.headers.get("ETag", "")
+
+    if remote_etag and remote_etag == cached_etag and INAT_DWCA_CACHE.exists():
+        print("  iNat DWC-A: cache up to date")
+        return INAT_DWCA_CACHE.read_bytes()
+
     print(f"Downloading {INAT_DWCA_URL} ...")
-    req = Request(INAT_DWCA_URL, headers={"User-Agent": "wherewild-build-id-maps/1.0"})
+    req = Request(INAT_DWCA_URL, headers={"User-Agent": _UA})
     with urlopen(req, timeout=120) as resp:
         data = resp.read()
     print(f"  Downloaded {len(data) / 1_048_576:.1f} MB")
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    INAT_DWCA_CACHE.write_bytes(data)
+    if remote_etag:
+        state.setdefault("inat_taxonomy", {})["etag"] = remote_etag
+        SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SYNC_STATE_PATH.write_text(json.dumps(state, indent=2))
+
     return data
 
 

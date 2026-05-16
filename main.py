@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from util import taxa
-from util.taxa import normalize_name, taxon_slug
+from util.taxa import format_common_name, normalize_name, taxon_slug
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
@@ -55,16 +55,18 @@ def query_taxa(
         results.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
-            "common_name": taxon.get("common_name") or None,
+            "common_name": format_common_name(
+                taxon.get("inat_preferred_common_name") or taxon.get("common_name") or ""
+            ) or None,
             "common_names": None,
             "rank": taxon.get("rank"),
             "slug": taxon_slug(taxon.get("scientific_name")),
             "description": None,
-            "image_url": None,
-            "image_license": None,
-            "image_creator": None,
-            "image_rights_holder": None,
-            "image_references": None,
+            "image_url": taxon.get("inat_preferred_image") or None,
+            "image_license": taxon.get("inat_preferred_image_license") or None,
+            "image_creator": taxon.get("inat_preferred_image_creator") or None,
+            "image_rights_holder": taxon.get("inat_preferred_image_attribution") or None,
+            "image_references": taxon.get("inat_preferred_image_references") or None,
             "match_score": score,
             "sample_count": None,
             "sort_value": None,

@@ -1,11 +1,13 @@
 """
-Add English common names to taxon_catalog.pkl from iNat DWC-A and GBIF backbone.
+Add English common names to taxon_catalog.pkl from iNat DWC-A and GBIF backbone,
+then fetch iNat preferred common names and default photo metadata via the iNat API.
 
 Sources:
 - iNat DWC-A VernacularNames-*.csv  (matched via inat_id)
 - GBIF backbone VernacularName.tsv  (matched via GBIF taxon key, extracted via range requests)
+- iNat API /v1/taxa                 (preferred_common_name + default_photo per taxon)
 
-Both sources are ETag-cached in data/taxonomy/cache/ via data/sync_state.json.
+Both file sources are ETag-cached in data/taxonomy/cache/ via data/sync_state.json.
 """
 
 from __future__ import annotations
@@ -16,9 +18,11 @@ import json
 import pickle
 import struct
 import sys
+import time
 import zipfile
 import zlib
 from pathlib import Path
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 CATALOG_PATH = Path("data/taxonomy/catalog/taxon_catalog.pkl")
@@ -208,6 +212,130 @@ def apply_names(
     return updated
 
 
+# --- iNat preferred names and images ---
+
+INAT_TAXA_ENDPOINT = "https://api.inaturalist.org/v1/taxa"
+INAT_PHOTO_BASE_URL = "https://www.inaturalist.org/photos"
+INAT_BATCH_SIZE = 200
+INAT_RATE_LIMIT = 1.0  # requests per second
+
+
+def fetch_taxa_batch(ids: list[str], timeout: int = 30) -> list[dict]:
+    params = {"id": ",".join(ids), "locale": "en", "per_page": str(len(ids))}
+    url = f"{INAT_TAXA_ENDPOINT}?{urlencode(params)}"
+    req = Request(url, headers={"User-Agent": _UA})
+    with urlopen(req, timeout=timeout) as r:
+        payload = json.loads(r.read().decode("utf-8"))
+    results = payload.get("results") or []
+    return results if isinstance(results, list) else []
+
+
+def _clean(value: object) -> str:
+    text = str(value or "").strip()
+    return "" if text.lower() in {"none", "null"} else text
+
+
+def extract_preferred_image_metadata(taxon_payload: dict) -> dict[str, str]:
+    default_photo = taxon_payload.get("default_photo")
+    if not isinstance(default_photo, dict):
+        return {}
+    image_url = ""
+    for field in ("original_url", "large_url", "medium_url", "url", "square_url"):
+        v = _clean(default_photo.get(field))
+        if v:
+            image_url = v
+            break
+    if not image_url:
+        return {}
+    photo_id = _clean(default_photo.get("id"))
+    return {
+        "inat_preferred_image": image_url,
+        "inat_preferred_image_license": _clean(default_photo.get("license_code")),
+        "inat_preferred_image_creator": _clean(default_photo.get("attribution_name")),
+        "inat_preferred_image_attribution": _clean(default_photo.get("attribution")),
+        "inat_preferred_image_references": f"{INAT_PHOTO_BASE_URL}/{photo_id}" if photo_id else "",
+    }
+
+
+def apply_inat_preferred(
+    catalog: dict,
+    inat_to_taxa: dict[str, list[str]],
+    results: list[dict],
+) -> tuple[int, int]:
+    names_updated = 0
+    images_updated = 0
+    for taxon in results:
+        inat_id = _clean(taxon.get("id"))
+        preferred_name = _clean(taxon.get("preferred_common_name"))
+        image_meta = extract_preferred_image_metadata(taxon)
+        if not inat_id:
+            continue
+        for taxon_key in inat_to_taxa.get(inat_id, []):
+            entry = catalog.get(taxon_key)
+            if not entry:
+                continue
+            if preferred_name and not _clean(entry.get("inat_preferred_common_name")):
+                entry["inat_preferred_common_name"] = preferred_name
+                names_updated += 1
+            if image_meta and not _clean(entry.get("inat_preferred_image")):
+                entry.update(image_meta)
+                images_updated += 1
+    return names_updated, images_updated
+
+
+def run_inat_preferred(catalog: dict) -> tuple[int, int]:
+    inat_to_taxa: dict[str, list[str]] = {}
+    for taxon_key, taxon in catalog.items():
+        inat_id = _clean(taxon.get("inat_id"))
+        if not inat_id:
+            continue
+        has_name = bool(_clean(taxon.get("inat_preferred_common_name")))
+        has_image = bool(_clean(taxon.get("inat_preferred_image")))
+        if has_name and has_image:
+            continue
+        inat_to_taxa.setdefault(inat_id, []).append(taxon_key)
+
+    inat_ids = list(inat_to_taxa.keys())
+    total_batches = (len(inat_ids) + INAT_BATCH_SIZE - 1) // INAT_BATCH_SIZE
+    eta_min = total_batches / INAT_RATE_LIMIT / 60
+    print(
+        f"  Taxa needing iNat preferred metadata: {len(inat_ids):,} "
+        f"({total_batches} batches, ~{eta_min:.0f} min)",
+        flush=True,
+    )
+    if not inat_ids:
+        print("  Nothing to do.")
+        return 0, 0
+
+    names_updated = 0
+    images_updated = 0
+    errors = 0
+
+    for i in range(0, len(inat_ids), INAT_BATCH_SIZE):
+        batch = inat_ids[i : i + INAT_BATCH_SIZE]
+        try:
+            results = fetch_taxa_batch(batch)
+        except Exception as exc:
+            print(f"  Batch error: {exc}", flush=True)
+            errors += 1
+            time.sleep(1.0 / INAT_RATE_LIMIT)
+            continue
+        n, im = apply_inat_preferred(catalog, inat_to_taxa, results)
+        names_updated += n
+        images_updated += im
+        request_num = i // INAT_BATCH_SIZE + 1
+        if request_num % 10 == 0:
+            remaining = max(total_batches - request_num, 0)
+            print(
+                f"  [{request_num:,}/{total_batches:,}] names={names_updated:,} "
+                f"images={images_updated:,} errors={errors:,} remaining={remaining:,}",
+                flush=True,
+            )
+        time.sleep(1.0 / INAT_RATE_LIMIT)
+
+    return names_updated, images_updated
+
+
 def main() -> None:
     dwca_bytes = fetch_inat_dwca()
     vernacular_bytes = fetch_backbone_vernacular()
@@ -225,9 +353,13 @@ def main() -> None:
 
     updated = apply_names(catalog, inat_map, gbif_map)
 
+    print("Fetching iNat preferred names and images...")
+    names_n, images_n = run_inat_preferred(catalog)
+
     with open(CATALOG_PATH, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"Updated {updated:,} catalog entries with common names.")
+    print(f"Updated {names_n:,} preferred common names, {images_n:,} preferred images.")
 
 
 if __name__ == "__main__":  # pragma: no cover

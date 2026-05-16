@@ -181,7 +181,8 @@ def test_main_missing_creds(monkeypatch):
 def test_main_already_up_to_date(httpx_mock: HTTPXMock, capsys):
     httpx_mock.add_response(json=_crawl_response())
     sync_gbif.save_sync_state({"gbif_taxonomy": {"crawl_finished": CRAWL_TS}})
-    sync_gbif.main()
+    result = sync_gbif.main()
+    assert result is False
     assert "Already up to date" in capsys.readouterr().out
 
 
@@ -192,7 +193,9 @@ def test_main_new_crawl(httpx_mock: HTTPXMock):
     with patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
          patch("scripts.sync_gbif.download_zip"), \
          patch("scripts.sync_gbif.extract"):
-        sync_gbif.main()
+        result = sync_gbif.main()
+
+    assert result is True
 
     state = json.loads(sync_gbif.SYNC_STATE_PATH.read_text())
     assert state["gbif_taxonomy"]["crawl_finished"] == CRAWL_TS

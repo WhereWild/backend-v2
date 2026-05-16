@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_DIR="$REPO_DIR/logs"
+
+mkdir -p "$LOG_DIR"
+exec >> "$LOG_DIR/rebuild.log" 2>&1
+
+docker compose -f "$REPO_DIR/docker-compose.yml" up -d gdal
+docker compose -f "$REPO_DIR/docker-compose.yml" exec -T --user ubuntu -e PYTHONUNBUFFERED=1 gdal \
+    bash -lc '. /etc/wherewild_aliases.sh; cd /workspace && uv run python -u -m scripts.rebuild'

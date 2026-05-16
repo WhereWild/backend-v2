@@ -157,6 +157,16 @@ def test_extract():
     assert (sync_gbif.CATALOG_DIR / "species.tsv").exists()
 
 
+def test_extract_renames_csv():
+    catalog_dir = sync_gbif.CATALOG_DIR
+    catalog_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(catalog_dir / "download.zip", "w") as z:
+        z.writestr("0020579-260507073636908.csv", "taxon\tdata")
+    sync_gbif.extract()
+    assert (catalog_dir / "species_list.csv").exists()
+    assert not (catalog_dir / "0020579-260507073636908.csv").exists()
+
+
 # --- main ---
 
 def test_main_missing_creds(monkeypatch):

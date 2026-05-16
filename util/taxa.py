@@ -98,8 +98,6 @@ def search_taxa_by_name(
             continue
         for key in name_index.get(name, []):
             taxon = get_taxon_by_id(key)
-            if not taxon:
-                continue
             existing = best_by_taxon.get(key)
             if existing is None or adjusted > existing[1]:
                 best_by_taxon[key] = (taxon, adjusted)

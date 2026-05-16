@@ -336,6 +336,31 @@ def run_inat_preferred(catalog: dict) -> tuple[int, int]:
     return names_updated, images_updated
 
 
+def _normalize_index_key(value: str) -> str:
+    return " ".join(value.replace("_", " ").lower().split())
+
+
+def update_name_index(payload: dict) -> int:
+    """Add common_name and inat_preferred_common_name entries missing from the index."""
+    catalog = payload["catalog"]
+    index = payload["combined_name_index"]
+    added = 0
+    for taxon_key, taxon in catalog.items():
+        for field in ("common_name", "inat_preferred_common_name"):
+            raw = str(taxon.get(field) or "").strip()
+            if not raw:
+                continue
+            key = _normalize_index_key(raw)
+            if not key:
+                continue
+            existing = set(index.get(key, []))
+            if taxon_key not in existing:
+                existing.add(taxon_key)
+                index[key] = sorted(existing)
+                added += 1
+    return added
+
+
 def main() -> None:
     dwca_bytes = fetch_inat_dwca()
     vernacular_bytes = fetch_backbone_vernacular()
@@ -356,10 +381,22 @@ def main() -> None:
     print("Fetching iNat preferred names and images...")
     names_n, images_n = run_inat_preferred(catalog)
 
+    index_added = update_name_index(payload)
+    print(f"Added {index_added:,} new entries to name search index.")
+
     with open(CATALOG_PATH, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"Updated {updated:,} catalog entries with common names.")
     print(f"Updated {names_n:,} preferred common names, {images_n:,} preferred images.")
+
+
+def rebuild_index() -> None:
+    with open(CATALOG_PATH, "rb") as f:
+        payload = pickle.load(f)
+    added = update_name_index(payload)
+    with open(CATALOG_PATH, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"Added {added:,} new entries to name search index.")
 
 
 if __name__ == "__main__":  # pragma: no cover

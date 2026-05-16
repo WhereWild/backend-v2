@@ -61,6 +61,24 @@ def test_load_payload_reads_pickle(tmp_path, monkeypatch):
     assert _real_load_payload() == PAYLOAD
 
 
+# --- format_common_name ---
+
+def test_format_common_name_basic():
+    assert taxa.format_common_name("prickly pear") == "Prickly Pear"
+
+
+def test_format_common_name_empty():
+    assert taxa.format_common_name("") == ""
+
+
+def test_format_common_name_acronym_preserved():
+    assert taxa.format_common_name("NW prickly pear") == "NW Prickly Pear"
+
+
+def test_format_common_name_apostrophe():
+    assert taxa.format_common_name("devil's tongue") == "Devil's Tongue"
+
+
 # --- normalize_name ---
 
 def test_normalize_name_basic():

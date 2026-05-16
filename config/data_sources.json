@@ -1,0 +1,27 @@
+{
+  "gbif_occurrence": {
+    "name": "GBIF Occurrence Download",
+    "url": "https://www.gbif.org/occurrence/download",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "note": "Citation, DOI, and download_url are populated at runtime from data/sync_state.json"
+  },
+  "gbif_backbone": {
+    "name": "GBIF Backbone Taxonomy",
+    "url": "https://www.gbif.org/dataset/d7dddbf4-2cf0-4f39-9b2a-bb099caae36c",
+    "download_url": "https://hosted-datasets.gbif.org/datasets/backbone/current/backbone.zip",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "GBIF Secretariat. GBIF Backbone Taxonomy. Checklist dataset https://doi.org/10.15468/39omei",
+    "doi": "https://doi.org/10.15468/39omei"
+  },
+  "inat_taxonomy": {
+    "name": "iNaturalist Taxonomy",
+    "url": "https://www.inaturalist.org/taxa",
+    "download_url": "https://www.inaturalist.org/taxa/inaturalist-taxonomy.dwca.zip",
+    "license": "CC0 (taxonomy data)",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "citation": "iNaturalist contributors, iNaturalist. iNaturalist Taxonomy. https://www.inaturalist.org/taxa",
+    "doi": ""
+  }
+}

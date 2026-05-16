@@ -162,6 +162,7 @@ def main() -> None:
     state["gbif_taxonomy"] = {
         "crawl_finished": crawl_finished,
         "download_key": download_key,
+        "download_link": gbif_meta.get("downloadLink"),
         "doi": gbif_meta.get("doi"),
         "citation": _build_citation(gbif_meta),
         "created": gbif_meta.get("created"),

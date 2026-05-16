@@ -176,7 +176,8 @@ def test_build_mapping_exact_match(tmp_path, monkeypatch):
          "scientificName": "Opuntia humifusa", "taxonRank": "SPECIES"},
     ])
     bim.build_mapping(dict(CATALOG), dwca)
-    rows = list(csv.DictReader(open(tmp_path / "inat_gbif_mapping.csv")))
+    with open(tmp_path / "inat_gbif_mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["gbif_taxon_key"] == "2923970"
     assert rows[0]["inat_id"] == "55555"
@@ -200,7 +201,8 @@ def test_build_mapping_stripped_match(tmp_path, monkeypatch):
          "scientificName": "Echinocereus triglochidiatus var. mojavensis", "taxonRank": "VARIETY"},
     ])
     bim.build_mapping(catalog_no_marker, dwca)
-    rows = list(csv.DictReader(open(tmp_path / "inat_gbif_mapping.csv")))
+    with open(tmp_path / "inat_gbif_mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["gbif_taxon_key"] == "3084112"
     assert rows[0]["match_type"] == "stripped"
@@ -213,7 +215,8 @@ def test_build_mapping_skips_empty_scientific_name(tmp_path, monkeypatch):
         {"id": "99999", "taxonID": "", "scientificName": "", "taxonRank": "SPECIES"},
     ])
     bim.build_mapping(dict(CATALOG), dwca)
-    rows = list(csv.DictReader(open(tmp_path / "inat_gbif_mapping.csv")))
+    with open(tmp_path / "inat_gbif_mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert rows == []
 
 
@@ -224,7 +227,8 @@ def test_build_mapping_skips_non_leaf_rank(tmp_path, monkeypatch):
         {"id": "99999", "taxonID": "", "scientificName": "Opuntia", "taxonRank": "GENUS"},
     ])
     bim.build_mapping(dict(CATALOG), dwca)
-    rows = list(csv.DictReader(open(tmp_path / "inat_gbif_mapping.csv")))
+    with open(tmp_path / "inat_gbif_mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert rows == []
 
 
@@ -235,7 +239,8 @@ def test_build_mapping_skips_no_inat_id(tmp_path, monkeypatch):
         {"id": "", "taxonID": "", "scientificName": "Opuntia humifusa", "taxonRank": "SPECIES"},
     ])
     bim.build_mapping(dict(CATALOG), dwca)
-    rows = list(csv.DictReader(open(tmp_path / "inat_gbif_mapping.csv")))
+    with open(tmp_path / "inat_gbif_mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert rows == []
 
 
@@ -250,7 +255,8 @@ def test_build_mapping_conflict_skipped(tmp_path, monkeypatch):
          "taxonRank": "SPECIES"},
     ])
     bim.build_mapping(dict(CATALOG), dwca)
-    rows = list(csv.DictReader(open(tmp_path / "inat_gbif_mapping.csv")))
+    with open(tmp_path / "inat_gbif_mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     # First match written; second is a conflict and skipped
     assert len(rows) == 1
     assert rows[0]["inat_id"] == "11111"
@@ -274,7 +280,8 @@ def test_build_mapping_ambiguous_gbif(tmp_path, monkeypatch):
          "taxonRank": "SPECIES"},
     ])
     bim.build_mapping(dup_catalog, dwca)
-    rows = list(csv.DictReader(open(tmp_path / "inat_gbif_mapping.csv")))
+    with open(tmp_path / "inat_gbif_mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert rows == []
 
 
@@ -286,7 +293,8 @@ def test_build_mapping_no_match(tmp_path, monkeypatch):
          "taxonRank": "SPECIES"},
     ])
     bim.build_mapping(dict(CATALOG), dwca)
-    rows = list(csv.DictReader(open(tmp_path / "inat_gbif_mapping.csv")))
+    with open(tmp_path / "inat_gbif_mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert rows == []
 
 

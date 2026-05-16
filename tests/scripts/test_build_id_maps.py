@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import pickle
 import zipfile
 from unittest.mock import MagicMock
@@ -109,15 +110,46 @@ def test_build_gbif_indexes_skip_empty_name():
 
 # --- download_dwca ---
 
-def test_download_dwca(monkeypatch):
+def _make_urlopen_mock(head_etag: str, body: bytes):
+    """urlopen mock: HEAD returns etag, GET returns body."""
+    def mock_urlopen(req, timeout=30):
+        resp = MagicMock()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        if req.get_method() == "HEAD":
+            resp.headers = {"ETag": head_etag}
+            resp.read.return_value = b""
+        else:
+            resp.headers = {"ETag": head_etag}
+            resp.read.return_value = body
+        return resp
+    return mock_urlopen
+
+
+def test_download_dwca_fresh(monkeypatch, tmp_path):
+    monkeypatch.setattr(bim, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(bim, "INAT_DWCA_CACHE", tmp_path / "inat_dwca.zip")
+    monkeypatch.setattr(bim, "SYNC_STATE_PATH", tmp_path / "sync_state.json")
     fake_data = b"fake zip content"
-    mock_resp = MagicMock()
-    mock_resp.__enter__ = lambda s: s
-    mock_resp.__exit__ = MagicMock(return_value=False)
-    mock_resp.read.return_value = fake_data
-    monkeypatch.setattr(bim, "urlopen", lambda *a, **kw: mock_resp)
+    monkeypatch.setattr(bim, "urlopen", _make_urlopen_mock('"new-etag"', fake_data))
     result = bim.download_dwca()
     assert result == fake_data
+    assert (tmp_path / "inat_dwca.zip").read_bytes() == fake_data
+    state = json.loads((tmp_path / "sync_state.json").read_text())
+    assert state["inat_taxonomy"]["etag"] == '"new-etag"'
+
+
+def test_download_dwca_cache_hit(monkeypatch, tmp_path):
+    monkeypatch.setattr(bim, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(bim, "INAT_DWCA_CACHE", tmp_path / "inat_dwca.zip")
+    monkeypatch.setattr(bim, "SYNC_STATE_PATH", tmp_path / "sync_state.json")
+    cached = b"cached zip"
+    (tmp_path / "inat_dwca.zip").write_bytes(cached)
+    state = {"inat_taxonomy": {"etag": '"same-etag"'}}
+    (tmp_path / "sync_state.json").write_text(json.dumps(state))
+    monkeypatch.setattr(bim, "urlopen", _make_urlopen_mock('"same-etag"', b"new data"))
+    result = bim.download_dwca()
+    assert result == cached
 
 
 # --- extract_taxa_csv ---

@@ -159,8 +159,10 @@ def main() -> None:
     # Check for new crawl before acquiring inhibitor or touching pipeline state.
     print("Checking for new GBIF crawl...")
     crawl_ts = sync_gbif.latest_crawl_finished()
-    existing_ts = sync_gbif.load_sync_state().get("gbif_taxonomy", {}).get("crawl_finished")
-    if crawl_ts == existing_ts:
+    state = sync_gbif.load_sync_state()
+    taxonomy_current = state.get("gbif_taxonomy", {}).get("crawl_finished") == crawl_ts
+    occurrences_current = state.get("gbif_occurrences", {}).get("crawl_finished") == crawl_ts
+    if taxonomy_current and occurrences_current:
         print("Already up to date")
         return
     print(f"New crawl detected: {crawl_ts}")
@@ -182,6 +184,7 @@ def main() -> None:
 
         _set_stage("sync_gbif", "in_progress")
         sync_gbif.main()
+        sync_gbif.sync_occurrences()
         _set_stage("sync_gbif", "completed")
 
         print("\n--- Building taxonomy tree ---")

@@ -70,7 +70,7 @@ def _urlopen_mock_for_zip(zip_bytes: bytes, etag: str = ""):
 def test_load_inat_vernacular_english():
     dwca = _make_dwca([{"id": "55555", "vernacularName": "Eastern Prickly Pear", "language": "en"}])
     result = an.load_inat_vernacular(dwca)
-    assert result == {"55555": "Eastern Prickly Pear"}
+    assert result == {"55555": ["Eastern Prickly Pear"]}
 
 
 def test_load_inat_vernacular_skips_non_english():
@@ -80,15 +80,23 @@ def test_load_inat_vernacular_skips_non_english():
 
 def test_load_inat_vernacular_accepts_eng():
     dwca = _make_dwca([{"id": "55555", "vernacularName": "Cactus", "language": "eng"}])
-    assert an.load_inat_vernacular(dwca) == {"55555": "Cactus"}
+    assert an.load_inat_vernacular(dwca) == {"55555": ["Cactus"]}
 
 
-def test_load_inat_vernacular_first_wins():
+def test_load_inat_vernacular_collects_all():
     dwca = _make_dwca([
         {"id": "55555", "vernacularName": "First", "language": "en"},
         {"id": "55555", "vernacularName": "Second", "language": "en"},
     ])
-    assert an.load_inat_vernacular(dwca)["55555"] == "First"
+    assert an.load_inat_vernacular(dwca)["55555"] == ["First", "Second"]
+
+
+def test_load_inat_vernacular_deduplicates():
+    dwca = _make_dwca([
+        {"id": "55555", "vernacularName": "Cactus", "language": "en"},
+        {"id": "55555", "vernacularName": "Cactus", "language": "en"},
+    ])
+    assert an.load_inat_vernacular(dwca)["55555"] == ["Cactus"]
 
 
 def test_load_inat_vernacular_skips_empty():
@@ -108,7 +116,7 @@ def test_load_inat_vernacular_skips_non_vernacular_files():
         zf.writestr("taxa.csv", "id,scientificName\n55555,Opuntia humifusa\n")
         zf.writestr("VernacularNames-1.csv", vern_buf.getvalue())
     result = an.load_inat_vernacular(zf_buf.getvalue())
-    assert result == {"55555": "Cactus"}
+    assert result == {"55555": ["Cactus"]}
 
 
 # --- load_gbif_vernacular ---
@@ -116,23 +124,45 @@ def test_load_inat_vernacular_skips_non_vernacular_files():
 def test_load_gbif_vernacular_preferred():
     tsv = _make_tsv([{"taxonID": "2923970", "vernacularName": "Prickly Pear",
                       "language": "eng", "isPreferredName": "1"}])
-    assert an.load_gbif_vernacular(tsv) == {"2923970": "Prickly Pear"}
+    assert an.load_gbif_vernacular(tsv) == {"2923970": ["Prickly Pear"]}
 
 
 def test_load_gbif_vernacular_non_preferred_fallback():
     tsv = _make_tsv([{"taxonID": "2923970", "vernacularName": "Cactus",
                       "language": "eng", "isPreferredName": "0"}])
-    assert an.load_gbif_vernacular(tsv) == {"2923970": "Cactus"}
+    assert an.load_gbif_vernacular(tsv) == {"2923970": ["Cactus"]}
 
 
-def test_load_gbif_vernacular_preferred_wins():
+def test_load_gbif_vernacular_preferred_first():
     tsv = _make_tsv([
         {"taxonID": "2923970", "vernacularName": "Fallback",
          "language": "eng", "isPreferredName": "0"},
         {"taxonID": "2923970", "vernacularName": "Preferred",
          "language": "eng", "isPreferredName": "1"},
     ])
-    assert an.load_gbif_vernacular(tsv)["2923970"] == "Preferred"
+    names = an.load_gbif_vernacular(tsv)["2923970"]
+    assert names[0] == "Preferred"
+    assert "Fallback" in names
+
+
+def test_load_gbif_vernacular_collects_all():
+    tsv = _make_tsv([
+        {"taxonID": "2923970", "vernacularName": "Brittle Pricklypear",
+         "language": "en", "isPreferredName": "0"},
+        {"taxonID": "2923970", "vernacularName": "Fragile Cactus",
+         "language": "en", "isPreferredName": "0"},
+    ])
+    names = an.load_gbif_vernacular(tsv)["2923970"]
+    assert "Brittle Pricklypear" in names
+    assert "Fragile Cactus" in names
+
+
+def test_load_gbif_vernacular_deduplicates():
+    tsv = _make_tsv([
+        {"taxonID": "2923970", "vernacularName": "Cactus", "language": "en", "isPreferredName": "0"},
+        {"taxonID": "2923970", "vernacularName": "Cactus", "language": "en", "isPreferredName": "0"},
+    ])
+    assert an.load_gbif_vernacular(tsv)["2923970"] == ["Cactus"]
 
 
 def test_load_gbif_vernacular_strips_uri():
@@ -151,22 +181,36 @@ def test_load_gbif_vernacular_skips_non_english():
 
 def test_apply_names_inat_source():
     catalog = {k: dict(v) for k, v in CATALOG.items()}
-    updated = an.apply_names(catalog, {"55555": "Prickly Pear"}, {})
+    updated = an.apply_names(catalog, {"55555": ["Prickly Pear"]}, {})
     assert updated == 1
     assert catalog["2923970"]["common_name"] == "Prickly Pear"
+    assert catalog["2923970"]["vernacular_names"] == ["Prickly Pear"]
 
 
 def test_apply_names_gbif_fallback():
     catalog = {"2923970": {"inat_id": "", "common_name": ""}}
-    updated = an.apply_names(catalog, {}, {"2923970": "Prickly Pear"})
+    updated = an.apply_names(catalog, {}, {"2923970": ["Prickly Pear", "Fragile Cactus"]})
     assert updated == 1
     assert catalog["2923970"]["common_name"] == "Prickly Pear"
+    assert catalog["2923970"]["vernacular_names"] == ["Prickly Pear", "Fragile Cactus"]
 
 
 def test_apply_names_inat_over_gbif():
     catalog = {"2923970": {"inat_id": "55555", "common_name": ""}}
-    an.apply_names(catalog, {"55555": "iNat Name"}, {"2923970": "GBIF Name"})
+    an.apply_names(catalog, {"55555": ["iNat Name"]}, {"2923970": ["GBIF Name"]})
     assert catalog["2923970"]["common_name"] == "iNat Name"
+    assert catalog["2923970"]["vernacular_names"] == ["iNat Name", "GBIF Name"]
+
+
+def test_apply_names_merges_inat_and_gbif():
+    catalog = {"2923970": {"inat_id": "55555", "common_name": ""}}
+    an.apply_names(
+        catalog,
+        {"55555": ["Brittle Pricklypear"]},
+        {"2923970": ["Brittle Pricklypear", "Fragile Cactus"]},
+    )
+    assert catalog["2923970"]["common_name"] == "Brittle Pricklypear"
+    assert catalog["2923970"]["vernacular_names"] == ["Brittle Pricklypear", "Fragile Cactus"]
 
 
 def test_apply_names_no_match():
@@ -532,6 +576,22 @@ def test_update_name_index_adds_preferred_name():
     assert "2923970" in payload["combined_name_index"]["eastern prickly pear"]
 
 
+def test_update_name_index_adds_vernacular_names():
+    payload = {
+        "catalog": {"2923970": {
+            "common_name": "Brittle Pricklypear",
+            "inat_preferred_common_name": "",
+            "vernacular_names": ["Brittle Pricklypear", "Fragile Cactus"],
+        }},
+        "combined_name_index": {},
+    }
+    added = an.update_name_index(payload)
+    assert "2923970" in payload["combined_name_index"]["fragile cactus"]
+    assert "2923970" in payload["combined_name_index"]["brittle pricklypear"]
+    # "Brittle Pricklypear" appears in both common_name and vernacular_names — counted once
+    assert added == 2
+
+
 def test_update_name_index_skips_existing():
     payload = {
         "catalog": {"2923970": {"common_name": "Prickly Pear", "inat_preferred_common_name": ""}},
@@ -558,6 +618,256 @@ def test_update_name_index_skips_normalizes_to_empty():
     assert an.update_name_index(payload) == 0
 
 
+# --- GBIF backup image helpers ---
+
+def test_license_score_public_domain():
+    assert an._license_score("publicdomain") == 0
+
+def test_license_score_cc_by():
+    assert an._license_score("https://creativecommons.org/licenses/by/4.0/") == 1
+
+def test_license_score_cc_by_nc():
+    assert an._license_score("CC BY-NC 4.0") == 3
+
+def test_license_score_unknown():
+    assert an._license_score("all rights reserved") == 99
+
+def test_license_score_empty():
+    assert an._license_score("") == 99
+
+
+def test_is_usable_license_cc_by():
+    assert an._is_usable_license("cc by 4.0")
+
+def test_is_usable_license_rejects_unknown():
+    assert not an._is_usable_license("all rights reserved")
+
+def test_is_usable_license_empty():
+    assert not an._is_usable_license("")
+
+
+def test_image_quality_alive_organism_flowers():
+    score = an._image_quality("cc0", "alive", "organism", "flowers")
+    assert score == (0, 0, 0, 0)
+
+def test_image_quality_dead_penalised():
+    dead = an._image_quality("cc0", "dead", "organism", "flowers")
+    alive = an._image_quality("cc0", "alive", "organism", "flowers")
+    assert dead > alive
+
+def test_image_quality_bad_evidence_penalised():
+    bad = an._image_quality("cc0", "alive", "track", "flowers")
+    good = an._image_quality("cc0", "alive", "organism", "flowers")
+    assert bad > good
+
+def test_image_quality_license_tiebreaker():
+    pd_score = an._image_quality("cc0", "alive", "organism", "")
+    nc_score = an._image_quality("cc by-nc 4.0", "alive", "organism", "")
+    assert pd_score < nc_score
+
+def test_image_quality_okay_evidence():
+    okay = an._image_quality("cc0", "alive", "gall", "")
+    bad = an._image_quality("cc0", "alive", "track", "")
+    good = an._image_quality("cc0", "alive", "organism", "")
+    assert good < okay < bad
+
+def test_image_quality_unknown_evidence_fallthrough():
+    unknown = an._image_quality("cc0", "alive", "someunknownthing", "")
+    missing = an._image_quality("cc0", "alive", "", "")
+    assert unknown[1] == missing[1] == 1
+
+
+def _make_occurrence_tsv(rows: list[dict]) -> str:
+    fields = ["gbifID", "taxonRank", "taxonKey", "speciesKey",
+              "vitality", "reproductiveCondition", "dynamicProperties"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fields, delimiter="\t")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: row.get(k, "") for k in fields})
+    return buf.getvalue()
+
+
+def _make_multimedia_tsv(rows: list[dict]) -> str:
+    fields = ["gbifID", "type", "format", "identifier",
+              "license", "creator", "rightsHolder", "references"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fields, delimiter="\t")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: row.get(k, "") for k in fields})
+    return buf.getvalue()
+
+
+def test_build_gbif_to_taxon(tmp_path):
+    occ = _make_occurrence_tsv([
+        {"gbifID": "1", "taxonRank": "SPECIES", "taxonKey": "999", "speciesKey": "2923970",
+         "vitality": "alive", "reproductiveCondition": "flowers", "dynamicProperties": ""},
+        {"gbifID": "2", "taxonRank": "SPECIES", "taxonKey": "888", "speciesKey": "UNKNOWN",
+         "vitality": "", "reproductiveCondition": "", "dynamicProperties": ""},
+    ])
+    (tmp_path / "occurrence.txt").write_text(occ)
+    an.OCCURRENCE_PATH = tmp_path / "occurrence.txt"
+    mapping = an._build_gbif_to_taxon({"2923970"})
+    assert "1" in mapping
+    assert mapping["1"] == ("2923970", "alive", "", "flowers")
+    assert "2" not in mapping  # speciesKey not in catalog
+
+
+def test_build_gbif_to_taxon_subspecies_uses_taxon_key(tmp_path):
+    occ = _make_occurrence_tsv([
+        {"gbifID": "1", "taxonRank": "SUBSPECIES", "taxonKey": "2923970", "speciesKey": "111",
+         "vitality": "", "reproductiveCondition": "", "dynamicProperties": ""},
+    ])
+    (tmp_path / "occurrence.txt").write_text(occ)
+    an.OCCURRENCE_PATH = tmp_path / "occurrence.txt"
+    mapping = an._build_gbif_to_taxon({"2923970"})
+    assert mapping["1"][0] == "2923970"
+
+
+def test_build_gbif_to_taxon_skips_empty_gbif_id(tmp_path):
+    occ = _make_occurrence_tsv([
+        {"gbifID": "", "taxonRank": "SPECIES", "taxonKey": "9", "speciesKey": "2923970"},
+    ])
+    (tmp_path / "occurrence.txt").write_text(occ)
+    an.OCCURRENCE_PATH = tmp_path / "occurrence.txt"
+    assert an._build_gbif_to_taxon({"2923970"}) == {}
+
+
+def test_build_gbif_to_taxon_bad_dynamic_properties_json(tmp_path):
+    occ = _make_occurrence_tsv([
+        {"gbifID": "1", "taxonRank": "SPECIES", "taxonKey": "9", "speciesKey": "2923970",
+         "vitality": "", "reproductiveCondition": "", "dynamicProperties": "{notjson}"},
+    ])
+    (tmp_path / "occurrence.txt").write_text(occ)
+    an.OCCURRENCE_PATH = tmp_path / "occurrence.txt"
+    mapping = an._build_gbif_to_taxon({"2923970"})
+    assert mapping["1"][2] == ""  # evidence falls back to empty string
+
+
+def test_build_gbif_to_taxon_evidence_from_dynamic_properties(tmp_path):
+    dp = json.dumps({"evidenceOfPresence": "organism"})
+    occ = _make_occurrence_tsv([
+        {"gbifID": "1", "taxonRank": "SPECIES", "taxonKey": "9", "speciesKey": "2923970",
+         "vitality": "", "reproductiveCondition": "", "dynamicProperties": dp},
+    ])
+    (tmp_path / "occurrence.txt").write_text(occ)
+    an.OCCURRENCE_PATH = tmp_path / "occurrence.txt"
+    mapping = an._build_gbif_to_taxon({"2923970"})
+    assert mapping["1"][2] == "organism"
+
+
+def test_build_gbif_images_picks_best(tmp_path):
+    gbif_to_taxon = {
+        "1": ("2923970", "alive", "organism", "flowers"),
+        "2": ("2923970", "dead", "", ""),
+    }
+    mm = _make_multimedia_tsv([
+        {"gbifID": "2", "type": "StillImage", "format": "image/jpeg",
+         "identifier": "https://bad.com/img.jpg", "license": "cc by 4.0",
+         "creator": "Bob", "rightsHolder": "Bob", "references": ""},
+        {"gbifID": "1", "type": "StillImage", "format": "image/jpeg",
+         "identifier": "https://good.com/img.jpg", "license": "cc0",
+         "creator": "Alice", "rightsHolder": "Alice", "references": "https://example.com"},
+    ])
+    (tmp_path / "multimedia.txt").write_text(mm)
+    an.MULTIMEDIA_PATH = tmp_path / "multimedia.txt"
+    result = an._build_gbif_images(gbif_to_taxon)
+    assert result["2923970"]["gbif_backup_image"] == "https://good.com/img.jpg"
+    assert result["2923970"]["gbif_backup_image_license"] == "cc0"
+    assert result["2923970"]["gbif_backup_image_creator"] == "Alice"
+    assert result["2923970"]["gbif_backup_image_attribution"] == "Alice"
+    assert result["2923970"]["gbif_backup_image_references"] == "https://example.com"
+
+
+def test_build_gbif_images_skips_bad_license(tmp_path):
+    gbif_to_taxon = {"1": ("2923970", "alive", "organism", "")}
+    mm = _make_multimedia_tsv([
+        {"gbifID": "1", "type": "StillImage", "format": "image/jpeg",
+         "identifier": "https://example.com/img.jpg", "license": "all rights reserved"},
+    ])
+    (tmp_path / "multimedia.txt").write_text(mm)
+    an.MULTIMEDIA_PATH = tmp_path / "multimedia.txt"
+    assert an._build_gbif_images(gbif_to_taxon) == {}
+
+
+def test_build_gbif_images_skips_unknown_gbif_id(tmp_path):
+    mm = _make_multimedia_tsv([
+        {"gbifID": "999", "type": "StillImage", "format": "image/jpeg",
+         "identifier": "https://example.com/img.jpg", "license": "cc0"},
+    ])
+    (tmp_path / "multimedia.txt").write_text(mm)
+    an.MULTIMEDIA_PATH = tmp_path / "multimedia.txt"
+    assert an._build_gbif_images({"1": ("2923970", "alive", "organism", "")}) == {}
+
+
+def test_build_gbif_images_skips_empty_url(tmp_path):
+    gbif_to_taxon = {"1": ("2923970", "alive", "organism", "")}
+    mm = _make_multimedia_tsv([
+        {"gbifID": "1", "type": "StillImage", "format": "image/jpeg",
+         "identifier": "", "license": "cc0"},
+    ])
+    (tmp_path / "multimedia.txt").write_text(mm)
+    an.MULTIMEDIA_PATH = tmp_path / "multimedia.txt"
+    assert an._build_gbif_images(gbif_to_taxon) == {}
+
+
+def test_build_gbif_images_keeps_better_skips_worse(tmp_path):
+    gbif_to_taxon = {
+        "1": ("2923970", "alive", "organism", "flowers"),
+        "2": ("2923970", "dead", "", ""),
+    }
+    mm = _make_multimedia_tsv([
+        {"gbifID": "1", "type": "StillImage", "format": "image/jpeg",
+         "identifier": "https://good.com/img.jpg", "license": "cc0"},
+        {"gbifID": "2", "type": "StillImage", "format": "image/jpeg",
+         "identifier": "https://worse.com/img.jpg", "license": "cc by-nc 4.0"},
+    ])
+    (tmp_path / "multimedia.txt").write_text(mm)
+    an.MULTIMEDIA_PATH = tmp_path / "multimedia.txt"
+    result = an._build_gbif_images(gbif_to_taxon)
+    assert result["2923970"]["gbif_backup_image"] == "https://good.com/img.jpg"
+
+
+def test_build_gbif_images_skips_non_image(tmp_path):
+    gbif_to_taxon = {"1": ("2923970", "alive", "organism", "")}
+    mm = _make_multimedia_tsv([
+        {"gbifID": "1", "type": "Sound", "format": "audio/mp3",
+         "identifier": "https://example.com/sound.mp3", "license": "cc0"},
+    ])
+    (tmp_path / "multimedia.txt").write_text(mm)
+    an.MULTIMEDIA_PATH = tmp_path / "multimedia.txt"
+    assert an._build_gbif_images(gbif_to_taxon) == {}
+
+
+def test_run_gbif_backup_skips_when_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(an, "OCCURRENCE_PATH", tmp_path / "occurrence.txt")
+    monkeypatch.setattr(an, "MULTIMEDIA_PATH", tmp_path / "multimedia.txt")
+    catalog = {"2923970": {}}
+    assert an.run_gbif_backup(catalog) == 0
+    assert "gbif_backup_image" not in catalog["2923970"]
+
+
+def test_run_gbif_backup_applies_images(monkeypatch, tmp_path):
+    occ = _make_occurrence_tsv([
+        {"gbifID": "1", "taxonRank": "SPECIES", "taxonKey": "9", "speciesKey": "2923970",
+         "vitality": "alive", "reproductiveCondition": "flowers", "dynamicProperties": ""},
+    ])
+    mm = _make_multimedia_tsv([
+        {"gbifID": "1", "type": "StillImage", "format": "image/jpeg",
+         "identifier": "https://example.com/img.jpg", "license": "cc0",
+         "creator": "Alice", "rightsHolder": "Alice", "references": ""},
+    ])
+    (tmp_path / "occurrence.txt").write_text(occ)
+    (tmp_path / "multimedia.txt").write_text(mm)
+    monkeypatch.setattr(an, "OCCURRENCE_PATH", tmp_path / "occurrence.txt")
+    monkeypatch.setattr(an, "MULTIMEDIA_PATH", tmp_path / "multimedia.txt")
+    catalog = {"2923970": {}}
+    n = an.run_gbif_backup(catalog)
+    assert n == 1
+    assert catalog["2923970"]["gbif_backup_image"] == "https://example.com/img.jpg"
+
+
 # --- main ---
 
 def test_main(monkeypatch, tmp_path):
@@ -575,6 +885,7 @@ def test_main(monkeypatch, tmp_path):
     monkeypatch.setattr(an, "fetch_inat_dwca", lambda: dwca)
     monkeypatch.setattr(an, "fetch_backbone_vernacular", lambda: tsv)
     monkeypatch.setattr(an, "run_inat_preferred", lambda catalog: (0, 0))
+    monkeypatch.setattr(an, "run_gbif_backup", lambda catalog: 0)
 
     an.main()
 

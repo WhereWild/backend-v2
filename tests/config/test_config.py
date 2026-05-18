@@ -11,7 +11,7 @@ def test_load_config_global():
     assert cfg.plantae_key == 6
     assert cfg.species_rank == "SPECIES"
     assert "SUBSPECIES" in cfg.leaf_rank_set
-    assert cfg.do_write_dirs is False
+    assert "SPECIES" in cfg.leaf_ranks
 
 
 def test_load_config_cached():

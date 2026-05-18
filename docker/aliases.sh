@@ -5,6 +5,10 @@ if [ -f /workspace/.env ]; then
     set +a
 fi
 
+_uv() {
+    uv run --env-file /workspace/.env "$@"
+}
+
 api() {
   local log_dir="/workspace/logs"
   local pid_dir="/workspace/logs/pids"
@@ -21,14 +25,14 @@ api() {
     mv -f "$log_dir/api.log" "$log_dir/api.previous.log"
   fi
 
-  setsid uv run uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
+  setsid _uv uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
     > "$log_dir/api.log" 2>&1 &
   echo "$!" > "$pid_file"
   echo "api started: http://localhost:8000/docs"
 }
 
 api-fg() {
-  uv run uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info --reload
+  _uv uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info --reload
 }
 
 api-stop() {
@@ -52,11 +56,11 @@ api-stop() {
 }
 
 pt() {
-  uv run pytest --cov --cov-report=term-missing "$@"
+  _uv pytest --cov --cov-report=term-missing "$@"
 }
 
 pl() {
-  uv run ruff check . "$@"
+  _uv ruff check . "$@"
 }
 
 pp() {
@@ -81,7 +85,7 @@ pd() {
   module="${module#./}"
   module="${module//\//.}"
 
-  uv run python -m "$module" "$@"
+  _uv python -m "$module" "$@"
 }
 
 pdb() {
@@ -116,7 +120,7 @@ pdb() {
     return 1
   fi
 
-  PYTHONUNBUFFERED=1 setsid uv run python -u -m "$module" "$@" > "$log_file" 2>&1 &
+  PYTHONUNBUFFERED=1 setsid _uv python -u -m "$module" "$@" > "$log_file" 2>&1 &
   echo "$!" > "$pid_file"
   echo "pdb started: $log_file"
 }
@@ -203,7 +207,7 @@ pdbc() {
         break
       fi
 
-      PYTHONUNBUFFERED=1 setsid uv run python -u -m "$module" > "$log_file" 2>&1 &
+      PYTHONUNBUFFERED=1 setsid _uv python -u -m "$module" > "$log_file" 2>&1 &
       pid="$!"
       echo "$pid" > "$pid_file"
       wait "$pid"

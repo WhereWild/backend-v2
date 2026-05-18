@@ -27,6 +27,8 @@ from urllib.request import Request, urlopen
 
 CATALOG_PATH = Path("data/taxonomy/catalog/taxon_catalog.pkl")
 CACHE_DIR = Path("data/taxonomy/cache")
+OCCURRENCE_PATH = Path("data/occurrences/occurrence.txt")
+MULTIMEDIA_PATH = Path("data/occurrences/multimedia.txt")
 INAT_DWCA_CACHE = CACHE_DIR / "inat_dwca.zip"
 BACKBONE_VERNACULAR_CACHE = CACHE_DIR / "gbif_vernacular.tsv"
 SYNC_STATE_PATH = Path("data/sync_state.json")
@@ -157,9 +159,10 @@ def fetch_backbone_vernacular() -> bytes:
 
 # --- name loading ---
 
-def load_inat_vernacular(dwca_bytes: bytes) -> dict[str, str]:
-    """Return inat_id -> first English vernacular name found."""
-    result: dict[str, str] = {}
+def load_inat_vernacular(dwca_bytes: bytes) -> dict[str, list[str]]:
+    """Return inat_id -> all English vernacular names found."""
+    result: dict[str, list[str]] = {}
+    seen: dict[str, set[str]] = {}
     zf = zipfile.ZipFile(io.BytesIO(dwca_bytes))
     for entry in sorted(zf.namelist()):
         if not (entry.startswith("VernacularNames") and entry.endswith(".csv")):
@@ -169,15 +172,19 @@ def load_inat_vernacular(dwca_bytes: bytes) -> dict[str, str]:
                 taxon_id = (row.get("id") or "").strip()
                 name = (row.get("vernacularName") or "").strip()
                 lang = (row.get("language") or "").strip().lower()
-                if taxon_id and name and lang in ("en", "eng") and taxon_id not in result:
-                    result[taxon_id] = name
+                if not taxon_id or not name or lang not in ("en", "eng"):
+                    continue
+                if name not in seen.setdefault(taxon_id, set()):
+                    result.setdefault(taxon_id, []).append(name)
+                    seen[taxon_id].add(name)
     return result
 
 
-def load_gbif_vernacular(tsv_bytes: bytes) -> dict[str, str]:
-    """Return gbif_taxon_key -> best English vernacular name (preferred names win)."""
-    preferred: dict[str, str] = {}
-    any_english: dict[str, str] = {}
+def load_gbif_vernacular(tsv_bytes: bytes) -> dict[str, list[str]]:
+    """Return gbif_taxon_key -> all English vernacular names (preferred names first)."""
+    preferred: dict[str, list[str]] = {}
+    others: dict[str, list[str]] = {}
+    seen: dict[str, set[str]] = {}
     reader = csv.DictReader(io.StringIO(tsv_bytes.decode("utf-8")), delimiter="\t")
     for row in reader:
         taxon_id = (row.get("taxonID") or "").strip()
@@ -188,26 +195,37 @@ def load_gbif_vernacular(tsv_bytes: bytes) -> dict[str, str]:
             continue
         if "/" in taxon_id:
             taxon_id = taxon_id.rsplit("/", 1)[-1]
-        if is_preferred and taxon_id not in preferred:
-            preferred[taxon_id] = name
-        elif taxon_id not in any_english:
-            any_english[taxon_id] = name
-    return {**any_english, **preferred}
+        if name in seen.setdefault(taxon_id, set()):
+            continue
+        seen[taxon_id].add(name)
+        if is_preferred:
+            preferred.setdefault(taxon_id, []).append(name)
+        else:
+            others.setdefault(taxon_id, []).append(name)
+    result = {**others}
+    for tid, names in preferred.items():
+        result[tid] = names + result.get(tid, [])
+    return result
 
 
 # --- catalog update ---
 
 def apply_names(
     catalog: dict,
-    inat_map: dict[str, str],
-    gbif_map: dict[str, str],
+    inat_map: dict[str, list[str]],
+    gbif_map: dict[str, list[str]],
 ) -> int:
     updated = 0
     for taxon_key, taxon in catalog.items():
         inat_id = str(taxon.get("inat_id") or "").strip()
-        name = (inat_map.get(inat_id) if inat_id else None) or gbif_map.get(taxon_key, "")
-        if name:
-            taxon["common_name"] = name
+        inat_names = (inat_map.get(inat_id) if inat_id else None) or []
+        gbif_names = gbif_map.get(taxon_key) or []
+        # iNat names first (preferred for display), then any GBIF names not already present
+        seen = set(inat_names)
+        merged = list(inat_names) + [n for n in gbif_names if n not in seen]
+        if merged:
+            taxon["common_name"] = merged[0]
+            taxon["vernacular_names"] = merged
             updated += 1
     return updated
 
@@ -341,15 +359,21 @@ def _normalize_index_key(value: str) -> str:
 
 
 def update_name_index(payload: dict) -> int:
-    """Add common_name and inat_preferred_common_name entries missing from the index."""
+    """Add all vernacular/preferred name entries missing from the index."""
     catalog = payload["catalog"]
     index = payload["combined_name_index"]
     added = 0
     for taxon_key, taxon in catalog.items():
+        candidates: list[str] = []
         for field in ("common_name", "inat_preferred_common_name"):
             raw = str(taxon.get(field) or "").strip()
-            if not raw:
-                continue
+            if raw:
+                candidates.append(raw)
+        for name in taxon.get("vernacular_names") or []:
+            raw = str(name).strip()
+            if raw:
+                candidates.append(raw)
+        for raw in candidates:
             key = _normalize_index_key(raw)
             if not key:
                 continue
@@ -359,6 +383,143 @@ def update_name_index(payload: dict) -> int:
                 index[key] = sorted(existing)
                 added += 1
     return added
+
+
+# --- GBIF backup images from occurrence DWCA ---
+
+_LICENSE_PRIORITY = [
+    ("publicdomain", 0), ("cc0", 0),
+    ("/by/4", 1), ("/by/3", 1), ("/by/2", 1), ("cc by ", 1),
+    ("/by-sa/", 2), ("cc by-sa", 2),
+    ("/by-nc/", 3), ("cc by-nc ", 3),
+    ("/by-nc-sa/", 4), ("cc by-nc-sa", 4),
+]
+_USABLE_LICENSES = {
+    "cc0", "cc by", "cc-by", "/by/", "/by-sa/", "/by-nc/", "/by-nc-sa/",
+    "publicdomain", "public domain",
+}
+_BAD_EVIDENCE = {"track", "scat", "feather", "bone", "molt", "hair"}
+_OKAY_EVIDENCE = {"gall", "egg", "construction", "leafmine"}
+_SUBSPECIES_RANKS = {"SUBSPECIES", "VARIETY", "FORM"}
+
+
+def _license_score(s: str) -> int:
+    n = s.strip().lower()
+    for pattern, score in _LICENSE_PRIORITY:
+        if pattern in n:
+            return score
+    return 99
+
+
+def _is_usable_license(s: str) -> bool:
+    n = s.strip().lower()
+    return any(p in n for p in _USABLE_LICENSES)
+
+
+def _image_quality(license_str: str, vitality: str, evidence: str, rcs: str) -> tuple:
+    v = 0 if vitality == "alive" else (2 if vitality == "dead" else 1)
+    if evidence == "organism":
+        e = 0
+    elif not evidence:
+        e = 1
+    elif any(b in evidence for b in _BAD_EVIDENCE):
+        e = 3
+    elif any(o in evidence for o in _OKAY_EVIDENCE):
+        e = 2
+    else:
+        e = 1
+    r = (0 if rcs == "flowers" else
+         1 if rcs in {"fruits or seeds", "fruits", "seeds"} else
+         2 if rcs == "flower buds" else 3)
+    return (v, e, r, _license_score(license_str))
+
+
+def _build_gbif_to_taxon(catalog_keys: set[str]) -> dict[str, tuple]:
+    """Stream occurrence.txt → gbifID: (taxon_key, vitality, evidence, rcs)."""
+    mapping: dict[str, tuple] = {}
+    rows = 0
+    with open(OCCURRENCE_PATH, encoding="utf-8") as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            rows += 1
+            if rows % 1_000_000 == 0:  # pragma: no cover
+                print(f"  {rows:,} rows, {len(mapping):,} matched...", flush=True)
+            gbif_id = (row.get("gbifID") or "").strip()
+            if not gbif_id:
+                continue
+            rank = (row.get("taxonRank") or "").upper()
+            taxon_key = (row.get("taxonKey") or "").strip()
+            species_key = (row.get("speciesKey") or "").strip()
+            key = taxon_key if rank in _SUBSPECIES_RANKS else (species_key or taxon_key)
+            if not key or key not in catalog_keys:
+                continue
+            vitality = (row.get("vitality") or "").strip().lower()
+            rcs = (row.get("reproductiveCondition") or "").strip().lower()
+            evidence = ""
+            dp = row.get("dynamicProperties") or ""
+            if dp:
+                try:
+                    obj = json.loads(dp)
+                    ev = obj.get("evidenceOfPresence", "")
+                    evidence = (",".join(ev) if isinstance(ev, list) else (ev or "")).lower()
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            mapping[gbif_id] = (key, vitality, evidence, rcs)
+    print(f"  {rows:,} rows scanned, {len(mapping):,} gbifIDs mapped", flush=True)
+    return mapping
+
+
+def _build_gbif_images(gbif_to_taxon: dict[str, tuple]) -> dict[str, dict]:
+    """Stream multimedia.txt → taxon_key: best image record."""
+    best: dict[str, tuple] = {}
+    rows = 0
+    with open(MULTIMEDIA_PATH, encoding="utf-8") as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            rows += 1
+            if rows % 5_000_000 == 0:  # pragma: no cover
+                print(f"  {rows:,} rows, {len(best):,} taxa covered...", flush=True)
+            gbif_id = (row.get("gbifID") or "").strip()
+            info = gbif_to_taxon.get(gbif_id)
+            if not info:
+                continue
+            taxon_key, vitality, evidence, rcs = info
+            license_str = row.get("license") or ""
+            if not _is_usable_license(license_str):
+                continue
+            media_type = (row.get("type") or "").strip().lower()
+            media_format = (row.get("format") or "").strip().lower()
+            if not (media_type in {"stillimage", "image"} or media_format.startswith("image/")):
+                continue
+            url = (row.get("identifier") or "").strip()
+            if not url:
+                continue
+            score = _image_quality(license_str, vitality, evidence, rcs)
+            if taxon_key in best and score >= best[taxon_key][0]:
+                continue
+            best[taxon_key] = (score, {
+                "gbif_backup_image": url,
+                "gbif_backup_image_license": license_str,
+                "gbif_backup_image_creator": _clean(row.get("creator")),
+                "gbif_backup_image_attribution": _clean(row.get("rightsHolder")),
+                "gbif_backup_image_references": _clean(row.get("references")),
+            })
+    print(f"  {rows:,} rows scanned, {len(best):,} taxa with images", flush=True)
+    return {k: v[1] for k, v in best.items()}
+
+
+def run_gbif_backup(catalog: dict) -> int:
+    """Apply best GBIF occurrence image to every catalog taxon that has one."""
+    if not OCCURRENCE_PATH.exists() or not MULTIMEDIA_PATH.exists():
+        print("  Occurrence data not yet downloaded, skipping.", flush=True)
+        return 0
+    gbif_to_taxon = _build_gbif_to_taxon(set(catalog.keys()))
+    taxon_images = _build_gbif_images(gbif_to_taxon)
+    updated = 0
+    for taxon_key, fields in taxon_images.items():
+        entry = catalog.get(taxon_key)
+        if entry is not None:
+            entry.update(fields)
+            updated += 1
+    return updated
 
 
 def main() -> None:
@@ -381,13 +542,16 @@ def main() -> None:
     print("Fetching iNat preferred names and images...")
     names_n, images_n = run_inat_preferred(catalog)
 
+    print("Fetching GBIF backup images from occurrence data...")
+    backup_n = run_gbif_backup(catalog)
+
     index_added = update_name_index(payload)
     print(f"Added {index_added:,} new entries to name search index.")
 
     with open(CATALOG_PATH, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"Updated {updated:,} catalog entries with common names.")
-    print(f"Updated {names_n:,} preferred common names, {images_n:,} preferred images.")
+    print(f"Updated {names_n:,} preferred common names, {images_n:,} preferred images, {backup_n:,} GBIF backup images.")
 
 
 def rebuild_index() -> None:

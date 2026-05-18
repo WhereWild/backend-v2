@@ -11,6 +11,7 @@ def patch_paths(monkeypatch, tmp_path):
     data_dir = tmp_path / "data"
     monkeypatch.setattr(rebuild, "DATA_DIR", data_dir)
     monkeypatch.setattr(rebuild, "SYNC_STATE_PATH", data_dir / "sync_state.json")
+    monkeypatch.setattr(rebuild, "NOTIFY_URL", "")
 
 
 def _pipeline(tmp_path) -> dict:
@@ -135,14 +136,11 @@ def test_main_already_up_to_date(tmp_path):
     ts = "2026-05-15T15:54:14.220+00:00"
     check1, check2 = _patch_sync_check(new_crawl_ts=ts, existing_ts=ts)
     with check1, check2, \
-         patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
-         patch("scripts.rebuild._release_inhibitor"):
+         patch("scripts.rebuild._acquire_shutdown_inhibitor") as mock_inhibitor:
         rebuild.main()
 
-    p = _pipeline(tmp_path)
-    assert p["status"] == "completed"
-    assert "sync_gbif" not in p["stages"]
-    assert "build_tree" not in p["stages"]
+    mock_inhibitor.assert_not_called()  # inhibitor not acquired when nothing to do
+    assert not (tmp_path / "data" / "sync_state.json").exists()  # state untouched
 
 
 def test_main_full_pipeline_completes(tmp_path):
@@ -169,6 +167,8 @@ def test_main_full_pipeline_completes(tmp_path):
     event, payload = mock_notify.call_args[0]
     assert event == "completed"
     assert "stages" in payload
+    assert "duration_s" in payload
+    assert isinstance(payload["duration_s"], int)
 
 
 def test_main_wipe_happens_before_sync_download(tmp_path):
@@ -289,11 +289,16 @@ def test_main_inhibitor_released_on_error():
 
 def test_main_inhibitor_released_on_success():
     mock_proc = MagicMock()
-    ts = "2026-05-15T15:54:14.220+00:00"
-    check1, check2 = _patch_sync_check(new_crawl_ts=ts, existing_ts=ts)
+    check1, check2 = _patch_sync_check()
     with check1, check2, \
+         patch("scripts.sync_gbif.main"), \
+         patch("scripts.rebuild.wipe_data_dir"), \
+         patch("scripts.build_tree.main"), \
+         patch("scripts.build_id_maps.main"), \
+         patch("scripts.polish_tree.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=mock_proc), \
-         patch("scripts.rebuild._release_inhibitor") as mock_release:
+         patch("scripts.rebuild._release_inhibitor") as mock_release, \
+         patch("scripts.rebuild.notify"):
         rebuild.main()
 
     mock_release.assert_called_once_with(mock_proc)

@@ -246,6 +246,7 @@ def test_build_catalog_path_structure(tmp_path):
 
 def test_main_writes_pickle(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "CATALOG_DIR", tmp_path)
+    monkeypatch.setattr(build_tree, "TREE_ROOT", tmp_path / "tree")
     _make_csv([SPECIES_ROW], tmp_path)
 
     build_tree.main()
@@ -264,8 +265,7 @@ def test_main_missing_csv(tmp_path, monkeypatch):
 
 
 def test_build_catalog_do_write_dirs(tmp_path, monkeypatch):
-    monkeypatch.setattr(build_tree.CONFIG, "do_write_dirs", True)
     monkeypatch.setattr(build_tree, "TREE_ROOT", tmp_path / "tree")
     csv_path = _make_csv([SPECIES_ROW], tmp_path)
-    build_tree.build_catalog(csv_path)
+    build_tree.build_catalog(csv_path, write_dirs=True)
     assert any((tmp_path / "tree").rglob("Plantae_6"))

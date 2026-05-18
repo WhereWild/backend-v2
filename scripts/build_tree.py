@@ -47,7 +47,7 @@ def clean_name(name: str, rank: str) -> str:
     return name.replace(" ", "_")
 
 
-def build_catalog(csv_path: Path) -> tuple[dict, dict]:
+def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]:
     """Parse species list CSV and return (catalog, combined_name_index)."""
     catalog: dict = {}
     scientific_index: dict = {}
@@ -93,7 +93,7 @@ def build_catalog(csv_path: Path) -> tuple[dict, dict]:
             elif row["taxonRank"] == CONFIG.species_rank:
                 taxon_key_to_write = row["speciesKey"]
 
-            if CONFIG.do_write_dirs:
+            if write_dirs:
                 (TREE_ROOT / Path(*path_parts)).mkdir(parents=True, exist_ok=True)
 
             common_name = row.get("commonName", "")
@@ -128,8 +128,7 @@ def main() -> None:
         raise FileNotFoundError(f"Species list not found: {csv_path} — run sync_gbif first")
 
     print(f"Building catalog from {csv_path}...")
-    CONFIG.do_write_dirs = True
-    catalog, combined_index = build_catalog(csv_path)
+    catalog, combined_index = build_catalog(csv_path, write_dirs=True)
 
     out_path = CATALOG_DIR / "taxon_catalog.pkl"
     with open(out_path, "wb") as f:

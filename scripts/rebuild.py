@@ -156,26 +156,26 @@ def main() -> None:
             "crashed_at": crashed_at,
         })
 
+    # Check for new crawl before acquiring inhibitor or touching pipeline state.
+    print("Checking for new GBIF crawl...")
+    crawl_ts = sync_gbif.latest_crawl_finished()
+    existing_ts = sync_gbif.load_sync_state().get("gbif_taxonomy", {}).get("crawl_finished")
+    if crawl_ts == existing_ts:
+        print("Already up to date")
+        return
+    print(f"New crawl detected: {crawl_ts}")
+
     inhibitor = _acquire_shutdown_inhibitor()
     try:
+        started_at = _now()
         _update_pipeline({
             "status": "in_progress",
             "stage": None,
-            "started_at": _now(),
+            "started_at": started_at,
             "finished_at": None,
             "stages": {},
             "error": None,
         })
-
-        # Check for new crawl before wiping so the download lands in a clean dir.
-        print("Checking for new GBIF crawl...")
-        crawl_ts = sync_gbif.latest_crawl_finished()
-        existing_ts = sync_gbif.load_sync_state().get("gbif_taxonomy", {}).get("crawl_finished")
-        if crawl_ts == existing_ts:
-            _update_pipeline({"status": "completed", "stage": None, "finished_at": _now()})
-            print("Already up to date")
-            return
-        print(f"New crawl detected: {crawl_ts}")
 
         print("\n--- Wiping data directory ---")
         wipe_data_dir()
@@ -200,11 +200,13 @@ def main() -> None:
         _set_stage("polish_tree", "completed")
 
         finished_at = _now()
-        _update_pipeline({"status": "completed", "stage": None, "finished_at": finished_at})
+        elapsed = int((datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds())
+        _update_pipeline({"status": "completed", "stage": None, "finished_at": finished_at, "duration_s": elapsed})
         final_state = _read_sync_state()
         notify("completed", {
-            "started_at": final_state.get("pipeline", {}).get("started_at"),
+            "started_at": started_at,
             "finished_at": finished_at,
+            "duration_s": elapsed,
             "stages": final_state.get("pipeline", {}).get("stages", {}),
         })
         print("\nRebuild complete.")

@@ -125,7 +125,10 @@ def test_release_inhibitor_none():
 
 def _patch_sync_check(new_crawl_ts="2026-05-15T15:54:14.220+00:00", existing_ts=None):
     """Patch sync_gbif pre-check helpers used by rebuild."""
-    state = {"gbif_taxonomy": {"crawl_finished": existing_ts}} if existing_ts else {}
+    state = {
+        "gbif_taxonomy": {"crawl_finished": existing_ts},
+        "gbif_occurrences": {"crawl_finished": existing_ts},
+    } if existing_ts else {}
     return (
         patch("scripts.sync_gbif.latest_crawl_finished", return_value=new_crawl_ts),
         patch("scripts.sync_gbif.load_sync_state", return_value=state),
@@ -148,6 +151,7 @@ def test_main_full_pipeline_completes(tmp_path):
     check1, check2 = _patch_sync_check()
     with check1, check2, \
          patch("scripts.sync_gbif.main"), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("tree")), \
          patch("scripts.build_id_maps.main", side_effect=lambda: call_order.append("maps")), \
@@ -177,6 +181,7 @@ def test_main_wipe_happens_before_sync_download(tmp_path):
     check1, check2 = _patch_sync_check()
     with check1, check2, \
          patch("scripts.sync_gbif.main", side_effect=lambda: call_order.append("sync")), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main"), \
          patch("scripts.build_id_maps.main"), \
@@ -198,6 +203,7 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
     check1, check2 = _patch_sync_check()
     with check1, check2, \
          patch("scripts.sync_gbif.main"), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main", side_effect=capture), \
          patch("scripts.build_id_maps.main"), \
@@ -213,6 +219,7 @@ def test_main_errored_on_exception(tmp_path):
     check1, check2 = _patch_sync_check()
     with check1, check2, \
          patch("scripts.sync_gbif.main"), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main", side_effect=RuntimeError("boom in build_tree")), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
@@ -277,6 +284,7 @@ def test_main_inhibitor_released_on_error():
     check1, check2 = _patch_sync_check()
     with check1, check2, \
          patch("scripts.sync_gbif.main"), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main", side_effect=RuntimeError("fail")), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=mock_proc), \
@@ -292,6 +300,7 @@ def test_main_inhibitor_released_on_success():
     check1, check2 = _patch_sync_check()
     with check1, check2, \
          patch("scripts.sync_gbif.main"), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main"), \
          patch("scripts.build_id_maps.main"), \

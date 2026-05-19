@@ -90,6 +90,7 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
             if row["taxonRank"] in CONFIG.subspecies_equivalents:
                 cleaned_name = clean_name(row["scientificName"], row["taxonRank"])
                 path_parts.append(f"{cleaned_name}_{row['taxonKey']}")
+                rel_path = "/".join(path_parts)
             elif row["taxonRank"] == CONFIG.species_rank:
                 taxon_key_to_write = row["speciesKey"]
 

@@ -4,7 +4,7 @@
     "url": "https://www.gbif.org/occurrence/download",
     "license": "CC BY 4.0",
     "license_url": "https://creativecommons.org/licenses/by/4.0/",
-    "note": "Citation, DOI, and download_url are populated at runtime from data/sync_state.json"
+    "note": "Citation, DOI, download_url, and references are populated at runtime from data/sync_state.json"
   },
   "gbif_backbone": {
     "name": "GBIF Backbone Taxonomy",
@@ -13,7 +13,14 @@
     "license": "CC BY 4.0",
     "license_url": "https://creativecommons.org/licenses/by/4.0/",
     "citation": "GBIF Secretariat. GBIF Backbone Taxonomy. Checklist dataset https://doi.org/10.15468/39omei",
-    "doi": "https://doi.org/10.15468/39omei"
+    "doi": "https://doi.org/10.15468/39omei",
+    "references": [
+      {
+        "authors": "GBIF Secretariat",
+        "title": "GBIF Backbone Taxonomy",
+        "doi": "https://doi.org/10.15468/39omei"
+      }
+    ]
   },
   "inat_taxonomy": {
     "name": "iNaturalist Taxonomy",
@@ -22,7 +29,14 @@
     "license": "CC0 (taxonomy data)",
     "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
     "citation": "iNaturalist contributors, iNaturalist. iNaturalist Taxonomy. https://www.inaturalist.org/taxa",
-    "doi": ""
+    "doi": "",
+    "references": [
+      {
+        "authors": "iNaturalist contributors, iNaturalist",
+        "title": "iNaturalist Taxonomy",
+        "url": "https://www.inaturalist.org/taxa"
+      }
+    ]
   },
   "chelsa_v2_1": {
     "name": "CHELSA v2.1",
@@ -30,6 +44,15 @@
     "license": "CC BY 4.0",
     "license_url": "https://creativecommons.org/licenses/by/4.0/",
     "citation": "Karger, D.N., Conrad, O., Böhner, J., Kawohl, T., Kreft, H., Soria-Auza, R.W., Zimmermann, N.E., Linder, P., and Kessler, M. (2017). Climatologies at high resolution for the Earth land surface areas (CHELSA). Scientific Data, 4, 170122.",
-    "doi": "https://doi.org/10.1038/sdata.2017.122"
+    "doi": "https://doi.org/10.1038/sdata.2017.122",
+    "references": [
+      {
+        "authors": "Karger, D.N., Conrad, O., Böhner, J., Kawohl, T., Kreft, H., Soria-Auza, R.W., Zimmermann, N.E., Linder, P., and Kessler, M.",
+        "year": 2017,
+        "title": "Climatologies at high resolution for the Earth land surface areas (CHELSA)",
+        "journal": "Scientific Data",
+        "doi": "https://doi.org/10.1038/sdata.2017.122"
+      }
+    ]
   }
 }

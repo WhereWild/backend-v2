@@ -305,6 +305,21 @@ def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
                 if _is_discrete(layer):
                     stats = _continuous_stats_exact(series[np.isfinite(series)], unique, None)
                     stats["mode"] = int(series.value_counts().idxmax())
+                    bin_counts = series.value_counts().sort_index()
+                    min_val, max_val = int(values.min()), int(values.max())
+                    bin_counts = bin_counts.reindex(range(min_val, max_val + 1), fill_value=0)
+                    total = int(bin_counts.sum())
+                    density_rows.append({
+                        "variable": col,
+                        "count": stats["count"],
+                        "sampleCount": len(values),
+                        "pointCount": len(bin_counts),
+                        "points": [float(v) for v in bin_counts.index.tolist()],
+                        "density": [float(c / total) for c in bin_counts.tolist()],
+                        "min": float(min_val),
+                        "max": float(max_val),
+                        "bandwidth": 0.0,
+                    })
                 else:
                     kde = build_density_curve(values, vtype)
                     stats = _continuous_stats_exact(series[np.isfinite(series)], unique, kde)
@@ -413,6 +428,21 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
             mode_val = counts.most_common(1)[0][0] if counts else None
             stats = _continuous_stats_streaming(digest, acc["unique"], None)
             stats["mode"] = mode_val
+            if counts:
+                total = sum(counts.values())
+                min_val, max_val = min(counts), max(counts)
+                all_bins = [(k, counts.get(k, 0)) for k in range(min_val, max_val + 1)]
+                density_rows.append({
+                    "variable": col,
+                    "count": int(digest.n_values),
+                    "sampleCount": len(reservoir),
+                    "pointCount": len(all_bins),
+                    "points": [float(k) for k, _ in all_bins],
+                    "density": [float(v / total) for _, v in all_bins],
+                    "min": float(min_val),
+                    "max": float(max_val),
+                    "bandwidth": 0.0,
+                })
         else:
             kde = build_density_curve(reservoir, vtype) if vtype is not None else None
             stats = _continuous_stats_streaming(digest, acc["unique"], kde)

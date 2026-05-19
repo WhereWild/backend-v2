@@ -321,11 +321,16 @@ def test_process_leaf_discrete(tmp_path, monkeypatch):
     _make_occ_parquet(taxon_dir / st.OCCURRENCE_FILE, extra_cols={"gsl": [float(v) for v in vals]})
     st._process_leaf(taxon_dir, {"gsl": _DISCRETE_LAYER})
     assert (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-    assert not (taxon_dir / st.NUMERICAL_DENSITY_FILE).exists()
+    assert (taxon_dir / st.NUMERICAL_DENSITY_FILE).exists()
     df = pd.read_parquet(taxon_dir / st.NUMERICAL_STATS_FILE)
     row = df[df["variable"] == "gsl"].iloc[0]
     assert row["mode"] == 42
     assert isinstance(row["mode"], (int, np.integer))
+    den = pd.read_parquet(taxon_dir / st.NUMERICAL_DENSITY_FILE)
+    hist_row = den[den["variable"] == "gsl"].iloc[0]
+    assert hist_row["pointCount"] == 3
+    assert list(hist_row["points"]) == [42.0, 43.0, 44.0]
+    assert abs(sum(hist_row["density"]) - 1.0) < 1e-9
 
 
 def test_process_nonleaf_discrete(tmp_path, monkeypatch):
@@ -337,10 +342,18 @@ def test_process_nonleaf_discrete(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
     st._process_nonleaf(FAKE_TAXON, taxon_dir, {"gsl": _DISCRETE_LAYER})
     assert (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-    assert not (taxon_dir / st.NUMERICAL_DENSITY_FILE).exists()
+    assert (taxon_dir / st.NUMERICAL_DENSITY_FILE).exists()
     df = pd.read_parquet(taxon_dir / st.NUMERICAL_STATS_FILE)
     row = df[df["variable"] == "gsl"].iloc[0]
     assert row["mode"] == 10
+    den = pd.read_parquet(taxon_dir / st.NUMERICAL_DENSITY_FILE)
+    hist_row = den[den["variable"] == "gsl"].iloc[0]
+    # integers 10..20 inclusive, zeros filled between observed values
+    assert hist_row["pointCount"] == 11
+    assert hist_row["points"][0] == 10.0
+    assert hist_row["points"][-1] == 20.0
+    assert hist_row["density"][5] == 0.0   # value 15 was never observed
+    assert abs(sum(hist_row["density"]) - 1.0) < 1e-9
 
 
 def test_process_leaf_nominal(tmp_path, monkeypatch):

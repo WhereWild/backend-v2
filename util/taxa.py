@@ -95,7 +95,7 @@ def get_taxon_by_slug(slug: str) -> TaxonRecord | None:
 def search_taxa_by_name(
     name_query: str,
     limit: int = 10,
-) -> list[tuple[TaxonRecord, float]]:
+) -> list[tuple[TaxonRecord, float, str]]:
     normalized_query = normalize_name(name_query)
     tokens = normalized_query.split()
     if not tokens:
@@ -109,7 +109,7 @@ def search_taxa_by_name(
         limit=max(limit * 25, 100),
     )
 
-    best_by_taxon: dict[str, tuple[TaxonRecord, float]] = {}
+    best_by_taxon: dict[str, tuple[TaxonRecord, float, str]] = {}
     for name, score, _ in matches:
         adjusted = _adjust_score(name, normalized_query, tokens, float(score))
         if adjusted is None:
@@ -118,7 +118,7 @@ def search_taxa_by_name(
             taxon = get_taxon_by_id(key)
             existing = best_by_taxon.get(key)
             if existing is None or adjusted > existing[1]:
-                best_by_taxon[key] = (taxon, adjusted)
+                best_by_taxon[key] = (taxon, adjusted, name)
 
     results = sorted(best_by_taxon.values(), key=lambda x: x[1], reverse=True)
     return results[:limit]

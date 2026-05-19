@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import util.taxa as taxa
+import util.tiles as tiles
 from main import app
 
 client = TestClient(app)
@@ -84,3 +85,59 @@ def test_query_taxa_limit():
     with patch.object(taxa, "search_taxa_by_name", return_value=[]) as mock_search:
         client.get("/api/taxa/query?q=opuntia&limit=5")
         mock_search.assert_called_once_with("opuntia", limit=5)
+
+
+FAKE_LAYER = {
+    "id": "bio1",
+    "display_name": "Annual Mean Temperature",
+    "units": "°C",
+    "value_type": "interval",
+    "source": "chelsa_v2_1",
+    "filename": "bio1.tif",
+    "scale_factor": 0.1,
+    "add_offset": -273.15,
+    "render_min": -50.0,
+    "render_max": 35.0,
+}
+FAKE_CATEGORY = {"id": "bioclimate", "display_name": "Bioclimatic"}
+
+
+def test_list_variables():
+    with patch.object(tiles, "load_layers_with_category", return_value=[(FAKE_LAYER, FAKE_CATEGORY)]):
+        response = client.get("/variables")
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["id"] == "bio1"
+    assert body[0]["category"] == "Bioclimatic"
+    assert body[0]["value_type"] == "continuous"
+
+
+def test_list_layers():
+    with patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]):
+        response = client.get("/api/layers")
+    assert response.status_code == 200
+    assert response.json()[0]["id"] == "bio1"
+
+
+def test_layer_tile():
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "render_layer_tile_bytes", return_value=png):
+        response = client.get("/api/layers/bio1/tiles/4/8/5.png")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+
+
+def test_layer_tile_not_found():
+    with patch.object(tiles, "get_layer", side_effect=KeyError("nope")):
+        response = client.get("/api/layers/nope/tiles/4/8/5.png")
+    assert response.status_code == 404
+
+
+def test_variable_tile_compat():
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "render_layer_tile_bytes", return_value=png):
+        response = client.get("/api/variables/bio_1/tiles/4/8/5.png")
+    assert response.status_code == 200

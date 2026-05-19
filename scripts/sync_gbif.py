@@ -8,6 +8,7 @@ Credentials are read from environment variables loaded from .env
 
 import json
 import os
+import subprocess
 import time
 import zipfile
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ INAT_DATASET_KEY = "50c9509d-22c7-4a22-a47d-8c48425ef4a7"
 CONFIG = load_config("global")
 
 CATALOG_DIR = Path("data/taxonomy/catalog")
+OCCURRENCES_DIR = Path("data/occurrences")
 SYNC_STATE_PATH = Path("data/sync_state.json")
 
 
@@ -114,30 +116,106 @@ def poll_until_ready(download_key: str, interval: int = 30, timeout: int = 7200)
     raise TimeoutError(f"Download not ready after {timeout}s")
 
 
-def download_zip(url: str) -> None:
-    print(f"Downloading {url}...")
-    CATALOG_DIR.mkdir(parents=True, exist_ok=True)
-    dest = CATALOG_DIR / "download.zip"
-    with httpx.stream(
-        "GET", url, auth=(GBIF_USER, GBIF_PASSWORD), timeout=300, follow_redirects=True
-    ) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_bytes(chunk_size=8192):
-                f.write(chunk)
-    print(f"Saved to {dest}")
+def download_zip(url: str, dest_dir: Path | None = None) -> None:
+    d = dest_dir if dest_dir is not None else CATALOG_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading {url} → {d}/download.zip")
+    subprocess.run(
+        [
+            "aria2c",
+            f"--http-user={GBIF_USER}",
+            f"--http-passwd={GBIF_PASSWORD}",
+            "--split=8",
+            "--max-connection-per-server=8",
+            "--continue=true",
+            "--max-tries=12",
+            "--retry-wait=15",
+            "--connect-timeout=60",
+            f"--dir={d}",
+            "--out=download.zip",
+            url,
+        ],
+        check=True,
+    )
+    print(f"Saved to {d}/download.zip")
 
 
-def extract() -> None:
-    zip_file = CATALOG_DIR / "download.zip"
+def extract(src_dir: Path | None = None, output_name: str = "species_list.csv") -> None:
+    d = src_dir if src_dir is not None else CATALOG_DIR
+    zip_file = d / "download.zip"
     with zipfile.ZipFile(zip_file, "r") as z:
-        z.extractall(CATALOG_DIR)
-    for f in CATALOG_DIR.glob("*.csv"):
-        if f.name != "species_list.csv":
-            f.rename(CATALOG_DIR / "species_list.csv")
+        z.extractall(d)
+    for f in d.glob("*.csv"):
+        if f.name != output_name:
+            f.rename(d / output_name)
             break
-    files = [f.name for f in CATALOG_DIR.iterdir()]
-    print(f"Extracted to {CATALOG_DIR}/: {files}")
+    files = [f.name for f in d.iterdir()]
+    print(f"Extracted to {d}/: {files}")
+
+
+def request_occurrence_download() -> str:
+    payload = {
+        "creator": GBIF_USER,
+        "notificationAddresses": [GBIF_EMAIL],
+        "sendNotification": True,
+        "format": "DWCA",
+        "predicate": {
+            "type": "and",
+            "predicates": [
+                {"type": "equals", "key": "DATASET_KEY", "value": INAT_DATASET_KEY},
+                {"type": "equals", "key": "TAXON_KEY", "value": str(CONFIG.plantae_key)},
+                {"type": "equals", "key": "OCCURRENCE_STATUS", "value": "PRESENT"},
+                {"type": "equals", "key": "HAS_COORDINATE", "value": "true"},
+            ],
+        },
+    }
+    resp = httpx.post(
+        f"{BASE_URL}/occurrence/download/request",
+        json=payload,
+        auth=(GBIF_USER, GBIF_PASSWORD),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    key = resp.text.strip().strip('"')
+    print(f"Occurrence download requested: {key}")
+    return key
+
+
+def sync_occurrences() -> bool:
+    """Download iNat occurrence records. Returns True if new data was downloaded."""
+    if not all([GBIF_USER, GBIF_PASSWORD, GBIF_EMAIL]):
+        raise OSError("GBIF_USER, GBIF_PASSWORD, and GBIF_EMAIL must be set")
+
+    print("Checking GBIF iNat crawl history (occurrences)...")
+    crawl_finished = latest_crawl_finished()
+    state = load_sync_state()
+
+    if state.get("gbif_occurrences", {}).get("crawl_finished") == crawl_finished:
+        print(f"Already up to date (last crawl: {crawl_finished})")
+        return False
+
+    print(f"New crawl detected: {crawl_finished}")
+
+    download_key = request_occurrence_download()
+    gbif_meta = poll_until_ready(download_key)
+    download_zip(gbif_meta["downloadLink"], OCCURRENCES_DIR)
+    extract(OCCURRENCES_DIR)
+
+    state["gbif_occurrences"] = {
+        "crawl_finished": crawl_finished,
+        "download_key": download_key,
+        "download_link": gbif_meta.get("downloadLink"),
+        "doi": gbif_meta.get("doi"),
+        "citation": _build_citation(gbif_meta),
+        "created": gbif_meta.get("created"),
+        "erase_after": gbif_meta.get("eraseAfter"),
+        "total_records": gbif_meta.get("totalRecords"),
+        "number_datasets": gbif_meta.get("numberDatasets"),
+        "size_bytes": gbif_meta.get("size"),
+    }
+    save_sync_state(state)
+    print("Done.")
+    return True
 
 
 def main() -> bool:
@@ -179,3 +257,4 @@ def main() -> bool:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
+    sync_occurrences()

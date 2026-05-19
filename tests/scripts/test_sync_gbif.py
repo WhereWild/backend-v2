@@ -144,12 +144,28 @@ def test_poll_until_ready_timeout():
 
 # --- download_zip ---
 
-def test_download_zip(httpx_mock: HTTPXMock):
-    redirect_url = "https://occurrence-download.gbif.org/occurrence/download/request/0020579.zip"
-    httpx_mock.add_response(status_code=302, headers={"location": redirect_url})
-    httpx_mock.add_response(content=b"zipdata")
-    sync_gbif.download_zip(DOWNLOAD_LINK)
-    assert (sync_gbif.CATALOG_DIR / "download.zip").read_bytes() == b"zipdata"
+def test_download_zip(tmp_path):
+    with patch("subprocess.run") as mock_run:
+        sync_gbif.download_zip(DOWNLOAD_LINK)
+    args = mock_run.call_args[0][0]
+    assert args[0] == "aria2c"
+    assert f"--http-user={sync_gbif.GBIF_USER}" in args
+    assert f"--http-passwd={sync_gbif.GBIF_PASSWORD}" in args
+    assert "--continue=true" in args
+    assert "--max-tries=12" in args
+    assert f"--dir={sync_gbif.CATALOG_DIR}" in args
+    assert "--out=download.zip" in args
+    assert DOWNLOAD_LINK in args
+    assert mock_run.call_args[1].get("check") is True
+
+
+def test_download_zip_custom_dest(tmp_path):
+    dest = tmp_path / "custom"
+    with patch("subprocess.run") as mock_run:
+        sync_gbif.download_zip(DOWNLOAD_LINK, dest)
+    args = mock_run.call_args[0][0]
+    assert f"--dir={dest}" in args
+    assert dest.exists()  # mkdir should have been called
 
 
 # --- extract ---
@@ -168,6 +184,71 @@ def test_extract_renames_csv():
     sync_gbif.extract()
     assert (catalog_dir / "species_list.csv").exists()
     assert not (catalog_dir / "0020579-260507073636908.csv").exists()
+
+
+def test_extract_dwca(tmp_path):
+    with zipfile.ZipFile(tmp_path / "download.zip", "w") as z:
+        z.writestr("occurrence.txt", "gbifID\tspecies\n1\tRosa")
+        z.writestr("multimedia.txt", "gbifID\tidentifier\n1\thttps://example.com/img.jpg")
+        z.writestr("meta.xml", "<archive/>")
+        z.writestr("citations.txt", "cite me")
+        z.writestr("rights.txt", "cc by")
+    sync_gbif.extract(tmp_path)
+    assert (tmp_path / "occurrence.txt").exists()
+    assert (tmp_path / "multimedia.txt").exists()
+    assert (tmp_path / "citations.txt").exists()
+
+
+# --- request_occurrence_download ---
+
+def test_request_occurrence_download(httpx_mock: HTTPXMock):
+    httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
+    key = sync_gbif.request_occurrence_download()
+    assert key == DOWNLOAD_KEY
+    request = httpx_mock.get_requests()[0]
+    body = json.loads(request.content)
+    assert body["format"] == "DWCA"
+    predicates = body["predicate"]["predicates"]
+    keys = {p["key"]: p["value"] for p in predicates}
+    assert keys["DATASET_KEY"] == sync_gbif.INAT_DATASET_KEY
+    assert keys["HAS_COORDINATE"] == "true"
+    assert keys["OCCURRENCE_STATUS"] == "PRESENT"
+
+
+# --- sync_occurrences ---
+
+def test_sync_occurrences_missing_creds(monkeypatch):
+    monkeypatch.setattr(sync_gbif, "GBIF_USER", "")
+    with pytest.raises(OSError, match="GBIF_USER"):
+        sync_gbif.sync_occurrences()
+
+
+def test_sync_occurrences_already_up_to_date(httpx_mock: HTTPXMock, capsys):
+    httpx_mock.add_response(json=_crawl_response())
+    sync_gbif.save_sync_state({"gbif_occurrences": {"crawl_finished": CRAWL_TS}})
+    result = sync_gbif.sync_occurrences()
+    assert result is False
+    assert "Already up to date" in capsys.readouterr().out
+
+
+def test_sync_occurrences_new_crawl(httpx_mock: HTTPXMock):
+    httpx_mock.add_response(json=_crawl_response())
+    httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
+
+    with patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
+         patch("scripts.sync_gbif.download_zip"), \
+         patch("scripts.sync_gbif.extract"):
+        result = sync_gbif.sync_occurrences()
+
+    assert result is True
+
+    state = json.loads(sync_gbif.SYNC_STATE_PATH.read_text())
+    occ = state["gbif_occurrences"]
+    assert occ["crawl_finished"] == CRAWL_TS
+    assert occ["download_key"] == DOWNLOAD_KEY
+    assert occ["doi"] == "10.15468/dl.7xvnxe"
+    assert occ["total_records"] == 1122173
+    assert "GBIF.org" in occ["citation"]
 
 
 # --- main ---

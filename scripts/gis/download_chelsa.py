@@ -56,17 +56,22 @@ def _compute_stats(path: Path, nodata: float | None, scale: float, offset: float
     print("  Computing statistics (full raster read)...", flush=True)
     with rasterio.open(path) as ds:
         dtype_str = ds.dtypes[0]
-        raw = ds.read(1).astype(np.float32)
+        raw_native = ds.read(1)
     if np.issubdtype(np.dtype(dtype_str), np.integer):
-        dtype_max = float(np.iinfo(dtype_str).max)
-        nd = nodata if nodata is not None else dtype_max
-        if nd == dtype_max:
-            raw[raw >= nd - 3] = np.nan
+        iinfo = np.iinfo(dtype_str)
+        dtype_max = iinfo.max
+        # Compare in native dtype to avoid float32 precision loss on uint32.
+        nd_int = round(nodata) if nodata is not None else dtype_max
+        if nd_int == dtype_max:
+            nodata_mask = raw_native >= dtype_max - 3
         else:
-            raw[raw == dtype_max] = np.nan
-            raw[raw == nd] = np.nan
-    elif nodata is not None:
-        raw[raw == nodata] = np.nan
+            nodata_mask = (raw_native == nd_int) | (raw_native >= dtype_max - 3)
+        raw = raw_native.astype(np.float32)
+        raw[nodata_mask] = np.nan
+    else:
+        raw = raw_native.astype(np.float32)
+        if nodata is not None:
+            raw[raw == nodata] = np.nan
     raw = raw * scale + offset
     return float(np.nanmin(raw)), float(np.nanmax(raw))
 

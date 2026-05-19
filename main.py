@@ -22,6 +22,9 @@ def _image_fields(taxon: dict) -> dict:
     }
 
 
+_VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "categorical"}
+
+
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -30,6 +33,21 @@ def root():
 @app.get("/data-sources")
 def data_sources():
     return citations.load_data_sources()
+
+
+@app.get("/variables")
+def list_variables():
+    return [
+        {
+            "id": layer["id"],
+            "name": layer.get("display_name"),
+            "units": layer.get("units") or None,
+            "value_type": _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous"),
+            "category": category.get("display_name", "Other"),
+            "source_ids": [layer["source"]] if layer.get("source") else None,
+        }
+        for layer, category in tiles.load_layers_with_category()
+    ]
 
 
 @app.get("/api/layers")

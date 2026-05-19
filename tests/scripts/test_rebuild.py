@@ -40,6 +40,23 @@ def test_wipe_data_dir_preserves_sync_state(monkeypatch, tmp_path):
     assert not (data_dir / "taxonomy").exists()
 
 
+def test_wipe_data_dir_preserves_gis(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    gis_dir = data_dir / "gis"
+    gis_dir.mkdir()
+    (gis_dir / "layers").mkdir()
+    (gis_dir / "layers" / "bio1.tif").write_bytes(b"raster")
+    (data_dir / "taxonomy").mkdir()
+    monkeypatch.setattr(rebuild, "DATA_DIR", data_dir)
+    monkeypatch.setattr(rebuild, "SYNC_STATE_PATH", data_dir / "sync_state.json")
+
+    rebuild.wipe_data_dir()
+
+    assert (gis_dir / "layers" / "bio1.tif").exists()
+    assert not (data_dir / "taxonomy").exists()
+
+
 def test_wipe_data_dir_no_sync_state(monkeypatch, tmp_path):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
@@ -58,6 +75,38 @@ def test_wipe_data_dir_missing_data_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(rebuild, "DATA_DIR", tmp_path / "nonexistent")
     monkeypatch.setattr(rebuild, "SYNC_STATE_PATH", tmp_path / "nonexistent" / "sync_state.json")
     rebuild.wipe_data_dir()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# _run_download_gis
+# ---------------------------------------------------------------------------
+
+def test_run_download_gis_empty_dir(tmp_path):
+    gis_dir = tmp_path / "gis"
+    gis_dir.mkdir()
+    rebuild._run_download_gis(gis_dir=gis_dir)  # should not raise
+
+
+def test_run_download_gis_calls_each_download_script(tmp_path):
+    gis_dir = tmp_path / "gis"
+    gis_dir.mkdir()
+    (gis_dir / "download_a.py").touch()
+    (gis_dir / "download_b.py").touch()
+    (gis_dir / "build_overviews.py").touch()  # should be ignored
+
+    called = []
+    fake_a, fake_b = MagicMock(), MagicMock()
+    fake_a.main.side_effect = lambda: called.append("download_a")
+    fake_b.main.side_effect = lambda: called.append("download_b")
+
+    def fake_import(name):
+        return {"scripts.gis.download_a": fake_a, "scripts.gis.download_b": fake_b}[name]
+
+    with patch("scripts.rebuild.importlib") as mock_importlib:
+        mock_importlib.import_module.side_effect = fake_import
+        rebuild._run_download_gis(gis_dir=gis_dir)
+
+    assert called == ["download_a", "download_b"]
 
 
 # ---------------------------------------------------------------------------
@@ -157,16 +206,19 @@ def test_main_full_pipeline_completes(tmp_path):
          patch("scripts.build_id_maps.main", side_effect=lambda: call_order.append("maps")), \
          patch("scripts.populate_tree.main", side_effect=lambda: call_order.append("populate")), \
          patch("scripts.polish_tree.main", side_effect=lambda: call_order.append("polish")), \
+         patch("scripts.rebuild._run_download_gis", side_effect=lambda: call_order.append("download_gis")), \
+         patch("scripts.gis.build_overviews.main", side_effect=lambda: call_order.append("build_overviews")), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"), \
          patch("scripts.rebuild.notify") as mock_notify:
         rebuild.main()
 
-    assert call_order == ["wipe", "tree", "maps", "polish", "populate"]
+    assert call_order == ["wipe", "tree", "maps", "polish", "populate", "download_gis", "build_overviews"]
     p = _pipeline(tmp_path)
     assert p["status"] == "completed"
     assert all(p["stages"][s]["status"] == "completed"
-               for s in ["sync_gbif", "build_tree", "build_id_maps", "polish_tree", "populate_tree"])
+               for s in ["sync_gbif", "build_tree", "build_id_maps", "polish_tree", "populate_tree",
+                         "download_gis", "build_overviews"])
     assert p["error"] is None
     mock_notify.assert_called_once()
     event, payload = mock_notify.call_args[0]
@@ -188,6 +240,8 @@ def test_main_wipe_happens_before_sync_download(tmp_path):
          patch("scripts.build_id_maps.main"), \
          patch("scripts.populate_tree.main"), \
          patch("scripts.polish_tree.main"), \
+         patch("scripts.rebuild._run_download_gis"), \
+         patch("scripts.gis.build_overviews.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"):
         rebuild.main()
@@ -211,6 +265,8 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
          patch("scripts.build_id_maps.main"), \
          patch("scripts.populate_tree.main"), \
          patch("scripts.polish_tree.main"), \
+         patch("scripts.rebuild._run_download_gis"), \
+         patch("scripts.gis.build_overviews.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"):
         rebuild.main()
@@ -309,6 +365,8 @@ def test_main_inhibitor_released_on_success():
          patch("scripts.build_id_maps.main"), \
          patch("scripts.populate_tree.main"), \
          patch("scripts.polish_tree.main"), \
+         patch("scripts.rebuild._run_download_gis"), \
+         patch("scripts.gis.build_overviews.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=mock_proc), \
          patch("scripts.rebuild._release_inhibitor") as mock_release, \
          patch("scripts.rebuild.notify"):

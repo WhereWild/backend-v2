@@ -10,6 +10,7 @@ data directory (preserving sync_state.json) and runs the full pipeline:
   5. populate_tree — stream occurrence.txt → per-taxon parquet files
   6. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
   7. build_overviews — build COG overviews for all GIS layers
+  8. enrich_tree   — sample GIS layer values into per-taxon occurrence parquets
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -30,6 +31,7 @@ import httpx
 
 import scripts.build_id_maps as build_id_maps
 import scripts.build_tree as build_tree
+import scripts.enrich_tree as enrich_tree
 import scripts.gis.build_overviews as build_overviews
 import scripts.polish_tree as polish_tree
 import scripts.populate_tree as populate_tree
@@ -236,6 +238,11 @@ def main() -> None:
         _set_stage("build_overviews", "in_progress")
         build_overviews.main()
         _set_stage("build_overviews", "completed")
+
+        print("\n--- Enriching tree (GIS sampling) ---")
+        _set_stage("enrich_tree", "in_progress")
+        enrich_tree.main()
+        _set_stage("enrich_tree", "completed")
 
         finished_at = _now()
         elapsed = int((datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds())

@@ -3,10 +3,11 @@ Full taxonomy rebuild pipeline.
 
 Checks GBIF for new iNat crawl data. If new data is available, wipes the
 data directory (preserving sync_state.json) and runs the full pipeline:
-  1. sync_gbif   — download new GBIF occurrence data
-  2. build_tree  — parse taxonomy, build catalog pickle
+  1. sync_gbif     — download taxonomy + occurrence data from GBIF
+  2. build_tree    — parse taxonomy, build catalog pickle
   3. build_id_maps — build id/slug lookup maps
-  4. polish_tree — fetch iNat preferred names/images, update index
+  4. polish_tree   — fetch iNat preferred names/images, update index
+  5. populate_tree — stream occurrence.txt → per-taxon parquet files
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -27,6 +28,7 @@ import httpx
 import scripts.build_id_maps as build_id_maps
 import scripts.build_tree as build_tree
 import scripts.polish_tree as polish_tree
+import scripts.populate_tree as populate_tree
 import scripts.sync_gbif as sync_gbif
 
 DATA_DIR = Path("data")
@@ -201,6 +203,11 @@ def main() -> None:
         _set_stage("polish_tree", "in_progress")
         polish_tree.main()
         _set_stage("polish_tree", "completed")
+
+        print("\n--- Populating tree (routing occurrences to parquet) ---")
+        _set_stage("populate_tree", "in_progress")
+        populate_tree.main()
+        _set_stage("populate_tree", "completed")
 
         finished_at = _now()
         elapsed = int((datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds())

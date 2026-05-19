@@ -8,6 +8,18 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
 
 
+def _image_fields(taxon: dict) -> dict:
+    """Return unified image_* fields, preferring iNat over GBIF backup."""
+    prefix = "inat_preferred" if taxon.get("inat_preferred_image") else "gbif_backup"
+    return {
+        "image_url": taxon.get(f"{prefix}_image") or None,
+        "image_license": taxon.get(f"{prefix}_image_license") or None,
+        "image_creator": taxon.get(f"{prefix}_image_creator") or None,
+        "image_rights_holder": taxon.get(f"{prefix}_image_attribution") or None,
+        "image_references": taxon.get(f"{prefix}_image_references") or None,
+    }
+
+
 @app.get("/")
 def root():
     return {"status": "ok"}
@@ -23,7 +35,7 @@ def get_taxon(taxon_id: str):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    return taxon
+    return {**taxon, **_image_fields(taxon)}
 
 
 @app.get("/api/taxa/query")
@@ -56,22 +68,19 @@ def query_taxa(
     matched_total = len(matches)
 
     results = []
-    for taxon, score in page:
+    for taxon, score, matched_name in page:
+        preferred = taxon.get("inat_preferred_common_name") or taxon.get("common_name") or ""
+        sci_normalized = normalize_name(taxon.get("scientific_name", ""))
+        display_name = preferred if matched_name == sci_normalized else (matched_name or preferred)
         results.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
-            "common_name": format_common_name(
-                taxon.get("inat_preferred_common_name") or taxon.get("common_name") or ""
-            ) or None,
+            "common_name": format_common_name(display_name) or None,
             "common_names": None,
             "rank": taxon.get("rank"),
             "slug": taxon_slug(taxon.get("scientific_name")),
             "description": None,
-            "image_url": taxon.get("inat_preferred_image") or None,
-            "image_license": taxon.get("inat_preferred_image_license") or None,
-            "image_creator": taxon.get("inat_preferred_image_creator") or None,
-            "image_rights_holder": taxon.get("inat_preferred_image_attribution") or None,
-            "image_references": taxon.get("inat_preferred_image_references") or None,
+            **_image_fields(taxon),
             "match_score": score,
             "sample_count": None,
             "sort_value": None,

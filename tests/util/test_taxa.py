@@ -170,13 +170,13 @@ def test_get_taxon_by_slug_ambiguous():
 
 def test_search_taxa_exact_match():
     results = taxa.search_taxa_by_name("opuntia humifusa")
-    keys = [t["taxon_key"] for t, _ in results]
+    keys = [t["taxon_key"] for t, _, _m in results]
     assert "2923970" in keys
 
 
 def test_search_taxa_common_name():
     results = taxa.search_taxa_by_name("devil's tongue")
-    keys = [t["taxon_key"] for t, _ in results]
+    keys = [t["taxon_key"] for t, _, _m in results]
     assert "2923970" in keys
 
 
@@ -191,8 +191,14 @@ def test_search_taxa_limit():
 
 def test_search_taxa_scores_descending():
     results = taxa.search_taxa_by_name("opuntia humifusa")
-    scores = [score for _, score in results]
+    scores = [score for _, score, _m in results]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_search_taxa_matched_name_returned():
+    results = taxa.search_taxa_by_name("devil's tongue")
+    matched_names = [_m for t, _, _m in results if t["taxon_key"] == "2923970"]
+    assert matched_names[0] == "devil's tongue"
 
 
 def test_search_taxa_no_match():

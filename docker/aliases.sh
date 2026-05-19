@@ -67,6 +67,36 @@ pp() {
   pl "$@" && pt
 }
 
+_resolve_script() {
+  local name="$1"
+  name="${name#./}"
+  name="${name#/}"
+  name="${name%.py}"
+
+  # already rooted at scripts/ or deeper
+  if [[ "$name" == scripts/* ]]; then
+    echo "$name"
+    return
+  fi
+
+  # direct match under scripts/
+  if [[ -f "/workspace/scripts/${name}.py" ]]; then
+    echo "scripts/${name}"
+    return
+  fi
+
+  # search subdirectories of scripts/
+  local found
+  found=$(find /workspace/scripts -name "${name}.py" -not -path "*/__pycache__/*" 2>/dev/null | head -1)
+  if [[ -n "$found" ]]; then
+    found="${found#/workspace/}"
+    echo "${found%.py}"
+    return
+  fi
+
+  echo "scripts/${name}"
+}
+
 pd() {
   local module="$1"
   shift
@@ -76,13 +106,7 @@ pd() {
     return 1
   fi
 
-  if [[ "$module" != */* && ( "$module" != *.* || "$module" == *.py ) ]]; then
-    module="scripts/$module"
-  fi
-
-  module="${module%.py}"
-  module="${module#/}"
-  module="${module#./}"
+  module="$(_resolve_script "$module")"
   module="${module//\//.}"
 
   _uv python -m "$module" "$@"
@@ -97,21 +121,14 @@ pdb() {
     return 1
   fi
 
-  if [[ "$module" != */* && ( "$module" != *.* || "$module" == *.py ) ]]; then
-    module="scripts/$module"
-  fi
+  module="$(_resolve_script "$module")"
 
   local log_dir="/workspace/logs/scripts"
   local pid_dir="/workspace/logs/pids"
   local log_name="${module##*/}"
-  log_name="${log_name%.py}"
   local pid_file="$pid_dir/$log_name.pid"
   local log_file="$log_dir/$log_name.log"
-
-  module="${module%.py}"
-  module="${module#/}"
-  module="${module#./}"
-  module="${module//\//.}"
+  local module_dotted="${module//\//.}"
 
   mkdir -p "$log_dir" "$pid_dir"
 
@@ -120,7 +137,7 @@ pdb() {
     return 1
   fi
 
-  PYTHONUNBUFFERED=1 setsid _uv python -u -m "$module" "$@" > "$log_file" 2>&1 &
+  PYTHONUNBUFFERED=1 setsid _uv python -u -m "$module_dotted" "$@" > "$log_file" 2>&1 &
   echo "$!" > "$pid_file"
   echo "pdb started: $log_file"
 }
@@ -133,18 +150,12 @@ pdbs() {
     return 1
   fi
 
-  local module_path="$module"
-  if [[ "$module_path" != */* && ( "$module_path" != *.* || "$module_path" == *.py ) ]]; then
-    module_path="scripts/$module_path"
-  fi
+  local module_path
+  module_path="$(_resolve_script "$module")"
 
   local log_name="${module_path##*/}"
-  log_name="${log_name%.py}"
   local pid_file="/workspace/logs/pids/$log_name.pid"
-  local module_dotted="${module_path%.py}"
-  module_dotted="${module_dotted#/}"
-  module_dotted="${module_dotted#./}"
-  module_dotted="${module_dotted//\//.}"
+  local module_dotted="${module_path//\//.}"
 
   if [[ -f "$pid_file" ]]; then
     local pid
@@ -188,18 +199,12 @@ pdbc() {
 
   (
     for module in "$@"; do
-      if [[ "$module" != */* && ( "$module" != *.* || "$module" == *.py ) ]]; then
-        module="scripts/$module"
-      fi
+      module="$(_resolve_script "$module")"
 
       log_name="${module##*/}"
-      log_name="${log_name%.py}"
       pid_file="$pid_dir/$log_name.pid"
       log_file="$log_dir/$log_name.log"
 
-      module="${module%.py}"
-      module="${module#/}"
-      module="${module#./}"
       module="${module//\//.}"
 
       if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then

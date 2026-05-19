@@ -158,8 +158,8 @@
           "filename": "bio12.tif",
           "scale_factor": 0.1,
           "add_offset": 0.0,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 6553.399902
         },
         {
           "id": "bio13",
@@ -171,8 +171,8 @@
           "filename": "bio13.tif",
           "scale_factor": 0.1,
           "add_offset": 0.0,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 2821.600098
         },
         {
           "id": "bio14",
@@ -184,8 +184,8 @@
           "filename": "bio14.tif",
           "scale_factor": 0.1,
           "add_offset": 0.0,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 1401.900024
         },
         {
           "id": "bio15",
@@ -210,8 +210,8 @@
           "filename": "bio16.tif",
           "scale_factor": 0.1,
           "add_offset": 0.0,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 6552.600098
         },
         {
           "id": "bio17",
@@ -223,8 +223,8 @@
           "filename": "bio17.tif",
           "scale_factor": 0.1,
           "add_offset": 0.0,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 4635.700195
         },
         {
           "id": "bio18",
@@ -236,8 +236,8 @@
           "filename": "bio18.tif",
           "scale_factor": 0.1,
           "add_offset": 0.0,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 6552.600098
         },
         {
           "id": "bio19",
@@ -249,8 +249,8 @@
           "filename": "bio19.tif",
           "scale_factor": 0.1,
           "add_offset": 0.0,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 5989.399902
         }
       ]
     }

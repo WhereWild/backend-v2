@@ -55,8 +55,17 @@ def _compute_stats(path: Path, nodata: float | None, scale: float, offset: float
     """Read the full raster and return (real_min, real_max) in display units."""
     print("  Computing statistics (full raster read)...", flush=True)
     with rasterio.open(path) as ds:
+        dtype_str = ds.dtypes[0]
         raw = ds.read(1).astype(np.float32)
-    if nodata is not None:
+    if np.issubdtype(np.dtype(dtype_str), np.integer):
+        dtype_max = float(np.iinfo(dtype_str).max)
+        nd = nodata if nodata is not None else dtype_max
+        if nd == dtype_max:
+            raw[raw >= nd - 3] = np.nan
+        else:
+            raw[raw == dtype_max] = np.nan
+            raw[raw == nd] = np.nan
+    elif nodata is not None:
         raw[raw == nodata] = np.nan
     raw = raw * scale + offset
     return float(np.nanmin(raw)), float(np.nanmax(raw))

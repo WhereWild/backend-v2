@@ -11,6 +11,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import rasterio
 
 CATALOG_PATH = Path("config/gis/catalog.json")
@@ -50,34 +51,70 @@ def _download(url: str, dest: Path) -> None:
     )
 
 
-def _read_file_scaling(path: Path) -> tuple[float | None, float | None]:
+def _compute_stats(path: Path, nodata: float | None, scale: float, offset: float) -> tuple[float, float]:
+    """Read the full raster and return (real_min, real_max) in display units."""
+    print("  Computing statistics (full raster read)...", flush=True)
+    with rasterio.open(path) as ds:
+        raw = ds.read(1).astype(np.float32)
+    if nodata is not None:
+        raw[raw == nodata] = np.nan
+    raw = raw * scale + offset
+    return float(np.nanmin(raw)), float(np.nanmax(raw))
+
+
+def _read_file_metadata(path: Path) -> dict:
+    """Read scale, offset, and statistics from the file. Returns only values that are meaningfully present."""
     with rasterio.open(path) as ds:
         scale  = ds.scales[0]  if ds.scales  else None
         offset = ds.offsets[0] if ds.offsets else None
-        # rasterio returns 1.0/0.0 when nothing is embedded — treat as absent
         if scale == 1.0 and offset == 0.0:
-            return None, None
-        return scale, offset
+            scale, offset = None, None
+
+        tags = ds.tags(1) or ds.tags() or {}
+        lower = {k.lower(): v for k, v in tags.items()}
+
+        def _stat(key: str) -> float | None:
+            raw = lower.get(key)
+            try:
+                return float(raw) if raw is not None else None
+            except (ValueError, TypeError):
+                return None
+
+        stat_min = _stat("statistics_minimum") or _stat("minimum") or _stat("min")
+        stat_max = _stat("statistics_maximum") or _stat("maximum") or _stat("max")
+
+        return {
+            "scale_factor": scale,
+            "add_offset":   offset,
+            "stat_min":     stat_min,
+            "stat_max":     stat_max,
+            "crs":          str(ds.crs),
+            "shape":        (ds.height, ds.width),
+            "dtype":        ds.dtypes[0],
+            "nodata":       ds.nodata,
+            "bounds":       ds.bounds,
+        }
 
 
-def _inspect(path: Path) -> None:
-    with rasterio.open(path) as ds:
-        scale, offset = _read_file_scaling(path)
-        print(f"  CRS        : {ds.crs}")
-        print(f"  Shape      : {ds.height} x {ds.width}")
-        print(f"  Dtype      : {ds.dtypes[0]}")
-        print(f"  Nodata     : {ds.nodata}")
-        print(f"  Bounds     : {ds.bounds}")
-        print(f"  Scale      : {scale}")
-        print(f"  Offset     : {offset}")
+def _inspect(path: Path, meta: dict) -> None:
+    print(f"  CRS        : {meta['crs']}")
+    print(f"  Shape      : {meta['shape'][0]} x {meta['shape'][1]}")
+    print(f"  Dtype      : {meta['dtype']}")
+    print(f"  Nodata     : {meta['nodata']}")
+    print(f"  Bounds     : {meta['bounds']}")
+    print(f"  Scale      : {meta['scale_factor']}")
+    print(f"  Offset     : {meta['add_offset']}")
+    print(f"  Stat min   : {meta['stat_min']}")
+    print(f"  Stat max   : {meta['stat_max']}")
 
 
-def _sync_scaling(layer: dict, path: Path) -> bool:
-    """Patch null scale/offset in the layer dict from file metadata. Returns True if changed."""
-    file_scale, file_offset = _read_file_scaling(path)
+def _sync_catalog(layer: dict, meta: dict, path: Path) -> bool:
+    """Patch null catalog fields from file metadata. Returns True if anything changed."""
     changed = False
 
-    for key, file_val in [("scale_factor", file_scale), ("add_offset", file_offset)]:
+    # scale_factor / add_offset — file is informational, catalog is authoritative
+    for key in ("scale_factor", "add_offset"):
+        file_val    = meta[key]
         catalog_val = layer.get(key)
         if catalog_val is None and file_val is not None:
             print(f"  {key}: null → {file_val} (read from file)")
@@ -85,6 +122,25 @@ def _sync_scaling(layer: dict, path: Path) -> bool:
             changed = True
         elif catalog_val is not None and file_val is not None and catalog_val != file_val:
             print(f"  WARNING: catalog {key}={catalog_val} differs from file {file_val} — keeping catalog value")
+
+    # render_min / render_max — try embedded stats first, fall back to full read
+    scale  = layer.get("scale_factor") or 1.0
+    offset = layer.get("add_offset")   or 0.0
+    if layer.get("render_min") is None or layer.get("render_max") is None:
+        stat_min, stat_max = meta["stat_min"], meta["stat_max"]
+        if stat_min is not None and stat_max is not None:
+            computed_min = round(stat_min * scale + offset, 6)
+            computed_max = round(stat_max * scale + offset, 6)
+        else:
+            computed_min, computed_max = _compute_stats(path, meta["nodata"], scale, offset)
+            computed_min = round(computed_min, 6)
+            computed_max = round(computed_max, 6)
+
+        for key, val in [("render_min", computed_min), ("render_max", computed_max)]:
+            if layer.get(key) is None:
+                print(f"  {key}: null → {val}")
+                layer[key] = val
+                changed = True
 
     return changed
 
@@ -104,16 +160,29 @@ def main() -> None:
             _download(layer["download_url"], dest)
             print(f"  Saved to {dest}")
 
+        meta = _read_file_metadata(dest)
         print(f"[inspect] {layer['id']}")
-        _inspect(dest)
+        _inspect(dest, meta)
 
-        if _sync_scaling(layer, dest):
+        if _sync_catalog(layer, meta, dest):
             catalog_dirty = True
         print()
 
     if catalog_dirty:
+        # Re-read from disk before writing so external edits (e.g. value_type) aren't clobbered.
+        updates = {
+            layer["id"]: {k: layer[k] for k in ("scale_factor", "add_offset", "render_min", "render_max")}
+            for cat in catalog["categories"]
+            for layer in cat["layers"]
+        }
+        with open(CATALOG_PATH) as f:
+            on_disk = json.load(f)
+        for cat in on_disk["categories"]:
+            for layer in cat["layers"]:
+                if layer["id"] in updates:
+                    layer.update(updates[layer["id"]])
         with open(CATALOG_PATH, "w") as f:
-            json.dump(catalog, f, indent=2, ensure_ascii=False)
+            json.dump(on_disk, f, indent=2, ensure_ascii=False)
             f.write("\n")
         print(f"Catalog updated: {CATALOG_PATH}")
 

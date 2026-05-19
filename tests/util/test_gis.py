@@ -1,4 +1,4 @@
-from util.gis import hilbert_index, _HILBERT_ORDER
+from util.gis import _HILBERT_ORDER, hilbert_index
 
 
 def test_hilbert_index_fits_in_int32():

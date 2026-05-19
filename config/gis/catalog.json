@@ -1,0 +1,22 @@
+{
+  "categories": [
+    {
+      "id": "bioclimate",
+      "display_name": "Bioclimatic",
+      "description": "Bioclimatic variables derived from monthly temperature and precipitation data, capturing annual trends, seasonality, and extremes relevant to ecological modeling.",
+      "layers": [
+        {
+          "id": "bio1",
+          "source": "chelsa_v2_1",
+          "display_name": "Annual Mean Temperature",
+          "units": "°C",
+          "value_type": "interval",
+          "download_url": "https://os.zhdk.cloud.switch.ch/chelsav2/GLOBAL/climatologies/1981-2010/bio/CHELSA_bio1_1981-2010_V.2.1.tif",
+          "filename": "bio1.tif",
+          "scale_factor": 0.1,
+          "add_offset": -273.15
+        }
+      ]
+    }
+  ]
+}

@@ -155,17 +155,18 @@ def test_main_full_pipeline_completes(tmp_path):
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("tree")), \
          patch("scripts.build_id_maps.main", side_effect=lambda: call_order.append("maps")), \
+         patch("scripts.populate_tree.main", side_effect=lambda: call_order.append("populate")), \
          patch("scripts.polish_tree.main", side_effect=lambda: call_order.append("polish")), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"), \
          patch("scripts.rebuild.notify") as mock_notify:
         rebuild.main()
 
-    assert call_order == ["wipe", "tree", "maps", "polish"]
+    assert call_order == ["wipe", "tree", "maps", "polish", "populate"]
     p = _pipeline(tmp_path)
     assert p["status"] == "completed"
     assert all(p["stages"][s]["status"] == "completed"
-               for s in ["sync_gbif", "build_tree", "build_id_maps", "polish_tree"])
+               for s in ["sync_gbif", "build_tree", "build_id_maps", "polish_tree", "populate_tree"])
     assert p["error"] is None
     mock_notify.assert_called_once()
     event, payload = mock_notify.call_args[0]
@@ -185,6 +186,7 @@ def test_main_wipe_happens_before_sync_download(tmp_path):
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main"), \
          patch("scripts.build_id_maps.main"), \
+         patch("scripts.populate_tree.main"), \
          patch("scripts.polish_tree.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"):
@@ -207,6 +209,7 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main", side_effect=capture), \
          patch("scripts.build_id_maps.main"), \
+         patch("scripts.populate_tree.main"), \
          patch("scripts.polish_tree.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"):
@@ -304,6 +307,7 @@ def test_main_inhibitor_released_on_success():
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main"), \
          patch("scripts.build_id_maps.main"), \
+         patch("scripts.populate_tree.main"), \
          patch("scripts.polish_tree.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=mock_proc), \
          patch("scripts.rebuild._release_inhibitor") as mock_release, \

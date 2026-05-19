@@ -133,6 +133,7 @@ def build_density_curve(values: np.ndarray, value_type: ValueType) -> dict | Non
             raise NotImplementedError("Von Mises KDE not yet implemented for circular data")
         case _:
             return None
+    return None
 
 
 # ---------------------------------------------------------------------------

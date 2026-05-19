@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.136.1",
+    "fastdigest>=0.12.0",
     "httpx>=0.28.1",
     "numpy>=2.4.6",
     "pandas>=2.3.0",
@@ -11,6 +12,7 @@ dependencies = [
     "pyarrow>=24.0.0",
     "rapidfuzz>=3.14.5",
     "rasterio>=1.5.0",
+    "scipy>=1.17.1",
     "uvicorn[standard]>=0.46.0",
 ]
 

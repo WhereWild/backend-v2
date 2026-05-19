@@ -32,7 +32,6 @@ def _make_occ_parquet(path: Path, extra_cols: dict | None = None) -> None:
 
 _CONTINUOUS_LAYER = {"id": "bio1", "value_type": "ratio", "scale_factor": 0.1, "add_offset": -273.15}
 _NOMINAL_LAYER    = {"id": "kg0",  "value_type": "nominal", "scale_factor": None, "add_offset": None}
-_INTERVAL_LAYER   = {"id": "bio12","value_type": "interval","scale_factor": 1.0, "add_offset": 0.0}
 _DISCRETE_LAYER   = {"id": "gsl",  "value_type": "ratio",   "scale_factor": None, "add_offset": None, "domain": "discrete"}
 
 

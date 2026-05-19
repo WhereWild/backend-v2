@@ -16,9 +16,14 @@ def _load_sync_state() -> dict:
 def load_data_sources() -> dict:
     sources = json.loads(DATA_SOURCES_PATH.read_text())
     gbif_taxonomy = _load_sync_state().get("gbif_taxonomy", {})
-    sources["gbif_occurrence"]["citation"] = gbif_taxonomy.get("citation", "")
-    sources["gbif_occurrence"]["doi"] = (
-        f"https://doi.org/{gbif_taxonomy['doi']}" if gbif_taxonomy.get("doi") else ""
-    )
-    sources["gbif_occurrence"]["download_url"] = gbif_taxonomy.get("download_link", "") or ""
+    occ = sources["gbif_occurrence"]
+    citation = gbif_taxonomy.get("citation", "")
+    doi_url = f"https://doi.org/{gbif_taxonomy['doi']}" if gbif_taxonomy.get("doi") else ""
+    occ["citation"] = citation
+    occ["doi"] = doi_url
+    occ["download_url"] = gbif_taxonomy.get("download_link", "") or ""
+    ref: dict = {"title": citation, "authors": "GBIF"}
+    if doi_url:
+        ref["doi"] = doi_url
+    occ["references"] = [ref] if citation or doi_url else []
     return sources

@@ -1,4 +1,5 @@
 import pickle
+from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, TypedDict
@@ -75,6 +76,45 @@ def _slug_index() -> dict[str, str]:
             index.setdefault(slug, []).append(taxon_key)
     # Discard ambiguous slugs (multiple taxa share a scientific name)
     return {slug: keys[0] for slug, keys in index.items() if len(keys) == 1}
+
+
+@lru_cache(maxsize=1)
+def _path_index() -> dict[str, str]:
+    """Map taxon path → taxon_key (built once from catalog)."""
+    return {taxon["path"]: key for key, taxon in load_catalog().items()}
+
+
+@lru_cache(maxsize=1)
+def _children_index() -> dict[str, list[str]]:
+    """Map taxon_key → list of direct-child taxon_keys."""
+    path_to_key = _path_index()
+    index: dict[str, list[str]] = {}
+    for key, taxon in load_catalog().items():
+        path = taxon["path"]
+        if "/" not in path:
+            continue
+        parent_path = path.rsplit("/", 1)[0]
+        parent_key = path_to_key.get(parent_path)
+        if parent_key:
+            index.setdefault(parent_key, []).append(key)
+    return index
+
+
+def get_children(taxon_key: Any) -> list[TaxonRecord]:
+    """Return the direct children of a taxon in catalog order."""
+    catalog = load_catalog()
+    return [catalog[k] for k in _children_index().get(str(taxon_key), []) if k in catalog]
+
+
+def iter_descendants(taxon: TaxonRecord, *, include_self: bool = True) -> Iterable[TaxonRecord]:
+    """DFS over a taxon and all its descendants."""
+    if include_self:
+        yield taxon
+    stack = get_children(taxon["taxon_key"])
+    while stack:
+        child = stack.pop()
+        yield child
+        stack.extend(get_children(child["taxon_key"]))
 
 
 def get_taxon_by_id(taxon_id: Any) -> TaxonRecord | None:

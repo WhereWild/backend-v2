@@ -11,6 +11,7 @@ data directory (preserving sync_state.json) and runs the full pipeline:
   6. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
   7. build_overviews — build COG overviews for all GIS layers
   8. enrich_tree   — sample GIS layer values into per-taxon occurrence parquets
+  9. process_tree  — compute per-taxon summary statistics and KDE density graphs
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -35,6 +36,7 @@ import scripts.enrich_tree as enrich_tree
 import scripts.gis.build_overviews as build_overviews
 import scripts.polish_tree as polish_tree
 import scripts.populate_tree as populate_tree
+import scripts.process_tree as process_tree
 import scripts.sync_gbif as sync_gbif
 
 DATA_DIR = Path("data")
@@ -243,6 +245,11 @@ def main() -> None:
         _set_stage("enrich_tree", "in_progress")
         enrich_tree.main()
         _set_stage("enrich_tree", "completed")
+
+        print("\n--- Processing tree (summary stats + KDE) ---")
+        _set_stage("process_tree", "in_progress")
+        process_tree.main()
+        _set_stage("process_tree", "completed")
 
         finished_at = _now()
         elapsed = int((datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds())

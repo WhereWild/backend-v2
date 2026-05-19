@@ -170,25 +170,28 @@ def render_layer_tile_bytes(
                 read_w = max(1, round(src_px_w))
                 read_h = max(1, round(src_px_h))
 
-            raw = ds.read(
+            raw_native = ds.read(
                 1,
                 window=src_window,
                 out_shape=(read_h, read_w),
                 resampling=resampling,
-            ).astype(np.float32)
+            )
 
-            if np.issubdtype(np.dtype(ds.dtypes[0]), np.integer):
-                dtype_max = float(np.iinfo(ds.dtypes[0]).max)
-                nd = ds.nodata if ds.nodata is not None else dtype_max
-                if nd == dtype_max:
-                    # nodata is the ceiling: also mask near-ceiling sentinels
-                    # (CHELSA writes e.g. 65533 at polar edges alongside 65535).
-                    raw[raw >= nd - 3] = np.nan
+            if np.issubdtype(raw_native.dtype, np.integer):
+                iinfo = np.iinfo(raw_native.dtype)
+                dtype_max = iinfo.max
+                # Compare in native dtype to avoid float32 precision loss on uint32.
+                nd_int = round(ds.nodata) if ds.nodata is not None else dtype_max
+                if nd_int == dtype_max:
+                    nodata_mask = raw_native >= dtype_max - 3
                 else:
-                    raw[raw == dtype_max] = np.nan
-                    raw[raw == nd] = np.nan
-            elif ds.nodata is not None:
-                raw[raw == ds.nodata] = np.nan
+                    nodata_mask = (raw_native == nd_int) | (raw_native >= dtype_max - 3)
+                raw = raw_native.astype(np.float32)
+                raw[nodata_mask] = np.nan
+            else:
+                raw = raw_native.astype(np.float32)
+                if ds.nodata is not None:
+                    raw[raw == ds.nodata] = np.nan
 
             raw = raw * scale + offset
 

@@ -8,6 +8,8 @@ data directory (preserving sync_state.json) and runs the full pipeline:
   3. build_id_maps — build id/slug lookup maps
   4. polish_tree   — fetch iNat preferred names/images, update index
   5. populate_tree — stream occurrence.txt → per-taxon parquet files
+  6. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
+  7. build_overviews — build COG overviews for all GIS layers
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -15,6 +17,7 @@ The 4am system reboot is delayed via systemd-inhibit until the pipeline
 finishes.
 """
 
+import importlib
 import json
 import os
 import shutil
@@ -27,6 +30,7 @@ import httpx
 
 import scripts.build_id_maps as build_id_maps
 import scripts.build_tree as build_tree
+import scripts.gis.build_overviews as build_overviews
 import scripts.polish_tree as polish_tree
 import scripts.populate_tree as populate_tree
 import scripts.sync_gbif as sync_gbif
@@ -124,20 +128,34 @@ def _release_inhibitor(proc: "subprocess.Popen | None") -> None:
 # data directory
 # ---------------------------------------------------------------------------
 
+def _run_download_gis(gis_dir: Path | None = None) -> None:
+    """Discover and run every scripts/gis/download_*.py in alphabetical order."""
+    if gis_dir is None:  # pragma: no cover
+        gis_dir = Path(__file__).parent / "gis"
+    for script in sorted(gis_dir.glob("download_*.py")):
+        module_name = f"scripts.gis.{script.stem}"
+        print(f"  [{script.stem}]")
+        mod = importlib.import_module(module_name)
+        mod.main()
+
+
 def wipe_data_dir() -> None:
-    """Delete everything in DATA_DIR except sync_state.json."""
+    """Delete GBIF-derived data in DATA_DIR, preserving sync_state.json and data/gis/."""
     if not DATA_DIR.exists():
         return
-    sync_state_backup = None
-    if SYNC_STATE_PATH.exists():
-        sync_state_backup = SYNC_STATE_PATH.read_bytes()
+    sync_state_backup = SYNC_STATE_PATH.read_bytes() if SYNC_STATE_PATH.exists() else None
 
-    shutil.rmtree(DATA_DIR)
-    DATA_DIR.mkdir()
+    for child in DATA_DIR.iterdir():
+        if child.name == "gis":
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
     if sync_state_backup is not None:
         SYNC_STATE_PATH.write_bytes(sync_state_backup)
-    print(f"Wiped {DATA_DIR}/ (sync_state.json preserved)")
+    print(f"Wiped {DATA_DIR}/ (sync_state.json and data/gis/ preserved)")
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +226,16 @@ def main() -> None:
         _set_stage("populate_tree", "in_progress")
         populate_tree.main()
         _set_stage("populate_tree", "completed")
+
+        print("\n--- Downloading GIS layers ---")
+        _set_stage("download_gis", "in_progress")
+        _run_download_gis()
+        _set_stage("download_gis", "completed")
+
+        print("\n--- Building COG overviews ---")
+        _set_stage("build_overviews", "in_progress")
+        build_overviews.main()
+        _set_stage("build_overviews", "completed")
 
         finished_at = _now()
         elapsed = int((datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds())

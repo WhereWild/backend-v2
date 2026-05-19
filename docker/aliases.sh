@@ -25,7 +25,7 @@ api() {
     mv -f "$log_dir/api.log" "$log_dir/api.previous.log"
   fi
 
-  setsid _uv uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
+  setsid uv run --env-file /workspace/.env uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
     > "$log_dir/api.log" 2>&1 &
   echo "$!" > "$pid_file"
   echo "api started: http://localhost:8000/docs"
@@ -137,7 +137,7 @@ pdb() {
     return 1
   fi
 
-  PYTHONUNBUFFERED=1 setsid _uv python -u -m "$module_dotted" "$@" > "$log_file" 2>&1 &
+  PYTHONUNBUFFERED=1 setsid uv run --env-file /workspace/.env python -u -m "$module_dotted" "$@" > "$log_file" 2>&1 &
   echo "$!" > "$pid_file"
   echo "pdb started: $log_file"
 }
@@ -212,7 +212,7 @@ pdbc() {
         break
       fi
 
-      PYTHONUNBUFFERED=1 setsid _uv python -u -m "$module" > "$log_file" 2>&1 &
+      PYTHONUNBUFFERED=1 setsid uv run --env-file /workspace/.env python -u -m "$module" > "$log_file" 2>&1 &
       pid="$!"
       echo "$pid" > "$pid_file"
       wait "$pid"

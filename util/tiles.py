@@ -55,6 +55,15 @@ def load_layers() -> list[dict]:
     ]
 
 
+def load_layers_with_category() -> list[tuple[dict, dict]]:
+    """Return (layer, category) pairs for every layer in the catalog."""
+    return [
+        (layer, category)
+        for category in _catalog()["categories"]
+        for layer in category["layers"]
+    ]
+
+
 def get_layer(layer_id: str) -> dict:
     for layer in load_layers():
         if layer["id"] == layer_id:
@@ -168,7 +177,17 @@ def render_layer_tile_bytes(
                 resampling=resampling,
             ).astype(np.float32)
 
-            if ds.nodata is not None:
+            if np.issubdtype(np.dtype(ds.dtypes[0]), np.integer):
+                dtype_max = float(np.iinfo(ds.dtypes[0]).max)
+                nd = ds.nodata if ds.nodata is not None else dtype_max
+                if nd == dtype_max:
+                    # nodata is the ceiling: also mask near-ceiling sentinels
+                    # (CHELSA writes e.g. 65533 at polar edges alongside 65535).
+                    raw[raw >= nd - 3] = np.nan
+                else:
+                    raw[raw == dtype_max] = np.nan
+                    raw[raw == nd] = np.nan
+            elif ds.nodata is not None:
                 raw[raw == ds.nodata] = np.nan
 
             raw = raw * scale + offset

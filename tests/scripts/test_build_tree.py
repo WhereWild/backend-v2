@@ -195,6 +195,14 @@ def test_build_catalog_subspecies_no_marker(tmp_path):
     assert "9999001" in catalog
 
 
+def test_build_catalog_subspecies_path_includes_subspecies_dir(tmp_path):
+    csv_path = _make_csv([SUBSPECIES_NO_MARKER_ROW], tmp_path)
+    catalog, _ = build_tree.build_catalog(csv_path)
+    path = catalog["9999001"]["path"]
+    assert "9999001" in path
+    assert path.endswith("Echinocereus_triglochidiatus_mojavensis_9999001")
+
+
 def test_build_catalog_skips_non_leaf_rank(tmp_path):
     csv_path = _make_csv([SKIPPED_RANK_ROW], tmp_path)
     catalog, _ = build_tree.build_catalog(csv_path)

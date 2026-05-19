@@ -1,7 +1,9 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 
-from util import citations, taxa
+from util import citations, taxa, tiles
 from util.taxa import format_common_name, normalize_name, taxon_slug
 
 app = FastAPI()
@@ -28,6 +30,32 @@ def root():
 @app.get("/data-sources")
 def data_sources():
     return citations.load_data_sources()
+
+
+@app.get("/api/layers")
+def list_layers():
+    return tiles.load_layers()
+
+
+@app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
+async def variable_tile_compat(variable_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024)):
+    """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
+    layer_id = variable_id.replace("_", "")
+    return await layer_tile(layer_id, z, x, y, tile_size)
+
+
+@app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
+async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024)):
+    try:
+        tiles.get_layer(layer_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Layer '{layer_id}' not found")
+
+    payload = await run_in_threadpool(
+        tiles.render_layer_tile_bytes,
+        layer_id, z, x, y, tile_size,
+    )
+    return Response(content=payload, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.get("/api/taxon/{taxon_id}")

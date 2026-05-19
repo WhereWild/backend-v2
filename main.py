@@ -72,6 +72,7 @@ def list_variables():
             "name": layer.get("display_name"),
             "units": layer.get("units") or None,
             "value_type": _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous"),
+            "domain": layer.get("domain") or None,
             "category": category.get("display_name", "Other"),
             "source_ids": [layer["source"]] if layer.get("source") else None,
         }
@@ -200,6 +201,7 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
         "name": layer["display_name"] if layer else variable_id,
         "units": (layer.get("units") or None) if layer else None,
         "value_type": layer.get("value_type") if layer else None,
+        "domain": (layer.get("domain") or None) if layer else None,
     }
     value_type = layer.get("value_type") if layer else None
 

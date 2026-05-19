@@ -15,8 +15,8 @@ from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 import rasterio
+from PIL import Image
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.transform import Affine, from_bounds

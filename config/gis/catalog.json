@@ -16,7 +16,8 @@
           "scale_factor": 0.1,
           "add_offset": -273.15,
           "render_min": -53.549988,
-          "render_max": 34.75
+          "render_max": 34.75,
+          "domain": "continuous"
         },
         {
           "id": "bio2",
@@ -29,7 +30,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 18.9
+          "render_max": 18.9,
+          "domain": "continuous"
         },
         {
           "id": "bio3",
@@ -42,7 +44,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.006,
-          "render_max": 0.954
+          "render_max": 0.954,
+          "domain": "continuous"
         },
         {
           "id": "bio4",
@@ -55,7 +58,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 4.7,
-          "render_max": 2334.199951
+          "render_max": 2334.199951,
+          "domain": "continuous"
         },
         {
           "id": "bio5",
@@ -68,7 +72,8 @@
           "scale_factor": 0.1,
           "add_offset": -273.15,
           "render_min": -33.749985,
-          "render_max": 46.950012
+          "render_max": 46.950012,
+          "domain": "continuous"
         },
         {
           "id": "bio6",
@@ -81,7 +86,8 @@
           "scale_factor": 0.1,
           "add_offset": -273.15,
           "render_min": -65.849991,
-          "render_max": 26.350006
+          "render_max": 26.350006,
+          "domain": "continuous"
         },
         {
           "id": "bio7",
@@ -94,7 +100,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 1.7,
-          "render_max": 70.700005
+          "render_max": 70.700005,
+          "domain": "continuous"
         },
         {
           "id": "bio8",
@@ -107,7 +114,8 @@
           "scale_factor": 0.1,
           "add_offset": -273.15,
           "render_min": -62.449997,
-          "render_max": 37.550018
+          "render_max": 37.550018,
+          "domain": "continuous"
         },
         {
           "id": "bio9",
@@ -120,7 +128,8 @@
           "scale_factor": 0.1,
           "add_offset": -273.15,
           "render_min": -61.049988,
-          "render_max": 38.850006
+          "render_max": 38.850006,
+          "domain": "continuous"
         },
         {
           "id": "bio10",
@@ -133,7 +142,8 @@
           "scale_factor": 0.1,
           "add_offset": -273.15,
           "render_min": -38.549988,
-          "render_max": 39.350006
+          "render_max": 39.350006,
+          "domain": "continuous"
         },
         {
           "id": "bio11",
@@ -146,7 +156,8 @@
           "scale_factor": 0.1,
           "add_offset": -273.15,
           "render_min": -63.049988,
-          "render_max": 31.450012
+          "render_max": 31.450012,
+          "domain": "continuous"
         },
         {
           "id": "bio12",
@@ -159,7 +170,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 6553.399902
+          "render_max": 6553.399902,
+          "domain": "continuous"
         },
         {
           "id": "bio13",
@@ -172,7 +184,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 2821.600098
+          "render_max": 2821.600098,
+          "domain": "continuous"
         },
         {
           "id": "bio14",
@@ -185,7 +198,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 1401.900024
+          "render_max": 1401.900024,
+          "domain": "continuous"
         },
         {
           "id": "bio15",
@@ -198,7 +212,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 231.199997
+          "render_max": 231.199997,
+          "domain": "continuous"
         },
         {
           "id": "bio16",
@@ -211,7 +226,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 6552.600098
+          "render_max": 6552.600098,
+          "domain": "continuous"
         },
         {
           "id": "bio17",
@@ -224,7 +240,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 4635.700195
+          "render_max": 4635.700195,
+          "domain": "continuous"
         },
         {
           "id": "bio18",
@@ -237,7 +254,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 6552.600098
+          "render_max": 6552.600098,
+          "domain": "continuous"
         },
         {
           "id": "bio19",
@@ -250,7 +268,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 5989.399902
+          "render_max": 5989.399902,
+          "domain": "continuous"
         }
       ]
     },
@@ -270,7 +289,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 365.0
+          "render_max": 365.0,
+          "domain": "discrete"
         },
         {
           "id": "gdd0",
@@ -283,7 +303,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 12693.100586
+          "render_max": 12693.100586,
+          "domain": "continuous"
         },
         {
           "id": "gdd5",
@@ -296,7 +317,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 10868.100586
+          "render_max": 10868.100586,
+          "domain": "continuous"
         },
         {
           "id": "gdd10",
@@ -309,7 +331,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 9043.100586
+          "render_max": 9043.100586,
+          "domain": "continuous"
         },
         {
           "id": "gddlgd0",
@@ -322,7 +345,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 365.0
+          "render_max": 365.0,
+          "domain": "discrete"
         },
         {
           "id": "gddlgd5",
@@ -335,7 +359,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 365.0
+          "render_max": 365.0,
+          "domain": "discrete"
         },
         {
           "id": "gddlgd10",
@@ -348,7 +373,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 365.0
+          "render_max": 365.0,
+          "domain": "discrete"
         },
         {
           "id": "ngd0",
@@ -361,7 +387,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 365.0
+          "render_max": 365.0,
+          "domain": "discrete"
         },
         {
           "id": "ngd5",
@@ -374,7 +401,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 365.0
+          "render_max": 365.0,
+          "domain": "discrete"
         },
         {
           "id": "ngd10",
@@ -387,7 +415,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 365.0
+          "render_max": 365.0,
+          "domain": "discrete"
         },
         {
           "id": "gst",
@@ -400,7 +429,8 @@
           "scale_factor": 0.1,
           "add_offset": -273.15,
           "render_min": 0.950012,
-          "render_max": 37.550018
+          "render_max": 37.550018,
+          "domain": "continuous"
         }
       ]
     },
@@ -420,7 +450,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 365.0
+          "render_max": 365.0,
+          "domain": "discrete"
         },
         {
           "id": "scd",
@@ -433,7 +464,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 365.0
+          "render_max": 365.0,
+          "domain": "discrete"
         },
         {
           "id": "swe",
@@ -446,7 +478,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.2,
-          "render_max": 6553.100098
+          "render_max": 6553.100098,
+          "domain": "continuous"
         },
         {
           "id": "swb",
@@ -459,7 +492,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": -4011.0,
-          "render_max": 406.0
+          "render_max": 406.0,
+          "domain": "continuous"
         }
       ]
     },
@@ -479,7 +513,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 8.51,
-          "render_max": 95.57
+          "render_max": 95.57,
+          "domain": "continuous"
         },
         {
           "id": "cltmean",
@@ -492,7 +527,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 5.99,
-          "render_max": 91.559998
+          "render_max": 91.559998,
+          "domain": "continuous"
         },
         {
           "id": "cltmin",
@@ -505,7 +541,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 0.13,
-          "render_max": 88.909996
+          "render_max": 88.909996,
+          "domain": "continuous"
         },
         {
           "id": "cltrange",
@@ -518,7 +555,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 1.71,
-          "render_max": 86.029999
+          "render_max": 86.029999,
+          "domain": "continuous"
         },
         {
           "id": "cmimax",
@@ -531,7 +569,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": -281.800018,
-          "render_max": 2502.300049
+          "render_max": 2502.300049,
+          "domain": "continuous"
         },
         {
           "id": "cmimean",
@@ -544,7 +583,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": -334.899994,
-          "render_max": 1739.300049
+          "render_max": 1739.300049,
+          "domain": "continuous"
         },
         {
           "id": "cmimin",
@@ -557,7 +597,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": -544.100037,
-          "render_max": 1293.700073
+          "render_max": 1293.700073,
+          "domain": "continuous"
         },
         {
           "id": "cmirange",
@@ -570,7 +611,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 13.2,
-          "render_max": 2561.699951
+          "render_max": 2561.699951,
+          "domain": "continuous"
         },
         {
           "id": "hursmax",
@@ -583,7 +625,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 32.719997,
-          "render_max": 100.0
+          "render_max": 100.0,
+          "domain": "continuous"
         },
         {
           "id": "hursmean",
@@ -596,7 +639,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 27.129999,
-          "render_max": 97.049995
+          "render_max": 97.049995,
+          "domain": "continuous"
         },
         {
           "id": "hursmin",
@@ -609,7 +653,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 20.539999,
-          "render_max": 90.709999
+          "render_max": 90.709999,
+          "domain": "continuous"
         },
         {
           "id": "hursrange",
@@ -622,7 +667,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 0.31,
-          "render_max": 50.799999
+          "render_max": 50.799999,
+          "domain": "continuous"
         },
         {
           "id": "npp",
@@ -635,7 +681,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 2645.900146
+          "render_max": 2645.900146,
+          "domain": "continuous"
         },
         {
           "id": "petmax",
@@ -648,7 +695,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 24.119999,
-          "render_max": 544.099976
+          "render_max": 544.099976,
+          "domain": "continuous"
         },
         {
           "id": "petmean",
@@ -661,7 +709,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 9.099999,
-          "render_max": 348.589996
+          "render_max": 348.589996,
+          "domain": "continuous"
         },
         {
           "id": "petmin",
@@ -674,7 +723,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 326.47998
+          "render_max": 326.47998,
+          "domain": "continuous"
         },
         {
           "id": "petrange",
@@ -687,7 +737,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 6.63,
-          "render_max": 452.949982
+          "render_max": 452.949982,
+          "domain": "continuous"
         },
         {
           "id": "rsdsmax",
@@ -700,7 +751,8 @@
           "scale_factor": 1.0,
           "add_offset": 0.0,
           "render_min": 97.0,
-          "render_max": 401.0
+          "render_max": 401.0,
+          "domain": "continuous"
         },
         {
           "id": "rsdsmean",
@@ -713,7 +765,8 @@
           "scale_factor": 1.0,
           "add_offset": 0.0,
           "render_min": 42.0,
-          "render_max": 290.0
+          "render_max": 290.0,
+          "domain": "continuous"
         },
         {
           "id": "rsdsmin",
@@ -726,7 +779,8 @@
           "scale_factor": 1.0,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 257.0
+          "render_max": 257.0,
+          "domain": "continuous"
         },
         {
           "id": "rsdsrange",
@@ -739,7 +793,8 @@
           "scale_factor": 1.0,
           "add_offset": 0.0,
           "render_min": 6.0,
-          "render_max": 401.0
+          "render_max": 401.0,
+          "domain": "continuous"
         },
         {
           "id": "sfcWindmax",
@@ -752,7 +807,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 0.16,
-          "render_max": 52.539997
+          "render_max": 52.539997,
+          "domain": "continuous"
         },
         {
           "id": "sfcWindmean",
@@ -765,7 +821,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 0.15,
-          "render_max": 48.27
+          "render_max": 48.27,
+          "domain": "continuous"
         },
         {
           "id": "sfcWindmin",
@@ -778,7 +835,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 0.12,
-          "render_max": 44.23
+          "render_max": 44.23,
+          "domain": "continuous"
         },
         {
           "id": "sfcWindrange",
@@ -791,7 +849,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "render_min": 0.01,
-          "render_max": 19.76
+          "render_max": 19.76,
+          "domain": "continuous"
         },
         {
           "id": "vpdmax",
@@ -804,7 +863,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 2.9,
-          "render_max": 5354.899902
+          "render_max": 5354.899902,
+          "domain": "continuous"
         },
         {
           "id": "vpdmean",
@@ -817,7 +877,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.4,
-          "render_max": 3166.800049
+          "render_max": 3166.800049,
+          "domain": "continuous"
         },
         {
           "id": "vpdmin",
@@ -830,7 +891,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 2382.800049
+          "render_max": 2382.800049,
+          "domain": "continuous"
         },
         {
           "id": "vpdrange",
@@ -843,7 +905,28 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "render_min": 2.9,
-          "render_max": 4451.899902
+          "render_max": 4451.899902,
+          "domain": "continuous"
+        }
+      ]
+    },
+    {
+      "id": "classification",
+      "display_name": "Classification",
+      "description": "Categorical climate and environment classification layers.",
+      "layers": [
+        {
+          "id": "kg0",
+          "source": "chelsa_v2_1",
+          "display_name": "Köppen-Geiger Climate Classification",
+          "units": "",
+          "value_type": "nominal",
+          "download_url": "https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/kg0/1981-2010/CHELSA_kg0_1981-2010_V.2.1.tif",
+          "filename": "kg0.tif",
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 1.0,
+          "render_max": 31.0
         }
       ]
     }

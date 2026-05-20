@@ -884,3 +884,479 @@ def test_distribute_positions_taxon_not_found(tmp_path, monkeypatch):
         rk._distribute_positions(_GENUS, index_path)
     # No position file written for unknown taxon
     assert not list(tmp_path.glob("**/relative_ranks_positions.parquet"))
+
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+
+def test_load_gid_levels_reads_csv(tmp_path, monkeypatch):
+    csv_path = tmp_path / "hierarchy.csv"
+    csv_path.write_text("level,gid,name,parent_gid\n0,USA,United States,\n1,USA.1,Alabama,USA\n")
+    monkeypatch.setattr(rk, "_HIERARCHY_CSV", csv_path)
+    rk._load_gid_levels.cache_clear()
+    levels = rk._load_gid_levels()
+    assert levels["USA"] == 0
+    assert levels["USA.1"] == 1
+    rk._load_gid_levels.cache_clear()
+
+
+def test_load_gid_levels_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "_HIERARCHY_CSV", tmp_path / "nonexistent.csv")
+    rk._load_gid_levels.cache_clear()
+    assert rk._load_gid_levels() == {}
+    rk._load_gid_levels.cache_clear()
+
+
+def test_gid_to_scope_known_level(tmp_path, monkeypatch):
+    csv_path = tmp_path / "hierarchy.csv"
+    csv_path.write_text("level,gid,name,parent_gid\n0,USA,United States,\n")
+    monkeypatch.setattr(rk, "_HIERARCHY_CSV", csv_path)
+    rk._load_gid_levels.cache_clear()
+    assert rk._gid_to_scope("USA") == "gadm_level0"
+    rk._load_gid_levels.cache_clear()
+
+
+def test_gid_to_scope_unknown_gid(tmp_path, monkeypatch):
+    csv_path = tmp_path / "hierarchy.csv"
+    csv_path.write_text("level,gid,name,parent_gid\n")
+    monkeypatch.setattr(rk, "_HIERARCHY_CSV", csv_path)
+    rk._load_gid_levels.cache_clear()
+    assert rk._gid_to_scope("UNKNOWN") == "gbif_region"
+    rk._load_gid_levels.cache_clear()
+
+
+def test_location_taxon_keys_reads_parquet(tmp_path, monkeypatch):
+    loc_path = tmp_path / "location_taxa.parquet"
+    pq.write_table(
+        pa.table({
+            "scope": pa.array(["gadm_level0", "gadm_level0"]),
+            "gid": pa.array(["USA", "USA"]),
+            "taxon_key": pa.array(["100", "200"]),
+            "count": pa.array([10, 20], type=pa.int64()),
+        }),
+        loc_path,
+    )
+    csv_path = tmp_path / "hierarchy.csv"
+    csv_path.write_text("level,gid,name,parent_gid\n0,USA,United States,\n")
+    monkeypatch.setattr(rk, "_LOC_TAXA_PATH", loc_path)
+    monkeypatch.setattr(rk, "_HIERARCHY_CSV", csv_path)
+    rk._load_gid_levels.cache_clear()
+    rk._location_taxon_keys.cache_clear()
+    keys, counts = rk._location_taxon_keys("USA")
+    assert keys == frozenset({"100", "200"})
+    assert counts["100"] == 10
+    assert counts["200"] == 20
+    rk._load_gid_levels.cache_clear()
+    rk._location_taxon_keys.cache_clear()
+
+
+def test_location_taxon_keys_bad_parquet(tmp_path, monkeypatch):
+    bad_path = tmp_path / "bad.parquet"
+    bad_path.write_bytes(b"garbage")
+    monkeypatch.setattr(rk, "_LOC_TAXA_PATH", bad_path)
+    monkeypatch.setattr(rk, "_HIERARCHY_CSV", tmp_path / "none.csv")
+    rk._load_gid_levels.cache_clear()
+    rk._location_taxon_keys.cache_clear()
+    keys, counts = rk._location_taxon_keys("USA")
+    assert keys == frozenset()
+    assert counts == {}
+    rk._load_gid_levels.cache_clear()
+    rk._location_taxon_keys.cache_clear()
+
+
+def test_read_index_entries_bad_file(tmp_path):
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"garbage")
+    assert rk._read_index_entries(bad, "bio1::mean", 5) == []
+
+
+def test_taxon_metric_value_from_numerical(tmp_path):
+    _write_numerical_stats(tmp_path, "bio1", mean=12.5, count=100)
+    result = rk._taxon_metric_value(tmp_path, "bio1", "mean")
+    assert result == pytest.approx(12.5)
+
+
+def test_taxon_metric_value_from_nominal(tmp_path):
+    _write_nominal_stats(tmp_path, "kg0", [("total_samples", 50.0), ("unique_classes", 3.0)])
+    result = rk._taxon_metric_value(tmp_path, "kg0", "total_samples")
+    assert result == pytest.approx(50.0)
+
+
+def test_taxon_metric_value_missing_variable(tmp_path):
+    _write_numerical_stats(tmp_path, "bio1", mean=5.0)
+    assert rk._taxon_metric_value(tmp_path, "bio99", "mean") is None
+
+
+def test_taxon_metric_value_no_files(tmp_path):
+    assert rk._taxon_metric_value(tmp_path, "bio1", "mean") is None
+
+
+def test_accepted_ranks_non_species():
+    assert rk._accepted_ranks("GENUS", False) is None
+    assert rk._accepted_ranks("FAMILY", True) is None
+
+
+def test_accepted_ranks_species_no_flag():
+    result = rk._accepted_ranks("SPECIES", False)
+    assert result == frozenset({"SPECIES"})
+
+
+def test_accepted_ranks_species_with_flag():
+    result = rk._accepted_ranks("SPECIES", True)
+    assert "SPECIES" in result
+    assert "SUBSPECIES" in result
+
+
+def test_query_ranked_scoped_no_column(tmp_path, monkeypatch):
+    """Index exists but requested column is absent → no_column."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    ancestor_dir = tmp_path / _GENUS["path"]
+    ancestor_dir.mkdir(parents=True)
+    # Write index with a different column
+    _write_rank_index(ancestor_dir / "species_index.parquet", {"other::mean": [("200", 1.0, 10)]})
+    result = rk._query_ranked_scoped(
+        q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
+        sort_variable="bio1", sort_metric="mean", sort_order="asc",
+        limit=10, offset=0, min_samples=0, include_species_like=False,
+        loc_keys=None, loc_counts={},
+    )
+    assert result["empty_reason"] == "no_column"
+
+
+def test_query_ranked_scoped_taxon_none_in_accepted_ranks(tmp_path, monkeypatch):
+    """Entries whose get_taxon_by_id returns None are skipped in accepted_ranks filter."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    ancestor_dir = tmp_path / _GENUS["path"]
+    ancestor_dir.mkdir(parents=True)
+    _write_rank_index(ancestor_dir / "species_index.parquet", {
+        "bio1::mean": [("200", 10.0, 100), ("999", 20.0, 50)]  # 999 is unknown
+    })
+    with patch("util.rankings.get_taxon_by_id", side_effect=lambda k: _SPECIES_A if k == "200" else None):
+        result = rk._query_ranked_scoped(
+            q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
+            sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert len(result["results"]) == 1
+    assert result["results"][0]["taxon"]["taxon_key"] == "200"
+
+
+def test_query_ranked_scoped_taxon_none_in_results(tmp_path, monkeypatch):
+    """get_taxon_by_id returning None during result building skips the entry."""
+    family: dict = {
+        "taxon_key": "50", "path": "Root_1/Order_10/Family_50",
+        "scientific_name": "Testaceae", "common_name": "", "rank": "FAMILY",
+    }
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    ancestor_dir = tmp_path / family["path"]
+    ancestor_dir.mkdir(parents=True)
+    # Use genus_index.parquet (descendant_rank=GENUS has no accepted_ranks filter)
+    _write_rank_index(ancestor_dir / "genus_index.parquet", {
+        "bio1::mean": [("100", 10.0, 100), ("999", 20.0, 50)]
+    })
+
+    def _resolve(k):
+        return _GENUS if k == "100" else None
+
+    with patch("util.rankings.get_taxon_by_id", side_effect=_resolve):
+        result = rk._query_ranked_scoped(
+            q=None, within_taxon=family, descendant_rank="GENUS",
+            sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    valid_ids = {r["taxon"]["taxon_key"] for r in result["results"]}
+    assert "100" in valid_ids
+    assert "999" not in valid_ids
+
+
+def test_query_ranked_text_loc_keys_filter(tmp_path, monkeypatch):
+    """location filter in ranked-text mode skips taxa not in loc_keys."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    (tmp_path / _SPECIES_A["path"]).mkdir(parents=True)
+    (tmp_path / _SPECIES_B["path"]).mkdir(parents=True)
+
+    with patch("util.rankings._taxon_metric_value", return_value=5.0), \
+         patch("util.rankings._infer_sample_count", return_value=100), \
+         patch("util.rankings.search_taxa_by_name",
+               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]):
+        result = rk._query_ranked_text(
+            q="testus", sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=frozenset({"200"}), loc_counts={},
+        )
+    assert len(result["results"]) == 1
+    assert result["results"][0]["taxon"]["taxon_key"] == "200"
+
+
+def test_query_ranked_text_no_metric_value(tmp_path, monkeypatch):
+    """Candidates with no metric value are excluded."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    with patch("util.rankings._taxon_metric_value", return_value=None), \
+         patch("util.rankings.search_taxa_by_name", return_value=[(_SPECIES_A, 90.0, "")]):
+        result = rk._query_ranked_text(
+            q="testus", sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["empty_reason"] == "no_results"
+
+
+def test_query_ranked_text_min_samples_filter(tmp_path, monkeypatch):
+    """Candidates with too few samples are excluded."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    with patch("util.rankings._taxon_metric_value", return_value=5.0), \
+         patch("util.rankings._infer_sample_count", return_value=3), \
+         patch("util.rankings.search_taxa_by_name", return_value=[(_SPECIES_A, 90.0, "")]):
+        result = rk._query_ranked_text(
+            q="testus", sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=10, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["empty_reason"] == "no_results"
+
+
+def test_query_text_scope_keys_filter(tmp_path, monkeypatch):
+    """Scope keys filter excludes candidates not in scope."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_path = tmp_path / _GENUS["path"] / "species.parquet"
+    catalog_path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist([
+            {"taxon_key": "200", "path": _SPECIES_A["path"], "scientific_name": "",
+             "common_name": "", "rank": "SPECIES", "sample_count": 50}
+        ]),
+        catalog_path,
+    )
+    with patch("util.rankings._infer_sample_count", return_value=50), \
+         patch("util.rankings.search_taxa_by_name",
+               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]):
+        result = rk._query_text(
+            q="testus", within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
+    assert "200" in ids
+    assert "201" not in ids
+
+
+def test_query_text_loc_keys_filter(tmp_path, monkeypatch):
+    """Location filter excludes candidates not in loc_keys."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    with patch("util.rankings._infer_sample_count", return_value=50), \
+         patch("util.rankings.search_taxa_by_name",
+               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]):
+        result = rk._query_text(
+            q="testus", within_taxon=None, descendant_rank=None,
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=frozenset({"201"}), loc_counts={},
+        )
+    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
+    assert "201" in ids
+    assert "200" not in ids
+
+
+def test_query_text_accepted_ranks_filter(tmp_path, monkeypatch):
+    """Rank filter excludes non-matching ranks."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    subsp = {**_SUBSPECIES_A, "rank": "SUBSPECIES"}
+    with patch("util.rankings._infer_sample_count", return_value=50), \
+         patch("util.rankings.search_taxa_by_name",
+               return_value=[(_SPECIES_A, 90.0, ""), (subsp, 85.0, "")]):
+        result = rk._query_text(
+            q="testus", within_taxon=None, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
+    assert "200" in ids
+    assert "300" not in ids
+
+
+def test_query_text_min_samples_filter(tmp_path, monkeypatch):
+    """min_samples filter excludes candidates with too few samples."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    with patch("util.rankings._infer_sample_count", return_value=2), \
+         patch("util.rankings.search_taxa_by_name", return_value=[(_SPECIES_A, 90.0, "")]):
+        result = rk._query_text(
+            q="testus", within_taxon=None, descendant_rank=None,
+            limit=10, offset=0, min_samples=10, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["empty_reason"] == "no_results"
+
+
+def test_load_scope_keys_dfs_fallback(tmp_path, monkeypatch):
+    """Falls back to DFS iteration when catalog parquet is absent."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    (tmp_path / _GENUS["path"]).mkdir(parents=True)
+    with patch("util.rankings.iter_descendants",
+               return_value=[_SPECIES_A, _SUBSPECIES_A]):
+        keys = rk._load_scope_keys(_GENUS, "SPECIES", False)
+    assert "200" in keys
+    assert "300" not in keys  # SUBSPECIES excluded when include_species_like=False
+
+
+def test_load_scope_keys_dfs_fallback_include_species_like(tmp_path, monkeypatch):
+    """DFS fallback with include_species_like includes subspecies equivalents."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    (tmp_path / _GENUS["path"]).mkdir(parents=True)
+    with patch("util.rankings.iter_descendants",
+               return_value=[_SPECIES_A, _SUBSPECIES_A]):
+        keys = rk._load_scope_keys(_GENUS, "SPECIES", True)
+    assert "200" in keys
+    assert "300" in keys
+
+
+def test_query_catalog_corrupt_parquet(tmp_path, monkeypatch):
+    """Corrupt catalog parquet returns no_catalog."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_dir = tmp_path / _GENUS["path"]
+    catalog_dir.mkdir(parents=True)
+    (catalog_dir / "species.parquet").write_bytes(b"garbage")
+    result = rk._query_catalog(
+        within_taxon=_GENUS, descendant_rank="SPECIES",
+        limit=10, offset=0, min_samples=0, include_species_like=False,
+        loc_keys=None, loc_counts={},
+    )
+    assert result["empty_reason"] == "no_catalog"
+
+
+def test_query_catalog_min_samples_filter(tmp_path, monkeypatch):
+    """min_samples filters out low-sample entries."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_dir = tmp_path / _GENUS["path"]
+    catalog_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist([
+            {"taxon_key": "200", "path": _SPECIES_A["path"], "scientific_name": "",
+             "common_name": "", "rank": "SPECIES", "sample_count": 3},
+            {"taxon_key": "201", "path": _SPECIES_B["path"], "scientific_name": "",
+             "common_name": "", "rank": "SPECIES", "sample_count": 100},
+        ]),
+        catalog_dir / "species.parquet",
+    )
+    with patch("util.rankings.get_taxon_by_id",
+               side_effect=lambda k: {"200": _SPECIES_A, "201": _SPECIES_B}.get(k)):
+        result = rk._query_catalog(
+            within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=10, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert len(result["results"]) == 1
+    assert result["results"][0]["taxon"]["taxon_key"] == "201"
+
+
+def test_query_catalog_loc_keys_filter(tmp_path, monkeypatch):
+    """Location filter excludes taxa not in loc_keys."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_dir = tmp_path / _GENUS["path"]
+    catalog_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist([
+            {"taxon_key": "200", "path": _SPECIES_A["path"], "scientific_name": "",
+             "common_name": "", "rank": "SPECIES", "sample_count": 50},
+            {"taxon_key": "201", "path": _SPECIES_B["path"], "scientific_name": "",
+             "common_name": "", "rank": "SPECIES", "sample_count": 50},
+        ]),
+        catalog_dir / "species.parquet",
+    )
+    with patch("util.rankings.get_taxon_by_id",
+               side_effect=lambda k: {"200": _SPECIES_A, "201": _SPECIES_B}.get(k)):
+        result = rk._query_catalog(
+            within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=frozenset({"201"}), loc_counts={"201": 5},
+        )
+    assert len(result["results"]) == 1
+    assert result["results"][0]["taxon"]["taxon_key"] == "201"
+    assert result["results"][0]["location_count"] == 5
+
+
+def test_load_gid_levels_bad_level_value(tmp_path, monkeypatch):
+    """Rows with non-integer level values are skipped."""
+    csv_path = tmp_path / "hierarchy.csv"
+    csv_path.write_text("level,gid,name,parent_gid\nbad,USA,United States,\n1,USA.1,Alabama,USA\n")
+    monkeypatch.setattr(rk, "_HIERARCHY_CSV", csv_path)
+    rk._load_gid_levels.cache_clear()
+    levels = rk._load_gid_levels()
+    assert "USA" not in levels  # bad level skipped
+    assert levels["USA.1"] == 1
+    rk._load_gid_levels.cache_clear()
+
+
+def test_taxon_metric_value_corrupt_numerical_stats(tmp_path):
+    """Corrupt numerical stats parquet falls through to nominal stats check."""
+    from util.stats import NUMERICAL_STATS_FILE
+    (tmp_path / NUMERICAL_STATS_FILE).write_bytes(b"garbage")
+    _write_nominal_stats(tmp_path, "kg0", [("total_samples", 25.0)])
+    result = rk._taxon_metric_value(tmp_path, "kg0", "total_samples")
+    assert result == pytest.approx(25.0)
+
+
+def test_taxon_metric_value_corrupt_nominal_stats(tmp_path):
+    """Corrupt nominal stats parquet returns None."""
+    from util.stats import NOMINAL_STATS_FILE
+    (tmp_path / NOMINAL_STATS_FILE).write_bytes(b"garbage")
+    assert rk._taxon_metric_value(tmp_path, "kg0", "total_samples") is None
+
+
+def test_query_ranked_scoped_all_null_entries(tmp_path, monkeypatch):
+    """Index column where all entries are null → no_column."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    ancestor_dir = tmp_path / _GENUS["path"]
+    ancestor_dir.mkdir(parents=True)
+    # Write an index with a null-only column
+    struct_type = pa.struct([
+        pa.field("taxonKey", pa.string()),
+        pa.field("value", pa.float64()),
+        pa.field("sampleCount", pa.int64()),
+    ])
+    null_arr = pa.nulls(2, type=struct_type)
+    import json
+    table = pa.table({"bio1::mean": null_arr}).replace_schema_metadata(
+        {b"column_lengths": json.dumps({"bio1::mean": 2}).encode()}
+    )
+    pq.write_table(table, ancestor_dir / "species_index.parquet")
+    result = rk._query_ranked_scoped(
+        q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
+        sort_variable="bio1", sort_metric="mean", sort_order="asc",
+        limit=10, offset=0, min_samples=0, include_species_like=False,
+        loc_keys=None, loc_counts={},
+    )
+    assert result["empty_reason"] == "no_column"
+
+
+def test_load_scope_keys_corrupt_catalog(tmp_path, monkeypatch):
+    """Corrupt catalog parquet in _load_scope_keys falls through to DFS."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_dir = tmp_path / _GENUS["path"]
+    catalog_dir.mkdir(parents=True)
+    (catalog_dir / "species.parquet").write_bytes(b"garbage")
+    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A]):
+        keys = rk._load_scope_keys(_GENUS, "SPECIES", False)
+    assert "200" in keys
+
+
+def test_query_catalog_taxon_none_skipped(tmp_path, monkeypatch):
+    """Entries whose get_taxon_by_id returns None are skipped."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_dir = tmp_path / _GENUS["path"]
+    catalog_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist([
+            {"taxon_key": "999", "path": "x/999", "scientific_name": "",
+             "common_name": "", "rank": "SPECIES", "sample_count": 50},
+        ]),
+        catalog_dir / "species.parquet",
+    )
+    with patch("util.rankings.get_taxon_by_id", return_value=None):
+        result = rk._query_catalog(
+            within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["total"] == 0

@@ -606,8 +606,34 @@ def test_get_species_occurrences_deduplication():
 
 
 # ---------------------------------------------------------------------------
-# /species/{id}/locations (lines 315-318)
+# /species/{id}/locations
 # ---------------------------------------------------------------------------
+
+_LOC_TABLE = pa.table({
+    "scope": ["gadm_level0", "gadm_level0", "gadm_level1", "gbif_region"],
+    "gid": ["USA", "CAN", "USA.1_1", "NORTH_AMERICA"],
+    "taxon_key": ["2923970", "2923970", "2923970", "2923970"],
+    "count": [100, 20, 80, 500],
+})
+
+_HIERARCHY_CSV = (
+    "level,gid,name,parent_gid\n"
+    "0,USA,United States,\n"
+    "0,CAN,Canada,\n"
+    "1,USA.1_1,California,USA\n"
+)
+
+
+def _patch_locations(tmp_path: Path, monkeypatch):
+    loc_path = tmp_path / "location_taxa.parquet"
+    pq.write_table(_LOC_TABLE, loc_path)
+    hier_path = tmp_path / "hierarchy.csv"
+    hier_path.write_text(_HIERARCHY_CSV, encoding="utf-8")
+    monkeypatch.setattr(main_module, "_LOC_TAXA_PATH", loc_path)
+    monkeypatch.setattr(main_module, "_LOCATIONS_DIR", tmp_path)
+    main_module._load_hierarchy.cache_clear()
+    return loc_path
+
 
 def test_get_species_locations_not_found():
     with patch.object(taxa, "get_taxon_by_id", return_value=None), \
@@ -616,12 +642,305 @@ def test_get_species_locations_not_found():
     assert r.status_code == 404
 
 
-def test_get_species_locations_returns_empty():
-    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+def test_get_species_locations_no_parquet(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "_LOC_TAXA_PATH", tmp_path / "missing.parquet")
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
         r = client.get("/species/2923970/locations")
     assert r.status_code == 200
     assert r.json() == []
+
+
+def test_get_species_locations_returns_results(tmp_path, monkeypatch):
+    _patch_locations(tmp_path, monkeypatch)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    assert r.status_code == 200
+    data = r.json()
+    gids = {row["gid"] for row in data}
+    assert "USA" in gids
+    assert "CAN" in gids
+    assert "USA.1_1" in gids
+    assert "NORTH_AMERICA" in gids
+
+
+def test_get_species_locations_response_shape(tmp_path, monkeypatch):
+    _patch_locations(tmp_path, monkeypatch)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    usa = next(row for row in r.json() if row["gid"] == "USA")
+    assert usa["name"] == "United States"
+    assert usa["level"] == 0
+    assert usa["count"] == 100
+    assert isinstance(usa["hierarchy"], list)
+
+
+def test_get_species_locations_hierarchy(tmp_path, monkeypatch):
+    _patch_locations(tmp_path, monkeypatch)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    state = next(row for row in r.json() if row["gid"] == "USA.1_1")
+    assert state["name"] == "California"
+    assert state["level"] == 1
+    assert "United States" in state["hierarchy"]
+
+
+def test_get_species_locations_gbif_region_level(tmp_path, monkeypatch):
+    _patch_locations(tmp_path, monkeypatch)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    region = next(row for row in r.json() if row["gid"] == "NORTH_AMERICA")
+    assert region["level"] == -1
+    assert region["count"] == 500
+
+
+def test_get_species_locations_sorted_by_count(tmp_path, monkeypatch):
+    _patch_locations(tmp_path, monkeypatch)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    counts = [row["count"] for row in r.json()]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_get_species_locations_level_filter(tmp_path, monkeypatch):
+    _patch_locations(tmp_path, monkeypatch)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations?level=0")
+    gids = {row["gid"] for row in r.json()}
+    assert "USA" in gids
+    assert "CAN" in gids
+    assert "USA.1_1" not in gids
+    assert "NORTH_AMERICA" not in gids
+
+
+def test_get_species_locations_limit(tmp_path, monkeypatch):
+    _patch_locations(tmp_path, monkeypatch)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations?limit=2")
+    assert len(r.json()) == 2
+
+
+def test_get_species_locations_no_data_for_taxon(tmp_path, monkeypatch):
+    loc_path = tmp_path / "location_taxa.parquet"
+    pq.write_table(pa.table({
+        "scope": ["gadm_level0"],
+        "gid": ["USA"],
+        "taxon_key": ["9999999"],
+        "count": [1],
+    }), loc_path)
+    monkeypatch.setattr(main_module, "_LOC_TAXA_PATH", loc_path)
+    monkeypatch.setattr(main_module, "_LOCATIONS_DIR", tmp_path)
+    main_module._load_hierarchy.cache_clear()
+    (tmp_path / "hierarchy.csv").write_text("level,gid,name,parent_gid\n")
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    assert r.json() == []
+
+
+def test_get_species_locations_parquet_read_error(tmp_path, monkeypatch):
+    loc_path = tmp_path / "bad.parquet"
+    loc_path.write_bytes(b"not a parquet file")
+    monkeypatch.setattr(main_module, "_LOC_TAXA_PATH", loc_path)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_get_species_locations_missing_hierarchy(tmp_path, monkeypatch):
+    # hierarchy.csv absent → _load_hierarchy returns {} → gid used as name
+    loc_path = tmp_path / "location_taxa.parquet"
+    pq.write_table(pa.table({
+        "scope": ["gadm_level0"],
+        "gid": ["USA"],
+        "taxon_key": ["2923970"],
+        "count": [5],
+    }), loc_path)
+    monkeypatch.setattr(main_module, "_LOC_TAXA_PATH", loc_path)
+    monkeypatch.setattr(main_module, "_LOCATIONS_DIR", tmp_path)
+    main_module._load_hierarchy.cache_clear()
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    assert r.status_code == 200
+    row = r.json()[0]
+    assert row["gid"] == "USA"
+    assert row["name"] == "USA"  # falls back to gid when no hierarchy
+    assert row["hierarchy"] == []
+
+
+def test_get_species_locations_unknown_scope_skipped(tmp_path, monkeypatch):
+    loc_path = tmp_path / "location_taxa.parquet"
+    pq.write_table(pa.table({
+        "scope": ["unknown_scope", "gadm_level0"],
+        "gid": ["X1", "USA"],
+        "taxon_key": ["2923970", "2923970"],
+        "count": [99, 10],
+    }), loc_path)
+    hier_path = tmp_path / "hierarchy.csv"
+    hier_path.write_text("level,gid,name,parent_gid\n0,USA,United States,\n")
+    monkeypatch.setattr(main_module, "_LOC_TAXA_PATH", loc_path)
+    monkeypatch.setattr(main_module, "_LOCATIONS_DIR", tmp_path)
+    main_module._load_hierarchy.cache_clear()
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    gids = {row["gid"] for row in r.json()}
+    assert "X1" not in gids
+    assert "USA" in gids
+
+
+def test_get_species_locations_broken_parent_chain(tmp_path, monkeypatch):
+    # parent_gid references a gid not in hierarchy → _resolve_hierarchy breaks cleanly
+    loc_path = tmp_path / "location_taxa.parquet"
+    pq.write_table(pa.table({
+        "scope": ["gadm_level1"],
+        "gid": ["USA.1_1"],
+        "taxon_key": ["2923970"],
+        "count": [7],
+    }), loc_path)
+    hier_path = tmp_path / "hierarchy.csv"
+    hier_path.write_text("level,gid,name,parent_gid\n1,USA.1_1,California,MISSING\n")
+    monkeypatch.setattr(main_module, "_LOC_TAXA_PATH", loc_path)
+    monkeypatch.setattr(main_module, "_LOCATIONS_DIR", tmp_path)
+    main_module._load_hierarchy.cache_clear()
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations")
+    row = r.json()[0]
+    assert row["gid"] == "USA.1_1"
+    assert row["hierarchy"] == []  # parent lookup failed, chain stops
+
+
+# ---------------------------------------------------------------------------
+# _location_filter_col
+# ---------------------------------------------------------------------------
+
+def _patch_hierarchy(monkeypatch, by_gid: dict) -> None:
+    """Patch _load_hierarchy to return by_gid without filesystem interaction."""
+    main_module._load_hierarchy.cache_clear()
+    monkeypatch.setattr(main_module, "_load_hierarchy", lambda: by_gid)
+
+
+_USA = {"level": 0, "name": "United States", "parent_gid": None}
+_CA  = {"level": 1, "name": "California", "parent_gid": "USA"}
+_LA  = {"level": 2, "name": "Los Angeles", "parent_gid": "USA.1_1"}
+
+
+def test_location_filter_col_level0(monkeypatch):
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    assert main_module._location_filter_col("USA") == "level0Gid"
+
+
+def test_location_filter_col_level1(monkeypatch):
+    _patch_hierarchy(monkeypatch, {"USA.1_1": _CA})
+    assert main_module._location_filter_col("USA.1_1") == "level1Gid"
+
+
+def test_location_filter_col_level2(monkeypatch):
+    _patch_hierarchy(monkeypatch, {"USA.1.1_1": _LA})
+    assert main_module._location_filter_col("USA.1.1_1") == "level2Gid"
+
+
+def test_location_filter_col_unknown_returns_gbif_region(monkeypatch):
+    _patch_hierarchy(monkeypatch, {})
+    assert main_module._location_filter_col("NORTH_AMERICA") == "gbifRegion"
+
+
+# ---------------------------------------------------------------------------
+# /species/{id}/environment/{var} with location param
+# ---------------------------------------------------------------------------
+
+def _make_occ_with_loc(tmp_path: Path, taxon_path: str, loc_col: str, gid: str, var_col: str, values: list) -> Path:
+    occ_dir = tmp_path / taxon_path
+    occ_dir.mkdir(parents=True, exist_ok=True)
+    n = len(values)
+    data = {
+        "catalogNumber": [f"obs{i}" for i in range(n)],
+        "decimalLatitude": [40.0] * n,
+        "decimalLongitude": [-75.0] * n,
+        "obscured": ["No"] * n,
+        "coordinateUncertaintyInMeters": [100.0] * n,
+        loc_col: [gid] * n,
+        var_col: values,
+    }
+    occ_path = occ_dir / "occurrence.parquet"
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False), occ_path)
+    return occ_path
+
+
+def test_get_species_environment_with_location_continuous(tmp_path, monkeypatch):
+    import numpy as np
+
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "bio1",
+                       list(np.linspace(5.0, 25.0, 20)))
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/environment/bio1?location=USA")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["observation_count"] == 20
+    assert body["density_curve"] is not None
+    assert body["relative_ranks"] == []
+    assert body["categorical_distribution"] is None
+
+
+def test_get_species_environment_with_location_nominal(tmp_path, monkeypatch):
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "kg0",
+                       [1.0] * 15 + [2.0] * 5)
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    legend = [{"id": 1, "name": "Tropical", "description": None, "traits": None},
+              {"id": 2, "name": "Arid", "description": None, "traits": {"color": "#f00"}}]
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch("main._load_legend", return_value=legend):
+        r = client.get("/species/2923970/environment/kg0?location=USA")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["observation_count"] == 20
+    dist = body["categorical_distribution"]
+    assert len(dist) == 2
+    assert dist[0]["fraction"] == pytest.approx(0.75)
+    assert body["relative_ranks"] == []
+
+
+def test_get_species_environment_with_location_no_data_falls_through(monkeypatch):
+    """compute_location_filtered_stats returns None → falls back to precomputed stats."""
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "collect_taxon_df", lambda t: None)
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", side_effect=_env_stats_read):
+        r = client.get("/species/2923970/environment/bio1?location=USA")
+    assert r.status_code == 200
+    assert r.json()["observation_count"] == 100  # from precomputed table
+
+
+def test_get_species_environment_with_location_no_layer_falls_through(monkeypatch):
+    """layer=None skips location block and falls through to precomputed path."""
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[]), \
+         patch("pathlib.Path.exists", return_value=False):
+        r = client.get("/species/2923970/environment/bio1?location=USA")
+    assert r.status_code == 404
+
+
+def test_get_species_environment_with_location_filter_col_none(monkeypatch):
+    """filter_col None (level not in 0-2) falls through to precomputed."""
+    _patch_hierarchy(monkeypatch, {"WEIRD": {"level": 99, "name": "Weird", "parent_gid": None}})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", side_effect=_env_stats_read):
+        r = client.get("/species/2923970/environment/bio1?location=WEIRD")
+    assert r.status_code == 200
+    assert r.json()["observation_count"] == 100  # from precomputed
 
 
 # ---------------------------------------------------------------------------
@@ -841,3 +1160,244 @@ def test_class_samples_success():
     assert body["class_value"] == 1
     assert body["count"] == 2
     assert all(obs["value"] == pytest.approx(1.0) for obs in body["observations"])
+
+
+# ---------------------------------------------------------------------------
+# Slice with location param
+# ---------------------------------------------------------------------------
+
+def test_slice_with_location_success(tmp_path, monkeypatch):
+    import numpy as np
+
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "bio1",
+                       list(np.linspace(5.0, 25.0, 20)))
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/environment/bio1/slice?min=10&max=20&location=USA")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] > 0
+    assert all(10.0 <= obs["value"] <= 20.0 for obs in body["observations"])
+
+
+def test_slice_with_location_no_data(tmp_path, monkeypatch):
+    """No occurrence.parquet → collect_taxon_df returns None → empty results."""
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    (tmp_path / TAXON["path"]).mkdir(parents=True, exist_ok=True)
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/environment/bio1/slice?min=0&max=30&location=USA")
+    assert r.status_code == 200
+    assert r.json()["count"] == 0
+
+
+def test_slice_with_location_empty_after_gid_filter(tmp_path, monkeypatch):
+    """Data exists but no rows match the requested GID → empty results."""
+    import numpy as np
+
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    # Occurrence file has CAN rows, not USA
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "CAN", "bio1",
+                       list(np.linspace(5.0, 25.0, 20)))
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/environment/bio1/slice?min=0&max=30&location=USA")
+    assert r.status_code == 200
+    assert r.json()["count"] == 0
+
+
+def test_slice_with_location_filter_col_none_falls_through(tmp_path, monkeypatch):
+    """filter_col None → falls through to precomputed index path."""
+    _patch_hierarchy(monkeypatch, {"WEIRD": {"level": 99, "name": "Weird", "parent_gid": None}})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_schema", return_value=_INDEX_SCHEMA), \
+         patch.object(pq, "read_table", return_value=_INDEX_TABLE):
+        r = client.get("/species/2923970/environment/bio1/slice?min=0&max=100&location=WEIRD")
+    assert r.status_code == 200
+    assert r.json()["count"] == 3
+
+
+def test_slice_from_raw_occ_circular_wrap(tmp_path, monkeypatch):
+    """_slice_from_raw_occ handles circular_wrap=True correctly."""
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    occ_dir = tmp_path / TAXON["path"]
+    occ_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "catalogNumber": ["A", "B", "C"],
+        "decimalLatitude": [40.0, 41.0, 42.0],
+        "decimalLongitude": [-75.0, -74.0, -73.0],
+        "obscured": ["No", "No", "No"],
+        "coordinateUncertaintyInMeters": [100.0, 100.0, 100.0],
+        "level0Gid": ["USA", "USA", "USA"],
+        "aspectdeg": [350.0, 10.0, 180.0],
+    }
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False),
+                   occ_dir / "occurrence.parquet")
+    with patch("main.iter_descendants", return_value=[TAXON]):
+        result = main_module._slice_from_raw_occ(
+            TAXON, "aspectdeg", "level0Gid", "USA", 315.0, 45.0, True, None,
+        )
+    catalogs = {r["catalogNumber"] for r in result}
+    assert "A" in catalogs
+    assert "B" in catalogs
+    assert "C" not in catalogs
+
+
+def test_slice_with_location_limit(tmp_path, monkeypatch):
+    import numpy as np
+
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "bio1",
+                       list(np.linspace(1.0, 20.0, 20)))
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/environment/bio1/slice?min=0&max=100&location=USA&limit=5")
+    assert r.status_code == 200
+    assert r.json()["count"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Class-samples with location param
+# ---------------------------------------------------------------------------
+
+def test_class_samples_with_location_success(tmp_path, monkeypatch):
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "kg0",
+                       [1.0] * 10 + [2.0] * 10)
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=USA")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["class_value"] == 1
+    assert body["count"] == 10
+    assert all(obs["value"] == pytest.approx(1.0) for obs in body["observations"])
+
+
+def test_class_samples_with_location_no_data(tmp_path, monkeypatch):
+    """No occurrence.parquet → collect_taxon_df returns None → empty results."""
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    (tmp_path / TAXON["path"]).mkdir(parents=True, exist_ok=True)
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=USA")
+    assert r.status_code == 200
+    assert r.json()["count"] == 0
+
+
+def test_class_samples_with_location_empty_after_gid_filter(tmp_path, monkeypatch):
+    """Data exists but no rows match the requested GID → empty results."""
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    # Occurrence file has CAN rows, not USA
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "CAN", "kg0", [1.0] * 10)
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=USA")
+    assert r.status_code == 200
+    assert r.json()["count"] == 0
+
+
+def test_class_samples_with_location_filter_col_none_falls_through(monkeypatch):
+    """filter_col None → falls through to precomputed index path."""
+    _patch_hierarchy(monkeypatch, {"WEIRD": {"level": 99, "name": "Weird", "parent_gid": None}})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_schema", return_value=_INDEX_SCHEMA), \
+         patch.object(pq, "read_table", return_value=_INDEX_TABLE):
+        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=WEIRD")
+    assert r.status_code == 200
+    assert r.json()["count"] == 2
+
+
+def test_class_samples_with_location_limit(tmp_path, monkeypatch):
+    import util.stats as st_module
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "kg0", [1.0] * 20)
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=USA&limit=3")
+    assert r.status_code == 200
+    assert r.json()["count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# /species/{id}/occurrences with location param
+# ---------------------------------------------------------------------------
+
+def test_get_species_occurrences_with_location(tmp_path, monkeypatch):
+    """location filter restricts returned pins to matching rows only."""
+    occ_dir = tmp_path / TAXON["path"]
+    occ_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "catalogNumber": ["USA001", "USA002", "CAN001"],
+        "decimalLatitude": [40.0, 41.0, 50.0],
+        "decimalLongitude": [-75.0, -74.0, -80.0],
+        "obscured": ["No", "No", "No"],
+        "coordinateUncertaintyInMeters": [100.0, 100.0, 100.0],
+        "level0Gid": ["USA", "USA", "CAN"],
+    }
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False),
+                   occ_dir / "occurrence.parquet")
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.TREE_ROOT", tmp_path), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/occurrences?location=USA")
+    assert r.status_code == 200
+    occs = r.json()["occurrences"]
+    catalog_numbers = {o["catalogNumber"] for o in occs}
+    assert catalog_numbers == {"USA001", "USA002"}
+    assert "CAN001" not in catalog_numbers
+
+
+def test_get_species_occurrences_with_location_no_match(tmp_path, monkeypatch):
+    """location filter with no matching rows returns empty list."""
+    occ_dir = tmp_path / TAXON["path"]
+    occ_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "catalogNumber": ["CAN001"],
+        "decimalLatitude": [50.0],
+        "decimalLongitude": [-80.0],
+        "obscured": ["No"],
+        "coordinateUncertaintyInMeters": [100.0],
+        "level0Gid": ["CAN"],
+    }
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False),
+                   occ_dir / "occurrence.parquet")
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.TREE_ROOT", tmp_path), \
+         patch("main.iter_descendants", return_value=[TAXON]):
+        r = client.get("/species/2923970/occurrences?location=USA")
+    assert r.status_code == 200
+    assert r.json()["occurrences"] == []

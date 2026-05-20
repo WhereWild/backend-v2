@@ -1,3 +1,4 @@
+import csv
 import json
 import math
 from functools import lru_cache
@@ -13,13 +14,23 @@ from starlette.concurrency import run_in_threadpool
 from config.config import load_config
 from util import citations, taxa, tiles
 from util.rankings import POSITION_FILE
-from util.stats import NOMINAL_STATS_FILE, NUMERICAL_DENSITY_FILE, NUMERICAL_STATS_FILE, OCCURRENCE_INDEX_FILE, TREE_ROOT
+from util.stats import (
+    NOMINAL_STATS_FILE,
+    NUMERICAL_DENSITY_FILE,
+    NUMERICAL_STATS_FILE,
+    OCCURRENCE_INDEX_FILE,
+    TREE_ROOT,
+    collect_taxon_df,
+    compute_location_filtered_stats,
+)
 from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
 
 _CONFIG = load_config("global")
 _LEGEND_DIR = Path("config/gis/legends")
 _OCC_FILE = "occurrence.parquet"
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
+_LOCATIONS_DIR = Path("data/gis/locations")
+_LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
 
 @lru_cache(maxsize=32)
@@ -218,8 +229,83 @@ def _load_relative_ranks(taxon_dir: Path, variable_id: str) -> list[dict]:
     return result
 
 
+_GADM_LEVEL_COLS: dict[int, str] = {0: "level0Gid", 1: "level1Gid", 2: "level2Gid"}
+
+
+def _location_filter_col(gid: str) -> str | None:
+    """Return the occurrence.parquet column to use when filtering observations to gid."""
+    rec = _load_hierarchy().get(gid)
+    if rec is not None:
+        return _GADM_LEVEL_COLS.get(rec["level"])
+    return "gbifRegion"
+
+
+def _slice_from_raw_occ(
+    taxon: dict,
+    variable_id: str,
+    filter_col: str,
+    gid: str,
+    value_min: float,
+    value_max: float,
+    circular_wrap: bool,
+    limit: int | None,
+) -> list[dict]:
+    df = collect_taxon_df(taxon)
+    if df is None or filter_col not in df.columns or variable_id not in df.columns:
+        return []
+    df = df[df[filter_col].astype(str) == str(gid)]
+    if df.empty:
+        return []
+    col = pd.to_numeric(df[variable_id], errors="coerce")
+    if circular_wrap:
+        mask = col.between(value_min, 360.0, inclusive="both") | col.between(0.0, value_max, inclusive="both")
+    else:
+        mask = col.between(value_min, value_max, inclusive="both")
+    df = df[mask].dropna(subset=["decimalLatitude", "decimalLongitude"])
+    if limit is not None:
+        df = df.head(limit)
+    return [
+        {
+            "catalogNumber": str(r["catalogNumber"]),
+            "latitude": r["decimalLatitude"],
+            "longitude": r["decimalLongitude"],
+            "value": float(r[variable_id]) if pd.notna(r[variable_id]) else None,
+        }
+        for r in df.to_dict("records")
+    ]
+
+
+def _class_samples_from_raw_occ(
+    taxon: dict,
+    variable_id: str,
+    filter_col: str,
+    gid: str,
+    class_value: float,
+    limit: int | None,
+) -> list[dict]:
+    df = collect_taxon_df(taxon)
+    if df is None or filter_col not in df.columns or variable_id not in df.columns:
+        return []
+    df = df[df[filter_col].astype(str) == str(gid)]
+    if df.empty:
+        return []
+    col = pd.to_numeric(df[variable_id], errors="coerce")
+    df = df[col == class_value].dropna(subset=["decimalLatitude", "decimalLongitude"])
+    if limit is not None:
+        df = df.head(limit)
+    return [
+        {
+            "catalogNumber": str(r["catalogNumber"]),
+            "latitude": r["decimalLatitude"],
+            "longitude": r["decimalLongitude"],
+            "value": float(r[variable_id]) if pd.notna(r[variable_id]) else None,
+        }
+        for r in df.to_dict("records")
+    ]
+
+
 @app.get("/species/{taxon_id}/environment/{variable_id}")
-def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | None = None):
+def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | None = None, location: str | None = None):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -234,6 +320,55 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
         "domain": (layer.get("domain") or None) if layer else None,
     }
     value_type = layer.get("value_type") if layer else None
+
+    if location is not None and layer is not None:
+        filter_col = _location_filter_col(location)
+        if filter_col is not None:
+            result = compute_location_filtered_stats(taxon, variable_id, filter_col, location, layer)
+            if result is not None:
+                if result["type"] == "continuous":
+                    stats = result["stats"]
+                    return {
+                        "species_id": taxon.get("taxon_key"),
+                        "variable": variable_id,
+                        "variable_metadata": variable_metadata,
+                        "observation_count": result["observation_count"],
+                        "summary": {
+                            "count": stats["count"],
+                            "min": stats.get("min"),
+                            "mean": stats.get("mean"),
+                            "max": stats.get("max"),
+                            "stddev": stats.get("std"),
+                            "q10": stats.get("10th_percentile"),
+                            "q90": stats.get("90th_percentile"),
+                        },
+                        "density_curve": result["density_curve"],
+                        "categorical_distribution": None,
+                        "relative_ranks": [],
+                    }
+                total_samples = result["observation_count"]
+                class_index = {c["id"]: c for c in _load_legend(variable_id)}
+                categorical_distribution = [
+                    {
+                        "value": item["class_id"],
+                        "class_name": class_index.get(item["class_id"], {}).get("name", str(item["class_id"])),
+                        "description": class_index.get(item["class_id"], {}).get("description"),
+                        "color": (class_index.get(item["class_id"], {}).get("traits") or {}).get("color"),
+                        "count": round(total_samples * item["fraction"]),
+                        "fraction": item["fraction"],
+                    }
+                    for item in result["distribution"]
+                ]
+                return {
+                    "species_id": taxon.get("taxon_key"),
+                    "variable": variable_id,
+                    "variable_metadata": variable_metadata,
+                    "observation_count": total_samples,
+                    "summary": {"count": total_samples, "min": None, "mean": None, "max": None},
+                    "density_curve": None,
+                    "categorical_distribution": categorical_distribution,
+                    "relative_ranks": [],
+                }
 
     if value_type == "nominal":
         nom_path = taxon_dir / NOMINAL_STATS_FILE
@@ -317,6 +452,8 @@ def get_species_occurrences(taxon_id: str, location: str | None = None):
         raise HTTPException(status_code=404, detail="Taxon not found")
 
     is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
+    filter_col = _location_filter_col(location) if location is not None else None
+    occ_columns = list(_OCC_COLUMNS) + ([filter_col] if filter_col else [])
     collected: list[dict] = []
 
     seen: set[str] = set()
@@ -324,7 +461,9 @@ def get_species_occurrences(taxon_id: str, location: str | None = None):
     def _read_occ(path: Path) -> None:
         if not path.exists():
             return
-        df = _filter_occ_df(pq.read_table(path, columns=_OCC_COLUMNS).to_pandas())
+        df = _filter_occ_df(pq.read_table(path, columns=occ_columns).to_pandas())
+        if filter_col is not None:
+            df = df[df[filter_col].astype(str) == str(location)]
         df = df[["catalogNumber", "decimalLatitude", "decimalLongitude"]].dropna()
         for r in df.to_dict("records"):
             cid = str(r["catalogNumber"])
@@ -345,12 +484,85 @@ def get_species_occurrences(taxon_id: str, location: str | None = None):
     return {"occurrences": collected}
 
 
+@lru_cache(maxsize=1)
+def _load_hierarchy() -> dict[str, dict]:
+    """Return gid → {name, level, parent_gid} from hierarchy.csv."""
+    path = _LOCATIONS_DIR / "hierarchy.csv"
+    if not path.exists():
+        return {}
+    result: dict[str, dict] = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            gid = row.get("gid", "")
+            if gid:
+                result[gid] = {
+                    "name": row.get("name", gid),
+                    "level": int(row["level"]),
+                    "parent_gid": row.get("parent_gid") or None,
+                }
+    return result
+
+
+def _resolve_hierarchy(gid: str, by_gid: dict[str, dict]) -> list[str]:
+    """Return ancestor names from top-level down to the immediate parent."""
+    names: list[str] = []
+    current = by_gid.get(gid, {}).get("parent_gid")
+    while current:
+        rec = by_gid.get(current)
+        if rec is None:
+            break
+        names.append(rec["name"])
+        current = rec.get("parent_gid")
+    names.reverse()
+    return names
+
+
 @app.get("/species/{taxon_id}/locations")
 def get_species_locations(taxon_id: str, level: int | None = None, limit: int = 500):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    return []
+
+    if not _LOC_TAXA_PATH.exists():
+        return []
+
+    taxon_key = str(taxon["taxon_key"])
+    try:
+        table = pq.read_table(_LOC_TAXA_PATH, filters=[("taxon_key", "=", taxon_key)])
+    except Exception:
+        return []
+
+    if table.num_rows == 0:
+        return []
+
+    scope_to_level: dict[str, int] = {v: k for k, v in _CONFIG.location_scope_by_level.items()}
+    scope_to_level["gbif_region"] = -1
+    by_gid = _load_hierarchy()
+
+    results: list[dict] = []
+    seen: set[str] = set()
+    for scope, gid, count in zip(
+        table.column("scope").to_pylist(),
+        table.column("gid").to_pylist(),
+        table.column("count").to_pylist(),
+    ):
+        loc_level = scope_to_level.get(str(scope))
+        if loc_level is None or gid in seen:
+            continue
+        if level is not None and loc_level != level:
+            continue
+        seen.add(gid)
+        rec = by_gid.get(gid)
+        results.append({
+            "gid": gid,
+            "name": rec["name"] if rec else gid,
+            "level": loc_level,
+            "hierarchy": _resolve_hierarchy(gid, by_gid) if rec else [],
+            "count": int(count),
+        })
+
+    results.sort(key=lambda r: (-r["count"], r["name"].lower(), r["gid"]))
+    return results[:limit]
 
 
 def _read_index_for_slice(
@@ -399,6 +611,7 @@ def get_species_environment_slice(
     min_value: float = Query(..., alias="min"),
     max_value: float = Query(..., alias="max"),
     limit: int | None = Query(None, ge=1, le=10000),
+    location: str | None = None,
 ):
     if not math.isfinite(min_value) or not math.isfinite(max_value):
         raise HTTPException(status_code=400, detail="min and max must be finite numbers")
@@ -414,6 +627,19 @@ def get_species_environment_slice(
     circular_wrap = variable_id == "aspect_deg" and max_value < min_value
     if max_value < min_value and not circular_wrap:
         min_value, max_value = max_value, min_value
+    if location is not None:
+        filter_col = _location_filter_col(location)
+        if filter_col is not None:
+            observations = _slice_from_raw_occ(
+                taxon, variable_id, filter_col, location, min_value, max_value, circular_wrap, limit,
+            )
+            return {
+                "species_id": taxon.get("taxon_key"),
+                "variable": variable_id,
+                "range": {"min": min_value, "max": max_value},
+                "count": len(observations),
+                "observations": observations,
+            }
     index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")
@@ -437,6 +663,7 @@ def get_species_environment_class_samples(
     variable_id: str,
     class_value: str,
     limit: int | None = Query(None, ge=1, le=10000),
+    location: str | None = None,
 ):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
@@ -453,6 +680,19 @@ def get_species_environment_class_samples(
             parsed = int(parsed)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid class value: {class_value!r}")
+    if location is not None:
+        filter_col = _location_filter_col(location)
+        if filter_col is not None:
+            observations = _class_samples_from_raw_occ(
+                taxon, variable_id, filter_col, location, float(parsed), limit,
+            )
+            return {
+                "species_id": taxon.get("taxon_key"),
+                "variable": variable_id,
+                "class_value": parsed,
+                "count": len(observations),
+                "observations": observations,
+            }
     index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
     if not index_path.exists():
         raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")

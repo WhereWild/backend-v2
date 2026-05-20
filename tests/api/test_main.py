@@ -14,7 +14,6 @@ import util.taxa as taxa
 import util.tiles as tiles
 from main import app
 from util.rankings import POSITION_FILE
-from util.stats import NOMINAL_STATS_FILE, NUMERICAL_DENSITY_FILE, NUMERICAL_STATS_FILE
 
 client = TestClient(app)
 
@@ -219,9 +218,9 @@ _OCC_TABLE = pa.table({
 
 def _env_stats_read(path, **kw):
     return {
-        NUMERICAL_STATS_FILE: _NUM_STATS_TABLE,
-        NOMINAL_STATS_FILE: _NOM_STATS_TABLE,
-        NUMERICAL_DENSITY_FILE: _DENSITY_TABLE,
+        st_module.NUMERICAL_STATS_FILE: _NUM_STATS_TABLE,
+        st_module.NOMINAL_STATS_FILE: _NOM_STATS_TABLE,
+        st_module.NUMERICAL_DENSITY_FILE: _DENSITY_TABLE,
     }.get(Path(str(path)).name, pa.table({}))
 
 
@@ -450,7 +449,7 @@ def test_get_species_environment_numerical_no_row():
 def test_get_species_environment_numerical_with_density():
     def _read(path, **kw):
         name = Path(str(path)).name
-        if name == NUMERICAL_STATS_FILE:
+        if name == st_module.NUMERICAL_STATS_FILE:
             return _NUM_STATS_TABLE
         return pa.table({"variable": ["bio1"], "points": [[1.0, 2.0]], "density": [[0.5, 0.5]]})
 
@@ -470,7 +469,7 @@ def test_get_species_environment_numerical_no_density_row():
     # density file exists but has no row for bio1 → density_curve=None
     def _read(path, **kw):
         name = Path(str(path)).name
-        if name == NUMERICAL_STATS_FILE:
+        if name == st_module.NUMERICAL_STATS_FILE:
             return _NUM_STATS_TABLE
         return pa.table({"variable": ["other"]})
 
@@ -488,7 +487,7 @@ def test_get_species_environment_underscore_variable():
     # bio_1 must be normalized to bio1
     def _read(path, **kw):
         name = Path(str(path)).name
-        if name == NUMERICAL_STATS_FILE:
+        if name == st_module.NUMERICAL_STATS_FILE:
             return _NUM_STATS_TABLE
         return pa.table({"variable": ["other"]})
 

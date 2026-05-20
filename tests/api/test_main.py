@@ -1,11 +1,18 @@
+import json
+from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from fastapi.testclient import TestClient
 
+import main as main_module
 import util.taxa as taxa
 import util.tiles as tiles
 from main import app
+from util.stats import NOMINAL_STATS_FILE, NUMERICAL_DENSITY_FILE, NUMERICAL_STATS_FILE
 
 client = TestClient(app)
 
@@ -141,3 +148,383 @@ def test_variable_tile_compat():
          patch.object(tiles, "render_layer_tile_bytes", return_value=png):
         response = client.get("/api/variables/bio_1/tiles/4/8/5.png")
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures for new tests
+# ---------------------------------------------------------------------------
+
+FAKE_NOM_LAYER = {
+    "id": "kg0",
+    "display_name": "Koppen-Geiger Climate",
+    "units": None,
+    "value_type": "nominal",
+    "domain": None,
+    "source": None,
+}
+
+NONLEAF_TAXON = {
+    "taxon_key": "2923968",
+    "path": "Plantae_6/Opuntia_2923968",
+    "scientific_name": "Opuntia",
+    "rank": "GENUS",
+}
+
+DESC_TAXON = {
+    "taxon_key": "2923970",
+    "path": "Plantae_6/Opuntia_2923968/Opuntia_humifusa_2923970",
+    "scientific_name": "Opuntia_humifusa",
+    "rank": "SPECIES",
+}
+
+_NUM_STATS_TABLE = pa.table({
+    "variable": ["bio1"],
+    "count": [100],
+    "min": [5.0],
+    "mean": [15.0],
+    "max": [25.0],
+    "std": [3.0],
+    "10th_percentile": [8.0],
+    "90th_percentile": [22.0],
+})
+
+_NOM_STATS_TABLE = pa.table({
+    "variable": ["kg0", "kg0", "kg0"],
+    "metric": ["total_samples", "class_1", "class_2"],
+    "value": [100.0, 0.6, 0.4],
+})
+
+_DENSITY_TABLE = pa.table({
+    "variable": ["bio1"],
+    "points": [[1.0, 2.0, 3.0]],
+    "density": [[0.25, 0.5, 0.25]],
+    "bandwidth": [0.5],
+    "count": [100],
+    "sampleCount": [100],
+    "pointCount": [3],
+    "min": [1.0],
+    "max": [3.0],
+})
+
+_OCC_TABLE = pa.table({
+    "catalogNumber": ["OCC001", "OCC002"],
+    "decimalLatitude": [40.5, 41.0],
+    "decimalLongitude": [-75.0, -74.5],
+    "obscured": ["No", "No"],
+    "coordinateUncertaintyInMeters": [100.0, 200.0],
+})
+
+
+def _env_stats_read(path, **kw):
+    return {
+        NUMERICAL_STATS_FILE: _NUM_STATS_TABLE,
+        NOMINAL_STATS_FILE: _NOM_STATS_TABLE,
+        NUMERICAL_DENSITY_FILE: _DENSITY_TABLE,
+    }.get(Path(str(path)).name, pa.table({}))
+
+
+# ---------------------------------------------------------------------------
+# _load_legend (lines 25-28)
+# ---------------------------------------------------------------------------
+
+def test_load_legend_file_present(tmp_path, monkeypatch):
+    data = {"classes": [{"id": 1, "name": "Forest"}]}
+    (tmp_path / "kg0_legend.json").write_text(json.dumps(data))
+    monkeypatch.setattr(main_module, "_LEGEND_DIR", tmp_path)
+    main_module._load_legend.cache_clear()
+    assert main_module._load_legend("kg0") == [{"id": 1, "name": "Forest"}]
+
+
+def test_load_legend_file_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(main_module, "_LEGEND_DIR", tmp_path)
+    main_module._load_legend.cache_clear()
+    assert main_module._load_legend("no_such_layer_xyz") == []
+
+
+# ---------------------------------------------------------------------------
+# _filter_occ_df (lines 32-36)
+# ---------------------------------------------------------------------------
+
+def test_filter_occ_df_removes_obscured():
+    df = pd.DataFrame({"obscured": ["No", "Yes", "No"], "x": [1, 2, 3]})
+    result = main_module._filter_occ_df(df)
+    assert list(result["x"]) == [1, 3]
+
+
+def test_filter_occ_df_removes_high_uncertainty():
+    df = pd.DataFrame({"coordinateUncertaintyInMeters": [100.0, 501.0, 500.0]})
+    assert len(main_module._filter_occ_df(df)) == 2
+
+
+def test_filter_occ_df_passthrough():
+    df = pd.DataFrame({"a": [1, 2, 3]})
+    assert len(main_module._filter_occ_df(df)) == 3
+
+
+# ---------------------------------------------------------------------------
+# /api/species/{id}/obscured (lines 120-123)
+# ---------------------------------------------------------------------------
+
+def test_get_species_obscured_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/api/species/2923970/obscured")
+    assert r.status_code == 200
+    assert r.json() == {"allObscured": False}
+
+
+def test_get_species_obscured_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/api/species/nope/obscured")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# /api/taxon/{id}/env-stats (lines 128-184)
+# ---------------------------------------------------------------------------
+
+def test_get_taxon_env_stats_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/api/taxon/nope/env-stats")
+    assert r.status_code == 404
+
+
+def test_get_taxon_env_stats_all_files():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", side_effect=_env_stats_read):
+        r = client.get("/api/taxon/2923970/env-stats")
+    assert r.status_code == 200
+    body = r.json()
+    bio1 = next(v for v in body["variables"] if v["id"] == "bio1")
+    assert bio1["stats"]["count"] == 100
+    assert bio1["density"] is not None
+    kg0 = next(v for v in body["variables"] if v["id"] == "kg0")
+    assert kg0["density"] is None
+    assert kg0["classes"] is not None
+
+
+def test_get_taxon_env_stats_no_files():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[]), \
+         patch("pathlib.Path.exists", return_value=False):
+        r = client.get("/api/taxon/2923970/env-stats")
+    assert r.status_code == 200
+    assert r.json()["variables"] == []
+
+
+# ---------------------------------------------------------------------------
+# /species/{id}/environment/{var} (lines 193-270)
+# ---------------------------------------------------------------------------
+
+def test_get_species_environment_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/nope/environment/bio1")
+    assert r.status_code == 404
+
+
+def test_get_species_environment_nominal_no_file():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("pathlib.Path.exists", return_value=False):
+        r = client.get("/species/2923970/environment/kg0")
+    assert r.status_code == 404
+
+
+def test_get_species_environment_nominal_no_rows():
+    empty = pa.table({
+        "variable": pa.array([], pa.string()),
+        "metric": pa.array([], pa.string()),
+        "value": pa.array([], pa.float64()),
+    })
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", return_value=empty), \
+         patch("main._load_legend", return_value=[]):
+        r = client.get("/species/2923970/environment/kg0")
+    assert r.status_code == 404
+
+
+def test_get_species_environment_nominal_success():
+    legend = [
+        {"id": 1, "name": "Tropical", "description": "Wet", "traits": {"color": "#0f0"}},
+        {"id": 2, "name": "Arid", "description": "Dry", "traits": None},
+    ]
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", return_value=_NOM_STATS_TABLE), \
+         patch("main._load_legend", return_value=legend):
+        r = client.get("/species/2923970/environment/kg0")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["variable"] == "kg0"
+    assert body["density_curve"] is None
+    dist = body["categorical_distribution"]
+    assert len(dist) == 2
+    assert dist[0]["fraction"] == pytest.approx(0.6)
+    assert dist[0]["color"] == "#0f0"
+    assert dist[1]["color"] is None
+
+
+def test_get_species_environment_numerical_no_file():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("pathlib.Path.exists", return_value=False):
+        r = client.get("/species/2923970/environment/bio1")
+    assert r.status_code == 404
+
+
+def test_get_species_environment_numerical_no_row():
+    empty_num = pa.table({"variable": pa.array([], pa.string())})
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", return_value=empty_num):
+        r = client.get("/species/2923970/environment/bio1")
+    assert r.status_code == 404
+
+
+def test_get_species_environment_numerical_with_density():
+    def _read(path, **kw):
+        name = Path(str(path)).name
+        if name == NUMERICAL_STATS_FILE:
+            return _NUM_STATS_TABLE
+        return pa.table({"variable": ["bio1"], "points": [[1.0, 2.0]], "density": [[0.5, 0.5]]})
+
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", side_effect=_read):
+        r = client.get("/species/2923970/environment/bio1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["summary"]["count"] == 100
+    assert body["density_curve"]["points"] == [1.0, 2.0]
+
+
+def test_get_species_environment_numerical_no_density_row():
+    # density file exists but has no row for bio1 → density_curve=None
+    def _read(path, **kw):
+        name = Path(str(path)).name
+        if name == NUMERICAL_STATS_FILE:
+            return _NUM_STATS_TABLE
+        return pa.table({"variable": ["other"]})
+
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", side_effect=_read):
+        r = client.get("/species/2923970/environment/bio1")
+    assert r.status_code == 200
+    assert r.json()["density_curve"] is None
+
+
+def test_get_species_environment_underscore_variable():
+    # bio_1 must be normalized to bio1
+    def _read(path, **kw):
+        name = Path(str(path)).name
+        if name == NUMERICAL_STATS_FILE:
+            return _NUM_STATS_TABLE
+        return pa.table({"variable": ["other"]})
+
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", side_effect=_read):
+        r = client.get("/species/2923970/environment/bio_1")
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /species/{id}/occurrences (lines 283-310)
+# ---------------------------------------------------------------------------
+
+def test_get_species_occurrences_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/nope/occurrences")
+    assert r.status_code == 404
+
+
+def test_get_species_occurrences_leaf():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", return_value=_OCC_TABLE):
+        r = client.get("/species/2923970/occurrences")
+    assert r.status_code == 200
+    occs = r.json()["occurrences"]
+    assert len(occs) == 2
+    assert occs[0]["catalogNumber"] == "OCC001"
+    assert occs[0]["latitude"] == pytest.approx(40.5)
+
+
+def test_get_species_occurrences_leaf_no_file():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("pathlib.Path.exists", return_value=False):
+        r = client.get("/species/2923970/occurrences")
+    assert r.status_code == 200
+    assert r.json()["occurrences"] == []
+
+
+def test_get_species_occurrences_nonleaf():
+    with patch.object(taxa, "get_taxon_by_id", return_value=NONLEAF_TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[DESC_TAXON]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", return_value=_OCC_TABLE):
+        r = client.get("/species/2923968/occurrences")
+    assert r.status_code == 200
+    assert len(r.json()["occurrences"]) == 2
+
+
+def test_get_species_occurrences_deduplication():
+    dup_table = pa.table({
+        "catalogNumber": ["DUP001", "DUP001"],
+        "decimalLatitude": [40.5, 40.5],
+        "decimalLongitude": [-75.0, -75.0],
+        "obscured": ["No", "No"],
+        "coordinateUncertaintyInMeters": [100.0, 100.0],
+    })
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", return_value=dup_table):
+        r = client.get("/species/2923970/occurrences")
+    assert len(r.json()["occurrences"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# /species/{id}/locations (lines 315-318)
+# ---------------------------------------------------------------------------
+
+def test_get_species_locations_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/nope/locations")
+    assert r.status_code == 404
+
+
+def test_get_species_locations_returns_empty():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/2923970/locations")
+    assert r.status_code == 200
+    assert r.json() == []

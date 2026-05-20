@@ -74,9 +74,9 @@ class TestGridIndices:
         assert lo >= ERA5_NX - 5
 
     def test_near_zero_meridian(self) -> None:
-        # London: lon = -0.13 → lon_idx ≈ 720 (same as 0°)
+        # London: lon = -0.13 → round(179.87 / 0.25) = round(719.48) = 719
         _, lo = grid_indices(51.51, -0.13, ERA5_NY, ERA5_NX, "lat_asc_lon_pm180", ERA5_STEP)
-        assert lo == 720
+        assert lo == 719
 
     def test_known_slc(self) -> None:
         # Salt Lake City: lat=40.77, lon=-111.89
@@ -263,8 +263,9 @@ class TestChunkBoundary:
     def test_cross_chunk_sum(self) -> None:
         # Chunk N: 24 hours of 2.0mm precipitation
         # Chunk N+1: 24 hours of 1.0mm precipitation
-        # Observation at index 5 of chunk N+1 with 24h window:
-        #   needs 19 values from tail + 6 values from chunk N+1 = sum(19*2 + 6*1) = 44
+        # Observation at chunk_n1 index 5, 24h window:
+        #   combined index = 24+5 = 29; start_idx = 29-23 = 6
+        #   combined[6..23] = 2.0 (18 values), combined[24..29] = 1.0 (6 values)
         chunk_n = np.full(24, 2.0, dtype=np.float32)
         chunk_n1 = np.full(24, 1.0, dtype=np.float32)
         tail_size = 24  # keep entire chunk N as tail (≥ window size)
@@ -277,7 +278,7 @@ class TestChunkBoundary:
         steps = {24: 24}
         sums, counts = window_stats_batch(combined, time_idx, steps)
 
-        expected = 19 * 2.0 + 6 * 1.0  # 19 from tail, 6 from chunk_n1
+        expected = 18 * 2.0 + 6 * 1.0  # 18 from tail, 6 from chunk_n1
         assert counts[24][0] == 24
         assert sums[24][0] == pytest.approx(expected)
 

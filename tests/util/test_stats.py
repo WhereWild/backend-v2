@@ -977,5 +977,300 @@ def test_process_nonleaf_nominal_series_empty_streaming(tmp_path, monkeypatch):
     assert not (taxon_dir / st.NOMINAL_STATS_FILE).exists()
 
 
+# ---------------------------------------------------------------------------
+# collect_taxon_df
+# ---------------------------------------------------------------------------
+
+LEAF_TAXON: dict = {
+    "taxon_key": "7001",
+    "path": "Root_1/Parent_9999/Leaf_7001",
+    "scientific_name": "Testus leafus",
+    "rank": "SUBSPECIES",
+}
+
+
+def test_collect_taxon_df_leaf_reads_own_occ(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_parquet(leaf_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [5.0] * 20})
+    df = st.collect_taxon_df(LEAF_TAXON)
+    assert df is not None
+    assert len(df) == 20
+
+
+def test_collect_taxon_df_leaf_no_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    (tmp_path / LEAF_TAXON["path"]).mkdir(parents=True, exist_ok=True)
+    assert st.collect_taxon_df(LEAF_TAXON) is None
+
+
+def test_collect_taxon_df_leaf_empty_parquet(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    leaf_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"catalogNumber": pa.array([], type=pa.string())}),
+                   leaf_dir / st.OCCURRENCE_FILE)
+    assert st.collect_taxon_df(LEAF_TAXON) is None
+
+
+def test_collect_taxon_df_leaf_all_filtered(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_parquet(leaf_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [5.0] * 20})
+    df = pd.read_parquet(leaf_dir / st.OCCURRENCE_FILE)
+    df["obscured"] = "Yes"
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), leaf_dir / st.OCCURRENCE_FILE)
+    assert st.collect_taxon_df(LEAF_TAXON) is None
+
+
+def test_collect_taxon_df_species_combines(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    sub_dir = tmp_path / SUBSPECIES_TAXON["path"]
+    _make_occ_parquet(species_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [10.0] * 20})
+    _make_occ_parquet_offset(sub_dir / st.OCCURRENCE_FILE, offset=100, extra_cols={"bio1": [20.0] * 20})
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(SPECIES_TAXON, [SUBSPECIES_TAXON]))
+    df = st.collect_taxon_df(SPECIES_TAXON)
+    assert df is not None
+    assert len(df) == 40
+
+
+def test_collect_taxon_df_species_deduplicates(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    sub_dir = tmp_path / SUBSPECIES_TAXON["path"]
+    shared = {
+        "catalogNumber": [f"obs{i}" for i in range(10)],
+        "decimalLatitude": [40.0] * 10,
+        "decimalLongitude": [-75.0] * 10,
+        "obscured": ["No"] * 10,
+        "coordinateUncertaintyInMeters": [100.0] * 10,
+        "bio1": [1.0] * 10,
+    }
+    species_dir.mkdir(parents=True, exist_ok=True)
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(shared), preserve_index=False), species_dir / st.OCCURRENCE_FILE)
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(shared), preserve_index=False), sub_dir / st.OCCURRENCE_FILE)
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(SPECIES_TAXON, [SUBSPECIES_TAXON]))
+    df = st.collect_taxon_df(SPECIES_TAXON)
+    assert df is not None
+    assert len(df) == 10
+
+
+def test_collect_taxon_df_nonleaf_excludes_self_but_reads_descendants(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    child_dir = tmp_path / CHILD_TAXON["path"]
+    _make_occ_parquet(child_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [5.0] * 20})
+    # FAKE_TAXON is GENUS (non-leaf, non-species) — include_self=False
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
+    df = st.collect_taxon_df(FAKE_TAXON)
+    assert df is not None
+    assert len(df) == 20
+
+
+def test_collect_taxon_df_nonleaf_no_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, []))
+    assert st.collect_taxon_df(FAKE_TAXON) is None
+
+
+def test_collect_taxon_df_nonleaf_skips_zero_row_parquet(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    child_dir = tmp_path / CHILD_TAXON["path"]
+    child_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"catalogNumber": pa.array([], type=pa.string())}),
+                   child_dir / st.OCCURRENCE_FILE)
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
+    assert st.collect_taxon_df(FAKE_TAXON) is None
+
+
+def test_collect_taxon_df_nonleaf_skips_empty_and_filtered(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    child_dir = tmp_path / CHILD_TAXON["path"]
+    _make_occ_parquet(child_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [5.0] * 20})
+    df = pd.read_parquet(child_dir / st.OCCURRENCE_FILE)
+    df["obscured"] = "Yes"
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), child_dir / st.OCCURRENCE_FILE)
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
+    assert st.collect_taxon_df(FAKE_TAXON) is None
+
+
+# ---------------------------------------------------------------------------
+# compute_location_filtered_stats
+# ---------------------------------------------------------------------------
+
+def _make_occ_with_location(
+    path: Path, loc_col: str, gid: str, var_col: str, values: list,
+    var2_col: str | None = None, var2_vals: list | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(values)
+    data = {
+        "catalogNumber": [f"obs{i}" for i in range(n)],
+        "decimalLatitude": [40.0] * n,
+        "decimalLongitude": [-75.0] * n,
+        "obscured": ["No"] * n,
+        "coordinateUncertaintyInMeters": [100.0] * n,
+        loc_col: [gid] * n,
+        var_col: values,
+    }
+    if var2_col and var2_vals:
+        data[var2_col] = var2_vals
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False), path)
+
+
+def test_compute_loc_stats_no_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(SPECIES_TAXON, []))
+    (tmp_path / SPECIES_TAXON["path"]).mkdir(parents=True, exist_ok=True)
+    result = st.compute_location_filtered_stats(SPECIES_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
+    assert result is None
+
+
+def test_compute_loc_stats_filter_col_not_in_df(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_parquet(leaf_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [5.0] * 20})
+    # level0Gid not in the parquet
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
+    assert result is None
+
+
+def test_compute_loc_stats_empty_after_location_filter(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "CAN", "bio1", [5.0] * 20)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
+    assert result is None
+
+
+def test_compute_loc_stats_variable_not_in_df(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    # has level0Gid=USA but no bio1 column
+    n = 20
+    data = {
+        "catalogNumber": [f"obs{i}" for i in range(n)],
+        "decimalLatitude": [40.0] * n,
+        "decimalLongitude": [-75.0] * n,
+        "obscured": ["No"] * n,
+        "coordinateUncertaintyInMeters": [100.0] * n,
+        "level0Gid": ["USA"] * n,
+    }
+    leaf_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False), leaf_dir / st.OCCURRENCE_FILE)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
+    assert result is None
+
+
+def test_compute_loc_stats_unknown_vtype_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "bio1", [5.0] * 20)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "bio1", "level0Gid", "USA", {"id": "bio1", "value_type": "bogus"})
+    assert result is None
+
+
+def test_compute_loc_stats_continuous_happy_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    vals = list(np.linspace(5.0, 25.0, 20))
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "bio1", vals)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
+    assert result is not None
+    assert result["type"] == "continuous"
+    assert result["observation_count"] == 20
+    assert result["stats"]["count"] == 20
+    assert result["density_curve"] is not None
+
+
+def test_compute_loc_stats_continuous_only_matches_gid(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    n = 20
+    data = {
+        "catalogNumber": [f"obs{i}" for i in range(n)],
+        "decimalLatitude": [40.0] * n,
+        "decimalLongitude": [-75.0] * n,
+        "obscured": ["No"] * n,
+        "coordinateUncertaintyInMeters": [100.0] * n,
+        "level0Gid": ["USA"] * 10 + ["CAN"] * 10,
+        "bio1": [10.0] * 10 + [20.0] * 10,
+    }
+    leaf_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False), leaf_dir / st.OCCURRENCE_FILE)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
+    assert result is not None
+    assert result["observation_count"] == 10
+
+
+def test_compute_loc_stats_discrete_happy_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    vals = [42.0] * 10 + [43.0] * 10
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "gsl", vals)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "gsl", "level0Gid", "USA", _DISCRETE_LAYER)
+    assert result is not None
+    assert result["type"] == "continuous"
+    assert result["density_curve"] is not None
+    assert result["stats"]["mode"] == 42
+
+
+def test_compute_loc_stats_nominal_happy_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    vals = [1.0] * 15 + [2.0] * 5
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "kg0", vals)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "kg0", "level0Gid", "USA", _NOMINAL_LAYER)
+    assert result is not None
+    assert result["type"] == "nominal"
+    assert result["observation_count"] == 20
+    assert result["summary"]["mode"] == 1
+    assert len(result["distribution"]) == 2
+
+
+def test_compute_loc_stats_continuous_all_null_series(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "bio1", [None] * 20)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
+    assert result is None
+
+
+def test_compute_loc_stats_continuous_all_inf(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "bio1", [float("inf")] * 20)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
+    assert result is None
+
+
+def test_compute_loc_stats_nominal_all_null(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "kg0", [None] * 20)
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "kg0", "level0Gid", "USA", _NOMINAL_LAYER)
+    assert result is None
+
+
+def test_compute_loc_stats_circular_type_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "circ", [45.0] * 20)
+    result = st.compute_location_filtered_stats(
+        LEAF_TAXON, "circ", "level0Gid", "USA", {"id": "circ", "value_type": "circular"},
+    )
+    assert result is None
+
+
+def test_compute_loc_stats_gbif_region_col(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf_dir = tmp_path / LEAF_TAXON["path"]
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "gbifRegion", "NORTH_AMERICA", "bio1",
+                             list(np.linspace(5.0, 25.0, 20)))
+    result = st.compute_location_filtered_stats(LEAF_TAXON, "bio1", "gbifRegion", "NORTH_AMERICA", _CONTINUOUS_LAYER)
+    assert result is not None
+    assert result["observation_count"] == 20
+
 
 

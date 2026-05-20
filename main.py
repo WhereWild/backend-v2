@@ -12,6 +12,7 @@ from starlette.concurrency import run_in_threadpool
 
 from config.config import load_config
 from util import citations, taxa, tiles
+from util.rankings import POSITION_FILE
 from util.stats import NOMINAL_STATS_FILE, NUMERICAL_DENSITY_FILE, NUMERICAL_STATS_FILE, OCCURRENCE_INDEX_FILE, TREE_ROOT
 from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
 
@@ -189,6 +190,34 @@ def get_taxon_env_stats(taxon_id: str):
 # Legacy compatibility endpoints (frontend still uses these URL patterns)
 # ---------------------------------------------------------------------------
 
+def _load_relative_ranks(taxon_dir: Path, variable_id: str) -> list[dict]:
+    """Read relative_ranks_positions.parquet and return rank rows for one variable."""
+    pos_path = taxon_dir / POSITION_FILE
+    if not pos_path.exists():
+        return []
+    try:
+        rows = pq.read_table(pos_path).to_pylist()
+    except Exception:
+        return []
+    result = []
+    for row in rows:
+        if row.get("variable") != variable_id:
+            continue
+        position = row.get("position") or 0
+        count = row.get("count") or 0
+        percentile = round(position / count, 3) if count > 0 else 0.0
+        result.append({
+            "metric": row.get("metric"),
+            "position": position + 1,          # 1-based rank
+            "count": count,
+            "percentile": percentile,
+            "sampleCount": row.get("sampleCount"),
+            "context_label": row.get("contextLabel"),
+            "label": row.get("contextLabel"),
+        })
+    return result
+
+
 @app.get("/species/{taxon_id}/environment/{variable_id}")
 def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | None = None):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
@@ -241,6 +270,7 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
             "summary": {"count": total_samples, "min": None, "mean": None, "max": None},
             "density_curve": None,
             "categorical_distribution": categorical_distribution,
+            "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
         }
 
     num_path = taxon_dir / NUMERICAL_STATS_FILE
@@ -276,6 +306,7 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
         "summary": summary,
         "density_curve": density_curve,
         "categorical_distribution": None,
+        "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
     }
 
 

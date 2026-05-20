@@ -215,9 +215,7 @@ def test_main_full_pipeline_completes(tmp_path):
          patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("tree")), \
-         patch("scripts.build_id_maps.main", side_effect=lambda: call_order.append("maps")), \
          patch("scripts.populate_tree.main", side_effect=lambda: call_order.append("populate")), \
-         patch("scripts.polish_tree.main", side_effect=lambda: call_order.append("polish")), \
          patch("scripts.gis.process_gadm.main", side_effect=lambda: call_order.append("process_gadm")), \
          patch("scripts.rebuild._run_download_gis", side_effect=lambda: call_order.append("download_gis")), \
          patch("scripts.gis.build_overviews.main", side_effect=lambda: call_order.append("build_overviews")), \
@@ -229,7 +227,7 @@ def test_main_full_pipeline_completes(tmp_path):
         rebuild.main()
 
     assert call_order == [
-        "wipe", "tree", "maps", "polish", "populate",
+        "wipe", "tree", "populate",
         "process_gadm", "download_gis", "build_overviews", "enrich_tree", "process_tree",
     ]
     p = _pipeline(tmp_path)
@@ -237,7 +235,7 @@ def test_main_full_pipeline_completes(tmp_path):
     assert all(
         p["stages"][s]["status"] == "completed"
         for s in [
-            "sync_gbif", "build_tree", "build_id_maps", "polish_tree", "populate_tree",
+            "sync_gbif", "build_tree", "populate_tree",
             "process_gadm", "download_gis", "build_overviews", "enrich_tree", "process_tree",
         ]
     )
@@ -259,9 +257,7 @@ def test_main_wipe_happens_before_sync_download(tmp_path):
          patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main"), \
-         patch("scripts.build_id_maps.main"), \
          patch("scripts.populate_tree.main"), \
-         patch("scripts.polish_tree.main"), \
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
@@ -285,9 +281,7 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
          patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main", side_effect=capture), \
-         patch("scripts.build_id_maps.main"), \
          patch("scripts.populate_tree.main"), \
-         patch("scripts.polish_tree.main"), \
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
@@ -386,9 +380,7 @@ def test_main_inhibitor_released_on_success():
          patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main"), \
-         patch("scripts.build_id_maps.main"), \
          patch("scripts.populate_tree.main"), \
-         patch("scripts.polish_tree.main"), \
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \

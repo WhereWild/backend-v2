@@ -509,7 +509,8 @@ def test_build_mapping_exact_match(tmp_path, monkeypatch):
          "taxonRank": "SPECIES", "scientificName": "Opuntia humifusa"},
     ])
     build_tree.build_mapping(catalog, dwca)
-    rows = list(csv.DictReader(open(tmp_path / "mapping.csv")))
+    with open(tmp_path / "mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["inat_id"] == "99"
     assert rows[0]["match_type"] == "exact"
@@ -524,7 +525,8 @@ def test_build_mapping_stripped_match(tmp_path, monkeypatch):
          "scientificName": "Opuntia polyacantha erinacea"},
     ])
     build_tree.build_mapping(catalog, dwca)
-    rows = list(csv.DictReader(open(tmp_path / "mapping.csv")))
+    with open(tmp_path / "mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["match_type"] == "stripped"
 
@@ -537,7 +539,8 @@ def test_build_mapping_no_match(tmp_path, monkeypatch):
         {"id": "55", "taxonID": "", "taxonRank": "SPECIES", "scientificName": "Completely different"},
     ])
     build_tree.build_mapping(catalog, dwca)
-    rows = list(csv.DictReader(open(tmp_path / "mapping.csv")))
+    with open(tmp_path / "mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert len(rows) == 0
 
 
@@ -550,7 +553,8 @@ def test_build_mapping_conflict_skipped(tmp_path, monkeypatch):
         {"id": "22", "taxonID": "", "taxonRank": "SPECIES", "scientificName": "Opuntia humifusa"},
     ])
     build_tree.build_mapping(catalog, dwca)
-    rows = list(csv.DictReader(open(tmp_path / "mapping.csv")))
+    with open(tmp_path / "mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["inat_id"] == "11"
 
@@ -563,7 +567,8 @@ def test_build_mapping_skips_unmapped_rank(tmp_path, monkeypatch):
         {"id": "11", "taxonID": "", "taxonRank": "GENUS", "scientificName": "Opuntia humifusa"},
     ])
     build_tree.build_mapping(catalog, dwca)
-    rows = list(csv.DictReader(open(tmp_path / "mapping.csv")))
+    with open(tmp_path / "mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert len(rows) == 0
 
 
@@ -575,7 +580,8 @@ def test_build_mapping_skips_empty_inat_id(tmp_path, monkeypatch):
         {"id": "", "taxonID": "", "taxonRank": "SPECIES", "scientificName": "Opuntia humifusa"},
     ])
     build_tree.build_mapping(catalog, dwca)
-    rows = list(csv.DictReader(open(tmp_path / "mapping.csv")))
+    with open(tmp_path / "mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert len(rows) == 0
 
 
@@ -1343,7 +1349,8 @@ def test_build_mapping_skips_empty_scientific_name(tmp_path, monkeypatch):
         {"id": "11", "taxonID": "", "taxonRank": "SPECIES", "scientificName": ""},
     ])
     build_tree.build_mapping(catalog, dwca)
-    rows = list(csv.DictReader(open(tmp_path / "mapping.csv")))
+    with open(tmp_path / "mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
     assert len(rows) == 0
 
 

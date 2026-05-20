@@ -46,7 +46,13 @@ _REQUIRED_COLS = ("decimalLatitude", "decimalLongitude", "catalogNumber", "hilbe
 def _load_layers() -> list[dict]:
     with open(CATALOG_PATH) as f:
         cat = json.load(f)
-    return [layer for category in cat["categories"] for layer in category["layers"]]
+    # Skip temporal/non-raster layers (they have no filename and are handled by enrich_temporal)
+    return [
+        layer
+        for category in cat["categories"]
+        for layer in category["layers"]
+        if layer.get("filename")
+    ]
 
 
 def _atomic_write(path: Path, table: pa.Table) -> None:

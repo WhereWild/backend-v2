@@ -535,6 +535,17 @@ def test_get_species_occurrences_leaf_no_file():
     assert r.json()["occurrences"] == []
 
 
+def test_get_species_occurrences_subspecies():
+    subspecies_taxon = {**TAXON, "rank": "SUBSPECIES"}
+    with patch.object(taxa, "get_taxon_by_id", return_value=subspecies_taxon), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", return_value=_OCC_TABLE):
+        r = client.get("/species/2923970/occurrences")
+    assert r.status_code == 200
+    assert len(r.json()["occurrences"]) == 2
+
+
 def test_get_species_occurrences_nonleaf():
     with patch.object(taxa, "get_taxon_by_id", return_value=NONLEAF_TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \

@@ -8,10 +8,11 @@ data directory (preserving sync_state.json) and runs the full pipeline:
   3. build_id_maps — build id/slug lookup maps
   4. polish_tree   — fetch iNat preferred names/images, update index
   5. populate_tree — stream occurrence.txt → per-taxon parquet files
-  6. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
-  7. build_overviews — build COG overviews for all GIS layers
-  8. enrich_tree   — sample GIS layer values into per-taxon occurrence parquets
-  9. process_tree  — compute per-taxon summary statistics and KDE density graphs
+  6. process_gadm  — download GADM GeoPackage + build location tables and catalog
+  7. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
+  8. build_overviews — build COG overviews for all GIS layers
+  9. enrich_tree   — sample GIS layer values into per-taxon occurrence parquets
+ 10. process_tree  — compute per-taxon summary statistics and KDE density graphs
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -34,6 +35,7 @@ import scripts.build_id_maps as build_id_maps
 import scripts.build_tree as build_tree
 import scripts.enrich_tree as enrich_tree
 import scripts.gis.build_overviews as build_overviews
+import scripts.gis.process_gadm as process_gadm
 import scripts.polish_tree as polish_tree
 import scripts.populate_tree as populate_tree
 import scripts.process_tree as process_tree
@@ -133,7 +135,7 @@ def _release_inhibitor(proc: "subprocess.Popen | None") -> None:
 # ---------------------------------------------------------------------------
 
 def _run_download_gis(gis_dir: Path | None = None) -> None:
-    """Discover and run every scripts/gis/download_*.py in alphabetical order."""
+    """Discover and run every scripts/gis/download_*.py."""
     if gis_dir is None:  # pragma: no cover
         gis_dir = Path(__file__).parent / "gis"
     for script in sorted(gis_dir.glob("download_*.py")):
@@ -230,6 +232,11 @@ def main() -> None:
         _set_stage("populate_tree", "in_progress")
         populate_tree.main()
         _set_stage("populate_tree", "completed")
+
+        print("\n--- Processing GADM (download + location tables + catalog) ---")
+        _set_stage("process_gadm", "in_progress")
+        process_gadm.main()
+        _set_stage("process_gadm", "completed")
 
         print("\n--- Downloading GIS layers ---")
         _set_stage("download_gis", "in_progress")

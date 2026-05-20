@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pyarrow as pa
@@ -528,3 +528,222 @@ def test_get_species_locations_returns_empty():
         r = client.get("/species/2923970/locations")
     assert r.status_code == 200
     assert r.json() == []
+
+
+# ---------------------------------------------------------------------------
+# Slice / class-samples shared index table
+# ---------------------------------------------------------------------------
+
+_INDEX_TABLE = pa.table({
+    "catalogNumber": ["OCC001", "OCC002", "OCC003"],
+    "decimalLatitude": [40.5, 41.0, 42.0],
+    "decimalLongitude": [-75.0, -74.5, -73.0],
+    "bio1": [10.0, 20.0, 30.0],
+    "kg0": [1.0, 2.0, 1.0],
+})
+
+_INDEX_SCHEMA = MagicMock()
+_INDEX_SCHEMA.names = list(_INDEX_TABLE.schema.names)
+
+FAKE_DISC_LAYER = {
+    "id": "bio1",
+    "display_name": "Annual Mean Temperature",
+    "units": "°C",
+    "value_type": "interval",
+    "domain": None,
+}
+
+
+# ---------------------------------------------------------------------------
+# _read_index_for_slice (lines 333-350)
+# ---------------------------------------------------------------------------
+
+def test_read_index_variable_not_in_schema(tmp_path):
+    path = tmp_path / "idx.parquet"
+    pq.write_table(_INDEX_TABLE, path)
+    result = main_module._read_index_for_slice(path, "missing_var", value_min=0.0, value_max=100.0)
+    assert result == []
+
+
+def test_read_index_range_filter(tmp_path):
+    path = tmp_path / "idx.parquet"
+    pq.write_table(_INDEX_TABLE, path)
+    result = main_module._read_index_for_slice(path, "bio1", value_min=5.0, value_max=15.0)
+    assert len(result) == 1
+    assert result[0]["catalogNumber"] == "OCC001"
+    assert result[0]["value"] == pytest.approx(10.0)
+
+
+def test_read_index_class_filter(tmp_path):
+    path = tmp_path / "idx.parquet"
+    pq.write_table(_INDEX_TABLE, path)
+    result = main_module._read_index_for_slice(path, "kg0", class_value=1.0)
+    assert len(result) == 2
+    assert all(r["value"] == pytest.approx(1.0) for r in result)
+
+
+def test_read_index_circular_wrap(tmp_path):
+    wrap_table = pa.table({
+        "catalogNumber": ["A", "B", "C"],
+        "decimalLatitude": [40.0, 41.0, 42.0],
+        "decimalLongitude": [-75.0, -74.0, -73.0],
+        "aspect_deg": [350.0, 10.0, 180.0],
+    })
+    path = tmp_path / "idx.parquet"
+    pq.write_table(wrap_table, path)
+    # selection 315→45 wraps through north; 350 and 10 should match, 180 should not
+    result = main_module._read_index_for_slice(
+        path, "aspect_deg", value_min=315.0, value_max=45.0, circular_wrap=True,
+    )
+    catalogs = {r["catalogNumber"] for r in result}
+    assert "A" in catalogs
+    assert "B" in catalogs
+    assert "C" not in catalogs
+
+
+def test_read_index_limit(tmp_path):
+    path = tmp_path / "idx.parquet"
+    pq.write_table(_INDEX_TABLE, path)
+    result = main_module._read_index_for_slice(path, "bio1", value_min=0.0, value_max=100.0, limit=2)
+    assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# /species/{id}/environment/{var}/slice (lines 369-397)
+# ---------------------------------------------------------------------------
+
+def test_slice_not_finite():
+    r = client.get("/species/2923970/environment/bio1/slice?min=nan&max=20")
+    assert r.status_code == 400
+
+
+def test_slice_taxon_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/nope/environment/bio1/slice?min=0&max=30")
+    assert r.status_code == 404
+
+
+def test_slice_layer_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[]):
+        r = client.get("/species/2923970/environment/bio1/slice?min=0&max=30")
+    assert r.status_code == 404
+
+
+def test_slice_nominal_rejected():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
+        r = client.get("/species/2923970/environment/kg0/slice?min=0&max=30")
+    assert r.status_code == 400
+
+
+def test_slice_no_index_file():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
+         patch("pathlib.Path.exists", return_value=False):
+        r = client.get("/species/2923970/environment/bio1/slice?min=0&max=30")
+    assert r.status_code == 404
+
+
+def test_slice_success(tmp_path):
+    idx_path = tmp_path / "idx.parquet"
+    pq.write_table(_INDEX_TABLE, idx_path)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch("main.TREE_ROOT", tmp_path / TAXON["path"]):
+        # Patch the index path directly via TREE_ROOT so the endpoint builds path correctly
+        pass
+
+    # Simpler: mock read_schema and read_table
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_schema", return_value=_INDEX_SCHEMA), \
+         patch.object(pq, "read_table", return_value=_INDEX_TABLE):
+        r = client.get("/species/2923970/environment/bio1/slice?min=5&max=25")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["variable"] == "bio1"
+    assert body["range"] == {"min": 5.0, "max": 25.0}
+    assert body["count"] == 2
+    assert body["observations"][0]["catalogNumber"] == "OCC001"
+
+
+def test_slice_min_greater_than_max_swapped():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_schema", return_value=_INDEX_SCHEMA), \
+         patch.object(pq, "read_table", return_value=_INDEX_TABLE):
+        r = client.get("/species/2923970/environment/bio1/slice?min=25&max=5")
+    assert r.status_code == 200
+    # After swap, min=5 max=25, same 2 results
+    assert r.json()["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# /species/{id}/environment/{var}/class/{val}/samples (lines 407-434)
+# ---------------------------------------------------------------------------
+
+def test_class_samples_taxon_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/nope/environment/kg0/class/1/samples")
+    assert r.status_code == 404
+
+
+def test_class_samples_layer_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[]):
+        r = client.get("/species/2923970/environment/kg0/class/1/samples")
+    assert r.status_code == 404
+
+
+def test_class_samples_not_nominal():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]):
+        r = client.get("/species/2923970/environment/bio1/class/10/samples")
+    assert r.status_code == 400
+
+
+def test_class_samples_invalid_class():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
+        r = client.get("/species/2923970/environment/kg0/class/notanumber/samples")
+    assert r.status_code == 400
+
+
+def test_class_samples_no_index():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("pathlib.Path.exists", return_value=False):
+        r = client.get("/species/2923970/environment/kg0/class/1/samples")
+    assert r.status_code == 404
+
+
+def test_class_samples_success():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_schema", return_value=_INDEX_SCHEMA), \
+         patch.object(pq, "read_table", return_value=_INDEX_TABLE):
+        r = client.get("/species/2923970/environment/kg0/class/1/samples")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["variable"] == "kg0"
+    assert body["class_value"] == 1
+    assert body["count"] == 2
+    assert all(obs["value"] == pytest.approx(1.0) for obs in body["observations"])

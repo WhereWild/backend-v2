@@ -1,0 +1,886 @@
+"""Tests for util/rankings.py."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+import util.rankings as rk
+from config.config import ValueType
+
+# ---------------------------------------------------------------------------
+# Shared fixtures / helpers
+# ---------------------------------------------------------------------------
+
+_RATIO_LAYER = {"id": "bio1", "value_type": "ratio"}
+_NOMINAL_LAYER = {"id": "kg0", "value_type": "nominal"}
+_CIRCULAR_LAYER = {"id": "aspect_deg", "value_type": "circular"}
+_ORDINAL_LAYER = {"id": "foo", "value_type": "ordinal"}
+_ALL_LAYERS = [_RATIO_LAYER, _NOMINAL_LAYER]
+
+_ANCESTOR: dict = {
+    "taxon_key": "1",
+    "path": "Root_1",
+    "scientific_name": "Plantae",
+    "common_name": "",
+    "rank": "KINGDOM",
+}
+
+_GENUS: dict = {
+    "taxon_key": "100",
+    "path": "Root_1/Order_10/Family_50/Genus_100",
+    "scientific_name": "Testus",
+    "common_name": "",
+    "rank": "GENUS",
+}
+
+_SPECIES_A: dict = {
+    "taxon_key": "200",
+    "path": "Root_1/Order_10/Family_50/Genus_100/Species_200",
+    "scientific_name": "Testus alpha",
+    "common_name": "alpha plant",
+    "rank": "SPECIES",
+}
+
+_SPECIES_B: dict = {
+    "taxon_key": "201",
+    "path": "Root_1/Order_10/Family_50/Genus_100/Species_201",
+    "scientific_name": "Testus beta",
+    "common_name": "",
+    "rank": "SPECIES",
+}
+
+_SUBSPECIES_A: dict = {
+    "taxon_key": "300",
+    "path": "Root_1/Order_10/Family_50/Genus_100/Species_200/Subspecies_300",
+    "scientific_name": "Testus alpha subsp.",
+    "common_name": "",
+    "rank": "SUBSPECIES",
+}
+
+
+def _write_numerical_stats(taxon_dir: Path, variable: str, **metrics) -> None:
+    """Write a minimal numerical_stats.parquet for one variable."""
+    taxon_dir.mkdir(parents=True, exist_ok=True)
+    row = {"variable": variable, **metrics}
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame([row]), preserve_index=False),
+                   taxon_dir / rk.NUMERICAL_STATS_FILE)
+
+
+def _write_nominal_stats(taxon_dir: Path, variable: str, entries: list[tuple[str, float]]) -> None:
+    """Write a minimal nominal_stats.parquet for one variable."""
+    taxon_dir.mkdir(parents=True, exist_ok=True)
+    rows = [{"variable": variable, "metric": m, "value": v} for m, v in entries]
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False),
+                   taxon_dir / rk.NOMINAL_STATS_FILE)
+
+
+def _write_rank_index(
+    index_path: Path,
+    entries: dict[str, list[tuple[str, float, int]]],  # col_name → [(taxon_key, value, sample_count)]
+) -> None:
+    """Write a minimal rank index parquet with column_lengths metadata."""
+    struct_type = pa.struct([
+        pa.field("taxonKey", pa.string()),
+        pa.field("value", pa.float64()),
+        pa.field("sampleCount", pa.int64()),
+    ])
+    max_len = max(len(v) for v in entries.values())
+    arrays: dict[str, pa.Array] = {}
+    column_lengths: dict[str, int] = {}
+    for col_name, rows in entries.items():
+        column_lengths[col_name] = len(rows)
+        arr = pa.StructArray.from_arrays(
+            [
+                pa.array([r[0] for r in rows], type=pa.string()),
+                pa.array([r[1] for r in rows], type=pa.float64()),
+                pa.array([r[2] for r in rows], type=pa.int64()),
+            ],
+            fields=[pa.field("taxonKey", pa.string()),
+                    pa.field("value", pa.float64()),
+                    pa.field("sampleCount", pa.int64())],
+        )
+        if len(arr) < max_len:
+            arr = pa.concat_arrays([arr, pa.nulls(max_len - len(arr), type=struct_type)])
+        arrays[col_name] = arr
+    table = pa.table(arrays)
+    metadata = {b"column_lengths": json.dumps(column_lengths).encode("utf-8")}
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table.replace_schema_metadata(metadata), index_path)
+
+
+# ---------------------------------------------------------------------------
+# _descendant_rank_targets
+# ---------------------------------------------------------------------------
+
+def test_descendant_rank_targets_kingdom():
+    targets = rk._descendant_rank_targets("KINGDOM")
+    assert targets == ["PHYLUM", "CLASS", "ORDER", "FAMILY", "GENUS", "SPECIES", "SUBSPECIES"]
+
+
+def test_descendant_rank_targets_genus():
+    targets = rk._descendant_rank_targets("GENUS")
+    assert targets == ["SPECIES", "SUBSPECIES"]
+
+
+def test_descendant_rank_targets_species():
+    targets = rk._descendant_rank_targets("SPECIES")
+    assert targets == ["SUBSPECIES"]
+
+
+def test_descendant_rank_targets_subspecies():
+    assert rk._descendant_rank_targets("SUBSPECIES") == []
+
+
+def test_descendant_rank_targets_unknown_rank():
+    assert rk._descendant_rank_targets("DOMAIN") == []
+
+
+# ---------------------------------------------------------------------------
+# _metrics_for_vtype
+# ---------------------------------------------------------------------------
+
+def test_metrics_for_vtype_ratio():
+    metrics = rk._metrics_for_vtype(_RATIO_LAYER, ValueType.RATIO)
+    assert "mean" in metrics
+    assert "median" in metrics
+    assert "count" in metrics
+
+
+def test_metrics_for_vtype_interval():
+    metrics = rk._metrics_for_vtype({"id": "x", "value_type": "interval"}, ValueType.INTERVAL)
+    assert "mean" in metrics
+
+
+def test_metrics_for_vtype_nominal():
+    metrics = rk._metrics_for_vtype(_NOMINAL_LAYER, ValueType.NOMINAL)
+    assert "entropy" in metrics
+    assert "unique_classes" in metrics
+    assert "mean" not in metrics
+
+
+def test_metrics_for_vtype_circular_raises():
+    with pytest.raises(NotImplementedError):
+        rk._metrics_for_vtype(_CIRCULAR_LAYER, ValueType.CIRCULAR)
+
+
+def test_metrics_for_vtype_ordinal_empty():
+    assert rk._metrics_for_vtype(_ORDINAL_LAYER, ValueType.ORDINAL) == ()
+
+
+# ---------------------------------------------------------------------------
+# _resolve_context_label
+# ---------------------------------------------------------------------------
+
+def test_resolve_context_label_scientific():
+    assert rk._resolve_context_label(_ANCESTOR) == "Plantae"
+
+
+def test_resolve_context_label_falls_back_to_common():
+    taxon = {**_ANCESTOR, "scientific_name": "", "common_name": "Flowering plants"}
+    assert rk._resolve_context_label(taxon) == "Flowering plants"
+
+
+def test_resolve_context_label_falls_back_to_key():
+    taxon = {**_ANCESTOR, "scientific_name": "", "common_name": ""}
+    assert rk._resolve_context_label(taxon) == "1"
+
+
+# ---------------------------------------------------------------------------
+# _infer_sample_count
+# ---------------------------------------------------------------------------
+
+def test_infer_sample_count_from_numerical_stats(tmp_path):
+    _write_numerical_stats(tmp_path, "bio1", count=42, mean=5.0)
+    assert rk._infer_sample_count(tmp_path) == 42
+
+
+def test_infer_sample_count_from_nominal_stats(tmp_path):
+    _write_nominal_stats(tmp_path, "kg0", [("total_samples", 17.0), ("entropy", 1.5)])
+    assert rk._infer_sample_count(tmp_path) == 17
+
+
+def test_infer_sample_count_from_occurrence_index(tmp_path):
+    idx_path = tmp_path / "occurrence_index.parquet"
+    pq.write_table(pa.table({"catalogNumber": ["a", "b", "c"]}), idx_path)
+    assert rk._infer_sample_count(tmp_path) == 3
+
+
+def test_infer_sample_count_no_files(tmp_path):
+    assert rk._infer_sample_count(tmp_path) == 0
+
+
+# ---------------------------------------------------------------------------
+# _write_descendant_catalog
+# ---------------------------------------------------------------------------
+
+def test_write_descendant_catalog_writes_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    sp_dir = tmp_path / _SPECIES_A["path"]
+    _write_numerical_stats(sp_dir, "bio1", count=10, mean=5.0)
+    out = tmp_path / "catalog.parquet"
+    rk._write_descendant_catalog(out, [_SPECIES_A])
+    df = pd.read_parquet(out)
+    assert len(df) == 1
+    assert df.iloc[0]["taxon_key"] == "200"
+    assert df.iloc[0]["sample_count"] == 10
+
+
+def test_write_descendant_catalog_empty_removes_file(tmp_path):
+    out = tmp_path / "catalog.parquet"
+    out.touch()
+    rk._write_descendant_catalog(out, [])
+    assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# build_descendant_catalogs
+# ---------------------------------------------------------------------------
+
+def test_build_descendant_catalogs_genus_writes_species(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    sp_dir = tmp_path / _SPECIES_A["path"]
+    _write_numerical_stats(sp_dir, "bio1", count=5, mean=2.0)
+
+    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SUBSPECIES_A]):
+        rk.build_descendant_catalogs(_GENUS)
+
+    genus_dir = tmp_path / _GENUS["path"]
+    species_cat = genus_dir / "species.parquet"
+    assert species_cat.exists()
+    df = pd.read_parquet(species_cat)
+    assert "200" in df["taxon_key"].tolist()
+
+
+def test_build_descendant_catalogs_genus_no_subspecies_catalog(tmp_path, monkeypatch):
+    """GENUS ancestors should NOT produce a subspecies.parquet (only SPECIES ancestors do)."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SUBSPECIES_A]):
+        rk.build_descendant_catalogs(_GENUS)
+
+    genus_dir = tmp_path / _GENUS["path"]
+    assert not (genus_dir / "subspecies.parquet").exists()
+
+
+def test_build_descendant_catalogs_species_writes_subspecies(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    subsp_dir = tmp_path / _SUBSPECIES_A["path"]
+    _write_numerical_stats(subsp_dir, "bio1", count=3, mean=1.0)
+
+    with patch("util.rankings.iter_descendants", return_value=[_SUBSPECIES_A]):
+        rk.build_descendant_catalogs(_SPECIES_A)
+
+    species_dir = tmp_path / _SPECIES_A["path"]
+    subsp_cat = species_dir / "subspecies.parquet"
+    assert subsp_cat.exists()
+    df = pd.read_parquet(subsp_cat)
+    assert "300" in df["taxon_key"].tolist()
+
+
+def test_build_descendant_catalogs_no_targets(tmp_path, monkeypatch):
+    """SUBSPECIES has no ranks below it — no catalogs written."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    with patch("util.rankings.iter_descendants", return_value=[]):
+        rk.build_descendant_catalogs(_SUBSPECIES_A)
+    # Nothing written
+    assert not (tmp_path / _SUBSPECIES_A["path"]).exists()
+
+
+# ---------------------------------------------------------------------------
+# _collect_entries_from_numerical_stats
+# ---------------------------------------------------------------------------
+
+def test_collect_entries_numerical_stats_ratio(tmp_path):
+    _write_numerical_stats(tmp_path, "bio1", count=20, mean=5.0, median=4.5)
+    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 20, [_RATIO_LAYER])
+    assert "bio1::mean" in entries
+    assert entries["bio1::mean"]["value"] == pytest.approx(5.0)
+    assert entries["bio1::mean"]["taxon_key"] == "100"
+    assert entries["bio1::mean"]["sample_count"] == 20
+
+
+def test_collect_entries_numerical_stats_skips_unknown_layer(tmp_path):
+    _write_numerical_stats(tmp_path, "bio1", count=5, mean=1.0)
+    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [_NOMINAL_LAYER])
+    assert len(entries) == 0
+
+
+def test_collect_entries_numerical_stats_skips_circular(tmp_path):
+    _write_numerical_stats(tmp_path, "aspect_deg", count=5, mean=90.0)
+    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [_CIRCULAR_LAYER])
+    assert len(entries) == 0
+
+
+def test_collect_entries_numerical_stats_no_file(tmp_path):
+    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 0, [_RATIO_LAYER])
+    assert entries == {}
+
+
+# ---------------------------------------------------------------------------
+# _collect_entries_from_nominal_stats
+# ---------------------------------------------------------------------------
+
+def test_collect_entries_nominal_stats(tmp_path):
+    _write_nominal_stats(tmp_path, "kg0", [
+        ("entropy", 1.5),
+        ("unique_classes", 3.0),
+        ("total_samples", 20.0),
+        ("mode", 5.0),
+        ("unique_samples", 18.0),
+    ])
+    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 20, [_NOMINAL_LAYER])
+    assert "kg0::entropy" in entries
+    assert entries["kg0::entropy"]["value"] == pytest.approx(1.5)
+    assert entries["kg0::entropy"]["taxon_key"] == "50"
+    assert "kg0::total_samples" in entries
+
+
+def test_collect_entries_nominal_stats_skips_non_nominal_layers(tmp_path):
+    _write_nominal_stats(tmp_path, "kg0", [("entropy", 1.5)])
+    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 10, [_RATIO_LAYER])
+    assert len(entries) == 0
+
+
+def test_collect_entries_nominal_stats_no_file(tmp_path):
+    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
+    assert entries == {}
+
+
+# ---------------------------------------------------------------------------
+# _build_rank_index
+# ---------------------------------------------------------------------------
+
+def test_build_rank_index_sorts_by_value(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_path = tmp_path / "species.parquet"
+    index_path = tmp_path / "species_index.parquet"
+
+    # Two species, B has higher mean bio1
+    sp_a_dir = tmp_path / _SPECIES_A["path"]
+    sp_b_dir = tmp_path / _SPECIES_B["path"]
+    _write_numerical_stats(sp_a_dir, "bio1", count=10, mean=3.0)
+    _write_numerical_stats(sp_b_dir, "bio1", count=8, mean=7.0)
+
+    pq.write_table(pa.Table.from_pylist([
+        {"taxon_key": "200", "path": _SPECIES_A["path"], "sample_count": 10,
+         "scientific_name": "A", "common_name": "", "rank": "SPECIES"},
+        {"taxon_key": "201", "path": _SPECIES_B["path"], "sample_count": 8,
+         "scientific_name": "B", "common_name": "", "rank": "SPECIES"},
+    ], schema=rk._CATALOG_SCHEMA), catalog_path)
+
+    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+
+    assert index_path.exists()
+    schema = pq.read_schema(index_path)
+    assert "bio1::mean" in schema.names
+
+    tbl = pq.read_table(index_path)
+    col = tbl.column("bio1::mean").combine_chunks()
+    keys = [col[i].as_py()["taxonKey"] for i in range(2)]
+    assert keys == ["200", "201"]  # A (3.0) before B (7.0)
+
+
+def test_build_rank_index_empty_catalog_removes_index(tmp_path):
+    catalog_path = tmp_path / "c.parquet"
+    index_path = tmp_path / "i.parquet"
+    pq.write_table(pa.Table.from_pylist([], schema=rk._CATALOG_SCHEMA), catalog_path)
+    index_path.touch()
+    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+    assert not index_path.exists()
+
+
+def test_build_rank_index_no_stats_removes_index(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_path = tmp_path / "c.parquet"
+    index_path = tmp_path / "i.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"taxon_key": "200", "path": _SPECIES_A["path"], "sample_count": 0,
+         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
+    ], schema=rk._CATALOG_SCHEMA), catalog_path)
+    index_path.touch()
+    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+    assert not index_path.exists()
+
+
+def test_build_rank_index_stores_column_lengths_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_path = tmp_path / "s.parquet"
+    index_path = tmp_path / "si.parquet"
+    sp_dir = tmp_path / _SPECIES_A["path"]
+    _write_numerical_stats(sp_dir, "bio1", count=5, mean=1.0)
+    pq.write_table(pa.Table.from_pylist([
+        {"taxon_key": "200", "path": _SPECIES_A["path"], "sample_count": 5,
+         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
+    ], schema=rk._CATALOG_SCHEMA), catalog_path)
+    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+
+    lengths = rk._load_column_lengths(index_path)
+    assert "bio1::mean" in lengths
+    assert lengths["bio1::mean"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _distribute_positions
+# ---------------------------------------------------------------------------
+
+def test_distribute_positions_writes_position_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    index_path = tmp_path / "species_index.parquet"
+    _write_rank_index(index_path, {
+        "bio1::mean": [("200", 3.0, 10), ("201", 7.0, 8)],
+    })
+
+    sp_a = {**_SPECIES_A}
+    sp_b = {**_SPECIES_B}
+    with patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {
+        "200": sp_a, "201": sp_b,
+    }.get(str(k))):
+        rk._distribute_positions(_GENUS, index_path)
+
+    pos_a = pq.read_table(tmp_path / sp_a["path"] / rk.POSITION_FILE).to_pandas()
+    assert len(pos_a) == 1
+    assert pos_a.iloc[0]["position"] == 0
+    assert pos_a.iloc[0]["count"] == 2
+    assert pos_a.iloc[0]["variable"] == "bio1"
+    assert pos_a.iloc[0]["metric"] == "mean"
+    assert pos_a.iloc[0]["contextTaxonId"] == "100"
+
+    pos_b = pq.read_table(tmp_path / sp_b["path"] / rk.POSITION_FILE).to_pandas()
+    assert pos_b.iloc[0]["position"] == 1
+
+
+def test_distribute_positions_no_duplicate_upsert(tmp_path, monkeypatch):
+    """Second distribution with same context should not add duplicate rows."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    index_path = tmp_path / "species_index.parquet"
+    _write_rank_index(index_path, {"bio1::mean": [("200", 3.0, 10)]})
+
+    sp_a = {**_SPECIES_A}
+    with patch("util.rankings.get_taxon_by_id", return_value=sp_a):
+        rk._distribute_positions(_GENUS, index_path)
+        rk._distribute_positions(_GENUS, index_path)  # second call
+
+    pos = pq.read_table(tmp_path / sp_a["path"] / rk.POSITION_FILE).to_pandas()
+    assert len(pos) == 1  # not doubled
+
+
+def test_distribute_positions_no_index(tmp_path):
+    """Missing index file is a no-op."""
+    rk._distribute_positions(_GENUS, tmp_path / "missing_index.parquet")
+
+
+def test_distribute_positions_accumulates_across_contexts(tmp_path, monkeypatch):
+    """A species should accumulate positions from both its genus and family contexts."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    genus_index = tmp_path / "genus_idx.parquet"
+    family_index = tmp_path / "family_idx.parquet"
+    _write_rank_index(genus_index,  {"bio1::mean": [("200", 3.0, 10), ("201", 7.0, 8)]})
+    _write_rank_index(family_index, {"bio1::mean": [("200", 3.0, 10), ("201", 7.0, 8)]})
+
+    genus_ancestor  = {**_GENUS}
+    family_ancestor = {**_GENUS, "taxon_key": "50", "scientific_name": "Testaceae", "rank": "FAMILY"}
+    sp_a = {**_SPECIES_A}
+
+    with patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {
+        "200": sp_a, "201": {**_SPECIES_B},
+    }.get(str(k))):
+        rk._distribute_positions(genus_ancestor, genus_index)
+        rk._distribute_positions(family_ancestor, family_index)
+
+    pos = pq.read_table(tmp_path / sp_a["path"] / rk.POSITION_FILE).to_pandas()
+    # One row from genus context, one from family context
+    assert len(pos) == 2
+    assert set(pos["contextTaxonId"].tolist()) == {"100", "50"}
+
+
+# ---------------------------------------------------------------------------
+# build_rank_indexes
+# ---------------------------------------------------------------------------
+
+def test_build_rank_indexes_skips_missing_catalog(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    # Genus has no species.parquet → no species_index.parquet
+    rk.build_rank_indexes(_GENUS, [_RATIO_LAYER])
+    genus_dir = tmp_path / _GENUS["path"]
+    assert not (genus_dir / "species_index.parquet").exists()
+
+
+# ---------------------------------------------------------------------------
+# compute_relative_ranks (integration)
+# ---------------------------------------------------------------------------
+
+def test_compute_relative_ranks_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+
+    # Write stats for both species
+    for sp in [_SPECIES_A, _SPECIES_B]:
+        _write_numerical_stats(tmp_path / sp["path"], "bio1", count=10, mean=float(sp["taxon_key"]))
+
+    sp_a = {**_SPECIES_A}
+    sp_b = {**_SPECIES_B}
+
+    with patch("util.rankings.iter_descendants", return_value=[sp_a, sp_b]), \
+         patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {
+             "200": sp_a, "201": sp_b,
+         }.get(str(k))):
+        rk.compute_relative_ranks(_GENUS, [_RATIO_LAYER])
+
+    genus_dir = tmp_path / _GENUS["path"]
+    assert (genus_dir / "species.parquet").exists()
+    assert (genus_dir / "species_index.parquet").exists()
+
+    # Positions written to both species
+    pos_a = pq.read_table(tmp_path / sp_a["path"] / rk.POSITION_FILE).to_pandas()
+    pos_b = pq.read_table(tmp_path / sp_b["path"] / rk.POSITION_FILE).to_pandas()
+    assert len(pos_a) > 0
+    assert len(pos_b) > 0
+    # Species A (mean=200) should have lower position than B (mean=201)
+    a_mean_row = pos_a[pos_a["metric"] == "mean"].iloc[0]
+    b_mean_row = pos_b[pos_b["metric"] == "mean"].iloc[0]
+    assert a_mean_row["position"] < b_mean_row["position"]
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gap tests
+# ---------------------------------------------------------------------------
+
+_FAMILY: dict = {
+    "taxon_key": "50",
+    "path": "Root_1/Order_10/Family_50",
+    "scientific_name": "Testaceae",
+    "common_name": "",
+    "rank": "FAMILY",
+}
+
+
+# _atomic_write — finally cleanup on write failure (line 77)
+def test_atomic_write_cleanup_on_write_failure(tmp_path):
+    with patch("util.rankings.pq.write_table", side_effect=OSError("disk full")):
+        with pytest.raises(OSError, match="disk full"):
+            rk._atomic_write(tmp_path / "out.parquet", pa.table({"x": [1]}))
+    # no stray temp files remain
+    assert list(tmp_path.glob("*.parquet")) == []
+
+
+# _infer_sample_count — bad int in count column (inner except, lines 131-132)
+def test_infer_sample_count_bad_count_value(tmp_path):
+    # Write numerical_stats with count = "bad" (not castable to int)
+    pq.write_table(
+        pa.table({"variable": ["bio1"], "count": ["bad"]}),
+        tmp_path / rk.NUMERICAL_STATS_FILE,
+    )
+    # Falls through to 0 since none of the count values are usable
+    assert rk._infer_sample_count(tmp_path) == 0
+
+
+# _infer_sample_count — pq.read_table raises (outer except, lines 133-134)
+def test_infer_sample_count_numerical_stats_read_fails(tmp_path):
+    # Write a parquet with no "count" column → read_table(columns=["count"]) raises
+    pq.write_table(pa.table({"variable": ["bio1"]}), tmp_path / rk.NUMERICAL_STATS_FILE)
+    assert rk._infer_sample_count(tmp_path) == 0
+
+
+# _infer_sample_count — corrupt nominal stats (lines 142-143)
+def test_infer_sample_count_corrupt_nominal_stats(tmp_path):
+    (tmp_path / rk.NOMINAL_STATS_FILE).write_bytes(b"not a parquet")
+    assert rk._infer_sample_count(tmp_path) == 0
+
+
+# _infer_sample_count — corrupt occurrence index (lines 148-149)
+def test_infer_sample_count_corrupt_occurrence_index(tmp_path):
+    (tmp_path / "occurrence_index.parquet").write_bytes(b"not a parquet")
+    assert rk._infer_sample_count(tmp_path) == 0
+
+
+# build_descendant_catalogs — else branch for non-SPECIES non-SUBSPECIES rank (line 204)
+def test_build_descendant_catalogs_family_writes_genus_catalog(tmp_path, monkeypatch):
+    """FAMILY ancestor: GENUS targets hit the else branch."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    genus_desc = {**_GENUS}
+    with patch("util.rankings.iter_descendants", return_value=[genus_desc]):
+        rk.build_descendant_catalogs(_FAMILY)
+    family_dir = tmp_path / _FAMILY["path"]
+    assert (family_dir / "genus.parquet").exists()
+    df = pd.read_parquet(family_dir / "genus.parquet")
+    assert "100" in df["taxon_key"].tolist()
+
+
+# _collect_entries_from_numerical_stats — corrupt stats file (lines 223-224)
+def test_collect_entries_numerical_stats_corrupt_file(tmp_path):
+    (tmp_path / rk.NUMERICAL_STATS_FILE).write_bytes(b"garbage")
+    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 0, [_RATIO_LAYER])
+    assert entries == {}
+
+
+# _collect_entries_from_numerical_stats — bad value_type in layer (lines 236-237)
+def test_collect_entries_numerical_stats_bad_vtype(tmp_path):
+    _write_numerical_stats(tmp_path, "bio1", count=5, mean=1.0)
+    bad_layer = {"id": "bio1", "value_type": "not_a_real_type"}
+    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [bad_layer])
+    assert entries == {}
+
+
+# _collect_entries_from_numerical_stats — non-castable float (lines 248-249)
+def test_collect_entries_numerical_stats_nonfloat_metric(tmp_path):
+    # Write stats where mean is a string that can't be cast to float
+    pq.write_table(
+        pa.table({"variable": ["bio1"], "count": [5], "mean": ["N/A"]}),
+        tmp_path / rk.NUMERICAL_STATS_FILE,
+    )
+    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [_RATIO_LAYER])
+    assert "bio1::mean" not in entries
+
+
+# _collect_entries_from_numerical_stats — non-finite metric value (line 251)
+def test_collect_entries_numerical_stats_nonfinite_metric(tmp_path):
+    _write_numerical_stats(tmp_path, "bio1", count=5, mean=float("inf"))
+    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [_RATIO_LAYER])
+    assert "bio1::mean" not in entries
+
+
+# _collect_entries_from_nominal_stats — corrupt stats file (lines 272-273)
+def test_collect_entries_nominal_stats_corrupt_file(tmp_path):
+    (tmp_path / rk.NOMINAL_STATS_FILE).write_bytes(b"garbage")
+    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
+    assert entries == {}
+
+
+# _collect_entries_from_nominal_stats — non-castable value (lines 287-288)
+def test_collect_entries_nominal_stats_bad_value(tmp_path):
+    pq.write_table(
+        pa.table({"variable": ["kg0"], "metric": ["entropy"], "value": ["bad"]}),
+        tmp_path / rk.NOMINAL_STATS_FILE,
+    )
+    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
+    assert entries == {}
+
+
+# _collect_entries_from_nominal_stats — non-finite value (line 290)
+def test_collect_entries_nominal_stats_nonfinite_value(tmp_path):
+    pq.write_table(
+        pa.table({"variable": ["kg0"], "metric": ["entropy"], "value": [float("inf")]}),
+        tmp_path / rk.NOMINAL_STATS_FILE,
+    )
+    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
+    assert "kg0::entropy" not in entries
+
+
+# _build_rank_index — corrupt catalog (lines 320-322)
+def test_build_rank_index_corrupt_catalog(tmp_path):
+    catalog_path = tmp_path / "c.parquet"
+    index_path = tmp_path / "i.parquet"
+    catalog_path.write_bytes(b"garbage")
+    index_path.touch()
+    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+    assert not index_path.exists()
+
+
+# _build_rank_index — catalog row with empty path (line 333)
+def test_build_rank_index_empty_path_row_skipped(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_path = tmp_path / "c.parquet"
+    index_path = tmp_path / "i.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"taxon_key": "200", "path": "", "sample_count": 0,
+         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
+    ], schema=rk._CATALOG_SCHEMA), catalog_path)
+    index_path.touch()
+    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+    # no entries → index removed
+    assert not index_path.exists()
+
+
+# _build_rank_index — padding when columns have unequal lengths (line 364)
+def test_build_rank_index_pads_unequal_columns(tmp_path, monkeypatch):
+    """Taxon A has bio1::mean + bio1::count; taxon B has bio1::mean only.
+
+    bio1::count column has 1 entry, bio1::mean has 2 → padding kicks in.
+    """
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    catalog_path = tmp_path / "c.parquet"
+    index_path = tmp_path / "i.parquet"
+
+    sp_a_dir = tmp_path / _SPECIES_A["path"]
+    sp_b_dir = tmp_path / _SPECIES_B["path"]
+    # A: has count + mean; B: count is None (won't produce count entry)
+    _write_numerical_stats(sp_a_dir, "bio1", count=10, mean=1.0)
+    _write_numerical_stats(sp_b_dir, "bio1", count=None, mean=2.0)
+
+    pq.write_table(pa.Table.from_pylist([
+        {"taxon_key": "200", "path": _SPECIES_A["path"], "sample_count": 10,
+         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
+        {"taxon_key": "201", "path": _SPECIES_B["path"], "sample_count": 0,
+         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
+    ], schema=rk._CATALOG_SCHEMA), catalog_path)
+
+    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+    assert index_path.exists()
+    tbl = pq.read_table(index_path)
+    # Both mean and count columns present; count column is padded to length 2
+    assert "bio1::mean" in tbl.schema.names
+    assert tbl.num_rows == 2
+
+
+# build_rank_indexes — no-targets branch (line 378)
+def test_build_rank_indexes_no_targets(tmp_path, monkeypatch):
+    """SUBSPECIES has no ranks below it → returns immediately."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    rk.build_rank_indexes(_SUBSPECIES_A, [_RATIO_LAYER])
+    # Nothing created
+    assert not (tmp_path / _SUBSPECIES_A["path"]).exists()
+
+
+# _load_column_lengths — no metadata (line 399)
+def test_load_column_lengths_no_metadata(tmp_path):
+    idx_path = tmp_path / "idx.parquet"
+    pq.write_table(pa.table({"x": [1]}), idx_path)
+    assert rk._load_column_lengths(idx_path) == {}
+
+
+# _load_column_lengths — corrupt schema (lines 401-402)
+def test_load_column_lengths_corrupt_file(tmp_path):
+    idx_path = tmp_path / "idx.parquet"
+    idx_path.write_bytes(b"garbage")
+    assert rk._load_column_lengths(idx_path) == {}
+
+
+# _load_existing_positions — corrupt file (lines 411-412)
+def test_load_existing_positions_corrupt_file(tmp_path):
+    pos_path = tmp_path / rk.POSITION_FILE
+    pos_path.write_bytes(b"garbage")
+    assert rk._load_existing_positions(pos_path) == []
+
+
+# _distribute_positions — corrupt schema read (lines 421-422)
+def test_distribute_positions_corrupt_schema(tmp_path):
+    index_path = tmp_path / "idx.parquet"
+    index_path.write_bytes(b"garbage")
+    rk._distribute_positions(_GENUS, index_path)  # should not raise
+
+
+# _distribute_positions — no metric columns in schema (line 426)
+def test_distribute_positions_no_metric_columns(tmp_path):
+    index_path = tmp_path / "idx.parquet"
+    pq.write_table(pa.table({"taxon_key": ["1"]}), index_path)
+    rk._distribute_positions(_GENUS, index_path)  # no-op
+
+
+# _distribute_positions — corrupt table read (lines 434-435)
+def test_distribute_positions_corrupt_table_read(tmp_path):
+    index_path = tmp_path / "idx.parquet"
+    _write_rank_index(index_path, {"bio1::mean": [("200", 1.0, 5)]})
+    with patch("util.rankings.pq.read_table", side_effect=OSError("fail")):
+        rk._distribute_positions(_GENUS, index_path)  # should not raise
+
+
+# _distribute_positions — col_len == 0 from column_lengths (line 443)
+def test_distribute_positions_zero_col_len(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    index_path = tmp_path / "idx.parquet"
+    _write_rank_index(index_path, {"bio1::mean": [("200", 1.0, 5)]})
+    # Override column_lengths to return 0 for the column
+    with patch("util.rankings._load_column_lengths", return_value={"bio1::mean": 0}), \
+         patch("util.rankings.get_taxon_by_id"):
+        rk._distribute_positions(_GENUS, index_path)
+    # No positions written (col skipped)
+    assert not (tmp_path / _SPECIES_A["path"] / rk.POSITION_FILE).exists()
+
+
+# _distribute_positions — None entry in padded struct array (line 447)
+def test_distribute_positions_null_struct_entry(tmp_path, monkeypatch):
+    """Two taxa with unequal column lengths → padded nulls hit line 447."""
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+
+    # Build an index with two columns of different lengths so padding produces nulls
+    struct_type = pa.struct([
+        pa.field("taxonKey", pa.string()),
+        pa.field("value", pa.float64()),
+        pa.field("sampleCount", pa.int64()),
+    ])
+    col_a = pa.StructArray.from_arrays(
+        [pa.array(["200"], type=pa.string()),
+         pa.array([1.0], type=pa.float64()),
+         pa.array([5], type=pa.int64())],
+        fields=[pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int64())],
+    )
+    col_b = pa.StructArray.from_arrays(
+        [pa.array(["200", "201"], type=pa.string()),
+         pa.array([1.0, 2.0], type=pa.float64()),
+         pa.array([5, 3], type=pa.int64())],
+        fields=[pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int64())],
+    )
+    # Pad col_a to length 2 with a null struct
+    col_a_padded = pa.concat_arrays([col_a, pa.nulls(1, type=struct_type)])
+    table = pa.table({"bio1::mean": col_b, "bio1::count": col_a_padded})
+    meta = {b"column_lengths": json.dumps({"bio1::mean": 2, "bio1::count": 1}).encode()}
+    index_path = tmp_path / "idx.parquet"
+    pq.write_table(table.replace_schema_metadata(meta), index_path)
+
+    sp_a = {**_SPECIES_A}
+    sp_b = {**_SPECIES_B}
+    with patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {
+        "200": sp_a, "201": sp_b,
+    }.get(str(k))):
+        rk._distribute_positions(_GENUS, index_path)
+
+    # Species A gets positions for both columns; species B only for bio1::mean
+    pos_a = pq.read_table(tmp_path / sp_a["path"] / rk.POSITION_FILE).to_pandas()
+    assert len(pos_a) == 2
+    pos_b = pq.read_table(tmp_path / sp_b["path"] / rk.POSITION_FILE).to_pandas()
+    assert len(pos_b) == 1
+
+
+# _distribute_positions — fully null struct entry (line 447, entry is None)
+def test_distribute_positions_null_struct_entry_is_none(tmp_path):
+    """A fully-null struct element returns None from as_py() — hits line 447."""
+    index_path = tmp_path / "idx.parquet"
+    struct_type = pa.struct([
+        pa.field("taxonKey", pa.string()),
+        pa.field("value", pa.float64()),
+        pa.field("sampleCount", pa.int64()),
+    ])
+    null_entry = pa.nulls(1, type=struct_type)
+    table = pa.table({"bio1::mean": null_entry})
+    meta = {b"column_lengths": json.dumps({"bio1::mean": 1}).encode()}
+    pq.write_table(table.replace_schema_metadata(meta), index_path)
+    rk._distribute_positions(_GENUS, index_path)  # should not raise or write anything
+
+
+# _distribute_positions — struct entry present but taxonKey field is null (line 450)
+def test_distribute_positions_null_taxon_key_in_struct(tmp_path):
+    """Struct entry exists but taxonKey is null → hits line 450."""
+    index_path = tmp_path / "idx.parquet"
+    arr = pa.StructArray.from_arrays(
+        [
+            pa.array([None], type=pa.string()),   # taxonKey = null
+            pa.array([1.0], type=pa.float64()),
+            pa.array([5], type=pa.int64()),
+        ],
+        fields=[pa.field("taxonKey", pa.string()),
+                pa.field("value", pa.float64()),
+                pa.field("sampleCount", pa.int64())],
+    )
+    table = pa.table({"bio1::mean": arr})
+    meta = {b"column_lengths": json.dumps({"bio1::mean": 1}).encode()}
+    pq.write_table(table.replace_schema_metadata(meta), index_path)
+    rk._distribute_positions(_GENUS, index_path)  # should not write any position file
+
+
+# _distribute_positions — get_taxon_by_id returns None (line 465)
+def test_distribute_positions_taxon_not_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
+    index_path = tmp_path / "idx.parquet"
+    _write_rank_index(index_path, {"bio1::mean": [("999", 1.0, 5)]})
+    with patch("util.rankings.get_taxon_by_id", return_value=None):
+        rk._distribute_positions(_GENUS, index_path)
+    # No position file written for unknown taxon
+    assert not list(tmp_path.glob("**/relative_ranks_positions.parquet"))

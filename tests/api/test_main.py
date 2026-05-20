@@ -12,6 +12,7 @@ import main as main_module
 import util.taxa as taxa
 import util.tiles as tiles
 from main import app
+from util.rankings import POSITION_FILE
 from util.stats import NOMINAL_STATS_FILE, NUMERICAL_DENSITY_FILE, NUMERICAL_STATS_FILE
 
 client = TestClient(app)
@@ -221,6 +222,54 @@ def _env_stats_read(path, **kw):
         NOMINAL_STATS_FILE: _NOM_STATS_TABLE,
         NUMERICAL_DENSITY_FILE: _DENSITY_TABLE,
     }.get(Path(str(path)).name, pa.table({}))
+
+
+# ---------------------------------------------------------------------------
+# _load_relative_ranks
+# ---------------------------------------------------------------------------
+
+def test_load_relative_ranks_no_file(tmp_path):
+    assert main_module._load_relative_ranks(tmp_path, "bio1") == []
+
+
+def test_load_relative_ranks_corrupt_file(tmp_path):
+    (tmp_path / POSITION_FILE).write_bytes(b"garbage")
+    assert main_module._load_relative_ranks(tmp_path, "bio1") == []
+
+
+def test_load_relative_ranks_filters_by_variable(tmp_path):
+    pq.write_table(pa.table({
+        "variable":       ["bio1", "kg0"],
+        "metric":         ["mean", "entropy"],
+        "position":       [4, 1],
+        "count":          [10, 5],
+        "sampleCount":    [50, 30],
+        "contextTaxonId": ["100", "100"],
+        "contextLabel":   ["Cactaceae", "Cactaceae"],
+    }), tmp_path / POSITION_FILE)
+    rows = main_module._load_relative_ranks(tmp_path, "bio1")
+    assert len(rows) == 1
+    assert rows[0]["metric"] == "mean"
+    assert rows[0]["position"] == 5          # 0-based 4 → 1-based 5
+    assert rows[0]["count"] == 10
+    assert rows[0]["percentile"] == pytest.approx(0.4)     # 4/10
+    assert rows[0]["label"] == "Cactaceae"
+    assert rows[0]["context_label"] == "Cactaceae"
+
+
+def test_load_relative_ranks_zero_count(tmp_path):
+    """count=0 edge case must not divide by zero."""
+    pq.write_table(pa.table({
+        "variable":       ["bio1"],
+        "metric":         ["mean"],
+        "position":       [0],
+        "count":          [0],
+        "sampleCount":    [0],
+        "contextTaxonId": ["1"],
+        "contextLabel":   ["Plantae"],
+    }), tmp_path / POSITION_FILE)
+    rows = main_module._load_relative_ranks(tmp_path, "bio1")
+    assert rows[0]["percentile"] == 0.0
 
 
 # ---------------------------------------------------------------------------

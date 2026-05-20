@@ -557,6 +557,159 @@ def test_process_leaf_nominal_series_empty_after_dropna(tmp_path):
     assert not (taxon_dir / st.NOMINAL_STATS_FILE).exists()
 
 
+# ---------------------------------------------------------------------------
+# _load_occ_for_index / _build_occurrence_index
+# ---------------------------------------------------------------------------
+
+def test_write_index_from_df_empty(tmp_path):
+    df = pd.DataFrame({"catalogNumber": [], "decimalLatitude": [], "decimalLongitude": []})
+    st._write_index_from_df(tmp_path / "taxon", df)
+    assert not (tmp_path / "taxon" / st.OCCURRENCE_INDEX_FILE).exists()
+
+
+def test_load_occ_for_index_empty_table(tmp_path):
+    path = tmp_path / "occ.parquet"
+    pq.write_table(pa.table({"catalogNumber": pa.array([], pa.string()),
+                              "decimalLatitude": pa.array([], pa.float64()),
+                              "decimalLongitude": pa.array([], pa.float64())}), path)
+    assert st._load_occ_for_index(path) is None
+
+
+def test_load_occ_for_index_all_filtered(tmp_path):
+    path = tmp_path / "occ.parquet"
+    pq.write_table(pa.table({
+        "catalogNumber": ["A", "B"],
+        "decimalLatitude": [40.0, 41.0],
+        "decimalLongitude": [-75.0, -74.0],
+        "obscured": ["Yes", "Yes"],
+    }), path)
+    assert st._load_occ_for_index(path) is None
+
+
+def test_build_occurrence_index_leaf(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf = {**CHILD_TAXON, "rank": "SPECIES"}
+    leaf_dir = tmp_path / leaf["path"]
+    _make_occ_parquet(leaf_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [10.0] * 20})
+    st._build_occurrence_index(leaf, leaf_dir, is_leaf=True)
+    index_path = leaf_dir / st.OCCURRENCE_INDEX_FILE
+    assert index_path.exists()
+    df = pd.read_parquet(index_path)
+    assert "bio1" in df.columns
+    assert "obscured" not in df.columns
+    assert len(df) == 20
+
+
+def test_build_occurrence_index_leaf_filters_quality(tmp_path, monkeypatch):
+    """Obscured and high-uncertainty rows must be excluded from the leaf index."""
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    leaf = {**CHILD_TAXON, "rank": "SPECIES"}
+    leaf_dir = tmp_path / leaf["path"]
+    df = pd.DataFrame({
+        "catalogNumber": [f"obs{i}" for i in range(6)],
+        "decimalLatitude": [40.0] * 6,
+        "decimalLongitude": [-75.0] * 6,
+        "obscured": ["No", "Yes", "No", "No", "No", "No"],           # obs1 excluded
+        "coordinateUncertaintyInMeters": [100.0, 100.0, 600.0, 100.0, 100.0, 100.0],  # obs2 excluded
+        "bio1": [1.0] * 6,
+    })
+    leaf_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), leaf_dir / st.OCCURRENCE_FILE)
+    st._build_occurrence_index(leaf, leaf_dir, is_leaf=True)
+    result = pd.read_parquet(leaf_dir / st.OCCURRENCE_INDEX_FILE)
+    assert len(result) == 4  # obs0, obs3, obs4, obs5 pass both filters
+    assert set(result["catalogNumber"]) == {"obs0", "obs3", "obs4", "obs5"}
+
+
+def test_build_occurrence_index_nonleaf_deduplicates(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    child2 = {**CHILD_TAXON, "taxon_key": "10001", "path": "Root_1/Parent_9999/Child_10001"}
+    # child1: obs0..obs9; child2: obs5..obs14 (obs5-9 overlap → 15 unique after dedup)
+    for i, child in enumerate([CHILD_TAXON, child2]):
+        child_dir = tmp_path / child["path"]
+        child_dir.mkdir(parents=True, exist_ok=True)
+        catalogs = [f"obs{j}" for j in range(5 * i, 5 * i + 10)]
+        pq.write_table(pa.Table.from_pandas(pd.DataFrame({
+            "catalogNumber": catalogs,
+            "decimalLatitude": [40.0] * 10,
+            "decimalLongitude": [-75.0] * 10,
+            "obscured": ["No"] * 10,
+            "coordinateUncertaintyInMeters": [100.0] * 10,
+            "bio1": [float(j) for j in range(10)],
+        }), preserve_index=False), child_dir / st.OCCURRENCE_FILE)
+    taxon_dir = tmp_path / FAKE_TAXON["path"]
+    monkeypatch.setattr(st, "iter_descendants",
+                        _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON, child2]))
+    st._build_occurrence_index(FAKE_TAXON, taxon_dir, is_leaf=False)
+    df = pd.read_parquet(taxon_dir / st.OCCURRENCE_INDEX_FILE)
+    assert len(df) == 15
+    assert df["catalogNumber"].nunique() == 15
+
+
+def test_build_nonleaf_index_from_children(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    child2 = {**CHILD_TAXON, "taxon_key": "10001", "path": "Root_1/Parent_9999/Child_10001"}
+    for child in [CHILD_TAXON, child2]:
+        idx_path = tmp_path / child["path"] / st.OCCURRENCE_INDEX_FILE
+        idx_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pandas(pd.DataFrame({
+            "catalogNumber": [f"{child['taxon_key']}_obs{i}" for i in range(5)],
+            "decimalLatitude": [40.0] * 5,
+            "decimalLongitude": [-75.0] * 5,
+            "bio1": [float(i) for i in range(5)],
+        }), preserve_index=False), idx_path)
+    taxon_dir = tmp_path / FAKE_TAXON["path"]
+
+    def _fake_children(key):
+        if str(key) == FAKE_TAXON["taxon_key"]:
+            return [CHILD_TAXON, child2]
+        return []
+
+    monkeypatch.setattr(st, "get_children", _fake_children)
+    st._build_nonleaf_index_from_children(FAKE_TAXON, taxon_dir)
+    df = pd.read_parquet(taxon_dir / st.OCCURRENCE_INDEX_FILE)
+    assert len(df) == 10
+    assert df["catalogNumber"].nunique() == 10
+
+
+def test_build_nonleaf_index_from_children_deduplicates(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    child2 = {**CHILD_TAXON, "taxon_key": "10001", "path": "Root_1/Parent_9999/Child_10001"}
+    shared_id = "shared_obs"
+    for i, child in enumerate([CHILD_TAXON, child2]):
+        idx_path = tmp_path / child["path"] / st.OCCURRENCE_INDEX_FILE
+        idx_path.parent.mkdir(parents=True, exist_ok=True)
+        catalogs = [f"obs{i}_{j}" for j in range(4)] + [shared_id]
+        pq.write_table(pa.Table.from_pandas(pd.DataFrame({
+            "catalogNumber": catalogs,
+            "decimalLatitude": [40.0] * 5,
+            "decimalLongitude": [-75.0] * 5,
+        }), preserve_index=False), idx_path)
+    taxon_dir = tmp_path / FAKE_TAXON["path"]
+    monkeypatch.setattr(st, "get_children", lambda key: [CHILD_TAXON, child2])
+    st._build_nonleaf_index_from_children(FAKE_TAXON, taxon_dir)
+    df = pd.read_parquet(taxon_dir / st.OCCURRENCE_INDEX_FILE)
+    # 4 unique from each child + 1 shared = 9
+    assert len(df) == 9
+    assert df["catalogNumber"].nunique() == 9
+
+
+def test_build_nonleaf_index_from_children_no_child_indices(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    monkeypatch.setattr(st, "get_children", lambda key: [CHILD_TAXON])
+    taxon_dir = tmp_path / FAKE_TAXON["path"]
+    st._build_nonleaf_index_from_children(FAKE_TAXON, taxon_dir)
+    assert not (taxon_dir / st.OCCURRENCE_INDEX_FILE).exists()
+
+
+def test_build_occurrence_index_nonleaf_no_occ(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    taxon_dir = tmp_path / FAKE_TAXON["path"]
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, []))
+    st._build_occurrence_index(FAKE_TAXON, taxon_dir, is_leaf=False)
+    assert not (taxon_dir / st.OCCURRENCE_INDEX_FILE).exists()
+
+
 
 
 # ---------------------------------------------------------------------------

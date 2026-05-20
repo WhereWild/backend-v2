@@ -522,6 +522,7 @@ def test_compute_taxon_stats_dispatches_leaf(tmp_path, monkeypatch):
 def test_compute_taxon_stats_dispatches_nonleaf(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
     monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, []))
+    monkeypatch.setattr(st, "get_children", lambda key: [])
     parent_dir = tmp_path / FAKE_TAXON["path"]
     st.compute_taxon_stats(FAKE_TAXON, [_CONTINUOUS_LAYER])
     assert not (parent_dir / st.NUMERICAL_STATS_FILE).exists()

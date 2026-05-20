@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import pickle
+import subprocess
 import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -86,13 +87,25 @@ def download_dwca() -> bytes:
         return INAT_DWCA_CACHE.read_bytes()
 
     print(f"Downloading {INAT_DWCA_URL} ...")
-    req = Request(INAT_DWCA_URL, headers={"User-Agent": _UA})
-    with urlopen(req, timeout=120) as resp:
-        data = resp.read()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "aria2c",
+            "--split=8",
+            "--max-connection-per-server=8",
+            "--continue=true",
+            "--max-tries=12",
+            "--retry-wait=15",
+            "--connect-timeout=60",
+            f"--dir={INAT_DWCA_CACHE.parent}",
+            f"--out={INAT_DWCA_CACHE.name}",
+            INAT_DWCA_URL,
+        ],
+        check=True,
+    )
+    data = INAT_DWCA_CACHE.read_bytes()
     print(f"  Downloaded {len(data) / 1_048_576:.1f} MB")
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    INAT_DWCA_CACHE.write_bytes(data)
     if remote_etag:
         state.setdefault("inat_taxonomy", {})["etag"] = remote_etag
         SYNC_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)

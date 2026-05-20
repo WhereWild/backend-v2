@@ -14,6 +14,8 @@ dependencies = [
     "rasterio>=1.5.0",
     "scipy>=1.17.1",
     "uvicorn[standard]>=0.46.0",
+    "fsspec[s3]>=2024.1.0",
+    "omfiles>=0.4.0",
 ]
 
 [tool.ruff]

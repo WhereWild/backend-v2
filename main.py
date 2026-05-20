@@ -333,7 +333,10 @@ def get_species_occurrences(taxon_id: str, location: str | None = None):
             seen.add(cid)
             collected.append({"catalogNumber": cid, "latitude": r["decimalLatitude"], "longitude": r["decimalLongitude"]})
 
-    if is_leaf:
+    if taxon["rank"] == _CONFIG.species_rank:
+        for desc in iter_descendants(taxon, include_self=True):
+            _read_occ(TREE_ROOT / desc["path"] / _OCC_FILE)
+    elif is_leaf:
         _read_occ(TREE_ROOT / taxon["path"] / _OCC_FILE)
     else:
         for desc in iter_descendants(taxon, include_self=False):

@@ -1,4 +1,5 @@
 import json
+import math
 from functools import lru_cache
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from starlette.concurrency import run_in_threadpool
 
 from config.config import load_config
 from util import citations, taxa, tiles
-from util.stats import NOMINAL_STATS_FILE, NUMERICAL_DENSITY_FILE, NUMERICAL_STATS_FILE, TREE_ROOT
+from util.stats import NOMINAL_STATS_FILE, NUMERICAL_DENSITY_FILE, NUMERICAL_STATS_FILE, OCCURRENCE_INDEX_FILE, TREE_ROOT
 from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
 
 _CONFIG = load_config("global")
@@ -316,6 +317,121 @@ def get_species_locations(taxon_id: str, level: int | None = None, limit: int = 
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
     return []
+
+
+def _read_index_for_slice(
+    index_path: Path,
+    variable_id: str,
+    *,
+    value_min: float | None = None,
+    value_max: float | None = None,
+    circular_wrap: bool = False,
+    class_value: float | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    """Filter occurrence_index.parquet by value range or class and return observations."""
+    schema = pq.read_schema(index_path)
+    if variable_id not in schema.names:
+        return []
+    cols = [c for c in ["catalogNumber", "decimalLatitude", "decimalLongitude", variable_id] if c in schema.names]
+    df = pq.read_table(index_path, columns=cols).to_pandas()
+    if class_value is not None:
+        col = pd.to_numeric(df[variable_id], errors="coerce")
+        mask = col == float(class_value)
+    elif circular_wrap:
+        col = pd.to_numeric(df[variable_id], errors="coerce")
+        mask = col.between(value_min, 360.0, inclusive="both") | col.between(0.0, value_max, inclusive="both")
+    else:
+        col = pd.to_numeric(df[variable_id], errors="coerce")
+        mask = col.between(value_min, value_max, inclusive="both")
+    df = df[mask].dropna(subset=["decimalLatitude", "decimalLongitude"])
+    if limit is not None:
+        df = df.head(limit)
+    return [
+        {
+            "catalogNumber": str(r["catalogNumber"]),
+            "latitude": r["decimalLatitude"],
+            "longitude": r["decimalLongitude"],
+            "value": (float(r[variable_id]) if pd.notna(r[variable_id]) else None),
+        }
+        for r in df.to_dict("records")
+    ]
+
+
+@app.get("/species/{taxon_id}/environment/{variable_id}/slice")
+def get_species_environment_slice(
+    taxon_id: str,
+    variable_id: str,
+    min_value: float = Query(..., alias="min"),
+    max_value: float = Query(..., alias="max"),
+    limit: int | None = Query(None, ge=1, le=10000),
+):
+    if not math.isfinite(min_value) or not math.isfinite(max_value):
+        raise HTTPException(status_code=400, detail="min and max must be finite numbers")
+    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+    if taxon is None:
+        raise HTTPException(status_code=404, detail="Taxon not found")
+    variable_id = variable_id.replace("_", "")
+    layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
+    if layer is None:
+        raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
+    if layer.get("value_type") == "nominal":
+        raise HTTPException(status_code=400, detail="Categorical variables must use the class samples endpoint")
+    circular_wrap = variable_id == "aspect_deg" and max_value < min_value
+    if max_value < min_value and not circular_wrap:
+        min_value, max_value = max_value, min_value
+    index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")
+    observations = _read_index_for_slice(
+        index_path, variable_id,
+        value_min=min_value, value_max=max_value, circular_wrap=circular_wrap,
+        limit=limit,
+    )
+    return {
+        "species_id": taxon.get("taxon_key"),
+        "variable": variable_id,
+        "range": {"min": min_value, "max": max_value},
+        "count": len(observations),
+        "observations": observations,
+    }
+
+
+@app.get("/species/{taxon_id}/environment/{variable_id}/class/{class_value}/samples")
+def get_species_environment_class_samples(
+    taxon_id: str,
+    variable_id: str,
+    class_value: str,
+    limit: int | None = Query(None, ge=1, le=10000),
+):
+    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+    if taxon is None:
+        raise HTTPException(status_code=404, detail="Taxon not found")
+    variable_id = variable_id.replace("_", "")
+    layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
+    if layer is None:
+        raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
+    if layer.get("value_type") != "nominal":
+        raise HTTPException(status_code=400, detail="Numerical variables must use the slice endpoint")
+    try:
+        parsed: float | int = float(class_value)
+        if parsed.is_integer():
+            parsed = int(parsed)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid class value: {class_value!r}")
+    index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")
+    observations = _read_index_for_slice(
+        index_path, variable_id, class_value=float(parsed), limit=limit,
+    )
+    return {
+        "species_id": taxon.get("taxon_key"),
+        "variable": variable_id,
+        "class_value": parsed,
+        "count": len(observations),
+        "observations": observations,
+    }
 
 
 @app.get("/api/taxa/query")

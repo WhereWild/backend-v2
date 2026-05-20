@@ -9,6 +9,8 @@ non-leaf taxa stream descendant occurrence parquets with T-Digest approximations
 from __future__ import annotations
 
 import json
+import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -20,6 +22,7 @@ CONFIG = load_config("global")
 
 CATALOG_PATH = Path("config/gis/catalog.json")
 STATS_WORKERS = 4
+LOG_INTERVAL = 50
 
 
 def _load_layers() -> list[dict]:
@@ -33,6 +36,11 @@ def _run_node(node: TaxonRecord, layers: list[dict]) -> str:
     return node["taxon_key"]
 
 
+def _fmt_duration(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
 def main() -> None:
     layers = _load_layers()
     root = get_taxon_by_id(CONFIG.plantae_key)
@@ -40,26 +48,52 @@ def main() -> None:
         print(f"[process_tree] root taxon {CONFIG.plantae_key} not found")
         return
 
-    taxa = list(iter_descendants(root, include_self=True))
-    total = len(taxa)
-    print(f"[process_tree] computing stats for {total} taxa")
+    all_taxa = list(iter_descendants(root, include_self=True))
+    total = len(all_taxa)
+
+    # Group by path depth so leaves (deepest) are processed first.
+    # This ensures children's occurrence_index.parquet files exist before
+    # their parents try to read from them during non-leaf index building.
+    by_depth: dict[int, list[TaxonRecord]] = defaultdict(list)
+    for t in all_taxa:
+        by_depth[t["path"].count("/")].append(t)
+    levels = sorted(by_depth.keys(), reverse=True)  # deepest first
+
+    print(f"[process_tree] {total} taxa across {len(levels)} levels — {STATS_WORKERS} workers")
 
     completed = 0
     failed = 0
-    with ThreadPoolExecutor(max_workers=STATS_WORKERS) as executor:
-        futures = {executor.submit(_run_node, node, layers): node for node in taxa}
-        for future in as_completed(futures):
-            node = futures[future]
-            try:
-                future.result()
-                completed += 1
-                if completed % 1000 == 0:
-                    print(f"[process_tree] {completed}/{total}")
-            except Exception as exc:
-                failed += 1
-                print(f"[process_tree] failed {node['taxon_key']} ({node['scientific_name']}): {exc}")
+    t0 = time.monotonic()
 
-    print(f"[process_tree] done — {completed} completed, {failed} failed")
+    with ThreadPoolExecutor(max_workers=STATS_WORKERS) as executor:
+        for depth in levels:
+            level_taxa = by_depth[depth]
+            futures = {executor.submit(_run_node, node, layers): node for node in level_taxa}
+            for future in as_completed(futures):
+                node = futures[future]
+                try:
+                    future.result()
+                    completed += 1
+                    if completed % LOG_INTERVAL == 0 or completed == total:
+                        elapsed = time.monotonic() - t0
+                        rate = completed / elapsed
+                        eta = (total - completed) / rate if rate > 0 else 0
+                        print(
+                            f"[process_tree] {completed}/{total}"
+                            f"  elapsed={_fmt_duration(elapsed)}"
+                            f"  eta={_fmt_duration(eta)}"
+                            f"  ({node['rank']} {node['scientific_name']})"
+                        )
+                except Exception as exc:
+                    failed += 1
+                    elapsed = time.monotonic() - t0
+                    print(
+                        f"[process_tree] FAIL [{elapsed:.0f}s]"
+                        f"  {node['rank']} {node['scientific_name']}: {exc}"
+                    )
+
+    elapsed = time.monotonic() - t0
+    print(f"[process_tree] done — {completed} ok, {failed} failed, {_fmt_duration(elapsed)} total")
 
 
 if __name__ == "__main__":  # pragma: no cover

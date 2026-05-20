@@ -269,25 +269,27 @@ def test_fetch_inat_dwca_cache_hit(monkeypatch, tmp_path):
 
 def test_fetch_inat_dwca_download(monkeypatch, tmp_path):
     monkeypatch.setattr(an, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(an, "INAT_DWCA_CACHE", tmp_path / "inat_dwca.zip")
+    cache_path = tmp_path / "inat_dwca.zip"
+    monkeypatch.setattr(an, "INAT_DWCA_CACHE", cache_path)
     monkeypatch.setattr(an, "SYNC_STATE_PATH", tmp_path / "sync_state.json")
     new_data = b"new zip data"
-    call_count = 0
 
     def mock_urlopen(req, timeout=30):
-        nonlocal call_count
-        call_count += 1
         resp = MagicMock()
         resp.__enter__ = lambda s: s
         resp.__exit__ = MagicMock(return_value=False)
         resp.headers = {"ETag": '"new-etag"'}
-        resp.read.return_value = b"" if req.get_method() == "HEAD" else new_data
+        resp.read.return_value = b""
         return resp
 
+    def fake_aria2c(args, **kwargs):
+        cache_path.write_bytes(new_data)
+
     monkeypatch.setattr(an, "urlopen", mock_urlopen)
+    monkeypatch.setattr(an.subprocess, "run", fake_aria2c)
     result = an.fetch_inat_dwca()
     assert result == new_data
-    assert (tmp_path / "inat_dwca.zip").read_bytes() == new_data
+    assert cache_path.read_bytes() == new_data
     state = json.loads((tmp_path / "sync_state.json").read_text())
     assert state["inat_taxonomy"]["etag"] == '"new-etag"'
 

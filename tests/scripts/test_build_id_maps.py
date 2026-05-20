@@ -128,13 +128,19 @@ def _make_urlopen_mock(head_etag: str, body: bytes):
 
 def test_download_dwca_fresh(monkeypatch, tmp_path):
     monkeypatch.setattr(bim, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(bim, "INAT_DWCA_CACHE", tmp_path / "inat_dwca.zip")
+    cache_path = tmp_path / "inat_dwca.zip"
+    monkeypatch.setattr(bim, "INAT_DWCA_CACHE", cache_path)
     monkeypatch.setattr(bim, "SYNC_STATE_PATH", tmp_path / "sync_state.json")
     fake_data = b"fake zip content"
     monkeypatch.setattr(bim, "urlopen", _make_urlopen_mock('"new-etag"', fake_data))
+
+    def fake_aria2c(args, **kwargs):
+        cache_path.write_bytes(fake_data)
+
+    monkeypatch.setattr(bim.subprocess, "run", fake_aria2c)
     result = bim.download_dwca()
     assert result == fake_data
-    assert (tmp_path / "inat_dwca.zip").read_bytes() == fake_data
+    assert cache_path.read_bytes() == fake_data
     state = json.loads((tmp_path / "sync_state.json").read_text())
     assert state["inat_taxonomy"]["etag"] == '"new-etag"'
 

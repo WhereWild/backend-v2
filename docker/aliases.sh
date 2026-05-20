@@ -1,10 +1,3 @@
-if [ -f /workspace/.env ]; then
-    set -a
-    # shellcheck disable=SC1091
-    . /workspace/.env
-    set +a
-fi
-
 _uv() {
     uv run --env-file /workspace/.env "$@"
 }

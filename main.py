@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
+import util.rankings as rankings
 from config.config import load_config
 from util import citations, taxa, tiles
 from util.rankings import POSITION_FILE
@@ -506,8 +507,12 @@ def _load_hierarchy() -> dict[str, dict]:
 def _resolve_hierarchy(gid: str, by_gid: dict[str, dict]) -> list[str]:
     """Return ancestor names from top-level down to the immediate parent."""
     names: list[str] = []
+    seen: set[str] = set()
     current = by_gid.get(gid, {}).get("parent_gid")
     while current:
+        if current in seen:
+            break
+        seen.add(current)
         rec = by_gid.get(current)
         if rec is None:
             break
@@ -517,8 +522,21 @@ def _resolve_hierarchy(gid: str, by_gid: dict[str, dict]) -> list[str]:
     return names
 
 
+def _ancestor_gids(gid: str, by_gid: dict[str, dict]) -> set[str]:
+    chain: set[str] = set()
+    current = by_gid.get(gid, {}).get("parent_gid")
+    seen: set[str] = set()
+    while current:
+        if current in seen:
+            break
+        seen.add(current)
+        chain.add(current.lower())
+        current = by_gid.get(current, {}).get("parent_gid")
+    return chain
+
+
 @app.get("/species/{taxon_id}/locations")
-def get_species_locations(taxon_id: str, level: int | None = None, limit: int = 500):
+def get_species_locations(taxon_id: str, level: int | None = None, parent: str | None = None, limit: int = 500):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -538,6 +556,7 @@ def get_species_locations(taxon_id: str, level: int | None = None, limit: int = 
     scope_to_level: dict[str, int] = {v: k for k, v in _CONFIG.location_scope_by_level.items()}
     scope_to_level["gbif_region"] = -1
     by_gid = _load_hierarchy()
+    parent_lower = parent.strip().lower() if parent else None
 
     results: list[dict] = []
     seen: set[str] = set()
@@ -550,6 +569,8 @@ def get_species_locations(taxon_id: str, level: int | None = None, limit: int = 
         if loc_level is None or gid in seen:
             continue
         if level is not None and loc_level != level:
+            continue
+        if parent_lower is not None and parent_lower not in _ancestor_gids(gid, by_gid):
             continue
         seen.add(gid)
         rec = by_gid.get(gid)
@@ -708,68 +729,154 @@ def get_species_environment_class_samples(
     }
 
 
+_METRIC_LABELS: dict[str, str] = {
+    "mean": "Average",
+    "median": "Median",
+    "min": "Minimum",
+    "max": "Maximum",
+    "std": "Standard deviation",
+}
+_METRIC_ORDER = ["mean", "median", "min", "max", "std"]
+_METRIC_RANK = {m: i for i, m in enumerate(_METRIC_ORDER)}
+
+
+@app.get("/api/taxa/ranking-options")
+def list_taxa_ranking_options(
+    within_taxon: str = Query(...),
+    descendant_rank: str = Query(...),
+):
+    resolved = taxa.get_taxon_by_id(within_taxon) or taxa.get_taxon_by_slug(within_taxon)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail=f"Taxon not found: {within_taxon}")
+
+    norm_rank = descendant_rank.upper()
+    rank_lower = "subspecies" if norm_rank in _CONFIG.subspecies_equivalents else norm_rank.lower()
+    index_path = rankings.TREE_ROOT / resolved["path"] / f"{rank_lower}_index.parquet"
+
+    if not index_path.exists():
+        return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": []}
+
+    column_lengths = rankings._load_column_lengths(index_path)
+    try:
+        schema = pq.read_schema(index_path)
+    except Exception:
+        return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": []}
+
+    variable_order = {v["id"]: i for i, v in enumerate(tiles.load_layers())}
+
+    options = []
+    for col in schema.names:
+        if "::" not in col:
+            continue
+        count = int(column_lengths.get(col, 0) or 0)
+        if count <= 0:
+            continue
+        variable, metric = col.split("::", 1)
+        if metric.startswith("class_"):
+            continue
+        options.append({
+            "variable": variable,
+            "metric": metric,
+            "label": _METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize()),
+            "column": col,
+            "count": count,
+        })
+
+    options.sort(key=lambda e: (
+        variable_order.get(e["variable"], len(variable_order)),
+        e["variable"],
+        _METRIC_RANK.get(e["metric"], len(_METRIC_ORDER)),
+        e["metric"],
+    ))
+
+    return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": options}
+
+
 @app.get("/api/taxa/query")
 def query_taxa(
     q: str | None = Query(None, min_length=1),
+    within_taxon: str | None = Query(None),
+    descendant_rank: str | None = Query(None),
+    sort_variable: str | None = Query(None),
+    sort_metric: str | None = Query(None),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$"),
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
     min_samples: int = Query(0, ge=0),
+    include_species_like: bool = Query(False),
+    location: str | None = Query(None),
     unit_system: str | None = Query(None),
 ):
-    normalized_query = normalize_name(q or "")
+    normalized_q = normalize_name(q or "") or None
 
-    if not normalized_query:
-        return {
-            "query": None,
-            "scope": {"within_taxon": None, "descendant_rank": None, "location": None,
-                      "min_samples": min_samples, "include_species_like": False},
-            "sort": {"variable": None, "metric": None, "order": "asc", "units": None},
-            "total": 0,
-            "matched_total": 0,
-            "eligible_total": 0,
-            "empty_reason": "no_query",
-            "limit": limit,
-            "offset": offset,
-            "results": [],
-        }
+    resolved_taxon: taxa.TaxonRecord | None = None
+    if within_taxon:
+        resolved_taxon = taxa.get_taxon_by_id(within_taxon)
+        if resolved_taxon is None:
+            resolved_taxon = taxa.get_taxon_by_slug(within_taxon)
+        if resolved_taxon is None:
+            raise HTTPException(status_code=404, detail=f"Taxon not found: {within_taxon}")
 
-    matches = taxa.search_taxa_by_name(normalized_query, limit=limit + offset)
-    page = matches[offset:]
-    matched_total = len(matches)
+    norm_rank = descendant_rank.upper() if descendant_rank else None
+    norm_sort_variable = sort_variable.replace("_", "") if sort_variable else None
 
-    results = []
-    for taxon, score, matched_name in page:
+    result = rankings.query_taxa(
+        q=normalized_q,
+        within_taxon=resolved_taxon,
+        descendant_rank=norm_rank,
+        sort_variable=norm_sort_variable,
+        sort_metric=sort_metric,
+        sort_order=sort_order,
+        limit=limit,
+        offset=offset,
+        min_samples=min_samples,
+        include_species_like=include_species_like,
+        location_gid=location,
+    )
+
+    serialized: list[dict] = []
+    for item in result["results"]:
+        taxon = item["taxon"]
         preferred = taxon.get("inat_preferred_common_name") or taxon.get("common_name") or ""
-        sci_normalized = normalize_name(taxon.get("scientific_name", ""))
-        display_name = preferred if matched_name == sci_normalized else (matched_name or preferred)
-        results.append({
+        serialized.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
-            "common_name": format_common_name(display_name) or None,
+            "common_name": format_common_name(preferred) or None,
             "common_names": None,
             "rank": taxon.get("rank"),
             "slug": taxon_slug(taxon.get("scientific_name")),
             "description": None,
             **_image_fields(taxon),
-            "match_score": score,
-            "sample_count": None,
-            "sort_value": None,
-            "sort_variable": None,
-            "sort_metric": None,
-            "position": None,
-            "percentile": None,
+            "match_score": item.get("match_score"),
+            "sample_count": item.get("sample_count"),
+            "sort_value": item.get("sort_value"),
+            "sort_variable": sort_variable,
+            "sort_metric": sort_metric,
+            "location_count": item.get("location_count"),
+            "position": item.get("position"),
+            "percentile": item.get("percentile"),
         })
 
     return {
-        "query": normalized_query,
-        "scope": {"within_taxon": None, "descendant_rank": None, "location": None,
-                  "min_samples": min_samples, "include_species_like": False},
-        "sort": {"variable": None, "metric": None, "order": "asc", "units": None},
-        "total": len(results),
-        "matched_total": matched_total,
-        "eligible_total": matched_total,
-        "empty_reason": None if results else "no_text_matches",
+        "query": normalized_q,
+        "scope": {
+            "within_taxon": resolved_taxon["taxon_key"] if resolved_taxon else None,
+            "descendant_rank": norm_rank,
+            "location": location,
+            "min_samples": min_samples,
+            "include_species_like": include_species_like,
+        },
+        "sort": {
+            "variable": sort_variable,
+            "metric": sort_metric,
+            "order": sort_order,
+            "units": unit_system,
+        },
+        "total": result["total"],
+        "matched_total": result["matched_total"],
+        "eligible_total": result["eligible_total"],
+        "empty_reason": result["empty_reason"],
         "limit": limit,
         "offset": offset,
-        "results": results,
+        "results": serialized,
     }

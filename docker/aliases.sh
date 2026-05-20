@@ -57,7 +57,7 @@ pl() {
 }
 
 pp() {
-  pl "$@" && pt
+  pl "$@" && pt "$@"
 }
 
 _resolve_script() {

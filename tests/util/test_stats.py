@@ -509,14 +509,25 @@ def test_process_nonleaf_aggregates_multiple_children(tmp_path, monkeypatch):
 # compute_taxon_stats (dispatch)
 # ---------------------------------------------------------------------------
 
-def test_compute_taxon_stats_dispatches_leaf(tmp_path, monkeypatch):
+def test_compute_taxon_stats_dispatches_subspecies(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
-    leaf = {**CHILD_TAXON, "rank": "SPECIES"}
-    leaf_dir = tmp_path / leaf["path"]
+    subspecies = {**CHILD_TAXON, "rank": "SUBSPECIES"}
+    leaf_dir = tmp_path / subspecies["path"]
     _make_occ_parquet(leaf_dir / st.OCCURRENCE_FILE,
                       extra_cols={"bio1": list(np.linspace(1, 10, 20))})
-    st.compute_taxon_stats(leaf, [_CONTINUOUS_LAYER])
+    st.compute_taxon_stats(subspecies, [_CONTINUOUS_LAYER])
     assert (leaf_dir / st.NUMERICAL_STATS_FILE).exists()
+
+
+def test_compute_taxon_stats_dispatches_species(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species = {**CHILD_TAXON, "rank": "SPECIES"}
+    species_dir = tmp_path / species["path"]
+    _make_occ_parquet(species_dir / st.OCCURRENCE_FILE,
+                      extra_cols={"bio1": list(np.linspace(1, 10, 20))})
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(species, []))
+    st.compute_taxon_stats(species, [_CONTINUOUS_LAYER])
+    assert (species_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
 def test_compute_taxon_stats_dispatches_nonleaf(tmp_path, monkeypatch):
@@ -526,6 +537,182 @@ def test_compute_taxon_stats_dispatches_nonleaf(tmp_path, monkeypatch):
     parent_dir = tmp_path / FAKE_TAXON["path"]
     st.compute_taxon_stats(FAKE_TAXON, [_CONTINUOUS_LAYER])
     assert not (parent_dir / st.NUMERICAL_STATS_FILE).exists()
+
+
+# ---------------------------------------------------------------------------
+# _collect_species_df / _process_species
+# ---------------------------------------------------------------------------
+
+SPECIES_TAXON: dict = {
+    "taxon_key": "5000",
+    "path": "Root_1/Parent_9999/Species_5000",
+    "scientific_name": "Testus speciesus",
+    "common_name": "",
+    "rank": "SPECIES",
+}
+
+SUBSPECIES_TAXON: dict = {
+    "taxon_key": "5001",
+    "path": "Root_1/Parent_9999/Species_5000/Sub_5001",
+    "scientific_name": "Testus speciesus subsp. alpha",
+    "common_name": "",
+    "rank": "SUBSPECIES",
+}
+
+
+def test_collect_species_df_own_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    _make_occ_parquet(species_dir / st.OCCURRENCE_FILE,
+                      extra_cols={"bio1": [10.0] * 20})
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(SPECIES_TAXON, []))
+    df = st._collect_species_df(SPECIES_TAXON, species_dir)
+    assert df is not None
+    assert len(df) == 20
+
+
+def _make_occ_parquet_offset(path: Path, offset: int, extra_cols: dict | None = None) -> None:
+    """Like _make_occ_parquet but catalog numbers start at `offset` to avoid dedup collisions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = 20
+    data = {
+        "catalogNumber": [f"obs{offset + i}" for i in range(n)],
+        "decimalLatitude": [40.0 + i * 0.01 for i in range(n)],
+        "decimalLongitude": [-105.0 + i * 0.01 for i in range(n)],
+        "hilbertIdx": list(range(n)),
+        "obscured": ["No"] * n,
+        "coordinateUncertaintyInMeters": [100.0] * n,
+    }
+    if extra_cols:
+        data.update(extra_cols)
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False), path)
+
+
+def test_collect_species_df_combines_subspecies(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    sub_dir = tmp_path / SUBSPECIES_TAXON["path"]
+    _make_occ_parquet(species_dir / st.OCCURRENCE_FILE,
+                      extra_cols={"bio1": [10.0] * 20})
+    _make_occ_parquet_offset(sub_dir / st.OCCURRENCE_FILE, offset=100,
+                             extra_cols={"bio1": [20.0] * 20})
+    monkeypatch.setattr(st, "iter_descendants",
+                        _make_fake_descendants(SPECIES_TAXON, [SUBSPECIES_TAXON]))
+    df = st._collect_species_df(SPECIES_TAXON, species_dir)
+    assert df is not None
+    assert len(df) == 40
+
+
+def test_collect_species_df_no_own_obs_has_subspecies(tmp_path, monkeypatch):
+    """Species with no occurrence.parquet but subspecies have data → still works."""
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    species_dir.mkdir(parents=True, exist_ok=True)
+    sub_dir = tmp_path / SUBSPECIES_TAXON["path"]
+    _make_occ_parquet(sub_dir / st.OCCURRENCE_FILE,
+                      extra_cols={"bio1": [5.0] * 20})
+    monkeypatch.setattr(st, "iter_descendants",
+                        _make_fake_descendants(SPECIES_TAXON, [SUBSPECIES_TAXON]))
+    df = st._collect_species_df(SPECIES_TAXON, species_dir)
+    assert df is not None
+    assert len(df) == 20
+
+
+def test_collect_species_df_deduplicates_shared_obs(tmp_path, monkeypatch):
+    """Observations shared between species and subspecies are deduplicated."""
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    sub_dir = tmp_path / SUBSPECIES_TAXON["path"]
+    # obs0-obs9 in species, obs5-obs14 in subspecies → 15 unique
+    species_data = {
+        "catalogNumber": [f"obs{i}" for i in range(10)],
+        "decimalLatitude": [40.0] * 10,
+        "decimalLongitude": [-75.0] * 10,
+        "obscured": ["No"] * 10,
+        "coordinateUncertaintyInMeters": [100.0] * 10,
+        "bio1": [1.0] * 10,
+    }
+    sub_data = {
+        "catalogNumber": [f"obs{i}" for i in range(5, 15)],
+        "decimalLatitude": [40.0] * 10,
+        "decimalLongitude": [-75.0] * 10,
+        "obscured": ["No"] * 10,
+        "coordinateUncertaintyInMeters": [100.0] * 10,
+        "bio1": [2.0] * 10,
+    }
+    species_dir.mkdir(parents=True, exist_ok=True)
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(species_data), preserve_index=False),
+                   species_dir / st.OCCURRENCE_FILE)
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(sub_data), preserve_index=False),
+                   sub_dir / st.OCCURRENCE_FILE)
+    monkeypatch.setattr(st, "iter_descendants",
+                        _make_fake_descendants(SPECIES_TAXON, [SUBSPECIES_TAXON]))
+    df = st._collect_species_df(SPECIES_TAXON, species_dir)
+    assert df is not None
+    assert len(df) == 15
+    assert df["catalogNumber"].nunique() == 15
+
+
+def test_collect_species_df_no_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    species_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(SPECIES_TAXON, []))
+    assert st._collect_species_df(SPECIES_TAXON, species_dir) is None
+
+
+def test_collect_species_df_skips_empty_parquet(tmp_path, monkeypatch):
+    """occurrence.parquet with zero rows is skipped."""
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    species_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({"catalogNumber": pa.array([], type=pa.string())}),
+                   species_dir / st.OCCURRENCE_FILE)
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(SPECIES_TAXON, []))
+    assert st._collect_species_df(SPECIES_TAXON, species_dir) is None
+
+
+def test_process_species_builds_stats_from_subspecies(tmp_path, monkeypatch):
+    """Stats for a species reflect combined own + subspecies observations."""
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    sub_dir = tmp_path / SUBSPECIES_TAXON["path"]
+    _make_occ_parquet(species_dir / st.OCCURRENCE_FILE,
+                      extra_cols={"bio1": [10.0] * 20})
+    _make_occ_parquet_offset(sub_dir / st.OCCURRENCE_FILE, offset=100,
+                             extra_cols={"bio1": [20.0] * 20})
+    monkeypatch.setattr(st, "iter_descendants",
+                        _make_fake_descendants(SPECIES_TAXON, [SUBSPECIES_TAXON]))
+    st._process_species(SPECIES_TAXON, species_dir, {"bio1": _CONTINUOUS_LAYER})
+    df = pd.read_parquet(species_dir / st.NUMERICAL_STATS_FILE)
+    row = df[df["variable"] == "bio1"].iloc[0]
+    assert row["count"] == 40
+
+
+def test_process_species_no_data_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    species_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(SPECIES_TAXON, []))
+    st._process_species(SPECIES_TAXON, species_dir, {"bio1": _CONTINUOUS_LAYER})
+    assert not (species_dir / st.NUMERICAL_STATS_FILE).exists()
+
+
+def test_process_species_builds_index_with_subspecies(tmp_path, monkeypatch):
+    """occurrence_index.parquet for a species includes subspecies observations."""
+    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
+    species_dir = tmp_path / SPECIES_TAXON["path"]
+    sub_dir = tmp_path / SUBSPECIES_TAXON["path"]
+    _make_occ_parquet(species_dir / st.OCCURRENCE_FILE,
+                      extra_cols={"bio1": [5.0] * 20})
+    _make_occ_parquet_offset(sub_dir / st.OCCURRENCE_FILE, offset=100,
+                             extra_cols={"bio1": [15.0] * 20})
+    monkeypatch.setattr(st, "iter_descendants",
+                        _make_fake_descendants(SPECIES_TAXON, [SUBSPECIES_TAXON]))
+    st._process_species(SPECIES_TAXON, species_dir, {"bio1": _CONTINUOUS_LAYER})
+    idx = pd.read_parquet(species_dir / st.OCCURRENCE_INDEX_FILE)
+    assert len(idx) == 40
 
 
 # ---------------------------------------------------------------------------

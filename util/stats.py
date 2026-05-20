@@ -280,17 +280,8 @@ def _write_numerical_density(directory: Path, rows: list[dict]) -> None:
 # Leaf (exact) processing
 # ---------------------------------------------------------------------------
 
-def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
-    occ_path = taxon_dir / OCCURRENCE_FILE
-    if not occ_path.exists():
-        return
-    table = pq.read_table(occ_path)
-    if table.num_rows == 0:
-        return
-    df = _filter_df(table.to_pandas())
-    if df.empty:
-        return
-
+def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:
+    """Compute exact stats from a pre-loaded, pre-filtered DataFrame and write all outputs."""
     gis_cols = [col for col in df.columns if col in layer_meta]
     if not gis_cols:
         return
@@ -369,6 +360,51 @@ def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_numerical_density(taxon_dir, density_rows)
     _write_index_from_df(taxon_dir, df)
+
+
+def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
+    occ_path = taxon_dir / OCCURRENCE_FILE
+    if not occ_path.exists():
+        return
+    table = pq.read_table(occ_path)
+    if table.num_rows == 0:
+        return
+    df = _filter_df(table.to_pandas())
+    if df.empty:
+        return
+    _process_leaf_df(taxon_dir, df, layer_meta)
+
+
+def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path) -> pd.DataFrame | None:
+    """Combine occurrence data for a SPECIES and all its subspecies-equivalent descendants.
+
+    Deduplicates by catalogNumber so shared observations are not double-counted.
+    Handles the edge case where the species itself has no observations but its
+    subspecies do.
+    """
+    frames = []
+    for desc in iter_descendants(taxon, include_self=True):
+        occ_path = TREE_ROOT / desc["path"] / OCCURRENCE_FILE
+        if not occ_path.exists():
+            continue
+        table = pq.read_table(occ_path)
+        if table.num_rows == 0:
+            continue
+        df = _filter_df(table.to_pandas())
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.drop_duplicates(subset=["catalogNumber"])
+
+
+def _process_species(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
+    """Compute exact stats for a SPECIES, rolling in all subspecies observations."""
+    df = _collect_species_df(taxon, taxon_dir)
+    if df is None or df.empty:
+        return
+    _process_leaf_df(taxon_dir, df, layer_meta)
 
 
 def _write_index_from_df(taxon_dir: Path, df: pd.DataFrame) -> None:
@@ -522,19 +558,23 @@ def _build_nonleaf_index_from_children(taxon: TaxonRecord, taxon_dir: Path) -> N
 def compute_taxon_stats(taxon: TaxonRecord, layers: list[dict]) -> None:
     """Compute and write summary stats for one taxon node.
 
-    Leaf-rank taxa use exact pandas/numpy stats; non-leaf taxa stream all
-    descendant occurrence parquets and use T-Digest approximations.
+    SUBSPECIES/VARIETY/FORM use exact stats from their own occurrence file.
+    SPECIES combine their own observations with any subspecies-equivalent descendants
+    before computing exact stats (so a species always reflects all sub-rank obs).
+    Higher taxa stream all descendant parquets via T-Digest approximations.
     Must be called in leaf-first (bottom-up) order so non-leaf index builds
     can read from already-completed children's occurrence_index.parquet files.
     """
     taxon_dir = TREE_ROOT / taxon["path"]
     layer_meta = {layer["id"]: layer for layer in layers}
-    is_leaf = taxon["rank"] in CONFIG.leaf_rank_set
-    if is_leaf:
+    rank = taxon["rank"]
+    if rank in CONFIG.subspecies_equivalents:
         _process_leaf(taxon_dir, layer_meta)
+    elif rank == CONFIG.species_rank:
+        _process_species(taxon, taxon_dir, layer_meta)
     else:
         _process_nonleaf(taxon, taxon_dir, layer_meta)
-        if taxon["rank"] in _INDEX_RANKS:
+        if rank in _INDEX_RANKS:
             _build_nonleaf_index_from_children(taxon, taxon_dir)
 
 

@@ -514,6 +514,7 @@ def test_get_species_occurrences_not_found():
 def test_get_species_occurrences_leaf():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
          patch("pathlib.Path.exists", return_value=True), \
          patch.object(pq, "read_table", return_value=_OCC_TABLE):
         r = client.get("/species/2923970/occurrences")
@@ -527,10 +528,22 @@ def test_get_species_occurrences_leaf():
 def test_get_species_occurrences_leaf_no_file():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
          patch("pathlib.Path.exists", return_value=False):
         r = client.get("/species/2923970/occurrences")
     assert r.status_code == 200
     assert r.json()["occurrences"] == []
+
+
+def test_get_species_occurrences_subspecies():
+    subspecies_taxon = {**TAXON, "rank": "SUBSPECIES"}
+    with patch.object(taxa, "get_taxon_by_id", return_value=subspecies_taxon), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", return_value=_OCC_TABLE):
+        r = client.get("/species/2923970/occurrences")
+    assert r.status_code == 200
+    assert len(r.json()["occurrences"]) == 2
 
 
 def test_get_species_occurrences_nonleaf():
@@ -544,6 +557,37 @@ def test_get_species_occurrences_nonleaf():
     assert len(r.json()["occurrences"]) == 2
 
 
+def test_get_species_occurrences_species_includes_subspecies():
+    """SPECIES occurrences endpoint iterates self + descendants to include subspecies."""
+    subspecies = {**DESC_TAXON, "taxon_key": "9999", "rank": "SUBSPECIES",
+                  "path": DESC_TAXON["path"] + "/Sub_9999"}
+    sub_table = pa.table({
+        "catalogNumber": ["SUB001"],
+        "decimalLatitude": [41.0],
+        "decimalLongitude": [-76.0],
+        "obscured": ["No"],
+        "coordinateUncertaintyInMeters": [100.0],
+    })
+    call_count = {"n": 0}
+    def _read_table_side_effect(path, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _OCC_TABLE   # species own obs
+        return sub_table         # subspecies obs
+
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON, subspecies]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", side_effect=_read_table_side_effect):
+        r = client.get("/species/2923970/occurrences")
+    assert r.status_code == 200
+    occs = r.json()["occurrences"]
+    catalog_numbers = {o["catalogNumber"] for o in occs}
+    assert "OCC001" in catalog_numbers
+    assert "SUB001" in catalog_numbers
+
+
 def test_get_species_occurrences_deduplication():
     dup_table = pa.table({
         "catalogNumber": ["DUP001", "DUP001"],
@@ -554,6 +598,7 @@ def test_get_species_occurrences_deduplication():
     })
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
          patch("pathlib.Path.exists", return_value=True), \
          patch.object(pq, "read_table", return_value=dup_table):
         r = client.get("/species/2923970/occurrences")

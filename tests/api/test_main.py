@@ -9,11 +9,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main as main_module
+import util.rankings as rankings_module
 import util.stats as st_module
 import util.taxa as taxa
 import util.tiles as tiles
 from main import app
-from util.rankings import POSITION_FILE
 
 client = TestClient(app)
 
@@ -67,7 +67,7 @@ def test_get_taxon_not_found():
 
 
 def test_query_taxa():
-    with patch.object(taxa, "search_taxa_by_name", return_value=[(TAXON, 95.0, "opuntia humifusa")]):
+    with patch.object(rankings_module, "search_taxa_by_name", return_value=[(TAXON, 95.0, "opuntia humifusa")]):
         response = client.get("/api/taxa/query?q=opuntia")
     assert response.status_code == 200
     body = response.json()
@@ -90,9 +90,379 @@ def test_query_taxa_empty_query():
 
 
 def test_query_taxa_limit():
-    with patch.object(taxa, "search_taxa_by_name", return_value=[]) as mock_search:
+    with patch.object(rankings_module, "search_taxa_by_name", return_value=[]) as mock_search:
         client.get("/api/taxa/query?q=opuntia&limit=5")
-        mock_search.assert_called_once_with("opuntia", limit=5)
+        # _query_text fetches max((limit+offset)*5, 200) candidates
+        mock_search.assert_called_once_with("opuntia", limit=200)
+
+
+def test_query_taxa_within_taxon_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/api/taxa/query?q=opuntia&within_taxon=99999")
+    assert r.status_code == 404
+
+
+def test_query_taxa_invalid_sort_order():
+    r = client.get("/api/taxa/query?sort_order=random")
+    assert r.status_code == 422
+
+
+def test_query_taxa_scope_no_sort_no_catalog(tmp_path):
+    """Scope without sort → catalog mode; missing catalog returns no_catalog."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Plantae_6/Opuntia_2923968", "rank": "GENUS"}
+    def _resolve(k):
+        return genus if k == "10" else None
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES")
+    assert r.status_code == 200
+    assert r.json()["empty_reason"] == "no_catalog"
+
+
+def test_query_taxa_scope_catalog_mode(tmp_path):
+    """Scope without sort lists catalog entries."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    catalog_dir = tmp_path / "Opuntia"
+    catalog_dir.mkdir(parents=True)
+    catalog_rows = [
+        {"taxon_key": "2923970", "path": TAXON["path"], "scientific_name": "Opuntia_humifusa",
+         "common_name": "devil's tongue", "rank": "SPECIES", "sample_count": 50},
+    ]
+    pq.write_table(pa.Table.from_pylist(catalog_rows), catalog_dir / "species.parquet")
+
+    def _resolve(k):
+        if k == "10":
+            return genus
+        if k == "2923970":
+            return TAXON
+        return None
+
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["empty_reason"] is None
+    assert len(body["results"]) == 1
+    assert body["results"][0]["taxon_id"] == "2923970"
+    assert body["results"][0]["sample_count"] == 50
+
+
+def test_query_taxa_text_in_scope(tmp_path):
+    """Text search filtered to scope."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    catalog_dir = tmp_path / "Opuntia"
+    catalog_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist([
+            {"taxon_key": "2923970", "path": TAXON["path"], "scientific_name": "Opuntia_humifusa",
+             "common_name": "devil's tongue", "rank": "SPECIES", "sample_count": 50},
+        ]),
+        catalog_dir / "species.parquet",
+    )
+
+    def _resolve(k):
+        if k == "10":
+            return genus
+        if k == "2923970":
+            return TAXON
+        return None
+
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "search_taxa_by_name",
+                      return_value=[(TAXON, 90.0, "opuntia humifusa")]), \
+         patch.object(rankings_module, "_infer_sample_count", return_value=50), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?q=opuntia&within_taxon=10&descendant_rank=SPECIES")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["scope"]["within_taxon"] == "10"
+    assert body["scope"]["descendant_rank"] == "SPECIES"
+    assert len(body["results"]) == 1
+    assert body["results"][0]["match_score"] == pytest.approx(90.0)
+
+
+def test_query_taxa_ranked_scoped_no_index(tmp_path):
+    """Ranked-scoped mode with missing index returns no_index."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    (tmp_path / "Opuntia").mkdir(parents=True)
+    def _resolve(k):
+        return genus if k == "10" else None
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES"
+                       "&sort_variable=bio1&sort_metric=mean")
+    assert r.status_code == 200
+    assert r.json()["empty_reason"] == "no_index"
+
+
+def _build_index_parquet(ancestor_dir: Path, col_name: str, entries: list[dict]) -> None:
+    import json
+    struct_fields = [
+        pa.field("taxonKey", pa.string()),
+        pa.field("value", pa.float64()),
+        pa.field("sampleCount", pa.int64()),
+    ]
+    arr = pa.StructArray.from_arrays(
+        [pa.array([e["taxonKey"] for e in entries], type=pa.string()),
+         pa.array([e["value"] for e in entries], type=pa.float64()),
+         pa.array([e["sampleCount"] for e in entries], type=pa.int64())],
+        fields=struct_fields,
+    )
+    table = pa.table({col_name: arr}).replace_schema_metadata(
+        {b"column_lengths": json.dumps({col_name: len(entries)}).encode()}
+    )
+    pq.write_table(table, ancestor_dir / "species_index.parquet")
+
+
+def test_query_taxa_ranked_scoped_mode(tmp_path):
+    """Ranked-scoped mode reads index and returns sorted results with position/percentile."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    ancestor_dir = tmp_path / "Opuntia"
+    ancestor_dir.mkdir(parents=True)
+    taxon2 = {**TAXON, "taxon_key": "111", "path": "Plantae_6/Opuntia_2923968/Other_111",
+              "scientific_name": "Opuntia_other", "rank": "SPECIES"}
+    _build_index_parquet(ancestor_dir, "bio1::mean", [
+        {"taxonKey": "2923970", "value": 10.0, "sampleCount": 100},
+        {"taxonKey": "111", "value": 20.0, "sampleCount": 200},
+    ])
+
+    def _resolve(k):
+        return {"10": genus, "2923970": TAXON, "111": taxon2}.get(k)
+
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES"
+                       "&sort_variable=bio1&sort_metric=mean&sort_order=asc")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["empty_reason"] is None
+    assert body["eligible_total"] == 2
+    results = body["results"]
+    assert len(results) == 2
+    # asc order: 10.0 first, then 20.0
+    assert results[0]["taxon_id"] == "2923970"
+    assert results[0]["sort_value"] == pytest.approx(10.0)
+    assert results[0]["position"] == 1
+    assert results[0]["percentile"] == pytest.approx(0.0)
+    assert results[1]["sort_value"] == pytest.approx(20.0)
+    assert results[1]["position"] == 2
+
+
+def test_query_taxa_ranked_scoped_desc(tmp_path):
+    """sort_order=desc reverses order."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    ancestor_dir = tmp_path / "Opuntia"
+    ancestor_dir.mkdir(parents=True)
+    taxon2 = {**TAXON, "taxon_key": "111", "path": "x/111", "scientific_name": "Other", "rank": "SPECIES"}
+    _build_index_parquet(ancestor_dir, "bio1::mean", [
+        {"taxonKey": "2923970", "value": 10.0, "sampleCount": 100},
+        {"taxonKey": "111", "value": 20.0, "sampleCount": 200},
+    ])
+
+    def _resolve(k):
+        return {"10": genus, "2923970": TAXON, "111": taxon2}.get(k)
+
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES"
+                       "&sort_variable=bio1&sort_metric=mean&sort_order=desc")
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert results[0]["sort_value"] == pytest.approx(20.0)
+    assert results[1]["sort_value"] == pytest.approx(10.0)
+
+
+def test_query_taxa_ranked_scoped_min_samples(tmp_path):
+    """min_samples filter excludes entries below threshold."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    ancestor_dir = tmp_path / "Opuntia"
+    ancestor_dir.mkdir(parents=True)
+    taxon2 = {**TAXON, "taxon_key": "111", "path": "x/111", "scientific_name": "Other", "rank": "SPECIES"}
+    _build_index_parquet(ancestor_dir, "bio1::mean", [
+        {"taxonKey": "2923970", "value": 10.0, "sampleCount": 5},
+        {"taxonKey": "111", "value": 20.0, "sampleCount": 200},
+    ])
+
+    def _resolve(k):
+        return {"10": genus, "2923970": TAXON, "111": taxon2}.get(k)
+
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES"
+                       "&sort_variable=bio1&sort_metric=mean&min_samples=10")
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["taxon_id"] == "111"
+
+
+def test_query_taxa_ranked_scoped_location_filter(tmp_path):
+    """Location filter excludes taxa not in the location."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    ancestor_dir = tmp_path / "Opuntia"
+    ancestor_dir.mkdir(parents=True)
+    taxon2 = {**TAXON, "taxon_key": "111", "path": "x/111", "scientific_name": "Other", "rank": "SPECIES"}
+    _build_index_parquet(ancestor_dir, "bio1::mean", [
+        {"taxonKey": "2923970", "value": 10.0, "sampleCount": 100},
+        {"taxonKey": "111", "value": 20.0, "sampleCount": 200},
+    ])
+
+    def _resolve(k):
+        return {"10": genus, "2923970": TAXON, "111": taxon2}.get(k)
+
+    loc_keys = frozenset({"2923970"})
+    loc_counts = {"2923970": 42}
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "_location_taxon_keys", return_value=(loc_keys, loc_counts)), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES"
+                       "&sort_variable=bio1&sort_metric=mean&location=USA")
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["taxon_id"] == "2923970"
+    assert results[0]["location_count"] == 42
+
+
+def test_query_taxa_ranked_scoped_text_filter(tmp_path):
+    """Mode 3: scope+sort+q filters index to text matches."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    ancestor_dir = tmp_path / "Opuntia"
+    ancestor_dir.mkdir(parents=True)
+    taxon2 = {**TAXON, "taxon_key": "111", "path": "x/111", "scientific_name": "Other", "rank": "SPECIES"}
+    _build_index_parquet(ancestor_dir, "bio1::mean", [
+        {"taxonKey": "2923970", "value": 10.0, "sampleCount": 100},
+        {"taxonKey": "111", "value": 20.0, "sampleCount": 200},
+    ])
+
+    def _resolve(k):
+        return {"10": genus, "2923970": TAXON, "111": taxon2}.get(k)
+
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "search_taxa_by_name",
+                      return_value=[(TAXON, 90.0, "opuntia humifusa")]), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES"
+                       "&sort_variable=bio1&sort_metric=mean&q=opuntia")
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["taxon_id"] == "2923970"
+    assert results[0]["match_score"] == pytest.approx(90.0)
+
+
+def test_query_taxa_ranked_text_no_scope(tmp_path):
+    """Mode 4: q+sort without scope reads per-taxon stats."""
+    taxon_dir = tmp_path / TAXON["path"]
+    taxon_dir.mkdir(parents=True)
+    with patch.object(rankings_module, "search_taxa_by_name",
+                      return_value=[(TAXON, 85.0, "opuntia humifusa")]), \
+         patch.object(rankings_module, "_taxon_metric_value", return_value=15.5), \
+         patch.object(rankings_module, "_infer_sample_count", return_value=100), \
+         patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/api/taxa/query?q=opuntia&sort_variable=bio1&sort_metric=mean")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["empty_reason"] is None
+    assert len(body["results"]) == 1
+    assert body["results"][0]["sort_value"] == pytest.approx(15.5)
+    assert body["results"][0]["position"] is None
+
+
+def test_query_taxa_ranked_text_no_matches():
+    """Mode 4 with no text matches returns no_text_matches."""
+    with patch.object(rankings_module, "search_taxa_by_name", return_value=[]):
+        r = client.get("/api/taxa/query?q=zzz&sort_variable=bio1&sort_metric=mean")
+    assert r.status_code == 200
+    assert r.json()["empty_reason"] == "no_text_matches"
+
+
+def test_query_taxa_scope_include_species_like(tmp_path):
+    """include_species_like=true accepts subspecies-rank entries."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    catalog_dir = tmp_path / "Opuntia"
+    catalog_dir.mkdir(parents=True)
+    subsp = {**TAXON, "taxon_key": "999", "path": "x/999",
+             "scientific_name": "Opuntia_humifusa_humifusa", "rank": "SUBSPECIES"}
+    pq.write_table(
+        pa.Table.from_pylist([
+            {"taxon_key": "2923970", "path": TAXON["path"], "scientific_name": "Opuntia_humifusa",
+             "common_name": "", "rank": "SPECIES", "sample_count": 50},
+            {"taxon_key": "999", "path": "x/999", "scientific_name": "Opuntia_humifusa_humifusa",
+             "common_name": "", "rank": "SUBSPECIES", "sample_count": 10},
+        ]),
+        catalog_dir / "species.parquet",
+    )
+
+    def _resolve(k):
+        return {"10": genus, "2923970": TAXON, "999": subsp}.get(k)
+
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r_no = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES")
+        r_yes = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES"
+                           "&include_species_like=true")
+    # Without flag: only SPECIES rank
+    assert len(r_no.json()["results"]) == 1
+    assert r_no.json()["results"][0]["taxon_id"] == "2923970"
+    # With flag: SPECIES + SUBSPECIES
+    assert len(r_yes.json()["results"]) == 2
+
+
+def test_query_taxa_offset_pagination(tmp_path):
+    """offset/limit pagination works in catalog mode."""
+    genus = {**TAXON, "taxon_key": "10", "path": "Opuntia", "rank": "GENUS"}
+    catalog_dir = tmp_path / "Opuntia"
+    catalog_dir.mkdir(parents=True)
+    taxa_list = [
+        {"taxon_key": str(i), "path": f"x/{i}", "scientific_name": f"Sp_{i}",
+         "common_name": "", "rank": "SPECIES", "sample_count": i * 10}
+        for i in range(1, 6)
+    ]
+    pq.write_table(pa.Table.from_pylist(taxa_list), catalog_dir / "species.parquet")
+
+    def _resolve(k):
+        if k == "10":
+            return genus
+        for row in taxa_list:
+            if row["taxon_key"] == k:
+                return {**TAXON, "taxon_key": k, "path": row["path"],
+                        "scientific_name": row["scientific_name"], "rank": "SPECIES"}
+        return None
+
+    with patch.object(taxa, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(rankings_module, "get_taxon_by_id", side_effect=_resolve), \
+         patch.object(rankings_module, "TREE_ROOT", tmp_path):
+        r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES&limit=2&offset=2")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 5
+    assert len(body["results"]) == 2
+    assert body["results"][0]["taxon_id"] == "3"
 
 
 FAKE_LAYER = {
@@ -233,7 +603,7 @@ def test_load_relative_ranks_no_file(tmp_path):
 
 
 def test_load_relative_ranks_corrupt_file(tmp_path):
-    (tmp_path / POSITION_FILE).write_bytes(b"garbage")
+    (tmp_path / rankings_module.POSITION_FILE).write_bytes(b"garbage")
     assert main_module._load_relative_ranks(tmp_path, "bio1") == []
 
 
@@ -246,7 +616,7 @@ def test_load_relative_ranks_filters_by_variable(tmp_path):
         "sampleCount":    [50, 30],
         "contextTaxonId": ["100", "100"],
         "contextLabel":   ["Cactaceae", "Cactaceae"],
-    }), tmp_path / POSITION_FILE)
+    }), tmp_path / rankings_module.POSITION_FILE)
     rows = main_module._load_relative_ranks(tmp_path, "bio1")
     assert len(rows) == 1
     assert rows[0]["metric"] == "mean"
@@ -267,7 +637,7 @@ def test_load_relative_ranks_zero_count(tmp_path):
         "sampleCount":    [0],
         "contextTaxonId": ["1"],
         "contextLabel":   ["Plantae"],
-    }), tmp_path / POSITION_FILE)
+    }), tmp_path / rankings_module.POSITION_FILE)
     rows = main_module._load_relative_ranks(tmp_path, "bio1")
     assert rows[0]["percentile"] == 0.0
 
@@ -1389,3 +1759,139 @@ def test_get_species_occurrences_with_location_no_match(tmp_path, monkeypatch):
         r = client.get("/species/2923970/occurrences?location=USA")
     assert r.status_code == 200
     assert r.json()["occurrences"] == []
+
+
+# ---------------------------------------------------------------------------
+# /species/{id}/locations — parent filter (_ancestor_gids coverage)
+# ---------------------------------------------------------------------------
+
+def test_get_species_locations_parent_filter_matches(tmp_path, monkeypatch):
+    """parent=USA returns only locations whose ancestor chain includes USA."""
+    _patch_locations(tmp_path, monkeypatch)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations?level=1&parent=USA")
+    assert r.status_code == 200
+    gids = {row["gid"] for row in r.json()}
+    assert "USA.1_1" in gids
+    assert "CAN" not in gids
+    assert "USA" not in gids
+
+
+def test_get_species_locations_parent_filter_excludes_all(tmp_path, monkeypatch):
+    """parent=CAN at level=1 returns nothing (no level-1 children of Canada in fixture)."""
+    _patch_locations(tmp_path, monkeypatch)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations?level=1&parent=CAN")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_get_species_locations_cycle_safe(tmp_path, monkeypatch):
+    """Cyclic parent_gid entries in hierarchy do not cause infinite loops."""
+    loc_path = tmp_path / "location_taxa.parquet"
+    pq.write_table(pa.table({
+        "scope": ["gadm_level1"],
+        "gid": ["X.1_1"],
+        "taxon_key": ["2923970"],
+        "count": [5],
+    }), loc_path)
+    hier = "level,gid,name,parent_gid\n1,X.1_1,Child,ROOT\n0,ROOT,Root,ROOT\n"
+    (tmp_path / "hierarchy.csv").write_text(hier, encoding="utf-8")
+    monkeypatch.setattr(main_module, "_LOC_TAXA_PATH", loc_path)
+    monkeypatch.setattr(main_module, "_LOCATIONS_DIR", tmp_path)
+    main_module._load_hierarchy.cache_clear()
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/species/2923970/locations?parent=ROOT")
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /api/taxa/ranking-options
+# ---------------------------------------------------------------------------
+
+def _write_rank_index_for_main(index_path: Path, entries: dict) -> None:
+    """Write a minimal rank index parquet (mirrors the rankings test helper)."""
+    struct_type = pa.struct([
+        pa.field("taxonKey", pa.string()),
+        pa.field("value", pa.float64()),
+        pa.field("sampleCount", pa.int64()),
+    ])
+    max_len = max(len(v) for v in entries.values()) if entries else 1
+    arrays: dict = {}
+    column_lengths: dict = {}
+    for col_name, rows in entries.items():
+        column_lengths[col_name] = len(rows)
+        arr = pa.StructArray.from_arrays(
+            [
+                pa.array([r[0] for r in rows], type=pa.string()),
+                pa.array([r[1] for r in rows], type=pa.float64()),
+                pa.array([r[2] for r in rows], type=pa.int64()),
+            ],
+            fields=list(struct_type),
+        )
+        if len(arr) < max_len:
+            arr = pa.concat_arrays([arr, pa.nulls(max_len - len(arr), type=struct_type)])
+        arrays[col_name] = arr
+    table = pa.table(arrays)
+    metadata = {b"column_lengths": json.dumps(column_lengths).encode("utf-8")}
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table.replace_schema_metadata(metadata), index_path)
+
+
+def test_ranking_options_taxon_not_found():
+    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/api/taxa/ranking-options?within_taxon=999&descendant_rank=SPECIES")
+    assert r.status_code == 404
+
+
+def test_ranking_options_no_index(tmp_path, monkeypatch):
+    monkeypatch.setattr(rankings_module, "TREE_ROOT", tmp_path)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/api/taxa/ranking-options?within_taxon=2923970&descendant_rank=SPECIES")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["options"] == []
+    assert body["rank"] == "SPECIES"
+
+
+def test_ranking_options_corrupt_index(tmp_path, monkeypatch):
+    monkeypatch.setattr(rankings_module, "TREE_ROOT", tmp_path)
+    index_path = tmp_path / TAXON["path"] / "species_index.parquet"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_bytes(b"garbage")
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/api/taxa/ranking-options?within_taxon=2923970&descendant_rank=SPECIES")
+    assert r.status_code == 200
+    assert r.json()["options"] == []
+
+
+def test_ranking_options_returns_options(tmp_path, monkeypatch):
+    monkeypatch.setattr(rankings_module, "TREE_ROOT", tmp_path)
+    index_path = tmp_path / TAXON["path"] / "species_index.parquet"
+    _write_rank_index_for_main(index_path, {
+        "bio1::mean": [("2923970", 10.0, 100)],
+        "bio1::class_0": [("2923970", 1.0, 100)],  # skipped: class_ metric
+        "bio12::median": [("2923970", 5.0, 100)],
+        "no_double_colon": [("2923970", 1.0, 100)],  # skipped: no ::
+        "bio12::p10": [],  # skipped: count == 0
+    })
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[
+             {"id": "bio1", "display_name": "Temperature"},
+             {"id": "bio12", "display_name": "Precipitation"},
+         ]):
+        r = client.get("/api/taxa/ranking-options?within_taxon=2923970&descendant_rank=SPECIES")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ancestor_taxon_id"] == TAXON["taxon_key"]
+    assert body["rank"] == "SPECIES"
+    options = body["options"]
+    variables = [o["variable"] for o in options]
+    assert "bio1" in variables
+    assert "bio12" in variables
+    # class_ metric excluded
+    assert all(not o["metric"].startswith("class_") for o in options)
+    # label populated
+    assert all(isinstance(o["label"], str) and o["label"] for o in options)
+    assert all(o["count"] > 0 for o in options)

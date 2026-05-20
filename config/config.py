@@ -86,7 +86,7 @@ class GlobalConfig:
     data_root: str = "data"
 
     # Temporal enrichment
-    temporal_min_year: int = 2015
+    temporal_min_year: int = 1940  # ERA5 coverage starts 1940; raise to limit processing time
     temporal_worklist_batch_rows: int = 100_000
     temporal_cache_dir: str = "/tmp/wherewild_temporal_cache"
     temporal_overwrite_all: bool = False

@@ -30,18 +30,30 @@ from scipy.stats import entropy as _scipy_entropy
 from scipy.stats import gaussian_kde
 
 from config.config import ValueType, load_config
-from util.taxa import TaxonRecord, iter_descendants
+from util.taxa import TaxonRecord, get_children, iter_descendants
 
 CONFIG = load_config("global")
 
 TREE_ROOT = Path("data/taxonomy/tree")
 OCCURRENCE_FILE = "occurrence.parquet"
+OCCURRENCE_INDEX_FILE = "occurrence_index.parquet"
 NUMERICAL_STATS_FILE = "numerical_stats.parquet"
 NOMINAL_STATS_FILE = "nominal_stats.parquet"
 NUMERICAL_DENSITY_FILE = "numerical_density.parquet"
 
 _KDE_MAX_SAMPLES = 20_000
 _KDE_N_POINTS = 128
+
+# Columns present in occurrence.parquet that are NOT GIS layer values and should
+# be stripped from the slice index (quality-filter cols are applied then dropped).
+_INDEX_STRIP_COLS = frozenset([
+    "hilbertIdx", "eventTimestamp", "coordinateUncertaintyInMeters", "obscured",
+    "gbifRegion", "level0Gid", "level1Gid", "level2Gid", "dp", "vitality", "rcs",
+])
+
+# Ranks for which occurrence_index.parquet is built.
+# Order and above aggregate too many descendants to be useful for slice queries.
+_INDEX_RANKS = CONFIG.leaf_rank_set | frozenset(["GENUS", "FAMILY"])
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +368,17 @@ def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
     _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats)
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_numerical_density(taxon_dir, density_rows)
+    _write_index_from_df(taxon_dir, df)
+
+
+def _write_index_from_df(taxon_dir: Path, df: pd.DataFrame) -> None:
+    """Write occurrence_index.parquet from an already-filtered DataFrame."""
+    idx = df.drop(columns=[c for c in _INDEX_STRIP_COLS if c in df.columns])
+    idx = idx.dropna(subset=["catalogNumber", "decimalLatitude", "decimalLongitude"])
+    if idx.empty:
+        return
+    taxon_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write(taxon_dir / OCCURRENCE_INDEX_FILE, pa.Table.from_pandas(idx, preserve_index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +390,7 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
     continuous_acc: dict[str, dict] = {}
     # nominal_acc: layer_id → {counts, unique}
     nominal_acc: dict[str, dict] = {}
-
+    # index accumulation: deduplicated rows for occurrence_index.parquet
     for desc in iter_descendants(taxon, include_self=True):
         occ_path = TREE_ROOT / desc["path"] / OCCURRENCE_FILE
         if not occ_path.exists():
@@ -473,6 +496,25 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
     _write_numerical_density(taxon_dir, density_rows)
 
 
+def _build_nonleaf_index_from_children(taxon: TaxonRecord, taxon_dir: Path) -> None:
+    """Build occurrence_index.parquet by concatenating direct children's index files.
+
+    Requires children to already be processed (call in bottom-up / leaf-first order).
+    Reads O(children) files instead of O(all leaf descendants).
+    """
+    frames = []
+    for child in get_children(taxon["taxon_key"]):
+        child_idx = TREE_ROOT / child["path"] / OCCURRENCE_INDEX_FILE
+        if child_idx.exists():
+            frames.append(pq.read_table(child_idx).to_pandas())
+    if not frames:
+        return
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["catalogNumber"])
+    taxon_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write(taxon_dir / OCCURRENCE_INDEX_FILE, pa.Table.from_pandas(combined, preserve_index=False))
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -482,6 +524,8 @@ def compute_taxon_stats(taxon: TaxonRecord, layers: list[dict]) -> None:
 
     Leaf-rank taxa use exact pandas/numpy stats; non-leaf taxa stream all
     descendant occurrence parquets and use T-Digest approximations.
+    Must be called in leaf-first (bottom-up) order so non-leaf index builds
+    can read from already-completed children's occurrence_index.parquet files.
     """
     taxon_dir = TREE_ROOT / taxon["path"]
     layer_meta = {layer["id"]: layer for layer in layers}
@@ -490,3 +534,50 @@ def compute_taxon_stats(taxon: TaxonRecord, layers: list[dict]) -> None:
         _process_leaf(taxon_dir, layer_meta)
     else:
         _process_nonleaf(taxon, taxon_dir, layer_meta)
+        if taxon["rank"] in _INDEX_RANKS:
+            _build_nonleaf_index_from_children(taxon, taxon_dir)
+
+
+def _load_occ_for_index(path: Path) -> pd.DataFrame | None:
+    """Read and quality-filter one occurrence.parquet, stripping non-index cols."""
+    if not path.exists():
+        return None
+    table = pq.read_table(path)
+    if table.num_rows == 0:
+        return None
+    df = _filter_df(table.to_pandas())
+    if df.empty:
+        return None
+    drop = [c for c in _INDEX_STRIP_COLS if c in df.columns]
+    if drop:
+        df = df.drop(columns=drop)
+    return df.dropna(subset=["catalogNumber", "decimalLatitude", "decimalLongitude"])
+
+
+def _build_occurrence_index(taxon: TaxonRecord, taxon_dir: Path, is_leaf: bool) -> None:
+    """Build and write occurrence_index.parquet for a taxon.
+
+    Stores catalogNumber, lat, lon, and all GIS layer columns (quality filters
+    pre-applied) so slice endpoints need no second lookup pass.
+    """
+    if is_leaf:
+        df = _load_occ_for_index(taxon_dir / OCCURRENCE_FILE)
+        frames = [df] if df is not None else []
+    else:
+        frames = []
+        seen: set[str] = set()
+        for desc in iter_descendants(taxon, include_self=True):
+            df = _load_occ_for_index(TREE_ROOT / desc["path"] / OCCURRENCE_FILE)
+            if df is None:
+                continue
+            df = df[~df["catalogNumber"].astype(str).isin(seen)]
+            seen.update(df["catalogNumber"].astype(str).tolist())
+            frames.append(df)
+
+    if not frames:
+        return
+    combined = pd.concat(frames, ignore_index=True)
+    if not is_leaf:
+        combined = combined.drop_duplicates(subset=["catalogNumber"])
+    taxon_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write(taxon_dir / OCCURRENCE_INDEX_FILE, pa.Table.from_pandas(combined, preserve_index=False))

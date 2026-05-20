@@ -46,7 +46,7 @@ def test_main_runs_compute_for_all(capsys, monkeypatch):
         pt.main()
     mock_compute.assert_called_once_with(_FAKE_TAXON, _FAKE_LAYERS)
     out = capsys.readouterr().out
-    assert "computing stats" in out
+    assert "taxa" in out
     assert "done" in out
 
 

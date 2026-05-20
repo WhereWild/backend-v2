@@ -202,12 +202,13 @@ def test_missing_rows_missing_required_col(tmp_path):
     assert result is None
 
 
-def test_missing_rows_nothing_missing(tmp_path):
+def test_missing_rows_always_returns_all_layers(tmp_path):
     path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
     _make_occurrence_parquet(path, extra_cols={"bio1": [1.0, 2.0]})
     with patch.object(et, "TREE_ROOT", tmp_path):
         result = et._missing_rows_for_taxon(FAKE_TAXON, ["bio1"])
-    assert result is None
+    assert result is not None
+    assert result.column("missingLayers").to_pylist()[0] == ["bio1"]
 
 
 def test_missing_rows_returns_chunk(tmp_path):
@@ -223,14 +224,13 @@ def test_missing_rows_returns_chunk(tmp_path):
     assert result.column("taxonKey").to_pylist()[0] == "2923970"
 
 
-def test_missing_rows_partial_layers(tmp_path):
+def test_missing_rows_includes_existing_layers(tmp_path):
     path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
     _make_occurrence_parquet(path, extra_cols={"bio1": [1.0, 2.0]})
     with patch.object(et, "TREE_ROOT", tmp_path):
         result = et._missing_rows_for_taxon(FAKE_TAXON, ["bio1", "bio2"])
     assert result is not None
-    missing = result.column("missingLayers").to_pylist()[0]
-    assert missing == ["bio2"]
+    assert result.column("missingLayers").to_pylist()[0] == ["bio1", "bio2"]
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +543,7 @@ def test_main_nothing_to_do(tmp_path, capsys):
          patch.object(et, "load_catalog", return_value={}):
         et.main()
     out = capsys.readouterr().out
-    assert "already populated" in out
+    assert "Completed" in out
 
 
 def test_main_processes_batch(tmp_path, capsys):
@@ -636,7 +636,7 @@ def test_main_skips_empty_batch(tmp_path, capsys):
          patch.object(et, "_iter_worklist_batches", return_value=iter([empty_batch])):
         et.main()
     out = capsys.readouterr().out
-    assert "already populated" in out
+    assert "Completed" in out
 
 
 def test_main_vars_to_enrich_filters_layers(tmp_path, capsys):

@@ -1,6 +1,37 @@
 import os
 from dataclasses import dataclass, fields
+from enum import StrEnum
 from typing import Any, get_type_hints
+
+
+class ValueType(StrEnum):
+    RATIO = "ratio"
+    INTERVAL = "interval"
+    ORDINAL = "ordinal"
+    CIRCULAR = "circular"
+    AGGREGATE = "aggregate"
+    NOMINAL = "nominal"
+
+
+_CONTINUOUS_METRICS: tuple[str, ...] = (
+    "count", "unique_samples", "min",
+    "10th_percentile", "25th_percentile", "median",
+    "75th_percentile", "90th_percentile", "max",
+    "mean", "std", "iqr", "10_90_range", "range", "mode",
+)
+
+_NOMINAL_METRICS: tuple[str, ...] = (
+    "unique_samples", "total_samples", "unique_classes", "entropy", "mode",
+)
+
+METRICS_BY_TYPE: dict[ValueType, tuple[str, ...]] = {
+    ValueType.RATIO:     _CONTINUOUS_METRICS,
+    ValueType.INTERVAL:  _CONTINUOUS_METRICS,
+    ValueType.NOMINAL:   _NOMINAL_METRICS,
+    ValueType.ORDINAL:   (),
+    ValueType.CIRCULAR:  (),
+    ValueType.AGGREGATE: (),
+}
 
 _REGISTRY: dict[str, type] = {}
 _CACHE: dict[str, Any] = {}

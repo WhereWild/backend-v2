@@ -514,6 +514,7 @@ def test_get_species_occurrences_not_found():
 def test_get_species_occurrences_leaf():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
          patch("pathlib.Path.exists", return_value=True), \
          patch.object(pq, "read_table", return_value=_OCC_TABLE):
         r = client.get("/species/2923970/occurrences")
@@ -527,6 +528,7 @@ def test_get_species_occurrences_leaf():
 def test_get_species_occurrences_leaf_no_file():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
          patch("pathlib.Path.exists", return_value=False):
         r = client.get("/species/2923970/occurrences")
     assert r.status_code == 200
@@ -585,6 +587,7 @@ def test_get_species_occurrences_deduplication():
     })
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
          patch("pathlib.Path.exists", return_value=True), \
          patch.object(pq, "read_table", return_value=dup_table):
         r = client.get("/species/2923970/occurrences")

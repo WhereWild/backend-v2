@@ -11,10 +11,12 @@ nominal_stats.parquet). Called from scripts/process_tree.py.
 """
 from __future__ import annotations
 
+import csv
 import json
 import math
 import os
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,7 @@ import pyarrow.parquet as pq
 
 from config.config import METRICS_BY_TYPE, ValueType, load_config
 from util.stats import NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE
-from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants
+from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
 
 CONFIG = load_config("global")
 
@@ -511,3 +513,489 @@ def compute_relative_ranks(ancestor: TaxonRecord, layers: list[dict]) -> None:
     build_descendant_catalogs(ancestor)
     build_rank_indexes(ancestor, layers)
     distribute_all_positions(ancestor)
+
+
+# ---------------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------------
+
+_LOCATIONS_DIR = Path("data/gis/locations")
+_LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
+_HIERARCHY_CSV = _LOCATIONS_DIR / "hierarchy.csv"
+
+
+@lru_cache(maxsize=1)
+def _load_gid_levels() -> dict[str, int]:
+    result: dict[str, int] = {}
+    try:
+        with open(_HIERARCHY_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                gid = (row.get("gid") or "").strip()
+                try:
+                    level = int(row.get("level", ""))
+                except (ValueError, TypeError):
+                    continue
+                if gid:
+                    result[gid] = level
+    except Exception:
+        pass
+    return result
+
+
+def _gid_to_scope(gid: str) -> str:
+    level = _load_gid_levels().get(gid)
+    if level is not None:
+        return CONFIG.location_scope_by_level.get(level, "gbif_region")
+    return "gbif_region"
+
+
+@lru_cache(maxsize=256)
+def _location_taxon_keys(gid: str) -> tuple[frozenset[str], dict[str, int]]:
+    """Return (taxon_key set, per-taxon observation counts) for a GID."""
+    scope = _gid_to_scope(gid)
+    try:
+        tbl = pq.read_table(
+            _LOC_TAXA_PATH,
+            filters=[("scope", "=", scope), ("gid", "=", gid)],
+        )
+        keys = frozenset(str(k) for k in tbl.column("taxon_key").to_pylist())
+        counts = {
+            str(k): int(c)
+            for k, c in zip(
+                tbl.column("taxon_key").to_pylist(),
+                tbl.column("count").to_pylist(),
+            )
+        }
+        return keys, counts
+    except Exception:
+        return frozenset(), {}
+
+
+def _read_index_entries(index_path: Path, col_name: str, col_len: int) -> list[dict]:
+    """Read one struct column from a rank_index.parquet, returning up to col_len entries."""
+    try:
+        tbl = pq.read_table(index_path, columns=[col_name])
+        column = tbl.column(col_name).combine_chunks()
+        result = []
+        for i in range(min(col_len, len(column))):
+            entry = column[i].as_py()
+            if entry is not None:
+                result.append(entry)
+        return result
+    except Exception:
+        return []
+
+
+def _taxon_metric_value(taxon_dir: Path, variable_id: str, metric_id: str) -> float | None:
+    """Read one variable::metric value from a taxon's stats files."""
+    num_path = taxon_dir / NUMERICAL_STATS_FILE
+    if num_path.exists():
+        try:
+            df = pq.read_table(num_path).to_pandas()
+            rows = df[df["variable"] == variable_id]
+            if not rows.empty and metric_id in rows.columns:
+                val = rows.iloc[0][metric_id]
+                if val is not None:
+                    fval = float(val)
+                    if math.isfinite(fval):
+                        return fval
+        except Exception:
+            pass
+    nom_path = taxon_dir / NOMINAL_STATS_FILE
+    if nom_path.exists():
+        try:
+            df = pq.read_table(nom_path).to_pandas()
+            rows = df[(df["variable"] == variable_id) & (df["metric"] == metric_id)]
+            if not rows.empty:
+                val = rows.iloc[0]["value"]
+                if val is not None:
+                    fval = float(val)
+                    if math.isfinite(fval):
+                        return fval
+        except Exception:
+            pass
+    return None
+
+
+def _accepted_ranks(descendant_rank: str, include_species_like: bool) -> frozenset[str] | None:
+    """Return accepted taxon rank set for filtering, or None if no rank filter needed."""
+    if descendant_rank == CONFIG.species_rank:
+        if include_species_like:
+            return frozenset({CONFIG.species_rank} | set(CONFIG.subspecies_equivalents))
+        return frozenset({CONFIG.species_rank})
+    return None
+
+
+def _empty_result(empty_reason: str, eligible_total: int = 0) -> dict:
+    return {
+        "total": 0,
+        "matched_total": 0,
+        "eligible_total": eligible_total,
+        "empty_reason": empty_reason,
+        "results": [],
+    }
+
+
+def _query_ranked_scoped(
+    *,
+    q: str | None,
+    within_taxon: TaxonRecord,
+    descendant_rank: str,
+    sort_variable: str,
+    sort_metric: str,
+    sort_order: str,
+    limit: int,
+    offset: int,
+    min_samples: int,
+    include_species_like: bool,
+    loc_keys: frozenset[str] | None,
+    loc_counts: dict[str, int],
+) -> dict:
+    rank_lower = "subspecies" if descendant_rank in CONFIG.subspecies_equivalents else descendant_rank.lower()
+    ancestor_dir = TREE_ROOT / within_taxon["path"]
+    index_path = ancestor_dir / f"{rank_lower}_index.parquet"
+
+    if not index_path.exists():
+        return _empty_result("no_index")
+
+    col_name = f"{sort_variable}::{sort_metric}"
+    col_len = _load_column_lengths(index_path).get(col_name)
+    if not col_len:
+        return _empty_result("no_column")
+
+    entries = _read_index_entries(index_path, col_name, col_len)
+    if not entries:
+        return _empty_result("no_column")
+
+    # Build reverse map: taxon_key → (raw_position, value, sample_count)
+    index_map: dict[str, tuple[int, float, int]] = {}
+    for pos, entry in enumerate(entries):
+        tk = str(entry.get("taxonKey") or "")
+        if tk:
+            index_map[tk] = (pos, float(entry.get("value") or 0.0), int(entry.get("sampleCount") or 0))
+
+    # Mode 3: restrict to text-matched taxon keys
+    candidate_keys: frozenset[str] | None = None
+    match_scores: dict[str, float] = {}
+    if q:
+        text_matches = search_taxa_by_name(q, limit=max(limit * 10, 200))
+        candidate_keys = frozenset(str(t["taxon_key"]) for t, _, _ in text_matches if str(t["taxon_key"]) in index_map)
+        match_scores = {str(t["taxon_key"]): score for t, score, _ in text_matches}
+
+    accepted_ranks = _accepted_ranks(descendant_rank, include_species_like)
+
+    # Filter
+    filtered: list[tuple[int, str, float, int]] = []  # (raw_pos, taxon_key, value, sample_count)
+    for tk, (pos, val, sc) in index_map.items():
+        if candidate_keys is not None and tk not in candidate_keys:
+            continue
+        if sc < min_samples:
+            continue
+        if loc_keys is not None and tk not in loc_keys:
+            continue
+        if accepted_ranks is not None:
+            taxon = get_taxon_by_id(tk)
+            if taxon is None or taxon.get("rank") not in accepted_ranks:
+                continue
+        filtered.append((pos, tk, val, sc))
+
+    reverse = (sort_order == "desc")
+    filtered.sort(key=lambda e: (e[2], e[1]), reverse=reverse)
+
+    total = len(filtered)
+    page = filtered[offset:offset + limit]
+
+    results = []
+    for local_rank, (raw_pos, tk, val, sc) in enumerate(page, start=offset + 1):
+        taxon = get_taxon_by_id(tk)
+        if taxon is None:
+            continue
+        percentile = (raw_pos / col_len * 100) if col_len > 0 else None
+        results.append({
+            "taxon": taxon,
+            "match_score": match_scores.get(tk),
+            "sample_count": loc_counts.get(tk) or sc or None,
+            "sort_value": val,
+            "location_count": loc_counts.get(tk) or None,
+            "position": local_rank,
+            "percentile": percentile,
+        })
+
+    return {
+        "total": total,
+        "matched_total": total,
+        "eligible_total": col_len,
+        "empty_reason": None if results else "no_results",
+        "results": results,
+    }
+
+
+def _query_ranked_text(
+    *,
+    q: str,
+    sort_variable: str,
+    sort_metric: str,
+    sort_order: str,
+    limit: int,
+    offset: int,
+    min_samples: int,
+    include_species_like: bool,
+    loc_keys: frozenset[str] | None,
+    loc_counts: dict[str, int],
+) -> dict:
+    candidates = search_taxa_by_name(q, limit=max((limit + offset) * 5, 200))
+    if not candidates:
+        return _empty_result("no_text_matches")
+
+    enriched: list[tuple[TaxonRecord, float, float, int]] = []  # taxon, score, sort_val, sc
+    for taxon, score, _ in candidates:
+        tk = str(taxon["taxon_key"])
+        if loc_keys is not None and tk not in loc_keys:
+            continue
+        taxon_dir = TREE_ROOT / taxon["path"]
+        val = _taxon_metric_value(taxon_dir, sort_variable, sort_metric)
+        if val is None:
+            continue
+        sc = _infer_sample_count(taxon_dir)
+        if sc < min_samples:
+            continue
+        enriched.append((taxon, score, val, sc))
+
+    reverse = (sort_order == "desc")
+    enriched.sort(key=lambda e: (e[2], str(e[0]["taxon_key"])), reverse=reverse)
+
+    total = len(enriched)
+    page = enriched[offset:offset + limit]
+
+    results = []
+    for taxon, score, val, sc in page:
+        tk = str(taxon["taxon_key"])
+        results.append({
+            "taxon": taxon,
+            "match_score": score,
+            "sample_count": loc_counts.get(tk) or sc or None,
+            "sort_value": val,
+            "location_count": loc_counts.get(tk) or None,
+            "position": None,
+            "percentile": None,
+        })
+
+    return {
+        "total": total,
+        "matched_total": len(candidates),
+        "eligible_total": total,
+        "empty_reason": None if results else "no_results",
+        "results": results,
+    }
+
+
+def _query_text(
+    *,
+    q: str,
+    within_taxon: TaxonRecord | None,
+    descendant_rank: str | None,
+    limit: int,
+    offset: int,
+    min_samples: int,
+    include_species_like: bool,
+    loc_keys: frozenset[str] | None,
+    loc_counts: dict[str, int],
+) -> dict:
+    candidates = search_taxa_by_name(q, limit=max((limit + offset) * 5, 200))
+    if not candidates:
+        return _empty_result("no_text_matches")
+
+    scope_keys: frozenset[str] | None = None
+    if within_taxon is not None and descendant_rank is not None:
+        scope_keys = _load_scope_keys(within_taxon, descendant_rank, include_species_like)
+
+    accepted_ranks = _accepted_ranks(descendant_rank, include_species_like) if descendant_rank else None
+
+    filtered: list[tuple[TaxonRecord, float, int]] = []
+    for taxon, score, _ in candidates:
+        tk = str(taxon["taxon_key"])
+        if scope_keys is not None and tk not in scope_keys:
+            continue
+        if loc_keys is not None and tk not in loc_keys:
+            continue
+        if accepted_ranks is not None and taxon.get("rank") not in accepted_ranks:
+            continue
+        sc = _infer_sample_count(TREE_ROOT / taxon["path"])
+        if sc < min_samples:
+            continue
+        filtered.append((taxon, score, sc))
+
+    total = len(filtered)
+    page = filtered[offset:offset + limit]
+
+    results = []
+    for taxon, score, sc in page:
+        tk = str(taxon["taxon_key"])
+        results.append({
+            "taxon": taxon,
+            "match_score": score,
+            "sample_count": loc_counts.get(tk) or sc or None,
+            "sort_value": None,
+            "location_count": loc_counts.get(tk) or None,
+            "position": None,
+            "percentile": None,
+        })
+
+    return {
+        "total": total,
+        "matched_total": len(candidates),
+        "eligible_total": total,
+        "empty_reason": None if results else ("no_text_matches" if not candidates else "no_results"),
+        "results": results,
+    }
+
+
+def _load_scope_keys(
+    within_taxon: TaxonRecord,
+    descendant_rank: str,
+    include_species_like: bool,
+) -> frozenset[str]:
+    """Return taxon_key set for all descendants of within_taxon at descendant_rank."""
+    rank_lower = "subspecies" if descendant_rank in CONFIG.subspecies_equivalents else descendant_rank.lower()
+    catalog_path = TREE_ROOT / within_taxon["path"] / f"{rank_lower}.parquet"
+    if catalog_path.exists():
+        try:
+            tbl = pq.read_table(catalog_path, columns=["taxon_key"])
+            return frozenset(str(k) for k in tbl.column("taxon_key").to_pylist())
+        except Exception:
+            pass
+    # Fall back to live DFS if catalog is missing
+    accepted_ranks_set: set[str] = {descendant_rank}
+    if descendant_rank == CONFIG.species_rank and include_species_like:
+        accepted_ranks_set |= set(CONFIG.subspecies_equivalents)
+    return frozenset(
+        str(t["taxon_key"])
+        for t in iter_descendants(within_taxon, include_self=False)
+        if (t.get("rank") or "") in accepted_ranks_set
+    )
+
+
+def _query_catalog(
+    *,
+    within_taxon: TaxonRecord,
+    descendant_rank: str,
+    limit: int,
+    offset: int,
+    min_samples: int,
+    include_species_like: bool,
+    loc_keys: frozenset[str] | None,
+    loc_counts: dict[str, int],
+) -> dict:
+    rank_lower = "subspecies" if descendant_rank in CONFIG.subspecies_equivalents else descendant_rank.lower()
+    catalog_path = TREE_ROOT / within_taxon["path"] / f"{rank_lower}.parquet"
+    if not catalog_path.exists():
+        return _empty_result("no_catalog")
+
+    try:
+        rows = pq.read_table(catalog_path).to_pylist()
+    except Exception:
+        return _empty_result("no_catalog")
+
+    accepted_ranks = _accepted_ranks(descendant_rank, include_species_like)
+
+    filtered: list[tuple[TaxonRecord, int]] = []
+    for row in rows:
+        tk = str(row.get("taxon_key") or "")
+        sc = int(row.get("sample_count") or 0)
+        if sc < min_samples:
+            continue
+        if loc_keys is not None and tk not in loc_keys:
+            continue
+        taxon = get_taxon_by_id(tk)
+        if taxon is None:
+            continue
+        if accepted_ranks is not None and taxon.get("rank") not in accepted_ranks:
+            continue
+        filtered.append((taxon, sc))
+
+    total = len(filtered)
+    page = filtered[offset:offset + limit]
+
+    results = []
+    for taxon, sc in page:
+        tk = str(taxon["taxon_key"])
+        results.append({
+            "taxon": taxon,
+            "match_score": None,
+            "sample_count": loc_counts.get(tk) or sc or None,
+            "sort_value": None,
+            "location_count": loc_counts.get(tk) or None,
+            "position": None,
+            "percentile": None,
+        })
+
+    return {
+        "total": total,
+        "matched_total": total,
+        "eligible_total": len(rows),
+        "empty_reason": None if results else "no_results",
+        "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public query entry point
+# ---------------------------------------------------------------------------
+
+def query_taxa(
+    q: str | None,
+    within_taxon: TaxonRecord | None,
+    descendant_rank: str | None,
+    sort_variable: str | None,
+    sort_metric: str | None,
+    sort_order: str,
+    limit: int,
+    offset: int,
+    min_samples: int,
+    include_species_like: bool,
+    location_gid: str | None,
+) -> dict:
+    """Search and rank taxa.
+
+    Returns a dict with keys: total, matched_total, eligible_total, empty_reason, results.
+    Each result has: taxon, match_score, sample_count, sort_value, location_count, position, percentile.
+    """
+    has_q = bool(q)
+    has_scope = within_taxon is not None and bool(descendant_rank)
+    has_sort = bool(sort_variable) and bool(sort_metric)
+
+    loc_keys: frozenset[str] | None = None
+    loc_counts: dict[str, int] = {}
+    if location_gid:
+        loc_keys, loc_counts = _location_taxon_keys(location_gid)
+
+    if has_scope and has_sort:
+        return _query_ranked_scoped(
+            q=q, within_taxon=within_taxon, descendant_rank=descendant_rank,
+            sort_variable=sort_variable, sort_metric=sort_metric,
+            sort_order=sort_order, limit=limit, offset=offset,
+            min_samples=min_samples, include_species_like=include_species_like,
+            loc_keys=loc_keys, loc_counts=loc_counts,
+        )
+    if has_q and has_sort:
+        return _query_ranked_text(
+            q=q, sort_variable=sort_variable, sort_metric=sort_metric,
+            sort_order=sort_order, limit=limit, offset=offset,
+            min_samples=min_samples, include_species_like=include_species_like,
+            loc_keys=loc_keys, loc_counts=loc_counts,
+        )
+    if has_q:
+        return _query_text(
+            q=q, within_taxon=within_taxon, descendant_rank=descendant_rank,
+            limit=limit, offset=offset, min_samples=min_samples,
+            include_species_like=include_species_like,
+            loc_keys=loc_keys, loc_counts=loc_counts,
+        )
+    if has_scope:
+        return _query_catalog(
+            within_taxon=within_taxon, descendant_rank=descendant_rank,
+            limit=limit, offset=offset, min_samples=min_samples,
+            include_species_like=include_species_like,
+            loc_keys=loc_keys, loc_counts=loc_counts,
+        )
+    return _empty_result("no_query")

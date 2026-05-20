@@ -4,15 +4,13 @@ Full taxonomy rebuild pipeline.
 Checks GBIF for new iNat crawl data. If new data is available, wipes the
 data directory (preserving sync_state.json) and runs the full pipeline:
   1. sync_gbif     — download taxonomy + occurrence data from GBIF
-  2. build_tree    — parse taxonomy, build catalog pickle
-  3. build_id_maps — build id/slug lookup maps
-  4. polish_tree   — fetch iNat preferred names/images, update index
-  5. populate_tree — stream occurrence.txt → per-taxon parquet files
-  6. process_gadm  — download GADM GeoPackage + build location tables and catalog
-  7. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
-  8. build_overviews — build COG overviews for all GIS layers
-  9. enrich_tree   — sample GIS layer values into per-taxon occurrence parquets
- 10. process_tree  — compute per-taxon summary statistics and KDE density graphs
+  2. build_tree    — build catalog, ID maps, names, and images
+  3. populate_tree — stream occurrence.txt → per-taxon parquet files
+  4. process_gadm  — download GADM GeoPackage + build location tables and catalog
+  5. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
+  6. build_overviews — build COG overviews for all GIS layers
+  7. enrich_tree   — sample GIS layer values into per-taxon occurrence parquets
+  8. process_tree  — compute per-taxon summary statistics and KDE density graphs
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -31,12 +29,10 @@ from pathlib import Path
 
 import httpx
 
-import scripts.build_id_maps as build_id_maps
 import scripts.build_tree as build_tree
 import scripts.enrich_tree as enrich_tree
 import scripts.gis.build_overviews as build_overviews
 import scripts.gis.process_gadm as process_gadm
-import scripts.polish_tree as polish_tree
 import scripts.populate_tree as populate_tree
 import scripts.process_tree as process_tree
 import scripts.sync_gbif as sync_gbif
@@ -213,20 +209,10 @@ def main() -> None:
         sync_gbif.sync_occurrences()
         _set_stage("sync_gbif", "completed")
 
-        print("\n--- Building taxonomy tree ---")
+        print("\n--- Building tree (catalog + ID maps + names + images) ---")
         _set_stage("build_tree", "in_progress")
         build_tree.main()
         _set_stage("build_tree", "completed")
-
-        print("\n--- Building ID maps ---")
-        _set_stage("build_id_maps", "in_progress")
-        build_id_maps.main()
-        _set_stage("build_id_maps", "completed")
-
-        print("\n--- Polishing tree (iNat preferred names/images) ---")
-        _set_stage("polish_tree", "in_progress")
-        polish_tree.main()
-        _set_stage("polish_tree", "completed")
 
         print("\n--- Populating tree (routing occurrences to parquet) ---")
         _set_stage("populate_tree", "in_progress")

@@ -468,40 +468,38 @@ def compute_location_filtered_stats(
     if vtype is None:
         return None
     unique = int(df[df[variable_id].notna()]["catalogNumber"].nunique())
-    match vtype:
-        case ValueType.RATIO | ValueType.INTERVAL:
-            series = pd.to_numeric(df[variable_id], errors="coerce").dropna()
-            if series.empty:
-                return None
-            values = series.to_numpy(dtype=float)
-            values = values[np.isfinite(values)]
-            if values.size == 0:
-                return None
-            if _is_discrete(layer):
-                stats = _continuous_stats_exact(series[np.isfinite(series)], unique, None)
-                stats["mode"] = int(series.value_counts().idxmax())
-                bin_counts = series.value_counts().sort_index()
-                min_val, max_val = int(values.min()), int(values.max())
-                bin_counts = bin_counts.reindex(range(min_val, max_val + 1), fill_value=0)
-                total = int(bin_counts.sum())
-                density_curve: dict | None = {
-                    "points": [float(v) for v in bin_counts.index.tolist()],
-                    "density": [float(c / total) for c in bin_counts.tolist()],
-                } if total > 0 else None
-            else:
-                kde = build_density_curve(values, vtype)
-                stats = _continuous_stats_exact(series[np.isfinite(series)], unique, kde)
-                density_curve = {"points": kde["points"], "density": kde["density"]} if kde else None
-            return {"type": "continuous", "observation_count": stats["count"], "stats": stats, "density_curve": density_curve}
-        case ValueType.NOMINAL:
-            series = df[variable_id].dropna()
-            if series.empty:
-                return None
-            raw_counts: Counter = Counter(int(float(v)) for v in series)
-            summary, distribution = _nominal_stats(raw_counts, unique)
-            return {"type": "nominal", "observation_count": summary["total_samples"], "summary": summary, "distribution": distribution}
-        case _:
+    if vtype in (ValueType.RATIO, ValueType.INTERVAL):
+        series = pd.to_numeric(df[variable_id], errors="coerce").dropna()
+        if series.empty:
             return None
+        values = series.to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return None
+        if _is_discrete(layer):
+            stats = _continuous_stats_exact(series[np.isfinite(series)], unique, None)
+            stats["mode"] = int(series.value_counts().idxmax())
+            bin_counts = series.value_counts().sort_index()
+            min_val, max_val = int(values.min()), int(values.max())
+            bin_counts = bin_counts.reindex(range(min_val, max_val + 1), fill_value=0)
+            total = int(bin_counts.sum())
+            density_curve: dict | None = {
+                "points": [float(v) for v in bin_counts.index.tolist()],
+                "density": [float(c / total) for c in bin_counts.tolist()],
+            } if total > 0 else None
+        else:
+            kde = build_density_curve(values, vtype)
+            stats = _continuous_stats_exact(series[np.isfinite(series)], unique, kde)
+            density_curve = {"points": kde["points"], "density": kde["density"]} if kde else None
+        return {"type": "continuous", "observation_count": stats["count"], "stats": stats, "density_curve": density_curve}
+    if vtype == ValueType.NOMINAL:
+        series = df[variable_id].dropna()
+        if series.empty:
+            return None
+        raw_counts: Counter = Counter(int(float(v)) for v in series)
+        summary, distribution = _nominal_stats(raw_counts, unique)
+        return {"type": "nominal", "observation_count": summary["total_samples"], "summary": summary, "distribution": distribution}
+    return None
 
 
 def _write_index_from_df(taxon_dir: Path, df: pd.DataFrame) -> None:

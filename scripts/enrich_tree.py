@@ -81,15 +81,12 @@ def _missing_rows_for_taxon(taxon: TaxonRecord, layer_ids: list[str]) -> pa.Tabl
     if any(col not in df.columns for col in _REQUIRED_COLS):
         return None
     _drop_stale_gis_columns(df, layer_ids, data_path)
-    missing = [lid for lid in layer_ids if lid not in df.columns]
-    if not missing:
-        return None
     return pa.table({
         "catalogNumber": pa.array(df["catalogNumber"].astype(str).tolist(), type=pa.string()),
         "hilbertIdx":    pa.array(df["hilbertIdx"].to_numpy(),              type=pa.int32()),
         "decimalLatitude":  pa.array(df["decimalLatitude"].to_numpy(),      type=pa.float64()),
         "decimalLongitude": pa.array(df["decimalLongitude"].to_numpy(),     type=pa.float64()),
-        "missingLayers": pa.array([missing] * len(df),                      type=pa.list_(pa.string())),
+        "missingLayers": pa.array([layer_ids] * len(df),                    type=pa.list_(pa.string())),
         "taxonKey":  pa.array([taxon["taxon_key"]] * len(df),               type=pa.string()),
         "dataPath":  pa.array([str(data_path)] * len(df),                   type=pa.string()),
     })
@@ -261,9 +258,6 @@ def main() -> None:
         batch_count += 1
         print(f"[worklist] processing batch {batch_count}")
         _process_batch(batch, layers)
-    if batch_count == 0:
-        print("All taxa already populated with GIS data.")
-        return
     print("Completed GIS enrichment.")
 
 

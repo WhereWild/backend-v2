@@ -40,11 +40,15 @@ def clear_lru_caches():
     taxa.load_catalog.cache_clear()
     taxa.load_name_index.cache_clear()
     taxa._slug_index.cache_clear()
+    taxa._path_index.cache_clear()
+    taxa._children_index.cache_clear()
     yield
     taxa._load_payload.cache_clear()
     taxa.load_catalog.cache_clear()
     taxa.load_name_index.cache_clear()
     taxa._slug_index.cache_clear()
+    taxa._path_index.cache_clear()
+    taxa._children_index.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -230,3 +234,115 @@ def test_adjust_score_below_min():
     # raw=40 + exact boost=20 = 60, still below single-token minimum of 70
     score = taxa._adjust_score("opuntia", "opuntia", ["opuntia"], 40.0)
     assert score is None
+
+
+# ---------------------------------------------------------------------------
+# _path_index / _children_index / get_children / iter_descendants
+# (uses a catalog with proper slash-delimited paths)
+# ---------------------------------------------------------------------------
+
+_TREE_CATALOG = {
+    "1": {
+        "taxon_key": "1",
+        "path": "Plantae_1",
+        "scientific_name": "Plantae",
+        "common_name": "",
+        "rank": "KINGDOM",
+    },
+    "2": {
+        "taxon_key": "2",
+        "path": "Plantae_1/Opuntia_2",
+        "scientific_name": "Opuntia",
+        "common_name": "",
+        "rank": "GENUS",
+    },
+    "3": {
+        "taxon_key": "3",
+        "path": "Plantae_1/Opuntia_2/Opuntia_humifusa_3",
+        "scientific_name": "Opuntia humifusa",
+        "common_name": "devil's tongue",
+        "rank": "SPECIES",
+    },
+    "4": {
+        "taxon_key": "4",
+        "path": "Plantae_1/Opuntia_2/Opuntia_ficus-indica_4",
+        "scientific_name": "Opuntia ficus-indica",
+        "common_name": "prickly pear",
+        "rank": "SPECIES",
+    },
+}
+_TREE_PAYLOAD = {"catalog": _TREE_CATALOG, "combined_name_index": {}}
+
+
+@pytest.fixture
+def tree_catalog():
+    """Swap catalog to one with proper parent-child paths."""
+    with patch.object(taxa, "_load_payload", return_value=_TREE_PAYLOAD):
+        taxa.load_catalog.cache_clear()
+        taxa._path_index.cache_clear()
+        taxa._children_index.cache_clear()
+        yield
+        taxa.load_catalog.cache_clear()
+        taxa._path_index.cache_clear()
+        taxa._children_index.cache_clear()
+
+
+def test_path_index_maps_all_paths(tree_catalog):
+    idx = taxa._path_index()
+    assert idx["Plantae_1"] == "1"
+    assert idx["Plantae_1/Opuntia_2"] == "2"
+    assert idx["Plantae_1/Opuntia_2/Opuntia_humifusa_3"] == "3"
+
+
+def test_children_index_genus_has_two_species(tree_catalog):
+    idx = taxa._children_index()
+    assert set(idx["2"]) == {"3", "4"}
+
+
+def test_children_index_root_has_one_child(tree_catalog):
+    idx = taxa._children_index()
+    assert idx["1"] == ["2"]
+
+
+def test_children_index_leaf_not_in_index(tree_catalog):
+    idx = taxa._children_index()
+    assert "3" not in idx
+    assert "4" not in idx
+
+
+def test_get_children_returns_records(tree_catalog):
+    children = taxa.get_children("2")
+    keys = {c["taxon_key"] for c in children}
+    assert keys == {"3", "4"}
+
+
+def test_get_children_no_children(tree_catalog):
+    assert taxa.get_children("3") == []
+
+
+def test_get_children_unknown_key(tree_catalog):
+    assert taxa.get_children("9999") == []
+
+
+def test_iter_descendants_include_self(tree_catalog):
+    root = _TREE_CATALOG["1"]
+    keys = {t["taxon_key"] for t in taxa.iter_descendants(root, include_self=True)}
+    assert keys == {"1", "2", "3", "4"}
+
+
+def test_iter_descendants_exclude_self(tree_catalog):
+    root = _TREE_CATALOG["1"]
+    keys = {t["taxon_key"] for t in taxa.iter_descendants(root, include_self=False)}
+    assert keys == {"2", "3", "4"}
+
+
+def test_iter_descendants_leaf_only_self(tree_catalog):
+    leaf = _TREE_CATALOG["3"]
+    keys = {t["taxon_key"] for t in taxa.iter_descendants(leaf, include_self=True)}
+    assert keys == {"3"}
+
+
+def test_iter_descendants_subtree(tree_catalog):
+    genus = _TREE_CATALOG["2"]
+    keys = {t["taxon_key"] for t in taxa.iter_descendants(genus, include_self=True)}
+    assert keys == {"2", "3", "4"}

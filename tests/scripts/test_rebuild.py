@@ -20,6 +20,12 @@ def patch_enrich_tree():
         yield
 
 
+@pytest.fixture(autouse=True)
+def patch_process_tree():
+    with patch("scripts.process_tree.main"):
+        yield
+
+
 def _pipeline(tmp_path) -> dict:
     return json.loads((tmp_path / "data" / "sync_state.json").read_text())["pipeline"]
 
@@ -215,17 +221,18 @@ def test_main_full_pipeline_completes(tmp_path):
          patch("scripts.rebuild._run_download_gis", side_effect=lambda: call_order.append("download_gis")), \
          patch("scripts.gis.build_overviews.main", side_effect=lambda: call_order.append("build_overviews")), \
          patch("scripts.enrich_tree.main", side_effect=lambda: call_order.append("enrich_tree")), \
+         patch("scripts.process_tree.main", side_effect=lambda: call_order.append("process_tree")), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"), \
          patch("scripts.rebuild.notify") as mock_notify:
         rebuild.main()
 
-    assert call_order == ["wipe", "tree", "maps", "polish", "populate", "download_gis", "build_overviews", "enrich_tree"]
+    assert call_order == ["wipe", "tree", "maps", "polish", "populate", "download_gis", "build_overviews", "enrich_tree", "process_tree"]
     p = _pipeline(tmp_path)
     assert p["status"] == "completed"
     assert all(p["stages"][s]["status"] == "completed"
                for s in ["sync_gbif", "build_tree", "build_id_maps", "polish_tree", "populate_tree",
-                         "download_gis", "build_overviews", "enrich_tree"])
+                         "download_gis", "build_overviews", "enrich_tree", "process_tree"])
     assert p["error"] is None
     mock_notify.assert_called_once()
     event, payload = mock_notify.call_args[0]

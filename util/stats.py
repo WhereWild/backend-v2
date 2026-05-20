@@ -407,6 +407,103 @@ def _process_species(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
     _process_leaf_df(taxon_dir, df, layer_meta)
 
 
+def collect_taxon_df(taxon: TaxonRecord) -> pd.DataFrame | None:
+    """Quality-filtered occurrence DataFrame for a taxon, deduped by catalogNumber.
+
+    Leaf (subspecies/variety): reads own occurrence file only.
+    Species: reads self + descendants (include_self=True), deduplicates.
+    Non-leaf: reads all descendants (include_self=False), deduplicates.
+    """
+    rank = taxon["rank"]
+    taxon_dir = TREE_ROOT / taxon["path"]
+    if rank in CONFIG.subspecies_equivalents:
+        occ_path = taxon_dir / OCCURRENCE_FILE
+        if not occ_path.exists():
+            return None
+        table = pq.read_table(occ_path)
+        if table.num_rows == 0:
+            return None
+        df = _filter_df(table.to_pandas())
+        return df if not df.empty else None
+    include_self = rank == CONFIG.species_rank
+    frames: list[pd.DataFrame] = []
+    seen: set[str] = set()
+    for desc in iter_descendants(taxon, include_self=include_self):
+        occ_path = TREE_ROOT / desc["path"] / OCCURRENCE_FILE
+        if not occ_path.exists():
+            continue
+        table = pq.read_table(occ_path)
+        if table.num_rows == 0:
+            continue
+        df = _filter_df(table.to_pandas())
+        if df.empty:
+            continue
+        new = df[~df["catalogNumber"].astype(str).isin(seen)]
+        seen.update(new["catalogNumber"].astype(str).tolist())
+        frames.append(new)
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True)
+
+
+def compute_location_filtered_stats(
+    taxon: TaxonRecord,
+    variable_id: str,
+    filter_col: str,
+    gid: str,
+    layer: dict,
+) -> dict | None:
+    """Compute stats on the fly for variable_id, restricted to observations where filter_col == gid."""
+    df = collect_taxon_df(taxon)
+    if df is None:
+        return None
+    if filter_col not in df.columns:
+        return None
+    df = df[df[filter_col].astype(str) == str(gid)]
+    if df.empty:
+        return None
+    if variable_id not in df.columns:
+        return None
+    vtype = _layer_value_type(layer)
+    if vtype is None:
+        return None
+    unique = int(df[df[variable_id].notna()]["catalogNumber"].nunique())
+    match vtype:
+        case ValueType.RATIO | ValueType.INTERVAL:
+            series = pd.to_numeric(df[variable_id], errors="coerce").dropna()
+            if series.empty:
+                return None
+            values = series.to_numpy(dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                return None
+            if _is_discrete(layer):
+                stats = _continuous_stats_exact(series[np.isfinite(series)], unique, None)
+                stats["mode"] = int(series.value_counts().idxmax())
+                bin_counts = series.value_counts().sort_index()
+                min_val, max_val = int(values.min()), int(values.max())
+                bin_counts = bin_counts.reindex(range(min_val, max_val + 1), fill_value=0)
+                total = int(bin_counts.sum())
+                density_curve: dict | None = {
+                    "points": [float(v) for v in bin_counts.index.tolist()],
+                    "density": [float(c / total) for c in bin_counts.tolist()],
+                } if total > 0 else None
+            else:
+                kde = build_density_curve(values, vtype)
+                stats = _continuous_stats_exact(series[np.isfinite(series)], unique, kde)
+                density_curve = {"points": kde["points"], "density": kde["density"]} if kde else None
+            return {"type": "continuous", "observation_count": stats["count"], "stats": stats, "density_curve": density_curve}
+        case ValueType.NOMINAL:
+            series = df[variable_id].dropna()
+            if series.empty:
+                return None
+            raw_counts: Counter = Counter(int(float(v)) for v in series)
+            summary, distribution = _nominal_stats(raw_counts, unique)
+            return {"type": "nominal", "observation_count": summary["total_samples"], "summary": summary, "distribution": distribution}
+        case _:
+            return None
+
+
 def _write_index_from_df(taxon_dir: Path, df: pd.DataFrame) -> None:
     """Write occurrence_index.parquet from an already-filtered DataFrame."""
     idx = df.drop(columns=[c for c in _INDEX_STRIP_COLS if c in df.columns])

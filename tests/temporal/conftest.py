@@ -203,7 +203,13 @@ def fixture_store(request: pytest.FixtureRequest) -> dict[str, dict[str, Any]]:
     """
     force = request.config.getoption("--regenerate-fixtures")
     if force or _missing_fixtures():
-        regenerate_fixtures()
+        try:
+            regenerate_fixtures()
+        except Exception as exc:
+            # Network unavailable (e.g. CI runners) — tests that need fixtures
+            # will be skipped via require_fixtures.
+            print(f"\n[fixtures] fetch failed ({exc}); tests requiring live data will be skipped.")
+            return load_fixtures()
     return load_fixtures()
 
 

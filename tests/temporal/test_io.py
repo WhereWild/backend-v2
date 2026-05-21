@@ -17,6 +17,7 @@ import pytest
 
 import util.temporal as tm
 from util.temporal import (
+    ELEVATION_CORRECTABLE_VARS,
     ChunkIndex,
     ChunkRange,
     _download_chunk,
@@ -24,6 +25,7 @@ from util.temporal import (
     _grid_indices_batch,
     _open_s3_json,
     _parse_s3_time,
+    _read_model_elevation,
     build_chunk_index,
     build_occ_index,
     load_temporal_layers,
@@ -507,3 +509,128 @@ class TestMapToWorklist:
         result = map_to_worklist(empty, index, "lat_asc_lon_pm180", 0.25)
         assert result.num_rows == 0
         assert "chunk_num" in result.column_names
+        assert "elevation" in result.column_names
+
+
+# ---------------------------------------------------------------------------
+# Elevation correction infrastructure
+# ---------------------------------------------------------------------------
+
+class TestBuildOccIndexElevation:
+    def _node(self, path):
+        return {"taxon_key": "1", "path": str(path), "scientific_name": "X",
+                "common_name": "", "rank": "SPECIES"}
+
+    def test_elevation_nan_when_column_absent(self, tmp_path, monkeypatch):
+        pq.write_table(pa.table({
+            "decimalLatitude": pa.array([52.52], type=pa.float64()),
+            "decimalLongitude": pa.array([13.40], type=pa.float64()),
+            "eventTimestamp": pa.array([1_000_000.0], type=pa.float64()),
+        }), tmp_path / "occurrence.parquet")
+        node = self._node(tmp_path)
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
+        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
+        result = build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        assert "elevation" in result.column_names
+        assert np.isnan(result["elevation"][0].as_py())
+
+    def test_elevation_read_when_column_present(self, tmp_path, monkeypatch):
+        pq.write_table(pa.table({
+            "decimalLatitude": pa.array([52.52], type=pa.float64()),
+            "decimalLongitude": pa.array([13.40], type=pa.float64()),
+            "eventTimestamp": pa.array([1_000_000.0], type=pa.float64()),
+            "elevation": pa.array([420.0], type=pa.float64()),
+        }), tmp_path / "occurrence.parquet")
+        node = self._node(tmp_path)
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
+        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
+        result = build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        assert result["elevation"][0].as_py() == pytest.approx(420.0)
+
+    def test_empty_result_has_elevation_column(self, tmp_path, monkeypatch):
+        node = self._node(tmp_path)
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
+        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
+        result = build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        assert "elevation" in result.column_names
+
+
+class TestMapToWorklistElevation:
+    def _make_occ(self, elev=None):
+        d = {
+            "taxon_path": pa.array(["/a.parquet"], type=pa.string()),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "latitude": pa.array([52.0], type=pa.float64()),
+            "longitude": pa.array([13.0], type=pa.float64()),
+            "timestamp": pa.array([3600.0], type=pa.float64()),
+        }
+        if elev is not None:
+            d["elevation"] = pa.array([elev], type=pa.float64())
+        return pa.table(d)
+
+    def _index(self):
+        entry = ChunkRange(chunk_num=0, start=0, end=7200, time_len=2, source="chunk")
+        return ChunkIndex(latest_end_time=7200, resolution=3600, ranges=[entry])
+
+    def test_elevation_passed_through(self):
+        result = map_to_worklist(self._make_occ(elev=500.0), self._index(), "lat_asc_lon_pm180", 0.25)
+        assert "elevation" in result.column_names
+        assert result["elevation"][0].as_py() == pytest.approx(500.0)
+
+    def test_elevation_nan_when_absent(self):
+        result = map_to_worklist(self._make_occ(), self._index(), "lat_asc_lon_pm180", 0.25)
+        assert "elevation" in result.column_names
+        assert np.isnan(result["elevation"][0].as_py())
+
+
+class TestReadModelElevation:
+    def test_returns_nan_on_s3_failure(self, monkeypatch):
+        monkeypatch.setitem(tm._MODEL_ELEV_CACHE, "bad_model", None)
+        # Clear so it tries to load
+        tm._MODEL_ELEV_CACHE.pop("bad_model", None)
+        import fsspec as _fsspec
+        monkeypatch.setattr(_fsspec, "open", lambda *a, **kw: (_ for _ in ()).throw(OSError("no s3")))
+        result = _read_model_elevation("bad_model", np.array([0]), np.array([0]))
+        assert np.isnan(result[0])
+
+    def test_uses_cached_grid(self, monkeypatch):
+        grid = np.array([[100.0, 200.0], [300.0, 400.0]])
+        tm._MODEL_ELEV_CACHE["test_model"] = grid
+        result = _read_model_elevation("test_model", np.array([0, 1]), np.array([1, 0]))
+        assert result[0] == pytest.approx(200.0)
+        assert result[1] == pytest.approx(300.0)
+        tm._MODEL_ELEV_CACHE.pop("test_model")
+
+    def test_nodata_masked_at_load_time(self, monkeypatch):
+        # Simulate loading a grid that contains -999 nodata values from S3.
+        # _read_model_elevation must mask them to NaN before caching.
+        raw_grid = np.array([[-999.0, 50.0]])
+        mock_reader = MagicMock()
+        mock_reader.__getitem__ = MagicMock(return_value=raw_grid)
+        mock_reader.__enter__ = lambda s: mock_reader
+        mock_reader.__exit__ = MagicMock(return_value=False)
+        import fsspec as _fsspec
+        monkeypatch.setattr(_fsspec, "open", lambda *a, **kw: mock_reader)
+        monkeypatch.setattr(tm, "OmFileReader", lambda fh: mock_reader)
+        tm._MODEL_ELEV_CACHE.pop("nodata_load_model", None)
+        result = _read_model_elevation("nodata_load_model", np.array([0, 0]), np.array([0, 1]))
+        assert np.isnan(result[0])
+        assert result[1] == pytest.approx(50.0)
+        tm._MODEL_ELEV_CACHE.pop("nodata_load_model", None)
+
+
+class TestElevationCorrectableVars:
+    def test_temperature_2m_in_set(self):
+        assert "temperature_2m" in ELEVATION_CORRECTABLE_VARS
+
+    def test_dew_point_in_set(self):
+        assert "dew_point_2m" in ELEVATION_CORRECTABLE_VARS
+
+    def test_soil_temperatures_in_set(self):
+        assert "soil_temperature_0_to_7cm" in ELEVATION_CORRECTABLE_VARS
+
+    def test_precipitation_not_in_set(self):
+        assert "precipitation" not in ELEVATION_CORRECTABLE_VARS
+
+    def test_cloud_cover_not_in_set(self):
+        assert "cloud_cover" not in ELEVATION_CORRECTABLE_VARS

@@ -956,7 +956,7 @@
         {
           "id": "dew_point_2m",
           "source": "open_meteo",
-          "model": "copernicus_era5",
+          "model": "copernicus_era5_land",
           "grid_mode": "lat_asc_lon_pm180",
           "display_name": "Dew Point (2m)",
           "units": "°C",
@@ -1024,7 +1024,7 @@
         {
           "id": "soil_temperature_0_to_7cm",
           "source": "open_meteo",
-          "model": "copernicus_era5",
+          "model": "copernicus_era5_land",
           "grid_mode": "lat_asc_lon_pm180",
           "display_name": "Soil Temperature (0–7cm)",
           "units": "°C",
@@ -1041,7 +1041,7 @@
         {
           "id": "soil_moisture_0_to_7cm",
           "source": "open_meteo",
-          "model": "copernicus_era5",
+          "model": "copernicus_era5_land",
           "grid_mode": "lat_asc_lon_pm180",
           "display_name": "Soil Moisture (0–7cm)",
           "units": "m³/m³",

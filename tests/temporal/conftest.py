@@ -215,7 +215,13 @@ def fixture_store(request: pytest.FixtureRequest) -> dict[str, dict[str, Any]]:
 
 @pytest.fixture(scope="session")
 def require_fixtures(fixture_store: dict[str, dict]) -> dict[str, dict]:
-    """Like fixture_store but skips the test if fixtures couldn't be loaded."""
-    if not fixture_store:
-        pytest.skip("Fixture data could not be loaded (fetch may have failed).")
+    """Like fixture_store but skips the test if any fixtures couldn't be loaded."""
+    expected = {
+        f"{loc['name']}_{label}"
+        for loc in TEST_LOCATIONS
+        for label, _, _ in FETCH_RANGES
+    }
+    missing = expected - fixture_store.keys()
+    if missing:
+        pytest.skip(f"Fixture data incomplete ({len(missing)} missing); skipping live-data tests.")
     return fixture_store

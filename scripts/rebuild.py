@@ -31,6 +31,7 @@ from pathlib import Path
 import httpx
 
 import scripts.build_tree as build_tree
+import scripts.enrich_temporal as enrich_temporal
 import scripts.enrich_tree as enrich_tree
 import scripts.gis.build_overviews as build_overviews
 import scripts.gis.process_gadm as process_gadm
@@ -240,11 +241,10 @@ def main() -> None:
         enrich_tree.main()
         _set_stage("enrich_tree", "completed")
 
-        # enrich_temporal temporarily disabled for debugging
-        # print("\n--- Enriching tree (temporal ERA5 weather) ---")
-        # _set_stage("enrich_temporal", "in_progress")
-        # enrich_temporal.main()
-        # _set_stage("enrich_temporal", "completed")
+        print("\n--- Enriching tree (temporal ERA5 weather) ---")
+        _set_stage("enrich_temporal", "in_progress")
+        enrich_temporal.main()
+        _set_stage("enrich_temporal", "completed")
 
         print("\n--- Processing tree (summary stats + KDE) ---")
         _set_stage("process_tree", "in_progress")

@@ -930,121 +930,118 @@ def process_chunk(
     max_window_steps = max(steps.values()) if steps else 0
 
     local_path = _download_chunk(chunk_entry, model, variable, cache_dir)
-    try:
-        reader = OmFileReader(str(local_path))
-        ny, nx, _ = reader.shape
+    reader = OmFileReader(str(local_path))
+    ny, nx, _ = reader.shape
 
-        data = worklist_slice.to_pydict()
-        lat = np.asarray(data["lat_idx"], dtype=np.int32)
-        lon = np.asarray(data["lon_idx"], dtype=np.int32)
-        time_idx = np.asarray(data["time_idx"], dtype=np.int32)
-        taxon_path = np.asarray(data["taxon_path"])
-        row_idx = np.asarray(data["row_idx"], dtype=np.int64)
-        obs_elev = np.asarray(
-            data.get("elevation", np.full(len(lat), np.nan)), dtype=np.float64
+    data = worklist_slice.to_pydict()
+    lat = np.asarray(data["lat_idx"], dtype=np.int32)
+    lon = np.asarray(data["lon_idx"], dtype=np.int32)
+    time_idx = np.asarray(data["time_idx"], dtype=np.int32)
+    taxon_path = np.asarray(data["taxon_path"])
+    row_idx = np.asarray(data["row_idx"], dtype=np.int64)
+    obs_elev = np.asarray(
+        data.get("elevation", np.full(len(lat), np.nan)), dtype=np.float64
+    )
+
+    # Re-clamp grid indices to actual file dimensions
+    lat = np.clip(lat, 0, ny - 1)
+    lon = np.clip(lon, 0, nx - 1)
+
+    # Elevation correction: compute per-observation offset upfront.
+    # No-op while obs_elev is all-NaN (DEM pipeline not yet built).
+    do_elev = variable in ELEVATION_CORRECTABLE_VARS
+    elev_correction: np.ndarray | None = None
+    if do_elev and np.isfinite(obs_elev).any():
+        model_elev = _read_model_elevation(model, lat, lon)
+        raw_corr = (model_elev - obs_elev) * _LAPSE_RATE
+        elev_correction = np.where(np.isfinite(raw_corr), raw_corr, 0.0)
+
+    # Sort by (lat, lon) to process one grid cell at a time
+    order = np.lexsort((lon, lat))
+    lat = lat[order]
+    lon = lon[order]
+    time_idx = time_idx[order]
+    taxon_path = taxon_path[order]
+    row_idx = row_idx[order]
+    if elev_correction is not None:
+        elev_correction = elev_correction[order]
+
+    change = np.empty(len(lat), dtype=bool)
+    change[0] = True
+    change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
+    group_starts = np.flatnonzero(change)
+    group_ends = np.append(group_starts[1:], len(lat))
+
+    updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+    new_tail: TailBuffer = {}
+
+    for s, e in zip(group_starts, group_ends):
+        li = int(lat[s])
+        lo = int(lon[s])
+
+        try:
+            series = np.asarray(reader[li, lo, :], dtype=np.float64)
+        except Exception:
+            continue
+        if series.size == 0:
+            continue
+
+        # Save tail from current chunk for next chunk's boundary handling
+        if max_window_steps > 0:
+            new_tail[(li, lo)] = series[-max_window_steps:].copy()
+
+        # Prepend previous chunk's tail if observations near chunk start
+        time_slice = time_idx[s:e]
+        prev_tail = tail_buffer.get((li, lo))
+        prev_len = 0
+
+        if prev_tail is not None and max_window_steps > 1:
+            min_t = int(time_slice.min())
+            need = (max_window_steps - 1) - min_t
+            if need > 0:
+                prev_len = min(int(need), len(prev_tail))
+                series = np.concatenate([prev_tail[-prev_len:], series])
+
+        # Narrow the series slice to only what the windows need
+        min_t = int(time_slice.min())
+        max_t = int(time_slice.max())
+        slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
+        slice_end = min(series.size - 1, max_t + prev_len)
+        series_slice = series[slice_start : slice_end + 1]
+        local_time = np.clip(
+            (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
         )
 
-        # Re-clamp grid indices to actual file dimensions
-        lat = np.clip(lat, 0, ny - 1)
-        lon = np.clip(lon, 0, nx - 1)
-
-        # Elevation correction: compute per-observation offset upfront.
-        # No-op while obs_elev is all-NaN (DEM pipeline not yet built).
-        do_elev = variable in ELEVATION_CORRECTABLE_VARS
-        elev_correction: np.ndarray | None = None
-        if do_elev and np.isfinite(obs_elev).any():
-            model_elev = _read_model_elevation(model, lat, lon)
-            raw_corr = (model_elev - obs_elev) * _LAPSE_RATE
-            elev_correction = np.where(np.isfinite(raw_corr), raw_corr, 0.0)
-
-        # Sort by (lat, lon) to process one grid cell at a time
-        order = np.lexsort((lon, lat))
-        lat = lat[order]
-        lon = lon[order]
-        time_idx = time_idx[order]
-        taxon_path = taxon_path[order]
-        row_idx = row_idx[order]
-        if elev_correction is not None:
-            elev_correction = elev_correction[order]
-
-        change = np.empty(len(lat), dtype=bool)
-        change[0] = True
-        change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
-        group_starts = np.flatnonzero(change)
-        group_ends = np.append(group_starts[1:], len(lat))
-
-        updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
-        new_tail: TailBuffer = {}
-
-        for s, e in zip(group_starts, group_ends):
-            li = int(lat[s])
-            lo = int(lon[s])
-
-            try:
-                series = np.asarray(reader[li, lo, :], dtype=np.float64)
-            except Exception:
+        # Cap observations that fall in a trailing NaN zone (e.g. ERA5 processing lag)
+        # to the last valid timestep so they receive data instead of NaN.
+        if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
+            finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
+            if finite_in_slice.size == 0:
                 continue
-            if series.size == 0:
-                continue
+            last_valid = int(finite_in_slice[-1])
+            local_time = np.minimum(local_time, last_valid)
 
-            # Save tail from current chunk for next chunk's boundary handling
-            if max_window_steps > 0:
-                new_tail[(li, lo)] = series[-max_window_steps:].copy()
+        window_sums, window_counts = window_stats_batch(series_slice, local_time, steps)
 
-            # Prepend previous chunk's tail if observations near chunk start
-            time_slice = time_idx[s:e]
-            prev_tail = tail_buffer.get((li, lo))
-            prev_len = 0
-
-            if prev_tail is not None and max_window_steps > 1:
-                min_t = int(time_slice.min())
-                need = (max_window_steps - 1) - min_t
-                if need > 0:
-                    prev_len = min(int(need), len(prev_tail))
-                    series = np.concatenate([prev_tail[-prev_len:], series])
-
-            # Narrow the series slice to only what the windows need
-            min_t = int(time_slice.min())
-            max_t = int(time_slice.max())
-            slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
-            slice_end = min(series.size - 1, max_t + prev_len)
-            series_slice = series[slice_start : slice_end + 1]
-            local_time = np.clip(
-                (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
-            )
-
-            # Cap observations that fall in a trailing NaN zone (e.g. ERA5 processing lag)
-            # to the last valid timestep so they receive data instead of NaN.
-            if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
-                finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
-                if finite_in_slice.size == 0:
-                    continue
-                last_valid = int(finite_in_slice[-1])
-                local_time = np.minimum(local_time, last_valid)
-
-            window_sums, window_counts = window_stats_batch(series_slice, local_time, steps)
-
-            paths_slice = taxon_path[s:e]
-            rows_slice = row_idx[s:e]
-            corr_slice = elev_correction[s:e] if elev_correction is not None else None
-            for tpath in np.unique(paths_slice):
-                mask = paths_slice == tpath
-                row_ids = rows_slice[mask]
-                for hours, sums in window_sums.items():
-                    cnts = window_counts[hours]
-                    if agg_mode == "sum":
-                        values = np.where(cnts > 0, sums, np.nan)
-                    else:
-                        values = np.full_like(sums, np.nan, dtype=np.float64)
-                        np.divide(sums, cnts, out=values, where=cnts > 0)
-                        if corr_slice is not None:
-                            values = values + corr_slice
-                    col = f"{variable}_{agg_mode}_{hours}h"
-                    updates.setdefault(str(tpath), {}).setdefault(col, []).append(
-                        (row_ids, values[mask])
-                    )
-    finally:
-        local_path.unlink(missing_ok=True)
+        paths_slice = taxon_path[s:e]
+        rows_slice = row_idx[s:e]
+        corr_slice = elev_correction[s:e] if elev_correction is not None else None
+        for tpath in np.unique(paths_slice):
+            mask = paths_slice == tpath
+            row_ids = rows_slice[mask]
+            for hours, sums in window_sums.items():
+                cnts = window_counts[hours]
+                if agg_mode == "sum":
+                    values = np.where(cnts > 0, sums, np.nan)
+                else:
+                    values = np.full_like(sums, np.nan, dtype=np.float64)
+                    np.divide(sums, cnts, out=values, where=cnts > 0)
+                    if corr_slice is not None:
+                        values = values + corr_slice
+                col = f"{variable}_{agg_mode}_{hours}h"
+                updates.setdefault(str(tpath), {}).setdefault(col, []).append(
+                    (row_ids, values[mask])
+                )
 
     return updates, new_tail
 
@@ -1068,117 +1065,112 @@ def process_chunk_mode(
     """
     max_window_steps = max(steps.values()) if steps else 0
 
-    local_paths: list[Path] = []
-    try:
-        for var in source_variables:
-            local_paths.append(_download_chunk(chunk_entry, model, var, cache_dir))
+    local_paths: list[Path] = [
+        _download_chunk(chunk_entry, model, var, cache_dir) for var in source_variables
+    ]
+    readers = [OmFileReader(str(p)) for p in local_paths]
+    ny, nx, _ = readers[0].shape
 
-        readers = [OmFileReader(str(p)) for p in local_paths]
-        ny, nx, _ = readers[0].shape
+    data = worklist_slice.to_pydict()
+    lat = np.asarray(data["lat_idx"], dtype=np.int32)
+    lon = np.asarray(data["lon_idx"], dtype=np.int32)
+    time_idx = np.asarray(data["time_idx"], dtype=np.int32)
+    taxon_path = np.asarray(data["taxon_path"])
+    row_idx = np.asarray(data["row_idx"], dtype=np.int64)
+    obs_elev = np.asarray(
+        data.get("elevation", np.full(len(lat), np.nan)), dtype=np.float64
+    )
 
-        data = worklist_slice.to_pydict()
-        lat = np.asarray(data["lat_idx"], dtype=np.int32)
-        lon = np.asarray(data["lon_idx"], dtype=np.int32)
-        time_idx = np.asarray(data["time_idx"], dtype=np.int32)
-        taxon_path = np.asarray(data["taxon_path"])
-        row_idx = np.asarray(data["row_idx"], dtype=np.int64)
-        obs_elev = np.asarray(
-            data.get("elevation", np.full(len(lat), np.nan)), dtype=np.float64
-        )
+    lat = np.clip(lat, 0, ny - 1)
+    lon = np.clip(lon, 0, nx - 1)
 
-        lat = np.clip(lat, 0, ny - 1)
-        lon = np.clip(lon, 0, nx - 1)
+    # Per-observation temperature correction (no-op until DEM pipeline populates elevation).
+    temp_var_idx = next(
+        (i for i, v in enumerate(source_variables) if v in ELEVATION_CORRECTABLE_VARS), None
+    )
+    elev_correction: np.ndarray | None = None
+    if temp_var_idx is not None and np.isfinite(obs_elev).any():
+        model_elev = _read_model_elevation(model, lat, lon)
+        raw_corr = (model_elev - obs_elev) * _LAPSE_RATE
+        elev_correction = np.where(np.isfinite(raw_corr), raw_corr, 0.0)
 
-        # Per-observation temperature correction (no-op until DEM pipeline populates elevation).
-        temp_var_idx = next(
-            (i for i, v in enumerate(source_variables) if v in ELEVATION_CORRECTABLE_VARS), None
-        )
-        elev_correction: np.ndarray | None = None
-        if temp_var_idx is not None and np.isfinite(obs_elev).any():
-            model_elev = _read_model_elevation(model, lat, lon)
-            raw_corr = (model_elev - obs_elev) * _LAPSE_RATE
-            elev_correction = np.where(np.isfinite(raw_corr), raw_corr, 0.0)
+    order = np.lexsort((lon, lat))
+    lat, lon = lat[order], lon[order]
+    time_idx = time_idx[order]
+    taxon_path, row_idx = taxon_path[order], row_idx[order]
+    if elev_correction is not None:
+        elev_correction = elev_correction[order]
 
-        order = np.lexsort((lon, lat))
-        lat, lon = lat[order], lon[order]
-        time_idx = time_idx[order]
-        taxon_path, row_idx = taxon_path[order], row_idx[order]
-        if elev_correction is not None:
-            elev_correction = elev_correction[order]
+    change = np.empty(len(lat), dtype=bool)
+    change[0] = True
+    change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
+    group_starts = np.flatnonzero(change)
+    group_ends = np.append(group_starts[1:], len(lat))
 
-        change = np.empty(len(lat), dtype=bool)
-        change[0] = True
-        change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
-        group_starts = np.flatnonzero(change)
-        group_ends = np.append(group_starts[1:], len(lat))
+    updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+    new_tail: TailBuffer = {}
 
-        updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
-        new_tail: TailBuffer = {}
+    for s, e in zip(group_starts, group_ends):
+        li, lo = int(lat[s]), int(lon[s])
 
-        for s, e in zip(group_starts, group_ends):
-            li, lo = int(lat[s]), int(lon[s])
+        try:
+            raw = [np.asarray(r[li, lo, :], dtype=np.float64) for r in readers]
+        except Exception:
+            continue
+        if any(a.size == 0 for a in raw):
+            continue
 
-            try:
-                raw = [np.asarray(r[li, lo, :], dtype=np.float64) for r in readers]
-            except Exception:
-                continue
-            if any(a.size == 0 for a in raw):
-                continue
+        # Pass temperature to weather_code_array, applying the median
+        # elevation correction for the cell.  Median is used because
+        # observations within a 0.25° cell may span different elevations.
+        temp_arr: np.ndarray | None = raw[temp_var_idx] if temp_var_idx is not None else None
+        if temp_arr is not None and elev_correction is not None:
+            cell_offset = float(np.median(elev_correction[s:e]))
+            temp_arr = temp_arr + cell_offset
 
-            # Pass temperature to weather_code_array, applying the median
-            # elevation correction for the cell.  Median is used because
-            # observations within a 0.25° cell may span different elevations.
-            temp_arr: np.ndarray | None = raw[temp_var_idx] if temp_var_idx is not None else None
-            if temp_arr is not None and elev_correction is not None:
-                cell_offset = float(np.median(elev_correction[s:e]))
-                temp_arr = temp_arr + cell_offset
+        derived = weather_code_array(raw[0], raw[1], raw[2], resolution, temp=temp_arr)
 
-            derived = weather_code_array(raw[0], raw[1], raw[2], resolution, temp=temp_arr)
+        if max_window_steps > 0:
+            new_tail[(li, lo)] = derived[-max_window_steps:].copy()
 
-            if max_window_steps > 0:
-                new_tail[(li, lo)] = derived[-max_window_steps:].copy()
-
-            time_slice = time_idx[s:e]
-            prev_tail = tail_buffer.get((li, lo))
-            prev_len = 0
-            if prev_tail is not None and max_window_steps > 1:
-                min_t = int(time_slice.min())
-                need = (max_window_steps - 1) - min_t
-                if need > 0:
-                    prev_len = min(int(need), len(prev_tail))
-                    derived = np.concatenate([prev_tail[-prev_len:], derived])
-
+        time_slice = time_idx[s:e]
+        prev_tail = tail_buffer.get((li, lo))
+        prev_len = 0
+        if prev_tail is not None and max_window_steps > 1:
             min_t = int(time_slice.min())
-            max_t = int(time_slice.max())
-            slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
-            slice_end = min(derived.size - 1, max_t + prev_len)
-            series_slice = derived[slice_start : slice_end + 1]
-            local_time = np.clip(
-                (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
-            )
+            need = (max_window_steps - 1) - min_t
+            if need > 0:
+                prev_len = min(int(need), len(prev_tail))
+                derived = np.concatenate([prev_tail[-prev_len:], derived])
 
-            if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
-                finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
-                if finite_in_slice.size == 0:
-                    continue
-                last_valid = int(finite_in_slice[-1])
-                local_time = np.minimum(local_time, last_valid)
+        min_t = int(time_slice.min())
+        max_t = int(time_slice.max())
+        slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
+        slice_end = min(derived.size - 1, max_t + prev_len)
+        series_slice = derived[slice_start : slice_end + 1]
+        local_time = np.clip(
+            (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
+        )
 
-            window_modes = _window_mode_batch(series_slice, local_time, steps)
+        if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
+            finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
+            if finite_in_slice.size == 0:
+                continue
+            last_valid = int(finite_in_slice[-1])
+            local_time = np.minimum(local_time, last_valid)
 
-            paths_slice = taxon_path[s:e]
-            rows_slice = row_idx[s:e]
-            for tpath in np.unique(paths_slice):
-                mask = paths_slice == tpath
-                rids = rows_slice[mask]
-                for hours, modes in window_modes.items():
-                    col = f"{col_prefix}_mode_{hours}h"
-                    updates.setdefault(str(tpath), {}).setdefault(col, []).append(
-                        (rids, modes[mask])
-                    )
-    finally:
-        for p in local_paths:
-            p.unlink(missing_ok=True)
+        window_modes = _window_mode_batch(series_slice, local_time, steps)
+
+        paths_slice = taxon_path[s:e]
+        rows_slice = row_idx[s:e]
+        for tpath in np.unique(paths_slice):
+            mask = paths_slice == tpath
+            rids = rows_slice[mask]
+            for hours, modes in window_modes.items():
+                col = f"{col_prefix}_mode_{hours}h"
+                updates.setdefault(str(tpath), {}).setdefault(col, []).append(
+                    (rids, modes[mask])
+                )
 
     return updates, new_tail
 

@@ -341,3 +341,11 @@ class TestMain:
                             lambda *a: (_ for _ in ()).throw(ValueError("not main thread")))
         self._patch_base(monkeypatch, tmp_path, _make_occ_table(0))
         et.main()  # must not propagate
+
+    def test_clear_cache_true_calls_cleanup(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(et, "CLEAR_CACHE", True)
+        self._patch_base(monkeypatch, tmp_path, _make_occ_table(0))
+        cleaned: list[str] = []
+        monkeypatch.setattr("scripts.enrich_temporal._cleanup_cache", lambda d: cleaned.append(d))
+        et.main()
+        assert len(cleaned) == 1

@@ -1065,6 +1065,11 @@ def process_chunk_mode(
     """
     max_window_steps = max(steps.values()) if steps else 0
 
+    _sv = source_variables
+    _cloud_idx  = _sv.index("cloud_cover")
+    _precip_idx = _sv.index("precipitation")
+    _snow_idx   = _sv.index("snowfall_water_equivalent")
+
     local_paths: list[Path] = [
         _download_chunk(chunk_entry, model, var, cache_dir) for var in source_variables
     ]
@@ -1128,7 +1133,7 @@ def process_chunk_mode(
             cell_offset = float(np.median(elev_correction[s:e]))
             temp_arr = temp_arr + cell_offset
 
-        derived = weather_code_array(raw[0], raw[1], raw[2], resolution, temp=temp_arr)
+        derived = weather_code_array(raw[_cloud_idx], raw[_precip_idx], raw[_snow_idx], resolution, temp=temp_arr)
 
         if max_window_steps > 0:
             new_tail[(li, lo)] = derived[-max_window_steps:].copy()

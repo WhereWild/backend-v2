@@ -220,6 +220,7 @@ def test_main_full_pipeline_completes(tmp_path):
          patch("scripts.rebuild._run_download_gis", side_effect=lambda: call_order.append("download_gis")), \
          patch("scripts.gis.build_overviews.main", side_effect=lambda: call_order.append("build_overviews")), \
          patch("scripts.enrich_tree.main", side_effect=lambda: call_order.append("enrich_tree")), \
+         patch("scripts.enrich_temporal.main", side_effect=lambda: call_order.append("enrich_temporal")), \
          patch("scripts.process_tree.main", side_effect=lambda: call_order.append("process_tree")), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"), \
@@ -228,7 +229,7 @@ def test_main_full_pipeline_completes(tmp_path):
 
     assert call_order == [
         "wipe", "tree", "populate",
-        "process_gadm", "download_gis", "build_overviews", "enrich_tree", "process_tree",
+        "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal", "process_tree",
     ]
     p = _pipeline(tmp_path)
     assert p["status"] == "completed"
@@ -236,7 +237,7 @@ def test_main_full_pipeline_completes(tmp_path):
         p["stages"][s]["status"] == "completed"
         for s in [
             "sync_gbif", "build_tree", "populate_tree",
-            "process_gadm", "download_gis", "build_overviews", "enrich_tree", "process_tree",
+            "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal", "process_tree",
         ]
     )
     assert p["error"] is None
@@ -261,6 +262,9 @@ def test_main_wipe_happens_before_sync_download(tmp_path):
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.enrich_tree.main"), \
+         patch("scripts.enrich_temporal.main"), \
+         patch("scripts.process_tree.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"):
         rebuild.main()
@@ -285,6 +289,9 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.enrich_tree.main"), \
+         patch("scripts.enrich_temporal.main"), \
+         patch("scripts.process_tree.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"):
         rebuild.main()
@@ -384,6 +391,9 @@ def test_main_inhibitor_released_on_success():
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.enrich_tree.main"), \
+         patch("scripts.enrich_temporal.main"), \
+         patch("scripts.process_tree.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=mock_proc), \
          patch("scripts.rebuild._release_inhibitor") as mock_release, \
          patch("scripts.rebuild.notify"):

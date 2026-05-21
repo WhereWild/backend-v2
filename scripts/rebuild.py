@@ -9,8 +9,9 @@ data directory (preserving sync_state.json) and runs the full pipeline:
   4. process_gadm  — download GADM GeoPackage + build location tables and catalog
   5. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
   6. build_overviews — build COG overviews for all GIS layers
-  7. enrich_tree   — sample GIS layer values into per-taxon occurrence parquets
-  8. process_tree  — compute per-taxon summary statistics and KDE density graphs
+  7. enrich_tree     — sample GIS layer values into per-taxon occurrence parquets
+  8. enrich_temporal — enrich occurrences with time-windowed ERA5 weather statistics
+  9. process_tree    — compute per-taxon summary statistics and KDE density graphs
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -30,6 +31,7 @@ from pathlib import Path
 import httpx
 
 import scripts.build_tree as build_tree
+import scripts.enrich_temporal as enrich_temporal
 import scripts.enrich_tree as enrich_tree
 import scripts.gis.build_overviews as build_overviews
 import scripts.gis.process_gadm as process_gadm
@@ -238,6 +240,11 @@ def main() -> None:
         _set_stage("enrich_tree", "in_progress")
         enrich_tree.main()
         _set_stage("enrich_tree", "completed")
+
+        print("\n--- Enriching tree (temporal ERA5 weather) ---")
+        _set_stage("enrich_temporal", "in_progress")
+        enrich_temporal.main()
+        _set_stage("enrich_temporal", "completed")
 
         print("\n--- Processing tree (summary stats + KDE) ---")
         _set_stage("process_tree", "in_progress")

@@ -165,7 +165,7 @@ def _occ_table_with_chunk() -> pa.Table:
 
 
 class _MockCfg:
-    root_taxon_id = "1"
+    plantae_key = 1
     data_root = "/data"
     occurrence_parquet_filename = "occurrence.parquet"
     temporal_min_year = 2000
@@ -200,6 +200,7 @@ class TestRunLayer:
                             lambda *a, **kw: _make_chunk_index())
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: _occ_table_with_chunk())
+        monkeypatch.setattr("scripts.enrich_temporal._download_layer_chunk", lambda *a, **kw: None)
         monkeypatch.setattr("scripts.enrich_temporal.process_chunk",
                             lambda *a, **kw: ({}, {}))
         monkeypatch.setattr("scripts.enrich_temporal.write_back", lambda *a, **kw: None)
@@ -213,6 +214,7 @@ class TestRunLayer:
                             lambda *a, **kw: _make_chunk_index())
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: _occ_table_with_chunk())
+        monkeypatch.setattr("scripts.enrich_temporal._download_layer_chunk", lambda *a, **kw: None)
 
         stop = threading.Event()
         stop.set()
@@ -230,6 +232,7 @@ class TestRunLayer:
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: _occ_table_with_chunk())
         mode_called = []
+        monkeypatch.setattr("scripts.enrich_temporal._download_layer_chunk", lambda *a, **kw: None)
         monkeypatch.setattr("scripts.enrich_temporal.process_chunk_mode",
                             lambda *a, **kw: (mode_called.append(1), ({}, {}))[-1])
         monkeypatch.setattr("scripts.enrich_temporal.write_back", lambda *a, **kw: None)
@@ -241,6 +244,7 @@ class TestRunLayer:
                             lambda *a, **kw: _make_chunk_index())
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: _occ_table_with_chunk())
+        monkeypatch.setattr("scripts.enrich_temporal._download_layer_chunk", lambda *a, **kw: None)
 
         def _raise(*a, **kw):
             raise RuntimeError("chunk failed")
@@ -279,7 +283,7 @@ def _all_layers() -> list[TemporalLayer]:
 class TestMain:
     def _patch_base(self, monkeypatch, tmp_path: Path, occ_table: pa.Table) -> None:
         class _Cfg:
-            root_taxon_id = "1"
+            plantae_key = 1
             data_root = str(tmp_path)
             occurrence_parquet_filename = "occurrence.parquet"
             temporal_min_year = 2000

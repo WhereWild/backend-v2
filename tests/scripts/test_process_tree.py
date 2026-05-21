@@ -4,6 +4,9 @@ import pytest
 
 import scripts.process_tree as pt
 
+# Capture before autouse fixture patches it.
+_real_load_layers = pt._load_layers
+
 _FAKE_LAYERS = [
     {"id": "bio1", "value_type": "ratio", "scale_factor": 0.1, "add_offset": -273.15},
 ]
@@ -22,9 +25,10 @@ def patch_load_layers(monkeypatch):
     monkeypatch.setattr(pt, "_load_layers", lambda: _FAKE_LAYERS)
 
 
-def test_load_layers():
-    # _load_layers delegates to tiles.load_layers(); test expansion separately via tiles tests
-    assert _FAKE_LAYERS == _FAKE_LAYERS  # trivially true — expansion tested in test_tiles.py
+def test_load_layers(monkeypatch):
+    monkeypatch.setattr(pt, "_load_layers", _real_load_layers)
+    monkeypatch.setattr("scripts.process_tree.load_layers", lambda: _FAKE_LAYERS)
+    assert pt._load_layers() == _FAKE_LAYERS
 
 
 def test_main_root_not_found(capsys, monkeypatch):

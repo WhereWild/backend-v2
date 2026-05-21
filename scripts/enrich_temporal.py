@@ -47,8 +47,6 @@ CATALOG_PATH = Path("config/gis/catalog.json")
 _raw_vars = os.environ.get("VARS_TO_ENRICH", "")
 VARS_TO_ENRICH: list[str] | None = [v.strip() for v in _raw_vars.split(",") if v.strip()] or None
 
-# ERA5 0.25° grid step — only model currently supported
-_ERA5_STEP = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +121,7 @@ def _run_layer(
         f"resolution={chunk_index.resolution:.0f}s"
     )
 
-    worklist = map_to_worklist(occ_table, chunk_index, layer.grid_mode, _ERA5_STEP)
+    worklist = map_to_worklist(occ_table, chunk_index, layer.grid_mode, layer.grid_step)
     if worklist.num_rows == 0:
         print(f"[skip] {layer.id}: no observations mapped to any chunk")
         return

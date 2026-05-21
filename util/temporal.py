@@ -117,6 +117,7 @@ class TemporalLayer:
     windows: list[int]
     derived: bool = False
     sources: list[str] = field(default_factory=list)
+    grid_step: float = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +144,7 @@ def load_temporal_layers(catalog_path: str | Path) -> list[TemporalLayer]:
                 windows=list(windows),
                 derived=bool(layer.get("derived", False)),
                 sources=list(layer.get("sources", [])),
+                grid_step=float(layer.get("grid_step", 0.25)),
             ))
     return layers
 
@@ -824,9 +826,10 @@ def map_to_worklist(
     # Pick ny, nx, step from a sample range (latest) to check bounds
     # grid dimensions are validated per-chunk when reading the .om file;
     # here we just store raw indices (clamping happens per-chunk)
-    # Use large-enough bounds to avoid premature clipping; real clamping
-    # happens inside process_chunk once reader.shape is known.
-    max_ny, max_nx = 721, 1440  # ERA5 0.25° default
+    # Derive loose upper bounds from the grid step so non-0.25° grids
+    # (e.g. ERA5-Land at 0.1°) are not prematurely clipped here.
+    max_ny = int(round(180.0 / step)) + 1
+    max_nx = int(round(360.0 / step)) + 1
 
     lat_idx, lon_idx = _grid_indices_batch(lats, lons, max_ny, max_nx, grid_mode, step)
 

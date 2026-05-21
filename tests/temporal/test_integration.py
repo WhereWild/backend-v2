@@ -367,6 +367,50 @@ class TestDerivedVariables:
         _, vals = list(updates.values())[0]["weather_code_simple_mode_1h"][0]
         assert vals[0] == pytest.approx(65.0)  # heavy rain
 
+    def test_process_chunk_mode_temp_first_in_sources(self, tmp_path, monkeypatch) -> None:
+        # Regression: catalog lists temperature_2m before cloud/precip/snow.
+        # process_chunk_mode must look up indices by name, not assume position 0/1/2.
+        temp  = np.full(10, 20.0)   # warm, no effect on clear-sky code
+        cloud = np.full(10,  5.0)   # clear sky → code 0
+        precip = np.zeros(10)
+        snow   = np.zeros(10)
+
+        class _MultiReader:
+            _series = [temp, cloud, precip, snow]
+            def __init__(self, fh, idx):
+                self.shape = (721, 1440, 10)
+                self._idx = idx
+            def __getitem__(self, key):
+                return self._series[self._idx]
+            def close(self): pass
+
+        readers = [_MultiReader(None, i) for i in range(4)]
+        _iter = iter(readers)
+
+        fake = tmp_path / "fake.om"
+        fake.write_bytes(b"")
+        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: fake)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: next(_iter))
+        monkeypatch.setattr(Path, "unlink", lambda self, **kw: None)
+
+        chunk = ChunkRange(chunk_num=0, start=0.0, end=9 * 3600.0, time_len=10, source="chunk")
+        worklist = pa.table({
+            "taxon_path": pa.array([str(tmp_path / "occurrence.parquet")]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([0], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([5], type=pa.int32()),
+        })
+        updates, _ = process_chunk_mode(
+            chunk, worklist, {}, "copernicus_era5",
+            ["temperature_2m", "cloud_cover", "precipitation", "snowfall_water_equivalent"],
+            "weather_code_simple", {1: 1}, 3600.0, str(tmp_path),
+        )
+        _, vals = list(updates.values())[0]["weather_code_simple_mode_1h"][0]
+        # clear sky (code 0), NOT code 65 from misidentified cloud-as-precip
+        assert vals[0] == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
 # process_chunk edge cases

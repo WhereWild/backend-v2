@@ -29,9 +29,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
-from dotenv import load_dotenv
-
-load_dotenv()
 
 import scripts.build_tree as build_tree
 import scripts.enrich_temporal as enrich_temporal

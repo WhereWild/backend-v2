@@ -158,8 +158,9 @@ def test_temporal_layers_expanded(patch_temporal_catalog):
 def test_temporal_layer_display_name(patch_temporal_catalog):
     layers = tiles.load_layers()
     t24 = next(lay for lay in layers if lay["id"] == "temperature_2m_avg_24h")
-    assert "24h" in t24["display_name"]
-    assert "Air Temperature" in t24["display_name"]
+    assert t24["display_name"] == "Air Temperature (2m)"
+    assert t24["window_hours"] == 24
+    assert t24["window_label"] == "24h"
 
 
 def test_temporal_layer_inherits_value_type(patch_temporal_catalog):

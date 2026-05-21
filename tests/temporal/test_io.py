@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import util.temporal as tm
+import util.temporal
 from util.temporal import (
     ELEVATION_CORRECTABLE_VARS,
     ChunkIndex,
@@ -49,7 +49,7 @@ _LISTING = [
 
 
 def _mock_s3(monkeypatch, meta=None, listing=None):
-    tm._CHUNK_INDEX_CACHE.clear()
+    util.temporal._CHUNK_INDEX_CACHE.clear()
     monkeypatch.setattr("util.temporal._open_s3_json", lambda uri: meta if meta is not None else _META.copy())
     mock_fs = MagicMock()
     mock_fs.ls.return_value = listing if listing is not None else list(_LISTING)
@@ -355,7 +355,7 @@ class TestBuildChunkIndex:
         assert idx1 is idx2
 
     def test_missing_end_time_raises(self, monkeypatch):
-        tm._CHUNK_INDEX_CACHE.clear()
+        util.temporal._CHUNK_INDEX_CACHE.clear()
         monkeypatch.setattr("util.temporal._open_s3_json", lambda uri: {})
         mock_fs = MagicMock()
         mock_fs.ls.return_value = []
@@ -364,7 +364,7 @@ class TestBuildChunkIndex:
             build_chunk_index("copernicus_era5", "bad_var")
 
     def test_no_files_raises(self, monkeypatch):
-        tm._CHUNK_INDEX_CACHE.clear()
+        util.temporal._CHUNK_INDEX_CACHE.clear()
         monkeypatch.setattr("util.temporal._open_s3_json", lambda uri: _META.copy())
         mock_fs = MagicMock()
         mock_fs.ls.return_value = []
@@ -585,9 +585,9 @@ class TestMapToWorklistElevation:
 
 class TestReadModelElevation:
     def test_returns_nan_on_s3_failure(self, monkeypatch):
-        monkeypatch.setitem(tm._MODEL_ELEV_CACHE, "bad_model", None)
+        monkeypatch.setitem(util.temporal._MODEL_ELEV_CACHE, "bad_model", None)
         # Clear so it tries to load
-        tm._MODEL_ELEV_CACHE.pop("bad_model", None)
+        util.temporal._MODEL_ELEV_CACHE.pop("bad_model", None)
         import fsspec as _fsspec
         monkeypatch.setattr(_fsspec, "open", lambda *a, **kw: (_ for _ in ()).throw(OSError("no s3")))
         result = _read_model_elevation("bad_model", np.array([0]), np.array([0]))
@@ -595,11 +595,11 @@ class TestReadModelElevation:
 
     def test_uses_cached_grid(self, monkeypatch):
         grid = np.array([[100.0, 200.0], [300.0, 400.0]])
-        tm._MODEL_ELEV_CACHE["test_model"] = grid
+        util.temporal._MODEL_ELEV_CACHE["test_model"] = grid
         result = _read_model_elevation("test_model", np.array([0, 1]), np.array([1, 0]))
         assert result[0] == pytest.approx(200.0)
         assert result[1] == pytest.approx(300.0)
-        tm._MODEL_ELEV_CACHE.pop("test_model")
+        util.temporal._MODEL_ELEV_CACHE.pop("test_model")
 
     def test_nodata_masked_at_load_time(self, monkeypatch):
         # Simulate loading a grid that contains -999 nodata values from S3.
@@ -611,12 +611,12 @@ class TestReadModelElevation:
         mock_reader.__exit__ = MagicMock(return_value=False)
         import fsspec as _fsspec
         monkeypatch.setattr(_fsspec, "open", lambda *a, **kw: mock_reader)
-        monkeypatch.setattr(tm, "OmFileReader", lambda fh: mock_reader)
-        tm._MODEL_ELEV_CACHE.pop("nodata_load_model", None)
+        monkeypatch.setattr(util.temporal, "OmFileReader", lambda fh: mock_reader)
+        util.temporal._MODEL_ELEV_CACHE.pop("nodata_load_model", None)
         result = _read_model_elevation("nodata_load_model", np.array([0, 0]), np.array([0, 1]))
         assert np.isnan(result[0])
         assert result[1] == pytest.approx(50.0)
-        tm._MODEL_ELEV_CACHE.pop("nodata_load_model", None)
+        util.temporal._MODEL_ELEV_CACHE.pop("nodata_load_model", None)
 
 
 class TestElevationCorrectableVars:

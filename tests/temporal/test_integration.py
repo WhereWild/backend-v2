@@ -378,7 +378,7 @@ class _ErrorReader:
         self.shape = (721, 1440, 10)
 
     def __getitem__(self, key):
-        raise ValueError("simulated read error")
+        raise IndexError("simulated read error")
 
     def close(self):
         pass
@@ -567,7 +567,7 @@ class TestProcessChunkModeEdgeCases:
         class _ErrReader:
             def __init__(self, fh):
                 self.shape = (721, 1440, 10)
-            def __getitem__(self, key): raise ValueError("boom")
+            def __getitem__(self, key): raise IndexError("boom")
             def close(self): pass
         readers = [_ErrReader(None) for _ in range(3)]
         _iter = iter(readers)

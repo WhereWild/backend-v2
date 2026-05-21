@@ -10,7 +10,6 @@ import pyarrow as pa
 import pytest
 
 import scripts.enrich_temporal as et
-from scripts.enrich_temporal import _cleanup_cache, _filter_layers, _rss_mb, _run_layer
 from util.temporal import ChunkIndex, ChunkRange, TemporalLayer
 
 
@@ -27,40 +26,40 @@ def _layers() -> list[TemporalLayer]:
 class TestFilterLayers:
     def test_none_returns_all(self) -> None:
         layers = _layers()
-        assert _filter_layers(layers, None) == layers
+        assert et._filter_layers(layers, None) == layers
 
     def test_single_temporal_id(self) -> None:
-        result = _filter_layers(_layers(), ["precipitation"])
+        result = et._filter_layers(_layers(), ["precipitation"])
         assert len(result) == 1
         assert result[0].id == "precipitation"
 
     def test_multiple_temporal_ids(self) -> None:
-        result = _filter_layers(_layers(), ["precipitation", "snow_depth"])
+        result = et._filter_layers(_layers(), ["precipitation", "snow_depth"])
         ids = {layer.id for layer in result}
         assert ids == {"precipitation", "snow_depth"}
 
     def test_no_temporal_ids_returns_all(self) -> None:
         # All ids are spatial → treat as "do all temporal"
         layers = _layers()
-        result = _filter_layers(layers, ["bio1", "bio12", "gsl"])
+        result = et._filter_layers(layers, ["bio1", "bio12", "gsl"])
         assert result == layers
 
     def test_mixed_ids_returns_only_temporal_matches(self) -> None:
-        result = _filter_layers(_layers(), ["bio1", "precipitation"])
+        result = et._filter_layers(_layers(), ["bio1", "precipitation"])
         assert len(result) == 1
         assert result[0].id == "precipitation"
 
     def test_derived_var_included_when_requested(self) -> None:
-        result = _filter_layers(_layers(), ["vapor_pressure_deficit"])
+        result = et._filter_layers(_layers(), ["vapor_pressure_deficit"])
         assert len(result) == 1
         assert result[0].derived is True
 
     def test_empty_list_returns_all(self) -> None:
         layers = _layers()
-        assert _filter_layers(layers, []) == layers
+        assert et._filter_layers(layers, []) == layers
 
     def test_order_preserved(self) -> None:
-        result = _filter_layers(_layers(), ["snow_depth", "temperature_2m"])
+        result = et._filter_layers(_layers(), ["snow_depth", "temperature_2m"])
         assert [layer.id for layer in result] == ["temperature_2m", "snow_depth"]
 
 
@@ -77,11 +76,11 @@ class TestVarsToEnrichParsing:
 
 class TestRssMb:
     def test_returns_float_or_none(self) -> None:
-        result = _rss_mb()
+        result = et._rss_mb()
         assert result is None or isinstance(result, float)
 
     def test_positive_when_present(self) -> None:
-        result = _rss_mb()
+        result = et._rss_mb()
         if result is not None:
             assert result > 0
 
@@ -92,7 +91,7 @@ class TestRssMb:
                 raise OSError("permission denied")
             return _orig(path, *a, **kw)
         monkeypatch.setattr(builtins, "open", _raise)
-        assert _rss_mb() is None
+        assert et._rss_mb() is None
 
     def test_returns_none_when_no_vmrss_line(self, monkeypatch) -> None:
         _orig = builtins.open
@@ -105,7 +104,7 @@ class TestRssMb:
                 return _NoVmRSSFile()
             return _orig(path, *a, **kw)
         monkeypatch.setattr(builtins, "open", _fake)
-        assert _rss_mb() is None
+        assert et._rss_mb() is None
 
 
 # ---------------------------------------------------------------------------
@@ -119,12 +118,12 @@ class TestCleanupCache:
         f2.parent.mkdir()
         f1.write_bytes(b"x")
         f2.write_bytes(b"y")
-        _cleanup_cache(str(tmp_path))
+        et._cleanup_cache(str(tmp_path))
         assert not f1.exists()
         assert not f2.exists()
 
     def test_nonexistent_dir_ok(self, tmp_path: Path) -> None:
-        _cleanup_cache(str(tmp_path / "nonexistent"))  # no error
+        et._cleanup_cache(str(tmp_path / "nonexistent"))  # no error
 
     def test_exception_in_unlink_swallowed(self, tmp_path: Path, monkeypatch) -> None:
         f = tmp_path / "locked.om"
@@ -134,7 +133,7 @@ class TestCleanupCache:
             raise PermissionError("locked")
 
         monkeypatch.setattr(Path, "unlink", _raise)
-        _cleanup_cache(str(tmp_path))  # must not raise
+        et._cleanup_cache(str(tmp_path))  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +175,7 @@ class TestRunLayer:
     def test_skips_when_chunk_index_fails(self, monkeypatch, capsys) -> None:
         monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
                             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no S3")))
-        _run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
+        et._run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
         assert "[skip]" in capsys.readouterr().out
 
     def test_skips_when_no_worklist_rows(self, monkeypatch, capsys) -> None:
@@ -192,7 +191,7 @@ class TestRunLayer:
         })
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: empty)
-        _run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
+        et._run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
         assert "[skip]" in capsys.readouterr().out
 
     def test_normal_run(self, monkeypatch, capsys) -> None:
@@ -205,7 +204,7 @@ class TestRunLayer:
                             lambda *a, **kw: ({}, {}))
         monkeypatch.setattr("scripts.enrich_temporal.write_back", lambda *a, **kw: None)
 
-        _run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
+        et._run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
         out = capsys.readouterr().out
         assert "[done]" in out
 
@@ -218,7 +217,7 @@ class TestRunLayer:
 
         stop = threading.Event()
         stop.set()
-        _run_layer(_make_layer(), pa.table({}), _MockCfg(), stop)
+        et._run_layer(_make_layer(), pa.table({}), _MockCfg(), stop)
         assert "[stop]" in capsys.readouterr().out
 
     def test_run_layer_mode_calls_process_chunk_mode(self, monkeypatch, capsys) -> None:
@@ -236,7 +235,7 @@ class TestRunLayer:
         monkeypatch.setattr("scripts.enrich_temporal.process_chunk_mode",
                             lambda *a, **kw: (mode_called.append(1), ({}, {}))[-1])
         monkeypatch.setattr("scripts.enrich_temporal.write_back", lambda *a, **kw: None)
-        _run_layer(mode_layer, pa.table({}), _MockCfg(), threading.Event())
+        et._run_layer(mode_layer, pa.table({}), _MockCfg(), threading.Event())
         assert mode_called
 
     def test_process_chunk_exception_propagates(self, monkeypatch) -> None:
@@ -251,7 +250,7 @@ class TestRunLayer:
 
         monkeypatch.setattr("scripts.enrich_temporal.process_chunk", _raise)
         with pytest.raises(RuntimeError, match="chunk failed"):
-            _run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
+            et._run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
 
 
 # ---------------------------------------------------------------------------

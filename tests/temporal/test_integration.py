@@ -629,3 +629,204 @@ class TestProcessChunkModeEdgeCases:
         # mode over 4-step window (all code 65) should be 65
         _, vals = list(updates.values())[0]["weather_code_simple_mode_4h"][0]
         assert vals[0] == pytest.approx(65.0)
+
+    def test_trailing_nan_all_nan_slice_skips_cell(self, tmp_path, monkeypatch):
+        """Series slice entirely NaN → cell skipped (no updates)."""
+        cloud = np.array([1.0, 2.0, 3.0, np.nan, np.nan])
+        precip = np.zeros(5)
+        snow = np.zeros(5)
+        self._patch_readers(monkeypatch, tmp_path, [cloud, precip, snow])
+        chunk = ChunkRange(chunk_num=0, start=0.0, end=4 * 3600.0, time_len=5, source="chunk")
+        worklist = pa.table({
+            "taxon_path": pa.array([str(tmp_path / "occ.parquet")]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([0], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([4], type=pa.int32()),  # in NaN zone
+        })
+        updates, _ = process_chunk_mode(
+            chunk, worklist, {}, "copernicus_era5",
+            ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+            "weather_code_simple", {1: 1}, 3600.0, str(tmp_path),
+        )
+        assert updates == {}
+
+    def test_trailing_nan_clamps_mode_to_last_valid(self, tmp_path, monkeypatch):
+        """Obs in trailing-NaN zone gets clamped to last valid derived code."""
+        # clear-sky first 3 steps (code 0), then NaN for cloud_cover
+        cloud = np.array([5.0, 5.0, 5.0, np.nan, np.nan])
+        precip = np.zeros(5)
+        snow = np.zeros(5)
+        self._patch_readers(monkeypatch, tmp_path, [cloud, precip, snow])
+        chunk = ChunkRange(chunk_num=0, start=0.0, end=4 * 3600.0, time_len=5, source="chunk")
+        worklist = pa.table({
+            "taxon_path": pa.array([str(tmp_path / "occ.parquet")]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([0], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([4], type=pa.int32()),  # in NaN zone
+        })
+        # window=3: slice = derived[2:5] = [0, nan, nan] → clamped to pos 0 → mode 0
+        updates, _ = process_chunk_mode(
+            chunk, worklist, {}, "copernicus_era5",
+            ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+            "weather_code_simple", {3: 3}, 3600.0, str(tmp_path),
+        )
+        _, vals = list(updates.values())[0]["weather_code_simple_mode_3h"][0]
+        assert vals[0] == pytest.approx(0.0)  # clear sky
+
+
+# ---------------------------------------------------------------------------
+# Elevation correction
+# ---------------------------------------------------------------------------
+
+class TestElevationCorrection:
+    """Covers process_chunk and process_chunk_mode elevation-correction paths."""
+
+    def _make_chunk(self, tlen=24):
+        return ChunkRange(chunk_num=1, start=0.0, end=(tlen - 1) * 3600.0, time_len=tlen, source="year")
+
+    def test_elevation_correction_shifts_avg_temperature(self, tmp_path, monkeypatch):
+        """Lapse-rate correction adds (model_elev - obs_elev)*0.0065 to avg values."""
+        occ_path = tmp_path / "occ.parquet"
+        _write_occ(occ_path, _BERLIN_LAT, _BERLIN_LON, 5 * 3600.0)
+        series = np.full(24, 10.0, dtype=np.float64)
+        chunk_entry = self._make_chunk(24)
+        # Worklist with finite elevation — triggers the correction path
+        worklist = pa.table({
+            "taxon_path": pa.array([str(occ_path)]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([1], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([5], type=pa.int32()),
+            "elevation": pa.array([200.0], type=pa.float64()),  # obs at 200 m
+        })
+        dummy = tmp_path / "dummy.om"
+        dummy.write_bytes(b"")
+        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: dummy)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: _FakeReader(series))
+        # Model surface at 700 m → correction = (700-200)*0.0065 = +3.25 °C
+        monkeypatch.setattr(
+            "util.temporal._read_model_elevation",
+            lambda model, li, lo: np.full(len(li), 700.0),
+        )
+        updates, _ = process_chunk(
+            chunk_entry, worklist, {}, "copernicus_era5",
+            "temperature_2m", {24: 24}, "avg", str(tmp_path),
+        )
+        write_back(updates)
+        result = pq.read_table(occ_path).to_pydict()
+        assert result["temperature_2m_avg_24h"][0] == pytest.approx(13.25, abs=1e-3)
+
+    def test_trailing_nan_all_nan_slice_skips_cell(self, tmp_path, monkeypatch):
+        """Series slice entirely NaN → cell skipped (no updates)."""
+        occ_path = tmp_path / "occ.parquet"
+        _write_occ(occ_path, _BERLIN_LAT, _BERLIN_LON, 5 * 3600.0)
+        series = np.array([1.0, 2.0, 3.0, np.nan, np.nan])
+        chunk_entry = self._make_chunk(5)
+        worklist = pa.table({
+            "taxon_path": pa.array([str(occ_path)]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([1], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([4], type=pa.int32()),  # last step, NaN
+        })
+        dummy = tmp_path / "dummy.om"
+        dummy.write_bytes(b"")
+        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: dummy)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: _FakeReader(series))
+        updates, _ = process_chunk(
+            chunk_entry, worklist, {}, "copernicus_era5",
+            "precipitation", {1: 1}, "avg", str(tmp_path),
+        )
+        assert updates == {}
+
+    def test_trailing_nan_clamps_to_last_valid(self, tmp_path, monkeypatch):
+        """Obs in trailing-NaN zone is clamped to last valid timestep."""
+        occ_path = tmp_path / "occ.parquet"
+        _write_occ(occ_path, _BERLIN_LAT, _BERLIN_LON, 5 * 3600.0)
+        # [3, 4, nan, nan] falls in series_slice for time_idx=5, window=4
+        series = np.array([1.0, 2.0, 3.0, 4.0, np.nan, np.nan])
+        chunk_entry = self._make_chunk(6)
+        worklist = pa.table({
+            "taxon_path": pa.array([str(occ_path)]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([1], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([5], type=pa.int32()),  # in NaN zone
+        })
+        dummy = tmp_path / "dummy.om"
+        dummy.write_bytes(b"")
+        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: dummy)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: _FakeReader(series))
+        # window=4: series_slice=series[2:6]=[3,4,nan,nan]; clamped local_time=1
+        # avg of series_slice[0:2]=[3,4] = 3.5
+        updates, _ = process_chunk(
+            chunk_entry, worklist, {}, "copernicus_era5",
+            "precipitation", {4: 4}, "avg", str(tmp_path),
+        )
+        write_back(updates)
+        result = pq.read_table(occ_path).to_pydict()
+        assert result["precipitation_avg_4h"][0] == pytest.approx(3.5, abs=1e-3)
+
+    def test_elevation_correction_in_process_chunk_mode(self, tmp_path, monkeypatch):
+        """Lapse-rate correction on temperature shifts weather code derivation."""
+        # precip=5 mm/h → code 63 (moderate rain).
+        # temp=-1°C < 0 → without correction: 63→73 (snow).
+        # model_elev=500, obs_elev=0 → correction=+3.25°C → temp=2.25 > 0 → stays 63.
+        n = 10
+        cloud = np.full(n, 90.0)
+        precip = np.full(n, 5.0)   # 5 mm/h
+        snow = np.zeros(n)
+        temperature = np.full(n, -1.0)  # below freezing
+
+        series_map = {
+            "cloud_cover": cloud,
+            "precipitation": precip,
+            "snowfall_water_equivalent": snow,
+            "temperature_2m": temperature,
+        }
+        sources = ["cloud_cover", "precipitation", "snowfall_water_equivalent", "temperature_2m"]
+        _iter_state = {"idx": 0}
+
+        fake = tmp_path / "fake.om"
+        fake.write_bytes(b"")
+
+        class _VarReader:
+            def __init__(self, fh):
+                self._series = series_map[sources[_iter_state["idx"]]]
+                _iter_state["idx"] += 1
+                self.shape = (721, 1440, n)
+            def __getitem__(self, key): return self._series
+            def close(self): pass
+
+        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: fake)
+        monkeypatch.setattr("util.temporal.OmFileReader", _VarReader)
+        monkeypatch.setattr(Path, "unlink", lambda self, **kw: None)
+        # model surface at 500 m, obs at 0 m → +3.25 °C correction
+        monkeypatch.setattr(
+            "util.temporal._read_model_elevation",
+            lambda model, li, lo: np.full(len(li), 500.0),
+        )
+
+        chunk = ChunkRange(chunk_num=0, start=0.0, end=(n - 1) * 3600.0, time_len=n, source="chunk")
+        worklist = pa.table({
+            "taxon_path": pa.array([str(tmp_path / "occ.parquet")]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([0], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([5], type=pa.int32()),
+            "elevation": pa.array([0.0], type=pa.float64()),  # obs at sea level
+        })
+        updates, _ = process_chunk_mode(
+            chunk, worklist, {}, "copernicus_era5",
+            sources, "weather_code_simple", {1: 1}, 3600.0, str(tmp_path),
+        )
+        _, vals = list(updates.values())[0]["weather_code_simple_mode_1h"][0]
+        assert vals[0] == pytest.approx(63.0)  # moderate rain (not 73 snow)

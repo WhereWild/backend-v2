@@ -33,7 +33,7 @@ source = ["."]
 omit = [".venv/*", "*/tests/*", "*/test_*"]
 
 [tool.coverage.report]
-include = ["main.py", "scripts/*.py", "scripts/**/*.py", "config/*.py", "util/*.py"]
+include = ["main.py", "scripts/*.py", "scripts/**/*.py", "util/*.py"]
 skip_empty = true
 show_missing = true
 

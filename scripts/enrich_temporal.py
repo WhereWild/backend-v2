@@ -12,6 +12,7 @@ variables are enriched (the assumption is the list was meant for enrich_tree).
 Usage:
     python -m scripts.enrich_temporal
     VARS_TO_ENRICH=precipitation,temperature_2m python -m scripts.enrich_temporal
+    CLEAR_CACHE=0 python -m scripts.enrich_temporal   # keep cache for quick re-runs
 """
 from __future__ import annotations
 
@@ -46,6 +47,11 @@ CATALOG_PATH = Path("config/gis/catalog.json")
 
 _raw_vars = os.environ.get("VARS_TO_ENRICH", "")
 VARS_TO_ENRICH: list[str] | None = [v.strip() for v in _raw_vars.split(",") if v.strip()] or None
+
+# Set CLEAR_CACHE=0 to preserve the download cache after a run (useful for
+# quick re-runs and debugging; files are reused automatically on next run).
+# Defaults to 1 (clear) so production runs don't accumulate hundreds of GB.
+CLEAR_CACHE: bool = os.environ.get("CLEAR_CACHE", "1") != "0"
 
 
 
@@ -268,9 +274,11 @@ def main() -> None:
                 traceback.print_exc()
 
     finally:
-        # Cache clearing disabled for debugging — re-enable when done
-        # _cleanup_cache(cfg.temporal_cache_dir)
-        print("[cleanup] cache preserved (debug mode)")
+        if CLEAR_CACHE:
+            print(f"[cleanup] clearing cache {cfg.temporal_cache_dir}")
+            _cleanup_cache(cfg.temporal_cache_dir)
+        else:
+            print(f"[cleanup] cache preserved (CLEAR_CACHE=0): {cfg.temporal_cache_dir}")
 
 
 if __name__ == "__main__":  # pragma: no cover

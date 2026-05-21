@@ -1,6 +1,7 @@
 import csv
 import json
 import math
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -50,6 +51,11 @@ def _resolve_variable_id(variable_id: str) -> str:
 @lru_cache(maxsize=32)
 def _load_legend(layer_id: str) -> list:
     path = _LEGEND_DIR / f"{layer_id}_legend.json"
+    if not path.exists():
+        # Temporal ids like weather_code_simple_mode_24h → weather_code_simple
+        base_id = re.sub(r'_(avg|sum|mode|snapshot)_\d+h$', '', layer_id, flags=re.IGNORECASE)
+        if base_id != layer_id:
+            path = _LEGEND_DIR / f"{base_id}_legend.json"
     if not path.exists():
         return []
     return json.loads(path.read_text()).get("classes", [])
@@ -366,7 +372,7 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
                     {
                         "value": item["class_id"],
                         "class_name": class_index.get(item["class_id"], {}).get("name", str(item["class_id"])),
-                        "description": class_index.get(item["class_id"], {}).get("description"),
+                        "description": "",
                         "color": (class_index.get(item["class_id"], {}).get("traits") or {}).get("color"),
                         "count": round(total_samples * item["fraction"]),
                         "fraction": item["fraction"],
@@ -405,7 +411,7 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
             categorical_distribution.append({
                 "value": class_id,
                 "class_name": info.get("name", str(class_id)),
-                "description": info.get("description"),
+                "description": "",
                 "color": info.get("traits", {}).get("color") if info.get("traits") else None,
                 "count": round(total_samples * fraction),
                 "fraction": fraction,

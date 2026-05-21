@@ -270,8 +270,9 @@ def main() -> None:
                 traceback.print_exc()
 
     finally:
-        _cleanup_cache(cfg.temporal_cache_dir)
-        print("[cleanup] cache cleared")
+        # Cache clearing disabled for debugging — re-enable when done
+        # _cleanup_cache(cfg.temporal_cache_dir)
+        print("[cleanup] cache preserved (debug mode)")
 
 
 if __name__ == "__main__":  # pragma: no cover

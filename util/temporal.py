@@ -42,7 +42,6 @@ _LAT_COL = "decimalLatitude"
 _LON_COL = "decimalLongitude"
 _TIME_COL = "eventTimestamp"
 
-_S3_BLOCK_SIZE = 64 * 1024 * 1024
 _S3_BASE_URL = "https://openmeteo.s3.amazonaws.com/data"
 _PREFETCH_WORKERS = 8
 _PREFETCH_DISK_LIMIT_GB = 1000
@@ -62,7 +61,6 @@ _LAPSE_RATE = 0.0065  # °C per metre
 
 # Per-model HSURF elevation grid cache {model: np.ndarray shape (ny, nx)}.
 _MODEL_ELEV_CACHE: dict[str, np.ndarray] = {}
-_MODEL_ELEV_WARNED = False
 
 
 def _read_model_elevation(model: str, lat_idx: np.ndarray, lon_idx: np.ndarray) -> np.ndarray:
@@ -658,12 +656,12 @@ def build_chunk_index(
             try:
                 chunk_nums.append(int(leaf[6:-3]))
             except ValueError:
-                pass
+                pass  # ignore malformed chunk filenames from directory listings
         elif leaf.startswith("year_") and leaf.endswith(".om"):
             try:
                 year_files.append(int(leaf[5:-3]))
             except ValueError:
-                pass
+                pass  # ignore malformed year filenames; only numeric suffixes are valid
 
     ranges: list[ChunkRange] = []
 

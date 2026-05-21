@@ -72,8 +72,8 @@ def _cleanup_cache(cache_dir: str) -> None:
         try:
             if path.is_file():
                 path.unlink()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[cleanup] failed to remove {path}: {exc}")
 
 
 def _filter_layers(all_layers: list[TemporalLayer], vars_to_enrich: list[str] | None) -> list[TemporalLayer]:
@@ -222,8 +222,8 @@ def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             signal.signal(sig, _handle_signal)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[warn] could not register handler for signal {sig}: {exc}")
 
     Path(cfg.temporal_cache_dir).mkdir(parents=True, exist_ok=True)
 

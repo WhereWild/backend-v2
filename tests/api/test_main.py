@@ -660,6 +660,15 @@ def test_load_legend_file_missing(tmp_path, monkeypatch):
     assert main_module._load_legend("no_such_layer_xyz") == []
 
 
+def test_load_legend_temporal_fallback(tmp_path, monkeypatch):
+    data = {"classes": [{"id": 0, "name": "Clear sky"}]}
+    (tmp_path / "weather_code_simple_legend.json").write_text(json.dumps(data))
+    monkeypatch.setattr(main_module, "_LEGEND_DIR", tmp_path)
+    main_module._load_legend.cache_clear()
+    assert main_module._load_legend("weather_code_simple_mode_24h") == [{"id": 0, "name": "Clear sky"}]
+    assert main_module._load_legend("weather_code_simple_mode_168h") == [{"id": 0, "name": "Clear sky"}]
+
+
 # ---------------------------------------------------------------------------
 # _filter_occ_df (lines 32-36)
 # ---------------------------------------------------------------------------

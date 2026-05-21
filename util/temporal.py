@@ -7,13 +7,14 @@ Processing model: chunks are processed sequentially in ascending time order.
 Each chunk is downloaded on-demand, processed, then deleted. A tail buffer
 (last max_window_steps timesteps per active grid cell) is kept in memory
 across chunk boundaries so 2160h windows spanning two chunks are handled
-correctly without re-downloading.
+correctly without re-downloaded.
 
-# TODO: elevation correction
-# Requires target elevation column in occurrence parquets (from DEM pipeline,
-# not yet built). Apply lapse rate: (model_elev - obs_elev) * 0.0065 °C/m.
-# Model elevation raster: s3://openmeteo/data/{model}/static/HSURF.om
-# Applicable variables: temperature_2m, dew_point_2m, soil_temperature_0_to_7cm
+Elevation correction: lapse-rate correction (model_elev - obs_elev) * 0.0065 °C/m
+is applied to temperature-like variables.  Model elevation comes from
+s3://openmeteo/data/{model}/static/HSURF.om (cached per model).  Observation
+elevation comes from the `elevation` column in occurrence parquets, written by
+the DEM pipeline (not yet built).  Until that column exists the correction is a
+no-op: obs_elev is NaN → offset is 0.
 """
 from __future__ import annotations
 
@@ -45,6 +46,46 @@ _S3_BLOCK_SIZE = 64 * 1024 * 1024
 _S3_BASE_URL = "https://openmeteo.s3.amazonaws.com/data"
 _PREFETCH_WORKERS = 8
 _PREFETCH_DISK_LIMIT_GB = 1000
+
+# Variables that receive lapse-rate elevation correction (°C/m × 0.0065).
+# Precipitation, cloud cover, and other flux/ratio variables are unaffected.
+ELEVATION_CORRECTABLE_VARS: frozenset[str] = frozenset({
+    "temperature_2m",
+    "dew_point_2m",
+    "soil_temperature_0_to_7cm",
+    "soil_temperature_7_to_28cm",
+    "soil_temperature_28_to_100cm",
+    "soil_temperature_100_to_255cm",
+})
+
+_LAPSE_RATE = 0.0065  # °C per metre
+
+# Per-model HSURF elevation grid cache {model: np.ndarray shape (ny, nx)}.
+_MODEL_ELEV_CACHE: dict[str, np.ndarray] = {}
+_MODEL_ELEV_WARNED = False
+
+
+def _read_model_elevation(model: str, lat_idx: np.ndarray, lon_idx: np.ndarray) -> np.ndarray:
+    """Return model surface elevation (m) at the given grid indices.
+
+    Loads HSURF.om from S3 once per model and caches the full grid in RAM
+    (~8 MB for ERA5).  Returns NaN for nodata cells (value <= -900 m).
+    """
+    grid = _MODEL_ELEV_CACHE.get(model)
+    if grid is None:
+        uri = f"s3://openmeteo/data/{model}/static/HSURF.om"
+        try:
+            with fsspec.open(uri, mode="rb", s3={"anon": True}) as fh:
+                reader = OmFileReader(fh)
+                grid = np.asarray(reader[:, :], dtype=np.float64)
+        except Exception:
+            grid = np.full((1, 1), np.nan)
+        grid = np.where(grid <= -900, np.nan, grid)
+        _MODEL_ELEV_CACHE[model] = grid
+    ny, nx = grid.shape
+    li = np.clip(lat_idx, 0, ny - 1)
+    lo = np.clip(lon_idx, 0, nx - 1)
+    return grid[li, lo]
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +309,7 @@ def weather_code_simple(
     precipitation: float | None,
     snowfall_water_equivalent: float | None,
     model_dt_seconds: float,
+    temperature_2m: float | None = None,
 ) -> int | None:
     """Derive simplified WMO weather code from 1-timestep aggregates.
 
@@ -276,9 +318,12 @@ def weather_code_simple(
         precipitation:            Precipitation (mm) over model_dt_seconds.
         snowfall_water_equivalent: Snowfall water equivalent (mm) over model_dt_seconds.
         model_dt_seconds:         Timestep length in seconds (e.g. 3600 for 1h).
+        temperature_2m:           Air temperature (°C). When provided, applies a hard
+                                  snow/rain cutoff: snow codes → rain when >0°C; rain
+                                  codes 61/63/65 → snow when <0°C.
 
     Returns:
-        WMO code (int) or None if any input is null/NaN.
+        WMO code (int) or None if any core input is null/NaN.
 
     Code table:
         Snow:  71 slight / 73 moderate / 75 heavy
@@ -295,35 +340,54 @@ def weather_code_simple(
     snow_cm_h = (float(snowfall_water_equivalent) / 10.0) / dt_hours
 
     if 0.01 <= snow_cm_h < 0.2:
-        return 71
-    if 0.2 <= snow_cm_h < 0.8:
-        return 73
-    if snow_cm_h >= 0.8:
-        return 75
+        code = 71
+    elif 0.2 <= snow_cm_h < 0.8:
+        code = 73
+    elif snow_cm_h >= 0.8:
+        code = 75
+    else:
+        rain_mm_h = float(precipitation) / dt_hours
+        if 0.01 <= rain_mm_h < 0.5:
+            code = 51
+        elif 0.5 <= rain_mm_h < 1.0:
+            code = 53
+        elif 1.0 <= rain_mm_h < 1.3:
+            code = 55
+        elif 1.3 <= rain_mm_h < 2.5:
+            code = 61
+        elif 2.5 <= rain_mm_h < 7.6:
+            code = 63
+        elif rain_mm_h >= 7.6:
+            code = 65
+        else:
+            cc = float(cloudcover)
+            if cc < 20.0:
+                code = 0
+            elif cc < 50.0:
+                code = 1
+            elif cc < 80.0:
+                code = 2
+            else:
+                code = 3
 
-    rain_mm_h = float(precipitation) / dt_hours
+    if temperature_2m is not None and np.isfinite(float(temperature_2m)):
+        t = float(temperature_2m)
+        if t > 0:
+            if code == 75:
+                code = 65
+            elif code == 73:
+                code = 63
+            elif code == 71:
+                code = 61
+        elif t < 0:
+            if code == 65:
+                code = 75
+            elif code == 63:
+                code = 73
+            elif code == 61:
+                code = 71
 
-    if 0.01 <= rain_mm_h < 0.5:
-        return 51
-    if 0.5 <= rain_mm_h < 1.0:
-        return 53
-    if 1.0 <= rain_mm_h < 1.3:
-        return 55
-    if 1.3 <= rain_mm_h < 2.5:
-        return 61
-    if 2.5 <= rain_mm_h < 7.6:
-        return 63
-    if rain_mm_h >= 7.6:
-        return 65
-
-    cc = float(cloudcover)
-    if cc < 20.0:
-        return 0
-    if cc < 50.0:
-        return 1
-    if cc < 80:
-        return 2
-    return 3
+    return code
 
 
 def weather_code_array(
@@ -331,10 +395,13 @@ def weather_code_array(
     precip: np.ndarray,
     snow: np.ndarray,
     resolution: float,
+    temp: np.ndarray | None = None,
 ) -> np.ndarray:
     """Vectorized per-timestep weather codes (NaN where any input is non-finite).
 
     Same code table as weather_code_simple; uses np.select for speed.
+    When temp is provided, applies a hard snow/rain cutoff: snow codes → rain
+    when >0°C; rain codes 61/63/65 → snow when <0°C. Drizzle codes are unaffected.
     """
     c = np.asarray(cloud, dtype=float)
     p = np.asarray(precip, dtype=float)
@@ -343,7 +410,7 @@ def weather_code_array(
     snow_cm_h = (s / 10.0) / dt_hours
     rain_mm_h = p / dt_hours
     valid = np.isfinite(c) & np.isfinite(p) & np.isfinite(s)
-    return np.select(
+    result = np.select(
         [
             ~valid,
             snow_cm_h >= 0.8,
@@ -362,6 +429,17 @@ def weather_code_array(
         [np.nan, 75.0, 73.0, 71.0, 65.0, 63.0, 61.0, 55.0, 53.0, 51.0, 3.0, 2.0, 1.0],
         default=0.0,
     )
+    if temp is not None:
+        t = np.asarray(temp, dtype=float)
+        warm = np.isfinite(t) & (t > 0)
+        cold = np.isfinite(t) & (t < 0)
+        result = np.where(warm & (result == 75), 65, result)
+        result = np.where(warm & (result == 73), 63, result)
+        result = np.where(warm & (result == 71), 61, result)
+        result = np.where(cold & (result == 65), 75, result)
+        result = np.where(cold & (result == 63), 73, result)
+        result = np.where(cold & (result == 61), 71, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +706,11 @@ def build_occ_index(
     """Scan all descendant occurrence parquets and return a flat index table.
 
     Columns: taxon_path (str), row_idx (int64), latitude (float64),
-             longitude (float64), timestamp (float64).
+             longitude (float64), timestamp (float64), elevation (float64).
+
+    The `elevation` column is NaN when the DEM pipeline has not yet written an
+    elevation column to the parquets; all downstream elevation corrections
+    degrade gracefully to no-ops in that case.
     """
     root = get_taxon_by_id(root_taxon_id)
     if root is None:
@@ -645,13 +727,19 @@ def build_occ_index(
     all_lats: list[np.ndarray] = []
     all_lons: list[np.ndarray] = []
     all_times: list[np.ndarray] = []
+    all_elevs: list[np.ndarray] = []
 
     tree_root = Path(data_root) / "taxonomy" / "tree"
     for node in iter_descendants(root, include_self=True):
         occ_path = tree_root / node["path"] / occ_filename
         if not occ_path.exists():
             continue
-        table = pq.read_table(occ_path, columns=[_LAT_COL, _LON_COL, _TIME_COL])
+        schema = pq.read_schema(occ_path)
+        read_cols = [_LAT_COL, _LON_COL, _TIME_COL]
+        has_elev = "elevation" in schema.names
+        if has_elev:
+            read_cols.append("elevation")
+        table = pq.read_table(occ_path, columns=read_cols)
         df = table.to_pandas()
 
         valid = df[_TIME_COL].notna() & df[_LAT_COL].notna() & df[_LON_COL].notna()
@@ -664,12 +752,18 @@ def build_occ_index(
         times = df.loc[valid, _TIME_COL].to_numpy(dtype=np.float64)
         lats = df.loc[valid, _LAT_COL].to_numpy(dtype=np.float64)
         lons = df.loc[valid, _LON_COL].to_numpy(dtype=np.float64)
+        elevs = (
+            df.loc[valid, "elevation"].to_numpy(dtype=np.float64)
+            if has_elev
+            else np.full(len(row_idx), np.nan)
+        )
 
         all_paths.append(np.full(len(row_idx), str(occ_path), dtype=object))
         all_rows.append(row_idx)
         all_lats.append(lats)
         all_lons.append(lons)
         all_times.append(times)
+        all_elevs.append(elevs)
 
     if not all_paths:
         return pa.table({
@@ -678,6 +772,7 @@ def build_occ_index(
             "latitude": pa.array([], type=pa.float64()),
             "longitude": pa.array([], type=pa.float64()),
             "timestamp": pa.array([], type=pa.float64()),
+            "elevation": pa.array([], type=pa.float64()),
         })
 
     return pa.table({
@@ -686,6 +781,7 @@ def build_occ_index(
         "latitude": np.concatenate(all_lats),
         "longitude": np.concatenate(all_lons),
         "timestamp": np.concatenate(all_times),
+        "elevation": np.concatenate(all_elevs),
     })
 
 
@@ -710,6 +806,9 @@ def map_to_worklist(
     lons = np.asarray(data["longitude"], dtype=np.float64)
     row_idx = np.asarray(data["row_idx"], dtype=np.int64)
     taxon_path = np.asarray(data["taxon_path"])
+    elevation = np.asarray(
+        data.get("elevation", np.full(len(times), np.nan)), dtype=np.float64
+    )
 
     if times.size == 0:
         return pa.table({
@@ -719,6 +818,7 @@ def map_to_worklist(
             "lat_idx": pa.array([], type=pa.int32()),
             "lon_idx": pa.array([], type=pa.int32()),
             "time_idx": pa.array([], type=pa.int32()),
+            "elevation": pa.array([], type=pa.float64()),
         })
 
     # Pick ny, nx, step from a sample range (latest) to check bounds
@@ -753,6 +853,7 @@ def map_to_worklist(
         "lat_idx": lat_idx,
         "lon_idx": lon_idx,
         "time_idx": time_indices,
+        "elevation": elevation,
     })
 
 
@@ -811,10 +912,22 @@ def process_chunk(
         time_idx = np.asarray(data["time_idx"], dtype=np.int32)
         taxon_path = np.asarray(data["taxon_path"])
         row_idx = np.asarray(data["row_idx"], dtype=np.int64)
+        obs_elev = np.asarray(
+            data.get("elevation", np.full(len(lat), np.nan)), dtype=np.float64
+        )
 
         # Re-clamp grid indices to actual file dimensions
         lat = np.clip(lat, 0, ny - 1)
         lon = np.clip(lon, 0, nx - 1)
+
+        # Elevation correction: compute per-observation offset upfront.
+        # No-op while obs_elev is all-NaN (DEM pipeline not yet built).
+        do_elev = variable in ELEVATION_CORRECTABLE_VARS
+        elev_correction: np.ndarray | None = None
+        if do_elev and np.isfinite(obs_elev).any():
+            model_elev = _read_model_elevation(model, lat, lon)
+            raw_corr = (model_elev - obs_elev) * _LAPSE_RATE
+            elev_correction = np.where(np.isfinite(raw_corr), raw_corr, 0.0)
 
         # Sort by (lat, lon) to process one grid cell at a time
         order = np.lexsort((lon, lat))
@@ -823,6 +936,8 @@ def process_chunk(
         time_idx = time_idx[order]
         taxon_path = taxon_path[order]
         row_idx = row_idx[order]
+        if elev_correction is not None:
+            elev_correction = elev_correction[order]
 
         change = np.empty(len(lat), dtype=bool)
         change[0] = True
@@ -883,6 +998,7 @@ def process_chunk(
 
             paths_slice = taxon_path[s:e]
             rows_slice = row_idx[s:e]
+            corr_slice = elev_correction[s:e] if elev_correction is not None else None
             for tpath in np.unique(paths_slice):
                 mask = paths_slice == tpath
                 row_ids = rows_slice[mask]
@@ -893,6 +1009,8 @@ def process_chunk(
                     else:
                         values = np.full_like(sums, np.nan, dtype=np.float64)
                         np.divide(sums, cnts, out=values, where=cnts > 0)
+                        if corr_slice is not None:
+                            values = values + corr_slice
                     col = f"{variable}_{agg_mode}_{hours}h"
                     updates.setdefault(str(tpath), {}).setdefault(col, []).append(
                         (row_ids, values[mask])
@@ -936,14 +1054,29 @@ def process_chunk_mode(
         time_idx = np.asarray(data["time_idx"], dtype=np.int32)
         taxon_path = np.asarray(data["taxon_path"])
         row_idx = np.asarray(data["row_idx"], dtype=np.int64)
+        obs_elev = np.asarray(
+            data.get("elevation", np.full(len(lat), np.nan)), dtype=np.float64
+        )
 
         lat = np.clip(lat, 0, ny - 1)
         lon = np.clip(lon, 0, nx - 1)
+
+        # Per-observation temperature correction (no-op until DEM pipeline populates elevation).
+        temp_var_idx = next(
+            (i for i, v in enumerate(source_variables) if v in ELEVATION_CORRECTABLE_VARS), None
+        )
+        elev_correction: np.ndarray | None = None
+        if temp_var_idx is not None and np.isfinite(obs_elev).any():
+            model_elev = _read_model_elevation(model, lat, lon)
+            raw_corr = (model_elev - obs_elev) * _LAPSE_RATE
+            elev_correction = np.where(np.isfinite(raw_corr), raw_corr, 0.0)
 
         order = np.lexsort((lon, lat))
         lat, lon = lat[order], lon[order]
         time_idx = time_idx[order]
         taxon_path, row_idx = taxon_path[order], row_idx[order]
+        if elev_correction is not None:
+            elev_correction = elev_correction[order]
 
         change = np.empty(len(lat), dtype=bool)
         change[0] = True
@@ -964,7 +1097,15 @@ def process_chunk_mode(
             if any(a.size == 0 for a in raw):
                 continue
 
-            derived = weather_code_array(*raw, resolution)
+            # Pass temperature to weather_code_array, applying the median
+            # elevation correction for the cell.  Median is used because
+            # observations within a 0.25° cell may span different elevations.
+            temp_arr: np.ndarray | None = raw[temp_var_idx] if temp_var_idx is not None else None
+            if temp_arr is not None and elev_correction is not None:
+                cell_offset = float(np.median(elev_correction[s:e]))
+                temp_arr = temp_arr + cell_offset
+
+            derived = weather_code_array(raw[0], raw[1], raw[2], resolution, temp=temp_arr)
 
             if max_window_steps > 0:
                 new_tail[(li, lo)] = derived[-max_window_steps:].copy()

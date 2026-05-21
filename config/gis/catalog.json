@@ -1058,8 +1058,9 @@
         {
           "id": "snow_depth",
           "source": "open_meteo",
-          "model": "copernicus_era5",
+          "model": "copernicus_era5_land",
           "grid_mode": "lat_asc_lon_pm180",
+          "grid_step": 0.1,
           "display_name": "Snow Depth",
           "units": "m",
           "value_type": "ratio",

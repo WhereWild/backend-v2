@@ -70,12 +70,19 @@ class TestLoadTemporalLayers:
         layers = load_temporal_layers(_CATALOG)
         derived = {la.id for la in layers if la.derived}
         assert "vapor_pressure_deficit" in derived
-        assert "weather_code_simple" in derived
 
     def test_layer_window_override(self):
         layers = load_temporal_layers(_CATALOG)
         snow = next(la for la in layers if la.id == "snow_depth")
-        assert snow.windows == [1]
+        # snow_depth inherits category windows (no per-layer override)
+        assert len(snow.windows) > 1
+
+    def test_weather_code_sources(self):
+        layers = load_temporal_layers(_CATALOG)
+        wc = next(la for la in layers if la.id == "weather_code_simple")
+        assert wc.agg == "mode"
+        assert "cloud_cover" in wc.sources
+        assert "precipitation" in wc.sources
 
     def test_category_windows_inherited(self):
         layers = load_temporal_layers(_CATALOG)

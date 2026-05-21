@@ -349,3 +349,12 @@ class TestMain:
         monkeypatch.setattr("scripts.enrich_temporal._cleanup_cache", lambda d: cleaned.append(d))
         et.main()
         assert len(cleaned) == 1
+
+    def test_clear_cache_false_preserves_cache(self, monkeypatch, tmp_path: Path, capsys) -> None:
+        monkeypatch.setattr(et, "CLEAR_CACHE", False)
+        self._patch_base(monkeypatch, tmp_path, _make_occ_table(0))
+        cleaned: list[str] = []
+        monkeypatch.setattr("scripts.enrich_temporal._cleanup_cache", lambda d: cleaned.append(d))
+        et.main()
+        assert cleaned == []
+        assert "preserved" in capsys.readouterr().out

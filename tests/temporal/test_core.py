@@ -11,8 +11,10 @@ import numpy as np
 import pytest
 
 from util.temporal import (
+    _window_mode_batch,
     grid_indices,
     vpd_kpa,
+    weather_code_array,
     weather_code_simple,
     window_stats_batch,
     window_steps,
@@ -438,3 +440,103 @@ class TestWeatherCodeSimple:
     def test_no_precip_boundary(self) -> None:
         # Exactly 0.0 precip and 0.0 snow → use cloud cover
         assert weather_code_simple(10.0, 0.0, 0.0, 3600) == 0
+
+
+# ---------------------------------------------------------------------------
+# weather_code_array
+# ---------------------------------------------------------------------------
+
+class TestWeatherCodeArray:
+    def test_matches_scalar_clear_sky(self) -> None:
+        result = weather_code_array(
+            np.array([5.0]), np.array([0.0]), np.array([0.0]), 3600.0
+        )
+        assert result[0] == pytest.approx(weather_code_simple(5.0, 0.0, 0.0, 3600))
+
+    def test_matches_scalar_heavy_rain(self) -> None:
+        result = weather_code_array(
+            np.array([90.0]), np.array([10.0]), np.array([0.0]), 3600.0
+        )
+        assert result[0] == pytest.approx(65.0)
+
+    def test_matches_scalar_heavy_snow(self) -> None:
+        result = weather_code_array(
+            np.array([90.0]), np.array([0.0]), np.array([10.0]), 3600.0
+        )
+        assert result[0] == pytest.approx(75.0)
+
+    def test_nan_on_invalid_input(self) -> None:
+        result = weather_code_array(
+            np.array([np.nan]), np.array([0.0]), np.array([0.0]), 3600.0
+        )
+        assert np.isnan(result[0])
+
+    def test_vectorized_mixed(self) -> None:
+        cloud = np.array([5.0, 90.0, 90.0])
+        precip = np.array([0.0, 0.0, 10.0])
+        snow = np.zeros(3)
+        result = weather_code_array(cloud, precip, snow, 3600.0)
+        assert result[0] == pytest.approx(0.0)   # clear
+        assert result[1] == pytest.approx(3.0)   # overcast
+        assert result[2] == pytest.approx(65.0)  # heavy rain
+
+    def test_3h_resolution(self) -> None:
+        # 15 mm over 3h = 5 mm/h → code 63 (moderate rain)
+        result = weather_code_array(
+            np.array([90.0]), np.array([15.0]), np.array([0.0]), 10800.0
+        )
+        assert result[0] == pytest.approx(63.0)
+
+    def test_snow_priority_over_rain(self) -> None:
+        result = weather_code_array(
+            np.array([80.0]), np.array([5.0]), np.array([5.0]), 3600.0
+        )
+        assert result[0] == pytest.approx(73.0)
+
+
+# ---------------------------------------------------------------------------
+# _window_mode_batch
+# ---------------------------------------------------------------------------
+
+class TestWindowModeBatch:
+    def test_single_step_window_returns_value(self) -> None:
+        series = np.array([0.0, 1.0, 2.0, 3.0])
+        result = _window_mode_batch(series, np.array([2]), {1: 1})
+        assert result[1][0] == pytest.approx(2.0)
+
+    def test_mode_of_uniform_window(self) -> None:
+        series = np.array([3.0, 3.0, 3.0, 3.0, 3.0])
+        result = _window_mode_batch(series, np.array([4]), {5: 5})
+        assert result[5][0] == pytest.approx(3.0)
+
+    def test_mode_picks_majority(self) -> None:
+        # window: [0, 0, 0, 65, 65] → mode = 0
+        series = np.array([0.0, 0.0, 0.0, 65.0, 65.0])
+        result = _window_mode_batch(series, np.array([4]), {5: 5})
+        assert result[5][0] == pytest.approx(0.0)
+
+    def test_nan_inputs_excluded(self) -> None:
+        series = np.array([np.nan, np.nan, 3.0])
+        result = _window_mode_batch(series, np.array([2]), {3: 3})
+        assert result[3][0] == pytest.approx(3.0)
+
+    def test_all_nan_returns_nan(self) -> None:
+        series = np.array([np.nan, np.nan, np.nan])
+        result = _window_mode_batch(series, np.array([2]), {3: 3})
+        assert np.isnan(result[3][0])
+
+    def test_empty_time_indices(self) -> None:
+        series = np.array([1.0, 2.0, 3.0])
+        result = _window_mode_batch(series, np.array([], dtype=int), {3: 3})
+        assert result[3].size == 0
+
+    def test_window_len_zero_returns_nan(self) -> None:
+        series = np.array([1.0, 2.0])
+        result = _window_mode_batch(series, np.array([1]), {0: 0})
+        assert np.isnan(result[0][0])
+
+    def test_multiple_windows(self) -> None:
+        series = np.array([0.0, 65.0, 65.0, 65.0])
+        result = _window_mode_batch(series, np.array([3]), {1: 1, 4: 4})
+        assert result[1][0] == pytest.approx(65.0)
+        assert result[4][0] == pytest.approx(65.0)

@@ -219,6 +219,23 @@ class TestRunLayer:
         _run_layer(_make_layer(), pa.table({}), _MockCfg(), stop)
         assert "[stop]" in capsys.readouterr().out
 
+    def test_run_layer_mode_calls_process_chunk_mode(self, monkeypatch, capsys) -> None:
+        mode_layer = TemporalLayer(
+            id="weather_code_simple", model="copernicus_era5",
+            grid_mode="lat_asc_lon_pm180", agg="mode", windows=[1, 24],
+            sources=["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+        )
+        monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
+                            lambda *a, **kw: _make_chunk_index())
+        monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
+                            lambda *a, **kw: _occ_table_with_chunk())
+        mode_called = []
+        monkeypatch.setattr("scripts.enrich_temporal.process_chunk_mode",
+                            lambda *a, **kw: (mode_called.append(1), ({}, {}))[-1])
+        monkeypatch.setattr("scripts.enrich_temporal.write_back", lambda *a, **kw: None)
+        _run_layer(mode_layer, pa.table({}), _MockCfg(), threading.Event())
+        assert mode_called
+
     def test_process_chunk_exception_propagates(self, monkeypatch) -> None:
         monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
                             lambda *a, **kw: _make_chunk_index())
@@ -254,7 +271,8 @@ def _all_layers() -> list[TemporalLayer]:
         TemporalLayer(id="vapor_pressure_deficit", model="copernicus_era5",
                       grid_mode="lat_asc_lon_pm180", agg="avg", windows=[24], derived=True),
         TemporalLayer(id="weather_code_simple", model="copernicus_era5",
-                      grid_mode="lat_asc_lon_pm180", agg="snapshot", windows=[1], derived=True),
+                      grid_mode="lat_asc_lon_pm180", agg="mode", windows=[1, 24],
+                      sources=["cloud_cover", "precipitation", "snowfall_water_equivalent"]),
     ]
 
 
@@ -287,37 +305,22 @@ class TestMain:
         monkeypatch.setattr("scripts.enrich_temporal._run_layer",
                             lambda *a, **kw: run_layer_calls.append(a[0].id))
         vpd_called = []
-        wc_called = []
         monkeypatch.setattr("scripts.enrich_temporal.derive_vpd",
                             lambda *a, **kw: vpd_called.append(1))
-        monkeypatch.setattr("scripts.enrich_temporal.derive_weather_code",
-                            lambda *a, **kw: wc_called.append(1))
         et.main()
         assert "precipitation" in run_layer_calls
+        assert "weather_code_simple" in run_layer_calls
         assert "vapor_pressure_deficit" not in run_layer_calls
         assert vpd_called
-        assert wc_called
 
     def test_derive_vpd_exception_handled(self, monkeypatch, tmp_path: Path) -> None:
         self._patch_base(monkeypatch, tmp_path, _make_occ_table())
         monkeypatch.setattr("scripts.enrich_temporal._run_layer", lambda *a, **kw: None)
-        monkeypatch.setattr("scripts.enrich_temporal.derive_weather_code", lambda *a, **kw: None)
 
         def _raise(*a, **kw):
             raise RuntimeError("vpd exploded")
 
         monkeypatch.setattr("scripts.enrich_temporal.derive_vpd", _raise)
-        et.main()  # must not propagate
-
-    def test_derive_weather_code_exception_handled(self, monkeypatch, tmp_path: Path) -> None:
-        self._patch_base(monkeypatch, tmp_path, _make_occ_table())
-        monkeypatch.setattr("scripts.enrich_temporal._run_layer", lambda *a, **kw: None)
-        monkeypatch.setattr("scripts.enrich_temporal.derive_vpd", lambda *a, **kw: None)
-
-        def _raise(*a, **kw):
-            raise RuntimeError("wc exploded")
-
-        monkeypatch.setattr("scripts.enrich_temporal.derive_weather_code", _raise)
         et.main()  # must not propagate
 
     def test_handle_signal_sets_stop(self, monkeypatch, tmp_path: Path, capsys) -> None:

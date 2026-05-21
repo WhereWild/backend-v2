@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -71,6 +71,7 @@ class TemporalLayer:
     agg: str
     windows: list[int]
     derived: bool = False
+    sources: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +97,7 @@ def load_temporal_layers(catalog_path: str | Path) -> list[TemporalLayer]:
                 agg=layer.get("agg", "avg"),
                 windows=list(windows),
                 derived=bool(layer.get("derived", False)),
+                sources=list(layer.get("sources", [])),
             ))
     return layers
 
@@ -211,6 +213,33 @@ def window_stats_batch(
     return sums, counts
 
 
+def _window_mode_batch(
+    series: np.ndarray,
+    time_indices: np.ndarray,
+    steps: dict[int, int],
+) -> dict[int, np.ndarray]:
+    """Sliding-window mode for an integer-valued (nominal) series.
+
+    For each observation and window size, collects all finite values in the
+    window ending at that timestep and returns the most frequent integer value.
+    Uses np.bincount for speed given the small number of distinct codes.
+    """
+    result: dict[int, np.ndarray] = {}
+    for hours, window_len in steps.items():
+        modes = np.full(len(time_indices), np.nan)
+        if window_len > 0 and time_indices.size > 0:
+            for i, t in enumerate(time_indices.tolist()):
+                start = max(0, t - window_len + 1)
+                window = series[start : t + 1]
+                finite = window[np.isfinite(window)]
+                if finite.size > 0:
+                    int_vals = finite.astype(np.int64)
+                    min_v = int(int_vals.min())
+                    modes[i] = float(min_v + int(np.argmax(np.bincount(int_vals - min_v))))
+        result[hours] = modes
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Pure math: derived variables
 # ---------------------------------------------------------------------------
@@ -284,13 +313,51 @@ def weather_code_simple(
         return 65
 
     cc = float(cloudcover)
-    if cc < 20:
+    if cc < 20.0:
         return 0
-    if cc < 50:
+    if cc < 50.0:
         return 1
     if cc < 80:
         return 2
     return 3
+
+
+def weather_code_array(
+    cloud: np.ndarray,
+    precip: np.ndarray,
+    snow: np.ndarray,
+    resolution: float,
+) -> np.ndarray:
+    """Vectorized per-timestep weather codes (NaN where any input is non-finite).
+
+    Same code table as weather_code_simple; uses np.select for speed.
+    """
+    c = np.asarray(cloud, dtype=float)
+    p = np.asarray(precip, dtype=float)
+    s = np.asarray(snow, dtype=float)
+    dt_hours = resolution / 3600.0
+    snow_cm_h = (s / 10.0) / dt_hours
+    rain_mm_h = p / dt_hours
+    valid = np.isfinite(c) & np.isfinite(p) & np.isfinite(s)
+    return np.select(
+        [
+            ~valid,
+            snow_cm_h >= 0.8,
+            snow_cm_h >= 0.2,
+            snow_cm_h >= 0.01,
+            rain_mm_h >= 7.6,
+            rain_mm_h >= 2.5,
+            rain_mm_h >= 1.3,
+            rain_mm_h >= 1.0,
+            rain_mm_h >= 0.5,
+            rain_mm_h >= 0.01,
+            c >= 80.0,
+            c >= 50.0,
+            c >= 20.0,
+        ],
+        [np.nan, 75.0, 73.0, 71.0, 65.0, 63.0, 61.0, 55.0, 53.0, 51.0, 3.0, 2.0, 1.0],
+        default=0.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +811,115 @@ def process_chunk(
     return updates, new_tail
 
 
+def process_chunk_mode(
+    chunk_entry: ChunkRange,
+    worklist_slice: pa.Table,
+    tail_buffer: TailBuffer,
+    model: str,
+    source_variables: list[str],
+    col_prefix: str,
+    steps: dict[int, int],
+    resolution: float,
+    cache_dir: str,
+) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
+    """Download multiple .om files, derive a per-timestep series, apply sliding-window mode.
+
+    Downloads one chunk file per source variable, computes weather_code_array
+    per timestep, then applies _window_mode_batch for each window size.
+    Columns are written as {col_prefix}_mode_{W}h.
+    """
+    max_window_steps = max(steps.values()) if steps else 0
+
+    local_paths: list[Path] = []
+    try:
+        for var in source_variables:
+            local_paths.append(_download_chunk(chunk_entry, model, var, cache_dir))
+
+        fhs = [open(p, "rb") for p in local_paths]  # noqa: WPS515
+        readers = [OmFileReader(fh) for fh in fhs]
+        try:
+            ny, nx, _ = readers[0].shape
+
+            data = worklist_slice.to_pydict()
+            lat = np.asarray(data["lat_idx"], dtype=np.int32)
+            lon = np.asarray(data["lon_idx"], dtype=np.int32)
+            time_idx = np.asarray(data["time_idx"], dtype=np.int32)
+            taxon_path = np.asarray(data["taxon_path"])
+            row_idx = np.asarray(data["row_idx"], dtype=np.int64)
+
+            lat = np.clip(lat, 0, ny - 1)
+            lon = np.clip(lon, 0, nx - 1)
+
+            order = np.lexsort((lon, lat))
+            lat, lon = lat[order], lon[order]
+            time_idx = time_idx[order]
+            taxon_path, row_idx = taxon_path[order], row_idx[order]
+
+            change = np.empty(len(lat), dtype=bool)
+            change[0] = True
+            change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
+            group_starts = np.flatnonzero(change)
+            group_ends = np.append(group_starts[1:], len(lat))
+
+            updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+            new_tail: TailBuffer = {}
+
+            for s, e in zip(group_starts, group_ends):
+                li, lo = int(lat[s]), int(lon[s])
+
+                try:
+                    raw = [np.asarray(r[li, lo, :], dtype=np.float64) for r in readers]
+                except Exception:
+                    continue
+                if any(a.size == 0 for a in raw):
+                    continue
+
+                derived = weather_code_array(*raw, resolution)
+
+                if max_window_steps > 0:
+                    new_tail[(li, lo)] = derived[-max_window_steps:].copy()
+
+                time_slice = time_idx[s:e]
+                prev_tail = tail_buffer.get((li, lo))
+                prev_len = 0
+                if prev_tail is not None and max_window_steps > 1:
+                    min_t = int(time_slice.min())
+                    need = (max_window_steps - 1) - min_t
+                    if need > 0:
+                        prev_len = min(int(need), len(prev_tail))
+                        derived = np.concatenate([prev_tail[-prev_len:], derived])
+
+                min_t = int(time_slice.min())
+                max_t = int(time_slice.max())
+                slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
+                slice_end = min(derived.size - 1, max_t + prev_len)
+                series_slice = derived[slice_start : slice_end + 1]
+                local_time = np.clip(
+                    (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
+                )
+
+                window_modes = _window_mode_batch(series_slice, local_time, steps)
+
+                paths_slice = taxon_path[s:e]
+                rows_slice = row_idx[s:e]
+                for tpath in np.unique(paths_slice):
+                    mask = paths_slice == tpath
+                    rids = rows_slice[mask]
+                    for hours, modes in window_modes.items():
+                        col = f"{col_prefix}_mode_{hours}h"
+                        updates.setdefault(str(tpath), {}).setdefault(col, []).append(
+                            (rids, modes[mask])
+                        )
+        finally:
+            for fh in fhs:
+                fh.close()
+    finally:
+        for p in local_paths:
+            p.unlink(missing_ok=True)
+
+    return updates, new_tail
+
+
 # ---------------------------------------------------------------------------
 # Parquet write-back
 # ---------------------------------------------------------------------------
@@ -843,35 +1019,3 @@ def derive_vpd(
         if updated_any:
             _atomic_write(path, pa.Table.from_pandas(df, preserve_index=False))
 
-
-def derive_weather_code(
-    root_taxon_id: str,
-    data_root: str,
-    occ_filename: str,
-) -> None:
-    """Compute weather_code_simple from 1h cloud/precip/snowfall aggregates."""
-    root = get_taxon_by_id(root_taxon_id)
-    if root is None:
-        raise RuntimeError(f"Unknown root taxon {root_taxon_id}")
-
-    for node in iter_descendants(root, include_self=True):
-        path = Path(node["path"]) / occ_filename
-        if not path.exists():
-            continue
-        table = pq.read_table(path).combine_chunks()
-        df = table.to_pandas()
-        if df.empty:
-            continue
-
-        cc = df.get("cloud_cover_avg_1h")
-        pr = df.get("precipitation_sum_1h")
-        sw = df.get("snowfall_water_equivalent_sum_1h")
-        if cc is None or pr is None or sw is None:
-            print(f"[weather_code] missing source columns in {path}, skipping")
-            continue
-
-        df["weather_code_simple"] = [
-            weather_code_simple(a, b, c, 3600)
-            for a, b, c in zip(cc.to_numpy(), pr.to_numpy(), sw.to_numpy())
-        ]
-        _atomic_write(path, pa.Table.from_pandas(df, preserve_index=False))

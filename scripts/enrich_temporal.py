@@ -6,6 +6,8 @@ Respects VARS_TO_ENRICH env var — same semantics as enrich_tree: if set,
 only enriches temporal variables whose id appears in the comma-separated list.
 Non-temporal ids in VARS_TO_ENRICH are silently ignored here (enrich_tree
 handles them; temporal ids are ignored there).
+If VARS_TO_ENRICH is set but contains no temporal variable ids, all temporal
+variables are enriched (the assumption is the list was meant for enrich_tree).
 
 Usage:
     python -m scripts.enrich_temporal
@@ -14,14 +16,244 @@ Usage:
 from __future__ import annotations
 
 import os
+import signal
+import threading
+import time
+import traceback
+from pathlib import Path
+
+import pyarrow.compute as pc
+
+from config.config import load_config
+from util.temporal import (
+    TailBuffer,
+    TemporalLayer,
+    build_chunk_index,
+    build_occ_index,
+    derive_vpd,
+    derive_weather_code,
+    load_temporal_layers,
+    map_to_worklist,
+    process_chunk,
+    window_steps,
+    write_back,
+)
+
+CATALOG_PATH = Path("config/gis/catalog.json")
 
 _raw_vars = os.environ.get("VARS_TO_ENRICH", "")
 VARS_TO_ENRICH: list[str] | None = [v.strip() for v in _raw_vars.split(",") if v.strip()] or None
 
+# ERA5 0.25° grid step — only model currently supported
+_ERA5_STEP = 0.25
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _rss_mb() -> float | None:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        return None
+    return None
+
+
+def _cleanup_cache(cache_dir: str) -> None:
+    cache_root = Path(cache_dir)
+    if not cache_root.exists():
+        return
+    for path in cache_root.rglob("*"):
+        try:
+            if path.is_file():
+                path.unlink()
+        except Exception:
+            pass
+
+
+def _filter_layers(all_layers: list[TemporalLayer], vars_to_enrich: list[str] | None) -> list[TemporalLayer]:
+    """Return layers to process, applying VARS_TO_ENRICH filter.
+
+    If vars_to_enrich contains at least one temporal id, restrict to those.
+    If it contains no temporal ids (all spatial), do all temporal layers.
+    """
+    if vars_to_enrich is None:
+        return all_layers
+    temporal_ids = {layer.id for layer in all_layers}
+    requested = [v for v in vars_to_enrich if v in temporal_ids]
+    if not requested:
+        return all_layers
+    requested_set = set(requested)
+    return [layer for layer in all_layers if layer.id in requested_set]
+
+
+# ---------------------------------------------------------------------------
+# Per-layer processing
+# ---------------------------------------------------------------------------
+
+def _run_layer(
+    layer: TemporalLayer,
+    occ_table,
+    cfg,
+    stop: threading.Event,
+) -> None:
+    print(
+        f"[layer] id={layer.id} model={layer.model} agg={layer.agg} "
+        f"windows={layer.windows} grid_mode={layer.grid_mode}"
+    )
+
+    try:
+        chunk_index = build_chunk_index(
+            layer.model, layer.id, min_year=cfg.temporal_min_year
+        )
+    except Exception as exc:
+        print(f"[skip] {layer.id}: could not build chunk index — {exc}")
+        return
+
+    print(
+        f"[chunks] {layer.id}: {len(chunk_index.ranges)} chunks, "
+        f"resolution={chunk_index.resolution:.0f}s"
+    )
+
+    worklist = map_to_worklist(occ_table, chunk_index, layer.grid_mode, _ERA5_STEP)
+    if worklist.num_rows == 0:
+        print(f"[skip] {layer.id}: no observations mapped to any chunk")
+        return
+
+    steps = window_steps(chunk_index.resolution, tuple(layer.windows))
+    tail_buffer: TailBuffer = {}
+
+    chunks_with_obs = [
+        entry
+        for entry in chunk_index.ranges
+        if worklist.filter(pc.equal(worklist["chunk_num"], entry.chunk_num)).num_rows > 0
+    ]
+    total_chunks = len(chunks_with_obs)
+    total_rows = worklist.num_rows
+    rows_done = 0
+    t_start = time.monotonic()
+
+    for chunk_idx, chunk_entry in enumerate(chunks_with_obs, 1):
+        if stop.is_set():
+            print(f"[stop] {layer.id}: interrupted before chunk {chunk_entry.chunk_num}")
+            return
+
+        chunk_worklist = worklist.filter(
+            pc.equal(worklist["chunk_num"], chunk_entry.chunk_num)
+        )
+
+        try:
+            updates, tail_buffer = process_chunk(
+                chunk_entry,
+                chunk_worklist,
+                tail_buffer,
+                layer.model,
+                layer.id,
+                steps,
+                layer.agg,
+                cfg.temporal_cache_dir,
+            )
+            write_back(updates)
+        except Exception:
+            print(f"[error] {layer.id} chunk={chunk_entry.chunk_num}")
+            traceback.print_exc()
+            raise
+
+        rows_done += chunk_worklist.num_rows
+        elapsed = time.monotonic() - t_start
+        rate = rows_done / elapsed if elapsed > 0 else 0.0
+        remaining = total_rows - rows_done
+        eta_s = remaining / rate if rate > 0 else float("inf")
+        rss = _rss_mb()
+        rss_str = f" rss={rss:.0f}MB" if rss is not None else ""
+        print(
+            f"[progress] {layer.id} chunk {chunk_idx}/{total_chunks} "
+            f"rows={rows_done}/{total_rows} "
+            f"rate={rate:.0f}/s eta={eta_s:.0f}s{rss_str}"
+        )
+
+    print(f"[done] {layer.id} rows={rows_done} elapsed={time.monotonic() - t_start:.1f}s")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    # TODO: implement in Phase 4 (after util/temporal.py core is complete)
-    raise NotImplementedError("enrich_temporal not yet implemented — see PLAN.md")
+    cfg = load_config("global")
+    stop = threading.Event()
+
+    def _handle_signal(signum: int, _frame: object) -> None:
+        print(f"[signal] received {signum}, stopping after current chunk...")
+        stop.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_signal)
+        except Exception:
+            pass
+
+    Path(cfg.temporal_cache_dir).mkdir(parents=True, exist_ok=True)
+
+    try:
+        all_layers = load_temporal_layers(CATALOG_PATH)
+        active_layers = _filter_layers(all_layers, VARS_TO_ENRICH)
+        active_ids = {layer.id for layer in active_layers}
+        print(f"[init] active layers: {[layer.id for layer in active_layers]}")
+
+        print(f"[occ_index] scanning root={cfg.root_taxon_id} min_year={cfg.temporal_min_year}")
+        occ_table = build_occ_index(
+            cfg.root_taxon_id,
+            cfg.data_root,
+            cfg.occurrence_parquet_filename,
+            cfg.temporal_min_year,
+        )
+        print(f"[occ_index] {occ_table.num_rows} observations")
+
+        if occ_table.num_rows == 0:
+            print("[done] no observations to enrich")
+            return
+
+        # Non-derived layers first
+        for layer in active_layers:
+            if layer.derived or stop.is_set():
+                continue
+            _run_layer(layer, occ_table, cfg, stop)
+
+        # Derived passes (only if their deps were processed or already present)
+        if "vapor_pressure_deficit" in active_ids and not stop.is_set():
+            vpd_layer = next(layer for layer in active_layers if layer.id == "vapor_pressure_deficit")
+            print(f"[derive] vapor_pressure_deficit windows={vpd_layer.windows}")
+            try:
+                derive_vpd(
+                    cfg.root_taxon_id,
+                    cfg.data_root,
+                    cfg.occurrence_parquet_filename,
+                    vpd_layer.windows,
+                )
+            except Exception:
+                print("[error] derive_vpd failed")
+                traceback.print_exc()
+
+        if "weather_code_simple" in active_ids and not stop.is_set():
+            print("[derive] weather_code_simple")
+            try:
+                derive_weather_code(
+                    cfg.root_taxon_id,
+                    cfg.data_root,
+                    cfg.occurrence_parquet_filename,
+                )
+            except Exception:
+                print("[error] derive_weather_code failed")
+                traceback.print_exc()
+
+    finally:
+        _cleanup_cache(cfg.temporal_cache_dir)
+        print("[cleanup] cache cleared")
 
 
 if __name__ == "__main__":  # pragma: no cover

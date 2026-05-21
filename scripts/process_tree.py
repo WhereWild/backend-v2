@@ -17,29 +17,25 @@ Pass 2 — Rankings (top-down, shallowest first):
 
 from __future__ import annotations
 
-import json
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 from config.config import load_config
 from util.rankings import compute_relative_ranks
 from util.stats import compute_taxon_stats
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants
+from util.tiles import load_layers
 
 CONFIG = load_config("global")
 
-CATALOG_PATH = Path("config/gis/catalog.json")
 STATS_WORKERS = 4
 RANK_WORKERS = 4
 LOG_INTERVAL = 50
 
 
 def _load_layers() -> list[dict]:
-    with open(CATALOG_PATH) as f:
-        cat = json.load(f)
-    return [layer for category in cat["categories"] for layer in category["layers"]]
+    return load_layers()
 
 
 def _run_node(node: TaxonRecord, layers: list[dict]) -> str:

@@ -1,6 +1,7 @@
 import csv
 import json
 import math
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -34,9 +35,27 @@ _LOCATIONS_DIR = Path("data/gis/locations")
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
 
+def _resolve_variable_id(variable_id: str) -> str:
+    """Normalise variable ids, keeping backward compat with old bio_1 → bio1 format.
+
+    Only strips underscores when the id is not already a known layer — preserves
+    temporal ids like temperature_2m_avg_24h unchanged.
+    """
+    known = {layer["id"] for layer in tiles.load_layers()}
+    if variable_id in known:
+        return variable_id
+    stripped = variable_id.replace("_", "")
+    return stripped
+
+
 @lru_cache(maxsize=32)
 def _load_legend(layer_id: str) -> list:
     path = _LEGEND_DIR / f"{layer_id}_legend.json"
+    if not path.exists():
+        # Temporal ids like weather_code_simple_mode_24h → weather_code_simple
+        base_id = re.sub(r'_(avg|sum|mode|snapshot)_\d+h$', '', layer_id, flags=re.IGNORECASE)
+        if base_id != layer_id:
+            path = _LEGEND_DIR / f"{base_id}_legend.json"
     if not path.exists():
         return []
     return json.loads(path.read_text()).get("classes", [])
@@ -102,7 +121,7 @@ def list_layers():
 @app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
 async def variable_tile_compat(variable_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024)):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
-    layer_id = variable_id.replace("_", "")
+    layer_id = _resolve_variable_id(variable_id)
     return await layer_tile(layer_id, z, x, y, tile_size)
 
 
@@ -311,7 +330,7 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
 
-    variable_id = variable_id.replace("_", "")  # bio_1 → bio1
+    variable_id = _resolve_variable_id(variable_id)
     taxon_dir = TREE_ROOT / taxon["path"]
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     variable_metadata = {
@@ -353,7 +372,7 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
                     {
                         "value": item["class_id"],
                         "class_name": class_index.get(item["class_id"], {}).get("name", str(item["class_id"])),
-                        "description": class_index.get(item["class_id"], {}).get("description"),
+                        "description": "",
                         "color": (class_index.get(item["class_id"], {}).get("traits") or {}).get("color"),
                         "count": round(total_samples * item["fraction"]),
                         "fraction": item["fraction"],
@@ -392,7 +411,7 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
             categorical_distribution.append({
                 "value": class_id,
                 "class_name": info.get("name", str(class_id)),
-                "description": info.get("description"),
+                "description": "",
                 "color": info.get("traits", {}).get("color") if info.get("traits") else None,
                 "count": round(total_samples * fraction),
                 "fraction": fraction,
@@ -639,7 +658,7 @@ def get_species_environment_slice(
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    variable_id = variable_id.replace("_", "")
+    variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
         raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
@@ -689,7 +708,7 @@ def get_species_environment_class_samples(
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    variable_id = variable_id.replace("_", "")
+    variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
         raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")

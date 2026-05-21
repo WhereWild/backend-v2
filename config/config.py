@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass, field, fields
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, get_type_hints
 
 
@@ -78,6 +79,23 @@ class GlobalConfig:
     location_scope_by_level: dict[int, str] = field(
         default_factory=lambda: {0: "gadm_level0", 1: "gadm_level1", 2: "gadm_level2"}
     )
+
+    # Taxonomy / occurrence
+    occurrence_parquet_filename: str = "occurrence.parquet"
+    data_root: str = "data"
+
+    # Temporal enrichment
+    temporal_min_year: int = 2000  # ERA5 coverage starts 1940; raise to limit processing time
+    temporal_worklist_batch_rows: int = 100_000
+    temporal_cache_dir: str = "data/cache/temporal"
+    temporal_overwrite_all: bool = False
+    temporal_elevation_correctable_vars: tuple[str, ...] = (
+        "temperature_2m", "dew_point_2m", "soil_temperature_0_to_7cm"
+    )
+
+    @property
+    def gis_root(self) -> Path:
+        return Path(self.data_root) / "gis"
 
     def __post_init__(self):
         hints = get_type_hints(self.__class__)

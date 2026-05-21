@@ -20,14 +20,17 @@ import signal
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pyarrow.compute as pc
 
 from config.config import load_config
 from util.temporal import (
+    _PREFETCH_WORKERS,
     TailBuffer,
     TemporalLayer,
+    _download_layer_chunk,
     build_chunk_index,
     build_occ_index,
     derive_vpd,
@@ -134,61 +137,74 @@ def _run_layer(
         if worklist.filter(pc.equal(worklist["chunk_num"], entry.chunk_num)).num_rows > 0
     ]
     total_chunks = len(chunks_with_obs)
+
+    prefetch_vars = layer.sources if layer.sources else [layer.id]
     total_rows = worklist.num_rows
     rows_done = 0
     t_start = time.monotonic()
 
-    for chunk_idx, chunk_entry in enumerate(chunks_with_obs, 1):
-        if stop.is_set():
-            print(f"[stop] {layer.id}: interrupted before chunk {chunk_entry.chunk_num}")
-            return
+    # Submit all downloads upfront; process each chunk as its download finishes.
+    # Pool limits to _PREFETCH_WORKERS concurrent downloads so chunks N+1..N+7
+    # are fetched while chunk N is being processed.
+    with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
+        dl_futures = [
+            pool.submit(_download_layer_chunk, entry, layer.model, prefetch_vars, cfg.temporal_cache_dir)
+            for entry in chunks_with_obs
+        ]
 
-        chunk_worklist = worklist.filter(
-            pc.equal(worklist["chunk_num"], chunk_entry.chunk_num)
-        )
+        for chunk_idx, (chunk_entry, dl_fut) in enumerate(zip(chunks_with_obs, dl_futures), 1):
+            if stop.is_set():
+                print(f"[stop] {layer.id}: interrupted before chunk {chunk_entry.chunk_num}")
+                return
 
-        try:
-            if layer.sources:
-                updates, tail_buffer = process_chunk_mode(
-                    chunk_entry,
-                    chunk_worklist,
-                    tail_buffer,
-                    layer.model,
-                    layer.sources,
-                    layer.id,
-                    steps,
-                    chunk_index.resolution,
-                    cfg.temporal_cache_dir,
-                )
-            else:
-                updates, tail_buffer = process_chunk(
-                    chunk_entry,
-                    chunk_worklist,
-                    tail_buffer,
-                    layer.model,
-                    layer.id,
-                    steps,
-                    layer.agg,
-                    cfg.temporal_cache_dir,
-                )
-            write_back(updates)
-        except Exception:
-            print(f"[error] {layer.id} chunk={chunk_entry.chunk_num}")
-            traceback.print_exc()
-            raise
+            dl_fut.result()  # wait for this chunk's files to be ready
 
-        rows_done += chunk_worklist.num_rows
-        elapsed = time.monotonic() - t_start
-        rate = rows_done / elapsed if elapsed > 0 else 0.0
-        remaining = total_rows - rows_done
-        eta_s = remaining / rate if rate > 0 else float("inf")
-        rss = _rss_mb()
-        rss_str = f" rss={rss:.0f}MB" if rss is not None else ""
-        print(
-            f"[progress] {layer.id} chunk {chunk_idx}/{total_chunks} "
-            f"rows={rows_done}/{total_rows} "
-            f"rate={rate:.0f}/s eta={eta_s:.0f}s{rss_str}"
-        )
+            chunk_worklist = worklist.filter(
+                pc.equal(worklist["chunk_num"], chunk_entry.chunk_num)
+            )
+
+            try:
+                if layer.sources:
+                    updates, tail_buffer = process_chunk_mode(
+                        chunk_entry,
+                        chunk_worklist,
+                        tail_buffer,
+                        layer.model,
+                        layer.sources,
+                        layer.id,
+                        steps,
+                        chunk_index.resolution,
+                        cfg.temporal_cache_dir,
+                    )
+                else:
+                    updates, tail_buffer = process_chunk(
+                        chunk_entry,
+                        chunk_worklist,
+                        tail_buffer,
+                        layer.model,
+                        layer.id,
+                        steps,
+                        layer.agg,
+                        cfg.temporal_cache_dir,
+                    )
+                write_back(updates)
+            except Exception:
+                print(f"[error] {layer.id} chunk={chunk_entry.chunk_num}")
+                traceback.print_exc()
+                raise
+
+            rows_done += chunk_worklist.num_rows
+            elapsed = time.monotonic() - t_start
+            rate = rows_done / elapsed if elapsed > 0 else 0.0
+            remaining = total_rows - rows_done
+            eta_s = remaining / rate if rate > 0 else float("inf")
+            rss = _rss_mb()
+            rss_str = f" rss={rss:.0f}MB" if rss is not None else ""
+            print(
+                f"[progress] {layer.id} chunk {chunk_idx}/{total_chunks} "
+                f"rows={rows_done}/{total_rows} "
+                f"rate={rate:.0f}/s eta={eta_s:.0f}s{rss_str}"
+            )
 
     print(f"[done] {layer.id} rows={rows_done} elapsed={time.monotonic() - t_start:.1f}s")
 
@@ -219,9 +235,9 @@ def main() -> None:
         active_ids = {layer.id for layer in active_layers}
         print(f"[init] active layers: {[layer.id for layer in active_layers]}")
 
-        print(f"[occ_index] scanning root={cfg.root_taxon_id} min_year={cfg.temporal_min_year}")
+        print(f"[occ_index] scanning root={str(cfg.plantae_key)} min_year={cfg.temporal_min_year}")
         occ_table = build_occ_index(
-            cfg.root_taxon_id,
+            str(cfg.plantae_key),
             cfg.data_root,
             cfg.occurrence_parquet_filename,
             cfg.temporal_min_year,
@@ -244,7 +260,7 @@ def main() -> None:
             print(f"[derive] vapor_pressure_deficit windows={vpd_layer.windows}")
             try:
                 derive_vpd(
-                    cfg.root_taxon_id,
+                    str(cfg.plantae_key),
                     cfg.data_root,
                     cfg.occurrence_parquet_filename,
                     vpd_layer.windows,

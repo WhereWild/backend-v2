@@ -55,8 +55,9 @@ def _parse_timestamp(date: str, time: str) -> int | None:
     if not date:
         return None
     try:
+        date_only = date.split("T")[0]
         if time and time.lower() != "na":
-            dt = datetime.fromisoformat(f"{date}T{time}")
+            dt = datetime.fromisoformat(f"{date_only}T{time}")
         else:
             dt = datetime.fromisoformat(date)
         if dt.tzinfo is None:

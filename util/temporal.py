@@ -18,8 +18,9 @@ correctly without re-downloading.
 from __future__ import annotations
 
 import json
-import shutil
+import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,9 @@ _LON_COL = "decimalLongitude"
 _TIME_COL = "eventTimestamp"
 
 _S3_BLOCK_SIZE = 64 * 1024 * 1024
+_S3_BASE_URL = "https://openmeteo.s3.amazonaws.com/data"
+_PREFETCH_WORKERS = 8
+_PREFETCH_DISK_LIMIT_GB = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -390,18 +394,21 @@ def _parse_s3_time(value: Any) -> float | None:
     return None
 
 
+def _chunk_filename(chunk_entry: ChunkRange) -> str:
+    if chunk_entry.source == "year":
+        return f"year_{chunk_entry.chunk_num}.om"
+    return f"chunk_{chunk_entry.chunk_num}.om"
+
+
 def _download_chunk(
     chunk_entry: ChunkRange,
     model: str,
     variable: str,
     cache_dir: str,
 ) -> Path:
-    """Download a single .om chunk to cache_dir and return the local path."""
-    if chunk_entry.source == "year":
-        filename = f"year_{chunk_entry.chunk_num}.om"
-    else:
-        filename = f"chunk_{chunk_entry.chunk_num}.om"
-    uri = f"s3://openmeteo/data/{model}/{variable}/{filename}"
+    """Download a single .om chunk via aria2c and return the local path."""
+    filename = _chunk_filename(chunk_entry)
+    url = f"{_S3_BASE_URL}/{model}/{variable}/{filename}"
 
     dest_dir = Path(cache_dir) / "chunks"
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -410,16 +417,92 @@ def _download_chunk(
     if target.exists():
         return target
 
-    tmp = target.with_suffix(".tmp")
+    print(f"[download] {url}", flush=True)
+    tmp_name = target.name + ".tmp"
+    tmp = dest_dir / tmp_name
     try:
-        with fsspec.open(uri, mode="rb", s3={"anon": True}) as src:
-            with open(tmp, "wb") as dst:
-                shutil.copyfileobj(src, dst, _S3_BLOCK_SIZE)
+        subprocess.run(
+            [
+                "aria2c",
+                "--split=8",
+                "--max-connection-per-server=8",
+                "--continue=true",
+                "--max-tries=12",
+                "--retry-wait=15",
+                "--connect-timeout=60",
+                f"--dir={dest_dir}",
+                f"--out={tmp_name}",
+                url,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         tmp.replace(target)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+    print(f"[download] done {target.name} ({target.stat().st_size // 1024 // 1024}MB)", flush=True)
     return target
+
+
+def _download_layer_chunk(
+    chunk_entry: ChunkRange,
+    model: str,
+    variables: list[str],
+    cache_dir: str,
+) -> ChunkRange:
+    """Download all .om files for one chunk/layer combination; return the entry."""
+    for var in variables:
+        _download_chunk(chunk_entry, model, var, cache_dir)
+    return chunk_entry
+
+
+def prefetch_chunks(
+    chunk_entries: list[ChunkRange],
+    model: str,
+    variables: list[str],
+    cache_dir: str,
+) -> None:
+    """Download all needed chunks in parallel, respecting a disk space limit."""
+    dest_dir = Path(cache_dir) / "chunks"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    limit_bytes = _PREFETCH_DISK_LIMIT_GB * 1024 ** 3
+    tasks: list[tuple[ChunkRange, str, str]] = []
+    for entry in chunk_entries:
+        for var in variables:
+            target = dest_dir / f"{model}_{var}_{_chunk_filename(entry)}"
+            if not target.exists():
+                tasks.append((entry, model, var))
+
+    if not tasks:
+        return
+
+    used = sum(f.stat().st_size for f in dest_dir.glob("*.om") if f.exists())
+    print(f"[prefetch] {len(tasks)} files to download, cache={used // 1024 // 1024}MB used", flush=True)
+
+    def _fetch(args: tuple[ChunkRange, str, str]) -> Path:
+        entry, mdl, var = args
+        # Re-check disk usage before each download
+        current = sum(f.stat().st_size for f in dest_dir.glob("*.om") if f.exists())
+        if current >= limit_bytes:
+            raise RuntimeError(f"Prefetch disk limit ({_PREFETCH_DISK_LIMIT_GB}GB) reached")
+        return _download_chunk(entry, mdl, var, cache_dir)
+
+    with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
+        futures = {pool.submit(_fetch, t): t for t in tasks}
+        done = 0
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as exc:
+                entry, _, var = futures[fut]
+                print(f"[prefetch] warning: {var} chunk={entry.chunk_num} failed — {exc}", flush=True)
+            done += 1
+            if done % 10 == 0:
+                print(f"[prefetch] {done}/{len(tasks)} done", flush=True)
+    print("[prefetch] complete", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -563,8 +646,9 @@ def build_occ_index(
     all_lons: list[np.ndarray] = []
     all_times: list[np.ndarray] = []
 
+    tree_root = Path(data_root) / "taxonomy" / "tree"
     for node in iter_descendants(root, include_self=True):
-        occ_path = Path(node["path"]) / occ_filename
+        occ_path = tree_root / node["path"] / occ_filename
         if not occ_path.exists():
             continue
         table = pq.read_table(occ_path, columns=[_LAT_COL, _LON_COL, _TIME_COL])
@@ -718,93 +802,92 @@ def process_chunk(
 
     local_path = _download_chunk(chunk_entry, model, variable, cache_dir)
     try:
-        with open(local_path, "rb") as fh:
-            reader = OmFileReader(fh)
-            ny, nx, _ = reader.shape
+        reader = OmFileReader(str(local_path))
+        ny, nx, _ = reader.shape
 
-            data = worklist_slice.to_pydict()
-            lat = np.asarray(data["lat_idx"], dtype=np.int32)
-            lon = np.asarray(data["lon_idx"], dtype=np.int32)
-            time_idx = np.asarray(data["time_idx"], dtype=np.int32)
-            taxon_path = np.asarray(data["taxon_path"])
-            row_idx = np.asarray(data["row_idx"], dtype=np.int64)
+        data = worklist_slice.to_pydict()
+        lat = np.asarray(data["lat_idx"], dtype=np.int32)
+        lon = np.asarray(data["lon_idx"], dtype=np.int32)
+        time_idx = np.asarray(data["time_idx"], dtype=np.int32)
+        taxon_path = np.asarray(data["taxon_path"])
+        row_idx = np.asarray(data["row_idx"], dtype=np.int64)
 
-            # Re-clamp grid indices to actual file dimensions
-            lat = np.clip(lat, 0, ny - 1)
-            lon = np.clip(lon, 0, nx - 1)
+        # Re-clamp grid indices to actual file dimensions
+        lat = np.clip(lat, 0, ny - 1)
+        lon = np.clip(lon, 0, nx - 1)
 
-            # Sort by (lat, lon) to process one grid cell at a time
-            order = np.lexsort((lon, lat))
-            lat = lat[order]
-            lon = lon[order]
-            time_idx = time_idx[order]
-            taxon_path = taxon_path[order]
-            row_idx = row_idx[order]
+        # Sort by (lat, lon) to process one grid cell at a time
+        order = np.lexsort((lon, lat))
+        lat = lat[order]
+        lon = lon[order]
+        time_idx = time_idx[order]
+        taxon_path = taxon_path[order]
+        row_idx = row_idx[order]
 
-            change = np.empty(len(lat), dtype=bool)
-            change[0] = True
-            change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
-            group_starts = np.flatnonzero(change)
-            group_ends = np.append(group_starts[1:], len(lat))
+        change = np.empty(len(lat), dtype=bool)
+        change[0] = True
+        change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
+        group_starts = np.flatnonzero(change)
+        group_ends = np.append(group_starts[1:], len(lat))
 
-            updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
-            new_tail: TailBuffer = {}
+        updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+        new_tail: TailBuffer = {}
 
-            for s, e in zip(group_starts, group_ends):
-                li = int(lat[s])
-                lo = int(lon[s])
+        for s, e in zip(group_starts, group_ends):
+            li = int(lat[s])
+            lo = int(lon[s])
 
-                try:
-                    series = np.asarray(reader[li, lo, :], dtype=np.float64)
-                except Exception:
-                    continue
-                if series.size == 0:
-                    continue
+            try:
+                series = np.asarray(reader[li, lo, :], dtype=np.float64)
+            except Exception:
+                continue
+            if series.size == 0:
+                continue
 
-                # Save tail from current chunk for next chunk's boundary handling
-                if max_window_steps > 0:
-                    new_tail[(li, lo)] = series[-max_window_steps:].copy()
+            # Save tail from current chunk for next chunk's boundary handling
+            if max_window_steps > 0:
+                new_tail[(li, lo)] = series[-max_window_steps:].copy()
 
-                # Prepend previous chunk's tail if observations near chunk start
-                time_slice = time_idx[s:e]
-                prev_tail = tail_buffer.get((li, lo))
-                prev_len = 0
+            # Prepend previous chunk's tail if observations near chunk start
+            time_slice = time_idx[s:e]
+            prev_tail = tail_buffer.get((li, lo))
+            prev_len = 0
 
-                if prev_tail is not None and max_window_steps > 1:
-                    min_t = int(time_slice.min())
-                    need = (max_window_steps - 1) - min_t
-                    if need > 0:
-                        prev_len = min(int(need), len(prev_tail))
-                        series = np.concatenate([prev_tail[-prev_len:], series])
-
-                # Narrow the series slice to only what the windows need
+            if prev_tail is not None and max_window_steps > 1:
                 min_t = int(time_slice.min())
-                max_t = int(time_slice.max())
-                slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
-                slice_end = min(series.size - 1, max_t + prev_len)
-                series_slice = series[slice_start : slice_end + 1]
-                local_time = np.clip(
-                    (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
-                )
+                need = (max_window_steps - 1) - min_t
+                if need > 0:
+                    prev_len = min(int(need), len(prev_tail))
+                    series = np.concatenate([prev_tail[-prev_len:], series])
 
-                window_sums, window_counts = window_stats_batch(series_slice, local_time, steps)
+            # Narrow the series slice to only what the windows need
+            min_t = int(time_slice.min())
+            max_t = int(time_slice.max())
+            slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
+            slice_end = min(series.size - 1, max_t + prev_len)
+            series_slice = series[slice_start : slice_end + 1]
+            local_time = np.clip(
+                (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
+            )
 
-                paths_slice = taxon_path[s:e]
-                rows_slice = row_idx[s:e]
-                for tpath in np.unique(paths_slice):
-                    mask = paths_slice == tpath
-                    row_ids = rows_slice[mask]
-                    for hours, sums in window_sums.items():
-                        cnts = window_counts[hours]
-                        if agg_mode == "sum":
-                            values = np.where(cnts > 0, sums, np.nan)
-                        else:
-                            values = np.full_like(sums, np.nan, dtype=np.float64)
-                            np.divide(sums, cnts, out=values, where=cnts > 0)
-                        col = f"{variable}_{agg_mode}_{hours}h"
-                        updates.setdefault(str(tpath), {}).setdefault(col, []).append(
-                            (row_ids, values[mask])
-                        )
+            window_sums, window_counts = window_stats_batch(series_slice, local_time, steps)
+
+            paths_slice = taxon_path[s:e]
+            rows_slice = row_idx[s:e]
+            for tpath in np.unique(paths_slice):
+                mask = paths_slice == tpath
+                row_ids = rows_slice[mask]
+                for hours, sums in window_sums.items():
+                    cnts = window_counts[hours]
+                    if agg_mode == "sum":
+                        values = np.where(cnts > 0, sums, np.nan)
+                    else:
+                        values = np.full_like(sums, np.nan, dtype=np.float64)
+                        np.divide(sums, cnts, out=values, where=cnts > 0)
+                    col = f"{variable}_{agg_mode}_{hours}h"
+                    updates.setdefault(str(tpath), {}).setdefault(col, []).append(
+                        (row_ids, values[mask])
+                    )
     finally:
         local_path.unlink(missing_ok=True)
 
@@ -835,84 +918,79 @@ def process_chunk_mode(
         for var in source_variables:
             local_paths.append(_download_chunk(chunk_entry, model, var, cache_dir))
 
-        fhs = [open(p, "rb") for p in local_paths]  # noqa: WPS515
-        readers = [OmFileReader(fh) for fh in fhs]
-        try:
-            ny, nx, _ = readers[0].shape
+        readers = [OmFileReader(str(p)) for p in local_paths]
+        ny, nx, _ = readers[0].shape
 
-            data = worklist_slice.to_pydict()
-            lat = np.asarray(data["lat_idx"], dtype=np.int32)
-            lon = np.asarray(data["lon_idx"], dtype=np.int32)
-            time_idx = np.asarray(data["time_idx"], dtype=np.int32)
-            taxon_path = np.asarray(data["taxon_path"])
-            row_idx = np.asarray(data["row_idx"], dtype=np.int64)
+        data = worklist_slice.to_pydict()
+        lat = np.asarray(data["lat_idx"], dtype=np.int32)
+        lon = np.asarray(data["lon_idx"], dtype=np.int32)
+        time_idx = np.asarray(data["time_idx"], dtype=np.int32)
+        taxon_path = np.asarray(data["taxon_path"])
+        row_idx = np.asarray(data["row_idx"], dtype=np.int64)
 
-            lat = np.clip(lat, 0, ny - 1)
-            lon = np.clip(lon, 0, nx - 1)
+        lat = np.clip(lat, 0, ny - 1)
+        lon = np.clip(lon, 0, nx - 1)
 
-            order = np.lexsort((lon, lat))
-            lat, lon = lat[order], lon[order]
-            time_idx = time_idx[order]
-            taxon_path, row_idx = taxon_path[order], row_idx[order]
+        order = np.lexsort((lon, lat))
+        lat, lon = lat[order], lon[order]
+        time_idx = time_idx[order]
+        taxon_path, row_idx = taxon_path[order], row_idx[order]
 
-            change = np.empty(len(lat), dtype=bool)
-            change[0] = True
-            change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
-            group_starts = np.flatnonzero(change)
-            group_ends = np.append(group_starts[1:], len(lat))
+        change = np.empty(len(lat), dtype=bool)
+        change[0] = True
+        change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
+        group_starts = np.flatnonzero(change)
+        group_ends = np.append(group_starts[1:], len(lat))
 
-            updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
-            new_tail: TailBuffer = {}
+        updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+        new_tail: TailBuffer = {}
 
-            for s, e in zip(group_starts, group_ends):
-                li, lo = int(lat[s]), int(lon[s])
+        for s, e in zip(group_starts, group_ends):
+            li, lo = int(lat[s]), int(lon[s])
 
-                try:
-                    raw = [np.asarray(r[li, lo, :], dtype=np.float64) for r in readers]
-                except Exception:
-                    continue
-                if any(a.size == 0 for a in raw):
-                    continue
+            try:
+                raw = [np.asarray(r[li, lo, :], dtype=np.float64) for r in readers]
+            except Exception:
+                continue
+            if any(a.size == 0 for a in raw):
+                continue
 
-                derived = weather_code_array(*raw, resolution)
+            derived = weather_code_array(*raw, resolution)
 
-                if max_window_steps > 0:
-                    new_tail[(li, lo)] = derived[-max_window_steps:].copy()
+            if max_window_steps > 0:
+                new_tail[(li, lo)] = derived[-max_window_steps:].copy()
 
-                time_slice = time_idx[s:e]
-                prev_tail = tail_buffer.get((li, lo))
-                prev_len = 0
-                if prev_tail is not None and max_window_steps > 1:
-                    min_t = int(time_slice.min())
-                    need = (max_window_steps - 1) - min_t
-                    if need > 0:
-                        prev_len = min(int(need), len(prev_tail))
-                        derived = np.concatenate([prev_tail[-prev_len:], derived])
-
+            time_slice = time_idx[s:e]
+            prev_tail = tail_buffer.get((li, lo))
+            prev_len = 0
+            if prev_tail is not None and max_window_steps > 1:
                 min_t = int(time_slice.min())
-                max_t = int(time_slice.max())
-                slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
-                slice_end = min(derived.size - 1, max_t + prev_len)
-                series_slice = derived[slice_start : slice_end + 1]
-                local_time = np.clip(
-                    (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
-                )
+                need = (max_window_steps - 1) - min_t
+                if need > 0:
+                    prev_len = min(int(need), len(prev_tail))
+                    derived = np.concatenate([prev_tail[-prev_len:], derived])
 
-                window_modes = _window_mode_batch(series_slice, local_time, steps)
+            min_t = int(time_slice.min())
+            max_t = int(time_slice.max())
+            slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
+            slice_end = min(derived.size - 1, max_t + prev_len)
+            series_slice = derived[slice_start : slice_end + 1]
+            local_time = np.clip(
+                (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
+            )
 
-                paths_slice = taxon_path[s:e]
-                rows_slice = row_idx[s:e]
-                for tpath in np.unique(paths_slice):
-                    mask = paths_slice == tpath
-                    rids = rows_slice[mask]
-                    for hours, modes in window_modes.items():
-                        col = f"{col_prefix}_mode_{hours}h"
-                        updates.setdefault(str(tpath), {}).setdefault(col, []).append(
-                            (rids, modes[mask])
-                        )
-        finally:
-            for fh in fhs:
-                fh.close()
+            window_modes = _window_mode_batch(series_slice, local_time, steps)
+
+            paths_slice = taxon_path[s:e]
+            rows_slice = row_idx[s:e]
+            for tpath in np.unique(paths_slice):
+                mask = paths_slice == tpath
+                rids = rows_slice[mask]
+                for hours, modes in window_modes.items():
+                    col = f"{col_prefix}_mode_{hours}h"
+                    updates.setdefault(str(tpath), {}).setdefault(col, []).append(
+                        (rids, modes[mask])
+                    )
     finally:
         for p in local_paths:
             p.unlink(missing_ok=True)

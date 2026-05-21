@@ -47,21 +47,49 @@ def _catalog() -> dict:
         return json.load(f)
 
 
+_WINDOW_LABELS = {1: "1h", 8: "8h", 24: "24h", 72: "3d", 168: "7d", 720: "30d", 2160: "90d"}
+
+
+def _expand_temporal_layers(category: dict) -> list[dict]:
+    """Expand temporal layers into one entry per window with synthesized ids."""
+    cat_windows = category.get("windows", [])
+    expanded = []
+    for layer in category["layers"]:
+        agg = layer.get("agg", "avg")
+        windows = layer.get("windows", cat_windows)
+        for w in windows:
+            label = _WINDOW_LABELS.get(w, f"{w}h")
+            expanded.append({
+                **layer,
+                "id": f"{layer['id']}_{agg}_{w}h",
+                "display_name": layer.get("display_name", layer["id"]),
+                "window_hours": w,
+                "window_label": label,
+            })
+    return expanded
+
+
 def load_layers() -> list[dict]:
-    return [
-        layer
-        for category in _catalog()["categories"]
-        for layer in category["layers"]
-    ]
+    layers = []
+    for category in _catalog()["categories"]:
+        if category.get("id") == "temporal":
+            layers.extend(_expand_temporal_layers(category))
+        else:
+            layers.extend(category["layers"])
+    return layers
 
 
 def load_layers_with_category() -> list[tuple[dict, dict]]:
     """Return (layer, category) pairs for every layer in the catalog."""
-    return [
-        (layer, category)
-        for category in _catalog()["categories"]
-        for layer in category["layers"]
-    ]
+    result = []
+    for category in _catalog()["categories"]:
+        if category.get("id") == "temporal":
+            for layer in _expand_temporal_layers(category):
+                result.append((layer, category))
+        else:
+            for layer in category["layers"]:
+                result.append((layer, category))
+    return result
 
 
 def get_layer(layer_id: str) -> dict:

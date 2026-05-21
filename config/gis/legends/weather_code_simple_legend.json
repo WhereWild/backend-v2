@@ -1,0 +1,123 @@
+{
+  "layer_id": "weather_code_simple",
+  "source": "Derived from ERA5 hourly cloud cover, precipitation, and snowfall \u2014 simplified WMO code table",
+  "classes": [
+    {
+      "id": 0,
+      "name": "Clear sky",
+      "group": "cloud",
+      "group_label": "Cloud cover",
+      "traits": {
+        "color": "#FFD700"
+      }
+    },
+    {
+      "id": 1,
+      "name": "Mainly clear",
+      "group": "cloud",
+      "group_label": "Cloud cover",
+      "traits": {
+        "color": "#FFF3CD"
+      }
+    },
+    {
+      "id": 2,
+      "name": "Partly cloudy",
+      "group": "cloud",
+      "group_label": "Cloud cover",
+      "traits": {
+        "color": "#CFD8DC"
+      }
+    },
+    {
+      "id": 3,
+      "name": "Overcast",
+      "group": "cloud",
+      "group_label": "Cloud cover",
+      "traits": {
+        "color": "#90A4AE"
+      }
+    },
+    {
+      "id": 51,
+      "name": "Slight drizzle",
+      "group": "drizzle",
+      "group_label": "Drizzle",
+      "traits": {
+        "color": "#B2EBF2"
+      }
+    },
+    {
+      "id": 53,
+      "name": "Moderate drizzle",
+      "group": "drizzle",
+      "group_label": "Drizzle",
+      "traits": {
+        "color": "#80DEEA"
+      }
+    },
+    {
+      "id": 55,
+      "name": "Heavy drizzle",
+      "group": "drizzle",
+      "group_label": "Drizzle",
+      "traits": {
+        "color": "#26C6DA"
+      }
+    },
+    {
+      "id": 61,
+      "name": "Slight rain",
+      "group": "rain",
+      "group_label": "Rain",
+      "traits": {
+        "color": "#42A5F5"
+      }
+    },
+    {
+      "id": 63,
+      "name": "Moderate rain",
+      "group": "rain",
+      "group_label": "Rain",
+      "traits": {
+        "color": "#1565C0"
+      }
+    },
+    {
+      "id": 65,
+      "name": "Heavy rain",
+      "group": "rain",
+      "group_label": "Rain",
+      "traits": {
+        "color": "#0D47A1"
+      }
+    },
+    {
+      "id": 71,
+      "name": "Slight snow",
+      "group": "snow",
+      "group_label": "Snow",
+      "traits": {
+        "color": "#E8EAF6"
+      }
+    },
+    {
+      "id": 73,
+      "name": "Moderate snow",
+      "group": "snow",
+      "group_label": "Snow",
+      "traits": {
+        "color": "#C5CAE9"
+      }
+    },
+    {
+      "id": 75,
+      "name": "Heavy snow",
+      "group": "snow",
+      "group_label": "Snow",
+      "traits": {
+        "color": "#9FA8DA"
+      }
+    }
+  ]
+}

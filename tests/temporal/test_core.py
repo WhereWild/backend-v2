@@ -306,6 +306,57 @@ class TestChunkBoundary:
 
 
 # ---------------------------------------------------------------------------
+# Trailing-NaN capping (ERA5 processing-lag zone)
+# ---------------------------------------------------------------------------
+
+class TestTrailingNanCap:
+    """
+    When the last N timesteps of a series are NaN (ERA5 hasn't processed them
+    yet), observations that land in that zone should receive the last valid
+    value's window rather than returning NaN.
+
+    process_chunk / process_chunk_mode implement this by capping local_time
+    to the index of the last finite value in series_slice before calling
+    window_stats_batch.  These tests verify the capping logic directly via
+    window_stats_batch to confirm that capped indices yield non-NaN output.
+    """
+
+    def test_capped_index_gives_non_nan(self) -> None:
+        # Series: 10 valid values then 5 NaN (57% of 15-step series)
+        series = np.array([1.0] * 10 + [np.nan] * 5, dtype=np.float32)
+        # Observation at position 13 (in NaN zone); cap to last valid = 9
+        capped_time = np.array([9])
+        steps = {5: 5}
+        sums, counts = window_stats_batch(series, capped_time, steps)
+        assert counts[5][0] == 5
+        assert sums[5][0] == pytest.approx(5.0)
+
+    def test_uncapped_nan_zone_produces_nan(self) -> None:
+        # Without capping, observation deep in NaN zone → count=0 → NaN
+        # series: valid[0..9], NaN[10..14]; window=3 ending at 12 → [10,11,12] all NaN
+        series = np.array([1.0] * 10 + [np.nan] * 5, dtype=np.float32)
+        uncapped_time = np.array([12])
+        steps = {3: 3}
+        sums, counts = window_stats_batch(series, uncapped_time, steps)
+        assert counts[3][0] == 0
+
+    def test_all_valid_series_unaffected(self) -> None:
+        # No trailing NaN — capping does nothing, normal output
+        series = np.full(20, 2.0, dtype=np.float32)
+        time_idx = np.array([15])
+        steps = {5: 5}
+        sums, counts = window_stats_batch(series, time_idx, steps)
+        assert counts[5][0] == 5
+        assert sums[5][0] == pytest.approx(10.0)
+
+    def test_last_valid_index_detection(self) -> None:
+        # Helper: np.flatnonzero(np.isfinite(series))[-1] should find the right boundary
+        series = np.array([3.0, np.nan, 5.0, np.nan, np.nan], dtype=np.float32)
+        finite_idx = np.flatnonzero(np.isfinite(series))
+        assert int(finite_idx[-1]) == 2
+
+
+# ---------------------------------------------------------------------------
 # vpd_kpa
 # ---------------------------------------------------------------------------
 

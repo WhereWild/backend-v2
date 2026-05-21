@@ -870,6 +870,15 @@ def process_chunk(
                 (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
             )
 
+            # Cap observations that fall in a trailing NaN zone (e.g. ERA5 processing lag)
+            # to the last valid timestep so they receive data instead of NaN.
+            if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
+                finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
+                if finite_in_slice.size == 0:
+                    continue
+                last_valid = int(finite_in_slice[-1])
+                local_time = np.minimum(local_time, last_valid)
+
             window_sums, window_counts = window_stats_batch(series_slice, local_time, steps)
 
             paths_slice = taxon_path[s:e]
@@ -979,6 +988,13 @@ def process_chunk_mode(
                 (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
             )
 
+            if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
+                finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
+                if finite_in_slice.size == 0:
+                    continue
+                last_valid = int(finite_in_slice[-1])
+                local_time = np.minimum(local_time, last_valid)
+
             window_modes = _window_mode_batch(series_slice, local_time, steps)
 
             paths_slice = taxon_path[s:e]
@@ -1071,8 +1087,9 @@ def derive_vpd(
     if root is None:
         raise RuntimeError(f"Unknown root taxon {root_taxon_id}")
 
+    tree_root = Path(data_root) / "taxonomy" / "tree"
     for node in iter_descendants(root, include_self=True):
-        path = Path(node["path"]) / occ_filename
+        path = tree_root / node["path"] / occ_filename
         if not path.exists():
             continue
         table = pq.read_table(path).combine_chunks()

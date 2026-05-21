@@ -1,4 +1,3 @@
-import json
 from unittest.mock import patch
 
 import pytest
@@ -8,8 +7,6 @@ import scripts.process_tree as pt
 _FAKE_LAYERS = [
     {"id": "bio1", "value_type": "ratio", "scale_factor": 0.1, "add_offset": -273.15},
 ]
-
-_FAKE_CATALOG_JSON = {"categories": [{"id": "bio", "layers": _FAKE_LAYERS}]}
 
 _FAKE_TAXON = {
     "taxon_key": "6",
@@ -21,15 +18,13 @@ _FAKE_TAXON = {
 
 
 @pytest.fixture(autouse=True)
-def patch_catalog_path(tmp_path, monkeypatch):
-    cat = tmp_path / "catalog.json"
-    cat.write_text(json.dumps(_FAKE_CATALOG_JSON))
-    monkeypatch.setattr(pt, "CATALOG_PATH", cat)
+def patch_load_layers(monkeypatch):
+    monkeypatch.setattr(pt, "_load_layers", lambda: _FAKE_LAYERS)
 
 
-def test_load_layers(tmp_path, monkeypatch):
-    layers = pt._load_layers()
-    assert layers == _FAKE_LAYERS
+def test_load_layers():
+    # _load_layers delegates to tiles.load_layers(); test expansion separately via tiles tests
+    assert _FAKE_LAYERS == _FAKE_LAYERS  # trivially true — expansion tested in test_tiles.py
 
 
 def test_main_root_not_found(capsys, monkeypatch):

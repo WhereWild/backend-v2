@@ -492,6 +492,37 @@ class TestWeatherCodeSimple:
         # Exactly 0.0 precip and 0.0 snow → use cloud cover
         assert weather_code_simple(10.0, 0.0, 0.0, 3600) == 0
 
+    def test_temp_correction_snow_to_rain_when_warm(self) -> None:
+        # 5mm WE → moderate snow (73), but temp=2°C → moderate rain (63)
+        assert weather_code_simple(80.0, 0.0, 5.0, 3600, temperature_2m=2.0) == 63
+
+    def test_temp_correction_heavy_snow_to_rain_when_warm(self) -> None:
+        assert weather_code_simple(80.0, 0.0, 10.0, 3600, temperature_2m=0.5) == 65
+
+    def test_temp_correction_slight_snow_to_rain_when_warm(self) -> None:
+        assert weather_code_simple(80.0, 0.0, 1.0, 3600, temperature_2m=1.0) == 61
+
+    def test_temp_correction_rain_to_snow_when_cold(self) -> None:
+        # 5mm precip → moderate rain (63), but temp=-2°C → moderate snow (73)
+        assert weather_code_simple(80.0, 5.0, 0.0, 3600, temperature_2m=-2.0) == 73
+
+    def test_temp_correction_heavy_rain_to_snow_when_cold(self) -> None:
+        assert weather_code_simple(80.0, 10.0, 0.0, 3600, temperature_2m=-1.0) == 75
+
+    def test_temp_correction_slight_rain_to_snow_when_cold(self) -> None:
+        assert weather_code_simple(80.0, 2.0, 0.0, 3600, temperature_2m=-0.5) == 71
+
+    def test_temp_correction_drizzle_unaffected_when_cold(self) -> None:
+        # Drizzle codes (51/53/55) are not corrected to snow
+        assert weather_code_simple(80.0, 0.3, 0.0, 3600, temperature_2m=-5.0) == 51
+
+    def test_temp_none_no_correction(self) -> None:
+        # Without temperature, snow code is returned as-is
+        assert weather_code_simple(80.0, 0.0, 5.0, 3600) == 73
+
+    def test_temp_nan_no_correction(self) -> None:
+        assert weather_code_simple(80.0, 0.0, 5.0, 3600, temperature_2m=np.nan) == 73
+
 
 # ---------------------------------------------------------------------------
 # weather_code_array
@@ -543,6 +574,50 @@ class TestWeatherCodeArray:
             np.array([80.0]), np.array([5.0]), np.array([5.0]), 3600.0
         )
         assert result[0] == pytest.approx(73.0)
+
+    def test_temp_snow_to_rain_when_warm(self) -> None:
+        result = weather_code_array(
+            np.array([90.0]), np.array([0.0]), np.array([10.0]), 3600.0,
+            temp=np.array([2.0]),
+        )
+        assert result[0] == pytest.approx(65.0)
+
+    def test_temp_rain_to_snow_when_cold(self) -> None:
+        result = weather_code_array(
+            np.array([90.0]), np.array([10.0]), np.array([0.0]), 3600.0,
+            temp=np.array([-2.0]),
+        )
+        assert result[0] == pytest.approx(75.0)
+
+    def test_temp_drizzle_unaffected_when_cold(self) -> None:
+        result = weather_code_array(
+            np.array([80.0]), np.array([0.3]), np.array([0.0]), 3600.0,
+            temp=np.array([-5.0]),
+        )
+        assert result[0] == pytest.approx(51.0)
+
+    def test_temp_none_backward_compat(self) -> None:
+        result = weather_code_array(
+            np.array([90.0]), np.array([0.0]), np.array([10.0]), 3600.0
+        )
+        assert result[0] == pytest.approx(75.0)
+
+    def test_temp_nan_no_correction(self) -> None:
+        result = weather_code_array(
+            np.array([90.0]), np.array([0.0]), np.array([10.0]), 3600.0,
+            temp=np.array([np.nan]),
+        )
+        assert result[0] == pytest.approx(75.0)
+
+    def test_temp_vectorized_mixed_corrections(self) -> None:
+        cloud = np.array([90.0, 90.0, 90.0])
+        precip = np.array([0.0, 10.0, 0.0])
+        snow = np.array([10.0, 0.0, 10.0])
+        t = np.array([2.0, -2.0, -2.0])  # warm, cold, cold
+        result = weather_code_array(cloud, precip, snow, 3600.0, temp=t)
+        assert result[0] == pytest.approx(65.0)  # heavy snow → heavy rain (warm)
+        assert result[1] == pytest.approx(75.0)  # heavy rain → heavy snow (cold)
+        assert result[2] == pytest.approx(75.0)  # heavy snow stays snow (cold)
 
 
 # ---------------------------------------------------------------------------

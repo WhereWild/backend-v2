@@ -1100,7 +1100,7 @@
           "value_type": "nominal",
           "domain": "discrete",
           "agg": "mode",
-          "sources": ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+          "sources": ["cloud_cover", "precipitation", "snowfall_water_equivalent", "temperature_2m"],
           "filename": null,
           "download_url": null,
           "scale_factor": null,

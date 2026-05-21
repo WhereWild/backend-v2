@@ -31,10 +31,10 @@ from util.temporal import (
     build_chunk_index,
     build_occ_index,
     derive_vpd,
-    derive_weather_code,
     load_temporal_layers,
     map_to_worklist,
     process_chunk,
+    process_chunk_mode,
     window_steps,
     write_back,
 )
@@ -106,9 +106,10 @@ def _run_layer(
         f"windows={layer.windows} grid_mode={layer.grid_mode}"
     )
 
+    chunk_var = layer.sources[0] if layer.sources else layer.id
     try:
         chunk_index = build_chunk_index(
-            layer.model, layer.id, min_year=cfg.temporal_min_year
+            layer.model, chunk_var, min_year=cfg.temporal_min_year
         )
     except Exception as exc:
         print(f"[skip] {layer.id}: could not build chunk index — {exc}")
@@ -147,16 +148,29 @@ def _run_layer(
         )
 
         try:
-            updates, tail_buffer = process_chunk(
-                chunk_entry,
-                chunk_worklist,
-                tail_buffer,
-                layer.model,
-                layer.id,
-                steps,
-                layer.agg,
-                cfg.temporal_cache_dir,
-            )
+            if layer.sources:
+                updates, tail_buffer = process_chunk_mode(
+                    chunk_entry,
+                    chunk_worklist,
+                    tail_buffer,
+                    layer.model,
+                    layer.sources,
+                    layer.id,
+                    steps,
+                    chunk_index.resolution,
+                    cfg.temporal_cache_dir,
+                )
+            else:
+                updates, tail_buffer = process_chunk(
+                    chunk_entry,
+                    chunk_worklist,
+                    tail_buffer,
+                    layer.model,
+                    layer.id,
+                    steps,
+                    layer.agg,
+                    cfg.temporal_cache_dir,
+                )
             write_back(updates)
         except Exception:
             print(f"[error] {layer.id} chunk={chunk_entry.chunk_num}")
@@ -237,18 +251,6 @@ def main() -> None:
                 )
             except Exception:
                 print("[error] derive_vpd failed")
-                traceback.print_exc()
-
-        if "weather_code_simple" in active_ids and not stop.is_set():
-            print("[derive] weather_code_simple")
-            try:
-                derive_weather_code(
-                    cfg.root_taxon_id,
-                    cfg.data_root,
-                    cfg.occurrence_parquet_filename,
-                )
-            except Exception:
-                print("[error] derive_weather_code failed")
                 traceback.print_exc()
 
     finally:

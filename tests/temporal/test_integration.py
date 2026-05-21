@@ -11,6 +11,8 @@ Each test:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -22,9 +24,9 @@ from util.temporal import (
     ChunkRange,
     _apply_updates_arrow,
     derive_vpd,
-    derive_weather_code,
     map_to_worklist,
     process_chunk,
+    process_chunk_mode,
     vpd_kpa,
     weather_code_simple,
     window_steps,
@@ -281,49 +283,89 @@ class TestDerivedVariables:
         result = pq.read_table(occ_path)
         assert "vapor_pressure_deficit_avg_24h" not in result.column_names
 
-    def test_derive_weather_code_clear_sky(self, tmp_path, monkeypatch) -> None:
-        occ_path = tmp_path / "occurrence.parquet"
-        pq.write_table(
-            pa.table({
-                "decimalLatitude": pa.array([_BERLIN_LAT]),
-                "decimalLongitude": pa.array([_BERLIN_LON]),
-                "eventTimestamp": pa.array([1.0]),
-                "cloud_cover_avg_1h": pa.array([5.0]),
-                "precipitation_sum_1h": pa.array([0.0]),
-                "snowfall_water_equivalent_sum_1h": pa.array([0.0]),
-            }),
-            occ_path,
+    def test_process_chunk_mode_clear_sky(self, tmp_path, monkeypatch) -> None:
+        # 10-step series: clear sky (low cloud, no rain, no snow) for all steps
+        cloud = np.full(10, 5.0)
+        precip = np.zeros(10)
+        snow = np.zeros(10)
+
+        class _MultiReader:
+            _series = [cloud, precip, snow]
+            def __init__(self, fh, idx):
+                self.shape = (721, 1440, 10)
+                self._idx = idx
+            def __getitem__(self, key):
+                return self._series[self._idx]
+            def close(self): pass
+
+        readers = [_MultiReader(None, i) for i in range(3)]
+        _iter = iter(readers)
+
+        fake = tmp_path / "fake.om"
+        fake.write_bytes(b"")
+        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: fake)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: next(_iter))
+        monkeypatch.setattr(Path, "unlink", lambda self, **kw: None)
+
+        chunk = ChunkRange(chunk_num=0, start=0.0, end=9 * 3600.0, time_len=10, source="chunk")
+        worklist = pa.table({
+            "taxon_path": pa.array([str(tmp_path / "occurrence.parquet")]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([0], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([5], type=pa.int32()),
+        })
+        steps = {1: 1, 8: 8}
+        updates, _ = process_chunk_mode(
+            chunk, worklist, {}, "copernicus_era5",
+            ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+            "weather_code_simple", steps, 3600.0, str(tmp_path),
         )
-        node = self._fake_taxon_node(occ_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
+        col = list(list(updates.values())[0].keys())
+        assert any("mode_1h" in c for c in col)
+        row_ids, vals = list(updates.values())[0]["weather_code_simple_mode_1h"][0]
+        assert vals[0] == pytest.approx(weather_code_simple(5.0, 0.0, 0.0, 3600))
 
-        derive_weather_code("1", str(tmp_path), "occurrence.parquet")
+    def test_process_chunk_mode_heavy_rain(self, tmp_path, monkeypatch) -> None:
+        cloud = np.full(10, 90.0)
+        precip = np.full(10, 10.0)   # 10 mm/h → code 65
+        snow = np.zeros(10)
 
-        result = pq.read_table(occ_path).to_pydict()
-        assert result["weather_code_simple"][0] == weather_code_simple(5.0, 0.0, 0.0, 3600)
+        class _MultiReader:
+            _series = [cloud, precip, snow]
+            def __init__(self, fh, idx):
+                self.shape = (721, 1440, 10)
+                self._idx = idx
+            def __getitem__(self, key):
+                return self._series[self._idx]
+            def close(self): pass
 
-    def test_derive_weather_code_heavy_rain(self, tmp_path, monkeypatch) -> None:
-        occ_path = tmp_path / "occurrence.parquet"
-        pq.write_table(
-            pa.table({
-                "decimalLatitude": pa.array([_BERLIN_LAT]),
-                "decimalLongitude": pa.array([_BERLIN_LON]),
-                "eventTimestamp": pa.array([1.0]),
-                "cloud_cover_avg_1h": pa.array([90.0]),
-                "precipitation_sum_1h": pa.array([10.0]),
-                "snowfall_water_equivalent_sum_1h": pa.array([0.0]),
-            }),
-            occ_path,
+        readers = [_MultiReader(None, i) for i in range(3)]
+        _iter = iter(readers)
+
+        fake = tmp_path / "fake.om"
+        fake.write_bytes(b"")
+        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: fake)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: next(_iter))
+        monkeypatch.setattr(Path, "unlink", lambda self, **kw: None)
+
+        chunk = ChunkRange(chunk_num=0, start=0.0, end=9 * 3600.0, time_len=10, source="chunk")
+        worklist = pa.table({
+            "taxon_path": pa.array([str(tmp_path / "occurrence.parquet")]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([0], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([5], type=pa.int32()),
+        })
+        updates, _ = process_chunk_mode(
+            chunk, worklist, {}, "copernicus_era5",
+            ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+            "weather_code_simple", {1: 1}, 3600.0, str(tmp_path),
         )
-        node = self._fake_taxon_node(occ_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-
-        derive_weather_code("1", str(tmp_path), "occurrence.parquet")
-
-        result = pq.read_table(occ_path).to_pydict()
-        assert result["weather_code_simple"][0] == 65  # heavy rain
+        _, vals = list(updates.values())[0]["weather_code_simple_mode_1h"][0]
+        assert vals[0] == pytest.approx(65.0)  # heavy rain
 
 
 # ---------------------------------------------------------------------------
@@ -488,45 +530,102 @@ class TestDeriveVpdEdgeCases:
         derive_vpd("1", str(tmp_path), "occurrence.parquet", [24])  # no error
 
 
-class TestDeriveWeatherCodeEdgeCases:
-    def _node(self, path):
-        return {"taxon_key": "1", "path": str(path), "scientific_name": "X",
-                "common_name": "", "rank": "SPECIES"}
+class TestProcessChunkModeEdgeCases:
+    def _make_worklist(self, tpath):
+        return pa.table({
+            "taxon_path": pa.array([str(tpath)]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([0], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([5], type=pa.int32()),
+        })
 
-    def test_unknown_root_raises(self, monkeypatch):
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: None)
-        with pytest.raises(RuntimeError, match="Unknown root taxon"):
-            derive_weather_code("bad", "/data", "occurrence.parquet")
+    def _make_chunk(self):
+        return ChunkRange(chunk_num=0, start=0.0, end=9 * 3600.0, time_len=10, source="chunk")
 
-    def test_missing_parquet_skipped(self, tmp_path, monkeypatch):
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        derive_weather_code("1", str(tmp_path), "occurrence.parquet")  # no error
+    def _patch_readers(self, monkeypatch, tmp_path, series_list):
+        fake = tmp_path / "f.om"
+        fake.write_bytes(b"")
+        readers = []
+        for s in series_list:
+            class _R:
+                def __init__(self, fh, _s=s):
+                    self.shape = (721, 1440, len(_s))
+                    self._s = _s
+                def __getitem__(self, key): return self._s
+                def close(self): pass
+            readers.append(_R(None))
+        _iter = iter(readers)
+        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: fake)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: next(_iter))
+        monkeypatch.setattr(Path, "unlink", lambda self, **kw: None)
 
-    def test_empty_df_skipped(self, tmp_path, monkeypatch):
-        occ_path = tmp_path / "occurrence.parquet"
-        pq.write_table(pa.table({
-            "decimalLatitude": pa.array([], type=pa.float64()),
-            "decimalLongitude": pa.array([], type=pa.float64()),
-            "eventTimestamp": pa.array([], type=pa.float64()),
-        }), occ_path)
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        derive_weather_code("1", str(tmp_path), "occurrence.parquet")  # no error
+    def test_reader_exception_skips_cell(self, tmp_path, monkeypatch):
+        fake = tmp_path / "f.om"
+        fake.write_bytes(b"")
+        class _ErrReader:
+            def __init__(self, fh):
+                self.shape = (721, 1440, 10)
+            def __getitem__(self, key): raise ValueError("boom")
+            def close(self): pass
+        readers = [_ErrReader(None) for _ in range(3)]
+        _iter = iter(readers)
+        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: fake)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: next(_iter))
+        monkeypatch.setattr(Path, "unlink", lambda self, **kw: None)
+        updates, _ = process_chunk_mode(
+            self._make_chunk(), self._make_worklist(tmp_path / "occ.parquet"),
+            {}, "copernicus_era5",
+            ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+            "weather_code_simple", {1: 1}, 3600.0, str(tmp_path),
+        )
+        assert updates == {}
 
-    def test_missing_source_columns_skipped(self, tmp_path, monkeypatch):
-        occ_path = tmp_path / "occurrence.parquet"
-        pq.write_table(pa.table({
-            "decimalLatitude": pa.array([_BERLIN_LAT]),
-            "decimalLongitude": pa.array([_BERLIN_LON]),
-            "eventTimestamp": pa.array([1.0]),
-            # cloud_cover_avg_1h absent
-        }), occ_path)
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        derive_weather_code("1", str(tmp_path), "occurrence.parquet")
-        result = pq.read_table(occ_path)
-        assert "weather_code_simple" not in result.column_names
+    def test_empty_series_skips_cell(self, tmp_path, monkeypatch):
+        self._patch_readers(monkeypatch, tmp_path, [np.array([]), np.array([]), np.array([])])
+        updates, _ = process_chunk_mode(
+            self._make_chunk(), self._make_worklist(tmp_path / "occ.parquet"),
+            {}, "copernicus_era5",
+            ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+            "weather_code_simple", {1: 1}, 3600.0, str(tmp_path),
+        )
+        assert updates == {}
+
+    def test_download_failure_propagates(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("util.temporal._download_chunk",
+                            lambda *a, **kw: (_ for _ in ()).throw(OSError("S3 down")))
+        with pytest.raises(OSError, match="S3 down"):
+            process_chunk_mode(
+                self._make_chunk(), self._make_worklist(tmp_path / "occ.parquet"),
+                {}, "copernicus_era5",
+                ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+                "weather_code_simple", {1: 1}, 3600.0, str(tmp_path),
+            )
+
+    def test_tail_buffer_prepended(self, tmp_path, monkeypatch):
+        # obs at time_idx=0 with window=4: needs prev tail to fill window
+        cloud = np.full(5, 90.0)
+        precip = np.full(5, 10.0)   # heavy rain = 65
+        snow = np.zeros(5)
+        self._patch_readers(monkeypatch, tmp_path, [cloud, precip, snow])
+        # tail from previous chunk: 4 steps all heavy rain (65)
+        prev_tail = np.full(4, 65.0)
+        tail_buffer = {(360, 720): prev_tail}
+        worklist = pa.table({
+            "taxon_path": pa.array([str(tmp_path / "occ.parquet")]),
+            "row_idx": pa.array([0], type=pa.int64()),
+            "chunk_num": pa.array([0], type=pa.int32()),
+            "lat_idx": pa.array([360], type=pa.int32()),
+            "lon_idx": pa.array([720], type=pa.int32()),
+            "time_idx": pa.array([0], type=pa.int32()),
+        })
+        chunk = ChunkRange(chunk_num=0, start=0.0, end=4 * 3600.0, time_len=5, source="chunk")
+        updates, _ = process_chunk_mode(
+            chunk, worklist, tail_buffer, "copernicus_era5",
+            ["cloud_cover", "precipitation", "snowfall_water_equivalent"],
+            "weather_code_simple", {4: 4}, 3600.0, str(tmp_path),
+        )
+        # mode over 4-step window (all code 65) should be 65
+        _, vals = list(updates.values())[0]["weather_code_simple_mode_4h"][0]
+        assert vals[0] == pytest.approx(65.0)

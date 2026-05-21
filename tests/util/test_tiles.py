@@ -108,6 +108,81 @@ def test_get_layer_not_found():
 
 
 # ---------------------------------------------------------------------------
+# Temporal layer expansion
+# ---------------------------------------------------------------------------
+
+_TEMPORAL_CATALOG = {
+    "categories": [
+        {
+            "id": "temporal",
+            "display_name": "Weather",
+            "windows": [24, 168],
+            "layers": [
+                {
+                    "id": "temperature_2m",
+                    "display_name": "Air Temperature (2m)",
+                    "units": "°C",
+                    "value_type": "interval",
+                    "agg": "avg",
+                },
+                {
+                    "id": "weather_code_simple",
+                    "display_name": "Weather Code",
+                    "units": "",
+                    "value_type": "nominal",
+                    "agg": "mode",
+                    "windows": [24],
+                },
+            ],
+        }
+    ]
+}
+
+
+@pytest.fixture
+def patch_temporal_catalog():
+    tiles._catalog.cache_clear()
+    with patch.object(tiles, "_catalog", return_value=_TEMPORAL_CATALOG):
+        yield
+    tiles._catalog.cache_clear()
+
+
+def test_temporal_layers_expanded(patch_temporal_catalog):
+    layers = tiles.load_layers()
+    ids = [lay["id"] for lay in layers]
+    assert "temperature_2m_avg_24h" in ids
+    assert "temperature_2m_avg_168h" in ids
+    assert len([lay for lay in layers if lay["id"].startswith("temperature_2m")]) == 2
+
+
+def test_temporal_layer_display_name(patch_temporal_catalog):
+    layers = tiles.load_layers()
+    t24 = next(lay for lay in layers if lay["id"] == "temperature_2m_avg_24h")
+    assert t24["display_name"] == "Air Temperature (2m)"
+    assert t24["window_hours"] == 24
+    assert t24["window_label"] == "24h"
+
+
+def test_temporal_layer_inherits_value_type(patch_temporal_catalog):
+    layers = tiles.load_layers()
+    t24 = next(lay for lay in layers if lay["id"] == "temperature_2m_avg_24h")
+    assert t24["value_type"] == "interval"
+    assert t24["units"] == "°C"
+
+
+def test_temporal_layer_window_override(patch_temporal_catalog):
+    layers = tiles.load_layers()
+    mode_ids = [lay["id"] for lay in layers if lay["id"].startswith("weather_code_simple")]
+    assert mode_ids == ["weather_code_simple_mode_24h"]
+
+
+def test_temporal_layers_with_category(patch_temporal_catalog):
+    pairs = tiles.load_layers_with_category()
+    categories = {cat["id"] for _, cat in pairs}
+    assert "temporal" in categories
+
+
+# ---------------------------------------------------------------------------
 # Tile bounds
 # ---------------------------------------------------------------------------
 

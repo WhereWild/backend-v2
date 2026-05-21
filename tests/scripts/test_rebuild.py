@@ -229,7 +229,7 @@ def test_main_full_pipeline_completes(tmp_path):
 
     assert call_order == [
         "wipe", "tree", "populate",
-        "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal", "process_tree",
+        "process_gadm", "download_gis", "build_overviews", "enrich_tree", "process_tree",
     ]
     p = _pipeline(tmp_path)
     assert p["status"] == "completed"
@@ -237,7 +237,7 @@ def test_main_full_pipeline_completes(tmp_path):
         p["stages"][s]["status"] == "completed"
         for s in [
             "sync_gbif", "build_tree", "populate_tree",
-            "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal", "process_tree",
+            "process_gadm", "download_gis", "build_overviews", "enrich_tree", "process_tree",
         ]
     )
     assert p["error"] is None

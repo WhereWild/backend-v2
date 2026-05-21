@@ -57,7 +57,14 @@ pl() {
 }
 
 pp() {
-  pl "$@" && pt "$@"
+  local lint_only=() shared=()
+  for arg in "$@"; do
+    case "$arg" in
+      --fix|--unsafe-fixes) lint_only+=("$arg") ;;
+      *) shared+=("$arg") ;;
+    esac
+  done
+  pl "${lint_only[@]}" "${shared[@]}" && pt "${shared[@]}"
 }
 
 _resolve_script() {

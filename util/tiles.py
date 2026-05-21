@@ -62,7 +62,9 @@ def _expand_temporal_layers(category: dict) -> list[dict]:
             expanded.append({
                 **layer,
                 "id": f"{layer['id']}_{agg}_{w}h",
-                "display_name": f"{layer.get('display_name', layer['id'])} ({label})",
+                "display_name": layer.get("display_name", layer["id"]),
+                "window_hours": w,
+                "window_label": label,
             })
     return expanded
 

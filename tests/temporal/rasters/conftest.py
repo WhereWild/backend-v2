@@ -29,6 +29,12 @@ class FakeRasterReader:
             return self._series[t][np.newaxis, np.newaxis, :]
         return self._series
 
+    def read_array(self, ranges: object) -> np.ndarray:
+        ny, nx, _ = self.shape
+        _, _, t = ranges  # type: ignore[misc]
+        ts = self._series[t]
+        return np.broadcast_to(ts[np.newaxis, np.newaxis, :], (ny, nx, len(ts))).copy()
+
 
 def chunk_from_fixture(fixture: dict[str, Any], model: str = "copernicus_era5") -> tuple[ChunkIndex, ChunkRange]:
     """Build a single-chunk ChunkIndex/ChunkRange covering the full fixture range."""

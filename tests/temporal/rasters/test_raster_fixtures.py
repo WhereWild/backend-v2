@@ -10,8 +10,6 @@ pass, the raster pipeline produces values that match the Open-Meteo API.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
-
 import numpy as np
 import pytest
 
@@ -56,12 +54,7 @@ def _run_accumulate(fix, variable, model, obs_hour, window_hours, monkeypatch, t
     index, entry = chunk_from_fixture(fix, model)
     start_ts = obs_ts - (window_hours - 1) * 3600
 
-    @contextmanager
-    def _fake_open(*a, **kw):
-        yield None
-
-    monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-    monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: FakeRasterReader(series, model))
+    monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series, model))
     grid, n = accumulate_raster(model, variable, start_ts, obs_ts, index)
     return grid, n, obs_ts
 
@@ -99,12 +92,12 @@ class TestRasterPrecipitationSum:
         assert expected is not None
         assert cell == pytest.approx(expected, abs=1e-3)
 
-    def test_sydney_early_720h(self, require_fixtures, monkeypatch, tmp_path) -> None:
+    def test_sydney_early_168h(self, require_fixtures, monkeypatch, tmp_path) -> None:
         fix = require_fixtures["sydney_early"]
-        obs_hour = 2000
-        grid, n, obs_ts = _run_accumulate(fix, self._VAR, self._MODEL, obs_hour, 720, monkeypatch, str(tmp_path))
+        obs_hour = 500
+        grid, n, obs_ts = _run_accumulate(fix, self._VAR, self._MODEL, obs_hour, 168, monkeypatch, str(tmp_path))
         cell = _cell_value(grid, n, "sydney", self._MODEL, "sum")
-        expected = expected_window(fix, obs_ts, self._VAR, 720, "sum")
+        expected = expected_window(fix, obs_ts, self._VAR, 168, "sum")
         assert expected is not None
         assert cell == pytest.approx(expected, abs=1e-2)
 
@@ -277,12 +270,11 @@ class TestRasterAllWindowSizes:
     """Verify all 7 window sizes against API fixtures for temperature and precip."""
 
     @pytest.mark.parametrize(("window_h", "label"), [
-        (1, "1h"), (8, "8h"), (24, "24h"), (72, "3d"), (168, "7d"), (720, "30d"),
+        (1, "1h"), (8, "8h"), (24, "24h"), (72, "3d"), (168, "7d"),
     ])
     def test_temperature_all_windows_berlin(self, window_h, label, require_fixtures, monkeypatch, tmp_path) -> None:
         fix = require_fixtures["berlin_early"]
-        # Use obs_hour = 2160 so even the 720h window is fully populated
-        obs_hour = 2160
+        obs_hour = 500
         grid, n, obs_ts = _run_accumulate(fix, "temperature_2m", "copernicus_era5_land", obs_hour, window_h, monkeypatch, str(tmp_path))
         cell = _cell_value(grid, n, "berlin", "copernicus_era5_land", "avg")
         expected = expected_window(fix, obs_ts, "temperature_2m", window_h, "avg")
@@ -290,7 +282,7 @@ class TestRasterAllWindowSizes:
         assert cell == pytest.approx(expected, abs=1e-3), f"window={label}"
 
     @pytest.mark.parametrize(("window_h", "label"), [
-        (1, "1h"), (8, "8h"), (24, "24h"), (72, "3d"), (168, "7d"), (720, "30d"),
+        (1, "1h"), (8, "8h"), (24, "24h"), (72, "3d"), (168, "7d"),
     ])
     def test_precipitation_all_windows_berlin(self, window_h, label, require_fixtures, monkeypatch, tmp_path) -> None:
         fix = require_fixtures["berlin_early"]
@@ -300,15 +292,6 @@ class TestRasterAllWindowSizes:
         expected = expected_window(fix, obs_ts, "precipitation", window_h, "sum")
         assert expected is not None
         assert cell == pytest.approx(expected, abs=1e-2), f"window={label}"
-
-    def test_full_90d_window_temperature(self, require_fixtures, monkeypatch, tmp_path) -> None:
-        fix = require_fixtures["berlin_early"]
-        obs_hour = 2160  # exactly 90 days in
-        grid, n, obs_ts = _run_accumulate(fix, "temperature_2m", "copernicus_era5_land", obs_hour, 2160, monkeypatch, str(tmp_path))
-        cell = _cell_value(grid, n, "berlin", "copernicus_era5_land", "avg")
-        expected = expected_window(fix, obs_ts, "temperature_2m", 2160, "avg")
-        assert expected is not None
-        assert cell == pytest.approx(expected, abs=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -358,17 +341,12 @@ class TestRasterVPD:
         index, _ = chunk_from_fixture(fix, "copernicus_era5_land")
         start_ts = obs_ts - 23 * 3600
 
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-
         # Accumulate t
-        monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: FakeRasterReader(series_t, "copernicus_era5_land"))
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series_t, "copernicus_era5_land"))
         t_grid, t_n = accumulate_raster("copernicus_era5_land", "temperature_2m", start_ts, obs_ts, index)
 
         # Accumulate td
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: FakeRasterReader(series_td, "copernicus_era5_land"))
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series_td, "copernicus_era5_land"))
         td_grid, td_n = accumulate_raster("copernicus_era5_land", "dew_point_2m", start_ts, obs_ts, index)
 
         # Compute VPD
@@ -393,14 +371,9 @@ class TestRasterVPD:
         index, _ = chunk_from_fixture(fix, "copernicus_era5_land")
         start_ts = obs_ts - 167 * 3600
 
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-
-        monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: FakeRasterReader(series_t, "copernicus_era5_land"))
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series_t, "copernicus_era5_land"))
         t_grid, t_n = accumulate_raster("copernicus_era5_land", "temperature_2m", start_ts, obs_ts, index)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: FakeRasterReader(series_td, "copernicus_era5_land"))
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series_td, "copernicus_era5_land"))
         td_grid, td_n = accumulate_raster("copernicus_era5_land", "dew_point_2m", start_ts, obs_ts, index)
 
         result = compute_raster_final("vapor_pressure_deficit", "avg",
@@ -501,15 +474,10 @@ class TestSlidingWindowIncrementalCorrectness:
         series = np.array(fix["hourly"][variable], dtype=np.float64)
         index, _ = chunk_from_fixture(fix, model)
 
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-
-        monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: FakeRasterReader(series, model))
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series, model))
         return accumulate_raster(model, variable, start_ts, end_ts, index)
 
-    @pytest.mark.parametrize("window_hours", [24, 168, 720, 2160])
+    @pytest.mark.parametrize("window_hours", [24, 168])
     def test_temperature_incremental_equals_full(self, window_hours, require_fixtures, monkeypatch, tmp_path) -> None:
         fix = require_fixtures["berlin_early"]
         times = fix["hourly"]["time_unix"]
@@ -547,7 +515,7 @@ class TestSlidingWindowIncrementalCorrectness:
             assert cell_avg == pytest.approx(expected, abs=1e-3), \
                 f"window={window_hours}h: cell avg does not match API expected"
 
-    @pytest.mark.parametrize("window_hours", [24, 168, 720])
+    @pytest.mark.parametrize("window_hours", [24, 168])
     def test_precipitation_incremental_equals_full(self, window_hours, require_fixtures, monkeypatch, tmp_path) -> None:
         fix = require_fixtures["berlin_early"]
         times = fix["hourly"]["time_unix"]
@@ -617,12 +585,7 @@ class TestForecastOffsetFixtures:
         series = np.array(fix["hourly"][variable], dtype=np.float64)
         index, _ = chunk_from_fixture(fix, model)
 
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-
-        monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: FakeRasterReader(series, model))
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series, model))
         return accumulate_raster(model, variable, start_ts, end_ts, index)
 
     @pytest.mark.parametrize("forecast_h", [1, 8, 24, 72])

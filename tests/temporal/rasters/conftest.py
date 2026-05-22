@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-import pytest
 
 from tests.temporal.conftest import TEST_LOCATIONS, expected_window
 from util.temporal import RASTER_GRIDS, ChunkIndex, ChunkRange, grid_indices
@@ -43,7 +42,7 @@ def chunk_from_fixture(fixture: dict[str, Any], model: str = "copernicus_era5") 
 def raster_cell(fixture: dict[str, Any], model: str) -> tuple[int, int]:
     """Return (lat_idx, lon_idx) for the fixture location on the given model's grid."""
     loc = next(
-        (l for l in TEST_LOCATIONS if l["name"] in fixture.get("_key", "")),
+        (loc for loc in TEST_LOCATIONS if loc["name"] in fixture.get("_key", "")),
         None,
     )
     if loc is None:

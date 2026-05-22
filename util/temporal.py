@@ -19,9 +19,7 @@ no-op: obs_elev is NaN → offset is 0.
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +30,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from omfiles import OmFileReader
+from rasterio.crs import CRS as _CRS
+from rasterio.transform import from_bounds as _from_bounds
+from rasterio.warp import Resampling as _Resampling
+from rasterio.warp import reproject as _reproject
 
 from config.config import load_config
 from util.taxa import get_taxon_by_id, iter_descendants
@@ -42,9 +44,6 @@ _LAT_COL = "decimalLatitude"
 _LON_COL = "decimalLongitude"
 _TIME_COL = "eventTimestamp"
 
-_S3_BASE_URL = "https://openmeteo.s3.amazonaws.com/data"
-_PREFETCH_WORKERS = 8
-_PREFETCH_DISK_LIMIT_GB = 1000
 
 # Variables that receive lapse-rate elevation correction (°C/m × 0.0065).
 # Precipitation, cloud cover, and other flux/ratio variables are unaffected.
@@ -505,15 +504,22 @@ def _chunk_filename(chunk_entry: ChunkRange) -> str:
     return f"chunk_{chunk_entry.chunk_num}.om"
 
 
+def _open_chunk(entry: ChunkRange, model: str, variable: str):
+    """Return an fsspec context manager streaming the .om chunk directly from S3."""
+    filename = _chunk_filename(entry)
+    uri = f"s3://openmeteo/data/{model}/{variable}/{filename}"
+    return fsspec.open(uri, mode="rb", s3={"anon": True})
+
+
 def _download_chunk(
     chunk_entry: ChunkRange,
     model: str,
     variable: str,
     cache_dir: str,
 ) -> Path:
-    """Download a single .om chunk via aria2c and return the local path."""
+    """Download a single .om chunk to local disk via fsspec and return the path."""
     filename = _chunk_filename(chunk_entry)
-    url = f"{_S3_BASE_URL}/{model}/{variable}/{filename}"
+    uri = f"s3://openmeteo/data/{model}/{variable}/{filename}"
 
     dest_dir = Path(cache_dir) / "chunks"
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -522,33 +528,12 @@ def _download_chunk(
     if target.exists():
         return target
 
-    print(f"[download] {url}", flush=True)
-    tmp_name = target.name + ".tmp"
-    tmp = dest_dir / tmp_name
-    try:
-        subprocess.run(
-            [
-                "aria2c",
-                "--split=8",
-                "--max-connection-per-server=8",
-                "--continue=true",
-                "--max-tries=12",
-                "--retry-wait=15",
-                "--connect-timeout=60",
-                f"--dir={dest_dir}",
-                f"--out={tmp_name}",
-                url,
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        tmp.replace(target)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-    print(f"[download] done {target.name} ({target.stat().st_size // 1024 // 1024}MB)", flush=True)
+    fs = fsspec.filesystem("s3", anon=True)
+    fs.get(uri, str(target))
     return target
+
+
+_PREFETCH_WORKERS = 8
 
 
 def _download_layer_chunk(
@@ -557,57 +542,10 @@ def _download_layer_chunk(
     variables: list[str],
     cache_dir: str,
 ) -> ChunkRange:
-    """Download all .om files for one chunk/layer combination; return the entry."""
+    """Download all variable files for one chunk; return the entry (for futures)."""
     for var in variables:
         _download_chunk(chunk_entry, model, var, cache_dir)
     return chunk_entry
-
-
-def prefetch_chunks(
-    chunk_entries: list[ChunkRange],
-    model: str,
-    variables: list[str],
-    cache_dir: str,
-) -> None:
-    """Download all needed chunks in parallel, respecting a disk space limit."""
-    dest_dir = Path(cache_dir) / "chunks"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    limit_bytes = _PREFETCH_DISK_LIMIT_GB * 1024 ** 3
-    tasks: list[tuple[ChunkRange, str, str]] = []
-    for entry in chunk_entries:
-        for var in variables:
-            target = dest_dir / f"{model}_{var}_{_chunk_filename(entry)}"
-            if not target.exists():
-                tasks.append((entry, model, var))
-
-    if not tasks:
-        return
-
-    used = sum(f.stat().st_size for f in dest_dir.glob("*.om") if f.exists())
-    print(f"[prefetch] {len(tasks)} files to download, cache={used // 1024 // 1024}MB used", flush=True)
-
-    def _fetch(args: tuple[ChunkRange, str, str]) -> Path:
-        entry, mdl, var = args
-        # Re-check disk usage before each download
-        current = sum(f.stat().st_size for f in dest_dir.glob("*.om") if f.exists())
-        if current >= limit_bytes:
-            raise RuntimeError(f"Prefetch disk limit ({_PREFETCH_DISK_LIMIT_GB}GB) reached")
-        return _download_chunk(entry, mdl, var, cache_dir)
-
-    with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
-        futures = {pool.submit(_fetch, t): t for t in tasks}
-        done = 0
-        for fut in as_completed(futures):
-            try:
-                fut.result()
-            except Exception as exc:
-                entry, _, var = futures[fut]
-                print(f"[prefetch] warning: {var} chunk={entry.chunk_num} failed — {exc}", flush=True)
-            done += 1
-            if done % 10 == 0:
-                print(f"[prefetch] {done}/{len(tasks)} done", flush=True)
-    print("[prefetch] complete", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1284,9 +1222,6 @@ def derive_vpd(
 # Raster builder helpers
 # ---------------------------------------------------------------------------
 
-from rasterio.crs import CRS as _CRS
-from rasterio.transform import from_bounds as _from_bounds
-from rasterio.warp import reproject as _reproject, Resampling as _Resampling
 
 _WGS84 = _CRS.from_epsg(4326)
 
@@ -1324,13 +1259,10 @@ def accumulate_raster(
     start_ts: float,
     end_ts: float,
     chunk_index: ChunkIndex,
-    cache_dir: str,
 ) -> tuple[np.ndarray, int]:
     """Sum all hourly slices in [start_ts, end_ts] across the full native grid.
 
-    Downloads chunks lazily via _download_chunk.  ERA5-land and GFS .om files
-    are stored lat-descending; this function flips them so the returned array
-    is always lat-ascending (index 0 = south pole).
+    Streams each chunk directly from S3 via fsspec (no local download).
 
     Returns:
         (sum_grid: float64 shape (ny, nx), n_steps: int)
@@ -1354,19 +1286,19 @@ def accumulate_raster(
         if t1 <= t0:
             continue
 
-        local = _download_chunk(entry, model, variable, cache_dir)
-        reader = OmFileReader(str(local))
-        ny, nx, _ = reader.shape
+        with _open_chunk(entry, model, variable) as fh:
+            reader = OmFileReader(fh)
+            ny, nx, _ = reader.shape
 
-        if total_sum is None:
-            total_sum = np.zeros((ny, nx), dtype=np.float64)
+            if total_sum is None:
+                total_sum = np.zeros((ny, nx), dtype=np.float64)
 
-        # Read in 24-step sub-slices to cap peak memory
-        sub = 24
-        for ts in range(t0, t1, sub):
-            te = min(ts + sub, t1)
-            chunk_data = np.asarray(reader[0:ny, 0:nx, ts:te], dtype=np.float64)
-            total_sum += np.nansum(chunk_data, axis=2)
+            # Read in 24-step sub-slices to cap peak memory
+            sub = 24
+            for ts in range(t0, t1, sub):
+                te = min(ts + sub, t1)
+                chunk_data = np.asarray(reader[0:ny, 0:nx, ts:te], dtype=np.float64)
+                total_sum += np.nansum(chunk_data, axis=2)
 
         n_steps += t1 - t0
 
@@ -1387,7 +1319,6 @@ def accumulate_raster_mode(
     cloud_index: ChunkIndex,
     precip_index: ChunkIndex,
     swe_index: ChunkIndex,
-    cache_dir: str,
     temp_grid_025: np.ndarray | None = None,
 ) -> dict[int, np.ndarray]:
     """Accumulate per-code timestep counts across the full native ERA5 0.25° grid.
@@ -1411,10 +1342,10 @@ def accumulate_raster_mode(
     counts: dict[int, np.ndarray | None] = {c: None for c in RASTER_WC_CODES}
 
     def _load_slice(cidx: ChunkIndex, var: str, entry: ChunkRange, t0: int, t1: int) -> np.ndarray:
-        local = _download_chunk(entry, model, var, cache_dir)
-        reader = OmFileReader(str(local))
-        ny, nx, _ = reader.shape
-        data = np.asarray(reader[0:ny, 0:nx, t0:t1], dtype=np.float64)
+        with _open_chunk(entry, model, var) as fh:
+            reader = OmFileReader(fh)
+            ny, nx, _ = reader.shape
+            data = np.asarray(reader[0:ny, 0:nx, t0:t1], dtype=np.float64)
         return data  # (ny, nx, steps)
 
     def _cidx_entry_for(cidx: ChunkIndex, ts: float) -> tuple[ChunkRange | None, int]:
@@ -1446,14 +1377,14 @@ def accumulate_raster_mode(
             step_ts = cc_entry.start + (t0 + i) * resolution
             pr_entry, pr_idx = _cidx_entry_for(precip_index, step_ts)
             if pr_entry is not None:
-                local = _download_chunk(pr_entry, model, "precipitation", cache_dir)
-                r = OmFileReader(str(local))
-                pr_data[:, :, i] = np.asarray(r[0:ny, 0:nx, pr_idx:pr_idx + 1], dtype=np.float64)[:, :, 0]
+                with _open_chunk(pr_entry, model, "precipitation") as fh:
+                    r = OmFileReader(fh)
+                    pr_data[:, :, i] = np.asarray(r[0:ny, 0:nx, pr_idx:pr_idx + 1], dtype=np.float64)[:, :, 0]
             sw_entry, sw_idx = _cidx_entry_for(swe_index, step_ts)
             if sw_entry is not None:
-                local = _download_chunk(sw_entry, model, "snowfall_water_equivalent", cache_dir)
-                r = OmFileReader(str(local))
-                sw_data[:, :, i] = np.asarray(r[0:ny, 0:nx, sw_idx:sw_idx + 1], dtype=np.float64)[:, :, 0]
+                with _open_chunk(sw_entry, model, "snowfall_water_equivalent") as fh:
+                    r = OmFileReader(fh)
+                    sw_data[:, :, i] = np.asarray(r[0:ny, 0:nx, sw_idx:sw_idx + 1], dtype=np.float64)[:, :, 0]
 
         if counts[0] is None:
             for c in RASTER_WC_CODES:
@@ -1537,13 +1468,13 @@ def compute_raster_final(
     zero = np.zeros_like(next(iter(sums.values())), dtype=np.float64)
 
     if var_id == "vapor_pressure_deficit":
-        T_e = sums.get("era5_temperature_2m", zero) / max(n_era5, 1)
-        Td_e = sums.get("era5_dew_point_2m", zero) / max(n_era5, 1)
-        val = vpd_kpa(T_e, Td_e) * n_era5
+        t_e = sums.get("era5_temperature_2m", zero) / max(n_era5, 1)
+        td_e = sums.get("era5_dew_point_2m", zero) / max(n_era5, 1)
+        val = vpd_kpa(t_e, td_e) * n_era5
         if n_gfs > 0 and "gfs_temperature_2m" in sums:
-            T_g = sums["gfs_temperature_2m"] / n_gfs
-            Td_g = sums["gfs_dew_point_2m"] / n_gfs  # derived from RH before accumulating
-            val = val + vpd_kpa(T_g, Td_g) * n_gfs
+            t_g = sums["gfs_temperature_2m"] / n_gfs
+            td_g = sums["gfs_dew_point_2m"] / n_gfs  # derived from RH before accumulating
+            val = val + vpd_kpa(t_g, td_g) * n_gfs
         result = val / n_total
         return np.maximum(result, 0.0).astype(np.float32)
 

@@ -1,0 +1,17 @@
+{
+  "berlin_temp_24h": 23.7,
+  "berlin_temp_72h": 22.3,
+  "berlin_precip_24h": 0.0,
+  "sydney_precip_24h": 0.0,
+  "nairobi_temp_72h": 19.2,
+  "berlin_cloud_24h": 54.7,
+  "reykjavik_snowfall_24h": 9.1,
+  "berlin_dewpoint_24h": 12.2,
+  "berlin_soiltemp_24h": 23.8,
+  "berlin_soiltemp_72h": 23.6,
+  "berlin_soilmoist_24h": 0.209,
+  "nairobi_soilmoist_72h": 0.422,
+  "reykjavik_snow_24h": 0.04,
+  "berlin_temp_chunk_24h": 10.5,
+  "berlin_soiltemp_chunk_24h": 9.8
+}

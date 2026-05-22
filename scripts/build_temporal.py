@@ -41,6 +41,7 @@ from util.temporal import (
     load_raster_state,
     reproject_to_grid,
     save_raster_state,
+    set_raster_chunk_cache,
 )
 
 # ---------------------------------------------------------------------------
@@ -655,6 +656,7 @@ def main() -> None:
     only_windows = [w.strip() for w in cfg.temporal_raster_windows.split(",") if w.strip()] or None
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
+    set_raster_chunk_cache(str(Path(out_dir).parent / "chunks"))
 
     t_main = time.perf_counter()
 
@@ -762,12 +764,11 @@ def main() -> None:
     t_windows = time.perf_counter()
     for window_h, wl in windows:
         print(f"\n=== window {wl} ===")
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(_process_var, vid, vcfg, window_h, wl): vid
-                       for vid, vcfg in var_configs.items()}
-            for fut in as_completed(futures):
-                if exc := fut.exception():
-                    print(f"  ERROR {futures[fut]}: {exc}", flush=True)
+        for vid, vcfg in var_configs.items():
+            try:
+                _process_var(vid, vcfg, window_h, wl)
+            except Exception as exc:
+                print(f"  ERROR {vid}: {exc}", flush=True)
     print(f"\n=== windows done in {time.perf_counter() - t_windows:.1f}s ===")
 
     # ── Forecast aggregates ────────────────────────────────────────────────

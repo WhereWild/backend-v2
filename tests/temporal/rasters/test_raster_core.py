@@ -5,8 +5,6 @@ that the sliding window must maintain.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
-
 import numpy as np
 import pytest
 
@@ -58,6 +56,12 @@ class _FakeRasterReader:
             return self._s[t:t + 1][np.newaxis, np.newaxis, :]
         return self._s
 
+    def read_array(self, ranges: object) -> np.ndarray:
+        ny, nx, _ = self.shape
+        _, _, t = ranges  # type: ignore[misc]
+        ts = self._s[t]
+        return np.broadcast_to(ts[np.newaxis, np.newaxis, :], (ny, nx, len(ts))).copy()
+
 
 class _FakeRasterReader3D:
     """OmFileReader stand-in that stores a full (ny, nx, time_len) array."""
@@ -72,6 +76,10 @@ class _FakeRasterReader3D:
             return self._data[r, c, t]
         return self._data
 
+    def read_array(self, ranges: object) -> np.ndarray:
+        r, c, t = ranges  # type: ignore[misc]
+        return self._data[r, c, t]
+
 
 # ---------------------------------------------------------------------------
 # TestAccumulateRaster
@@ -83,11 +91,7 @@ class TestAccumulateRaster:
              model: str = "copernicus_era5") -> tuple[np.ndarray, int]:
         index, _ = _make_chunk_index(len(series), t0=_T0)
         if monkeypatch is not None:
-            @contextmanager
-            def _fake_open(*a, **kw):
-                yield None
-            monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-            monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: _FakeRasterReader(series, ny, nx))
+            monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: _FakeRasterReader(series, ny, nx))
         return accumulate_raster(model, "precipitation", start_ts, end_ts, index)
 
     def test_full_range_sum(self, monkeypatch) -> None:
@@ -140,11 +144,13 @@ class TestAccumulateRaster:
                 out[ny - 1, :, :] = row_last[:, np.newaxis]
                 return out
 
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-        monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: _RowReader())
+            def read_array(self, ranges):
+                out = np.zeros((ny, nx, 3))
+                out[0, :, :] = row0[:, np.newaxis]
+                out[ny - 1, :, :] = row_last[:, np.newaxis]
+                return out
+
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: _RowReader())
 
         index, _ = _make_chunk_index(3)
         grid, n = accumulate_raster("copernicus_era5_land", "temperature_2m",
@@ -167,16 +173,11 @@ class TestAccumulateRaster:
         )
         call_count = [0]
 
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-
-        def _counting_reader(fh) -> _FakeRasterReader:
+        def _fake_open(entry, model, var) -> _FakeRasterReader:
             call_count[0] += 1
             return _FakeRasterReader(chunk_a, 2, 2)
 
         monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", _counting_reader)
         grid, n = accumulate_raster(
             "copernicus_era5", "precipitation", t0_a, t0_a + 2 * 3600, index
         )
@@ -201,11 +202,7 @@ class TestAccumulateRaster:
         for row in range(ny):
             data[row, :, :] = float(row + 1)  # row 0 = 1.0, row 1 = 2.0, row 2 = 3.0
 
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-        monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: _FakeRasterReader3D(data))
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: _FakeRasterReader3D(data))
         index, _ = _make_chunk_index(n)
         grid, steps = accumulate_raster(
             "copernicus_era5", "precipitation", _T0, _T0 + (n - 1) * 3600, index
@@ -227,17 +224,12 @@ class TestAccumulateRaster:
 
         call_count = [0]
 
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-
-        def _fake_reader(fh):
+        def _fake_open(entry, model, var):
             r = _FakeRasterReader(chunk_a if call_count[0] == 0 else chunk_b, 2, 2)
             call_count[0] += 1
             return r
 
         monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", _fake_reader)
 
         grid, n = accumulate_raster("copernicus_era5", "precipitation",
                                     t0_a, t0_b + 2 * 3600, index)
@@ -264,25 +256,16 @@ class TestAccumulateRasterMode:
                 "precipitation": np.zeros((ny, nx, n)),
                 "snowfall_water_equivalent": np.zeros((ny, nx, n)),
             }
-        last_var: list[str] = []
 
-        @contextmanager
         def _fake_open(entry, model, var):
-            last_var.clear()
-            last_var.append(var)
-            yield None
-
-        def _fake_reader(fh):
-            var = last_var[-1] if last_var else "cloud_cover"
             return _FakeRasterReader3D(data_by_var[var])
 
-        return data_by_var, _fake_open, _fake_reader
+        return data_by_var, _fake_open
 
     def test_basic_code_counts(self, monkeypatch) -> None:
         n, ny, nx = 2, 2, 2
-        _, _fake_open, _fake_reader = self._make_fixtures(n, ny, nx)
+        _, _fake_open = self._make_fixtures(n, ny, nx)
         monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", _fake_reader)
 
         cloud_idx = self._make_index(n)
         precip_idx = self._make_index(n)
@@ -306,9 +289,8 @@ class TestAccumulateRasterMode:
             "precipitation": np.full((ny, nx, n), 2.0),
             "snowfall_water_equivalent": np.full((ny, nx, n), 0.5),
         }
-        _, _fake_open, _fake_reader = self._make_fixtures(n, ny, nx, data_by_var)
+        _, _fake_open = self._make_fixtures(n, ny, nx, data_by_var)
         monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", _fake_reader)
 
         cloud_idx = self._make_index(n)
         precip_idx = self._make_index(n)
@@ -329,9 +311,8 @@ class TestAccumulateRasterMode:
     def test_break_at_second_chunk(self, monkeypatch) -> None:
         # Second cloud chunk starts after end_ts → break (line 1431 in accumulate_raster_mode)
         n, ny, nx = 2, 2, 2
-        _, _fake_open, _fake_reader = self._make_fixtures(n, ny, nx)
+        _, _fake_open = self._make_fixtures(n, ny, nx)
         monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", _fake_reader)
 
         t0_b = _T0 + 10 * 3600  # second chunk starts far after end_ts
         entry_a = ChunkRange(0, _T0, _T0 + (n - 1) * 3600.0, n, "chunk")
@@ -357,12 +338,7 @@ class TestAccumulateRasterMode:
         # Request range entirely past the data → continue fires (line 1429), result is zeros
         n = 2
 
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-
-        monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: None)
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: None)
 
         cloud_idx = self._make_index(n, t0=_T0)
         precip_idx = self._make_index(n, t0=_T0)
@@ -384,9 +360,8 @@ class TestAccumulateRasterMode:
         # _cidx_entry_for returns None,-1 (line 1425); pr/sw data stays zero
         n, ny, nx = 1, 2, 2
         data_by_var = {"cloud_cover": np.full((ny, nx, n), 50.0)}
-        _, _fake_open, _fake_reader = self._make_fixtures(n, ny, nx, data_by_var)
+        _, _fake_open = self._make_fixtures(n, ny, nx, data_by_var)
         monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", _fake_reader)
 
         cloud_idx = self._make_index(n, t0=_T0)
         far_future = _T0 + 1_000_000 * 3600.0
@@ -406,9 +381,8 @@ class TestAccumulateRasterMode:
         # Inverted start_ts > end_ts — chunk must span both values so the outer
         # guards pass, but t1 <= t0 fires (line 1437).  n=11 gives end=_T0+10h.
         n, ny, nx = 11, 2, 2
-        _, _fake_open, _fake_reader = self._make_fixtures(n, ny, nx)
+        _, _fake_open = self._make_fixtures(n, ny, nx)
         monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", _fake_reader)
 
         cloud_idx = self._make_index(n, t0=_T0)   # covers _T0 .. _T0+10h
         precip_idx = self._make_index(n, t0=_T0)
@@ -532,13 +506,7 @@ class TestDropAddInvariant:
     def _accum(self, series: np.ndarray, start_ts: float, end_ts: float,
                monkeypatch) -> tuple[np.ndarray, int]:
         index, _ = _make_chunk_index(len(series))
-
-        @contextmanager
-        def _fake_open(*a, **kw):
-            yield None
-
-        monkeypatch.setattr("util.temporal._open_chunk", _fake_open)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: _FakeRasterReader(series, 2, 2))
+        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: _FakeRasterReader(series, 2, 2))
         return accumulate_raster("copernicus_era5", "precipitation", start_ts, end_ts, index)
 
     def test_subtract_add_back_is_identity(self, monkeypatch) -> None:

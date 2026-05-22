@@ -665,7 +665,7 @@ def build_chunk_index(
 
     ranges: list[ChunkRange] = []
 
-    # chunk_* files: walk backwards from data_end_time using chunk_time_len
+    # chunk_* files: epoch-aligned formula — chunk_N starts at N * chunk_time_len * resolution
     if chunk_nums:
         for chunk_num in sorted(chunk_nums, reverse=True):
             if chunk_time_len is not None:
@@ -676,13 +676,12 @@ def build_chunk_index(
                 with fsspec.open(uri, mode="rb", s3={"anon": True}) as fh:
                     reader = OmFileReader(fh)
                     tlen = reader.shape[2]
-            # Running end decrements after each chunk
-            running_end = float(end_time) if not ranges else ranges[-1].start - resolution
-            start = running_end - (tlen - 1) * resolution
+            start = float(chunk_num) * float(tlen) * resolution
+            end   = start + (tlen - 1) * resolution
             ranges.append(ChunkRange(
                 chunk_num=chunk_num,
                 start=start,
-                end=running_end,
+                end=end,
                 time_len=tlen,
                 source="chunk",
             ))

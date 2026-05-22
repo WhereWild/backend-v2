@@ -175,14 +175,6 @@ def obs_timestamp(fixture: dict[str, Any], offset_from_start_hours: int) -> floa
 # pytest hooks and fixtures
 # ---------------------------------------------------------------------------
 
-def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption(
-        "--regenerate-fixtures",
-        action="store_true",
-        default=False,
-        help="Force re-fetch all Open-Meteo fixture data even if files already exist (~20 API requests)",
-    )
-
 
 def _missing_fixtures() -> bool:
     """Return True if any expected fixture files are absent."""

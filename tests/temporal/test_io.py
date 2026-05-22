@@ -190,17 +190,28 @@ class TestChunkHelpers:
 
     def test_open_chunk_builds_correct_uri(self, monkeypatch):
         captured = {}
+        mock_fs = MagicMock()
 
-        @contextmanager
-        def _fake_open(uri, **kw):
-            captured["uri"] = uri
-            yield BytesIO(b"")
+        def _fake_from_fsspec(fs, path):
+            captured["path"] = path
+            return MagicMock()
 
-        monkeypatch.setattr(fsspec, "open", _fake_open)
+        monkeypatch.setattr(fsspec, "filesystem", lambda *a, **kw: mock_fs)
+        monkeypatch.setattr("util.temporal.OmFileReader.from_fsspec", staticmethod(_fake_from_fsspec))
+        monkeypatch.setattr("util.temporal._RASTER_CHUNK_CACHE_DIR", None)
         entry = util.temporal.ChunkRange(chunk_num=2023, start=0, end=0, time_len=1, source="year")
-        with util.temporal._open_chunk(entry, "copernicus_era5", "precipitation"):
-            pass
-        assert captured["uri"] == "s3://openmeteo/data/copernicus_era5/precipitation/year_2023.om"
+        util.temporal._open_chunk(entry, "copernicus_era5", "precipitation")
+        assert captured["path"] == "openmeteo/data/copernicus_era5/precipitation/year_2023.om"
+
+    def test_open_chunk_uses_cache_dir(self, monkeypatch, tmp_path):
+        fake_local = tmp_path / "copernicus_era5_precipitation_year_2023.om"
+        fake_local.write_bytes(b"")
+        monkeypatch.setattr("util.temporal._RASTER_CHUNK_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr("util.temporal._download_chunk", lambda e, m, v, d: fake_local)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda path: path)
+        entry = util.temporal.ChunkRange(chunk_num=2023, start=0, end=0, time_len=1, source="year")
+        result = util.temporal._open_chunk(entry, "copernicus_era5", "precipitation")
+        assert result == str(fake_local)
 
     def test_download_chunk_returns_cached(self, tmp_path):
         entry = util.temporal.ChunkRange(chunk_num=2019, start=0, end=0, time_len=1, source="chunk")

@@ -49,7 +49,15 @@ api-stop() {
 }
 
 pt() {
-  _uv pytest --cov --cov-report=term-missing "$@"
+  local extra=()
+  local args=()
+  for arg in "$@"; do
+    case "$arg" in
+      --temporal) extra+=("--live") ;;
+      *) args+=("$arg") ;;
+    esac
+  done
+  _uv pytest --cov --cov-report=term-missing "${extra[@]}" "${args[@]}"
 }
 
 pl() {
@@ -229,9 +237,11 @@ api        start api in background
 api-fg     start api in foreground (with reload)
 api-stop   stop api
 
-pt         run tests with coverage
-pl         lint (ruff)
-pp         lint + test (pipeline approximation)
+pt                   run tests with coverage
+pt --temporal        run live S3 end-to-end tests
+pt --temporal --regenerate-live   re-fetch API ground truth first
+pl                   lint (ruff)
+pp                   lint + test (pipeline approximation)
 
 pd  <script>         run script in foreground  (scripts/ prefix assumed)
 pdb <script>         run script in background with logging

@@ -27,6 +27,9 @@ select = ["E", "F", "I", "N", "UP", "PT"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "live: end-to-end tests against real S3 .om files — run with: pt --temporal",
+]
 
 [tool.coverage.run]
 source = ["."]

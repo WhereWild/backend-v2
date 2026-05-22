@@ -8,6 +8,7 @@ differ from what the catalog already records.
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -17,6 +18,9 @@ import rasterio
 CATALOG_PATH = Path("config/gis/catalog.json")
 LAYERS_DIR   = Path("data/gis/layers")
 SOURCE_ID    = "chelsa_v2_1"
+
+_raw_vars = os.environ.get("VARS_TO_DOWNLOAD", "")
+VARS_TO_DOWNLOAD: list[str] | None = [v.strip() for v in _raw_vars.split(",") if v.strip()] or None
 
 
 def _load_catalog() -> dict:
@@ -163,6 +167,8 @@ def main() -> None:
     LAYERS_DIR.mkdir(parents=True, exist_ok=True)
     catalog = _load_catalog()
     layers = _chelsa_layers(catalog)
+    if VARS_TO_DOWNLOAD is not None:
+        layers = [layer for layer in layers if layer["id"] in VARS_TO_DOWNLOAD]
     catalog_dirty = False
 
     for layer in layers:

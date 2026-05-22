@@ -1119,6 +1119,30 @@
           "render_max": null
         }
       ]
+    },
+    {
+      "id": "terrain",
+      "display_name": "Terrain & Earth",
+      "description": "Terrain elevation derived from FABDEM V1-2, a forest- and building-removed global DEM at ~30m resolution.",
+      "layers": [
+        {
+          "id": "elevation",
+          "source": "fabdem",
+          "display_name": "Elevation",
+          "units": "m",
+          "value_type": "ratio",
+          "domain": "continuous",
+          "storage": "regions",
+          "region_size": 10,
+          "region_filename": "elevation.tif",
+          "filename": null,
+          "download_url": null,
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": -430.0,
+          "render_max": 8849.0
+        }
+      ]
     }
   ]
 }

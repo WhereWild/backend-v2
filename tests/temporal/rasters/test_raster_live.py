@@ -24,7 +24,6 @@ subsequent runs.
 from __future__ import annotations
 
 import json
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -71,21 +70,35 @@ def _model_end_ts(model: str) -> float:
 # obs_ts is filled in at regeneration time from era5_end_ts - 30 days.
 _CASE_TEMPLATES: list[dict[str, Any]] = [
     # --- ERA5 0.25° ---
-    dict(key="berlin_temp_24h",        variable="temperature_2m",           model=_ERA5_MODEL,      lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=1),
-    dict(key="berlin_temp_168h",       variable="temperature_2m",           model=_ERA5_MODEL,      lat=52.5,  lon=13.5,  window_hours=168, agg="avg", api_decimals=1),
-    dict(key="berlin_precip_24h",      variable="precipitation",            model=_ERA5_MODEL,      lat=52.5,  lon=13.5,  window_hours=24,  agg="sum", api_decimals=1),
-    dict(key="berlin_precip_168h",     variable="precipitation",            model=_ERA5_MODEL,      lat=52.5,  lon=13.5,  window_hours=168, agg="sum", api_decimals=1),
-    dict(key="sydney_precip_24h",      variable="precipitation",            model=_ERA5_MODEL,      lat=-33.5, lon=151.5, window_hours=24,  agg="sum", api_decimals=1),
-    dict(key="nairobi_temp_72h",       variable="temperature_2m",           model=_ERA5_MODEL,      lat=-1.5,  lon=37.0,  window_hours=72,  agg="avg", api_decimals=1),
-    dict(key="berlin_cloud_24h",       variable="cloud_cover",              model=_ERA5_MODEL,      lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=1),
-    dict(key="berlin_snowfall_24h",    variable="snowfall_water_equivalent", model=_ERA5_MODEL,     lat=52.5,  lon=13.5,  window_hours=24,  agg="sum", api_decimals=1),
+    dict(key="berlin_temp_24h",     variable="temperature_2m",            model=_ERA5_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=1),
+    dict(key="berlin_temp_168h",    variable="temperature_2m",            model=_ERA5_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=168, agg="avg", api_decimals=1),
+    dict(key="berlin_precip_24h",   variable="precipitation",             model=_ERA5_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=24,  agg="sum", api_decimals=1),
+    dict(key="berlin_precip_168h",  variable="precipitation",             model=_ERA5_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=168, agg="sum", api_decimals=1),
+    dict(key="sydney_precip_24h",   variable="precipitation",             model=_ERA5_MODEL,
+         lat=-33.5, lon=151.5, window_hours=24,  agg="sum", api_decimals=1),
+    dict(key="nairobi_temp_72h",    variable="temperature_2m",            model=_ERA5_MODEL,
+         lat=-1.5,  lon=37.0,  window_hours=72,  agg="avg", api_decimals=1),
+    dict(key="berlin_cloud_24h",    variable="cloud_cover",               model=_ERA5_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=1),
+    dict(key="berlin_snowfall_24h", variable="snowfall_water_equivalent",  model=_ERA5_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=24,  agg="sum", api_decimals=1),
     # --- ERA5-Land 0.1° ---
-    dict(key="berlin_dewpoint_24h",    variable="dew_point_2m",             model=_ERA5_LAND_MODEL, lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=1),
-    dict(key="berlin_soiltemp_24h",    variable="soil_temperature_0_to_7cm",model=_ERA5_LAND_MODEL, lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=1),
-    dict(key="berlin_soiltemp_168h",   variable="soil_temperature_0_to_7cm",model=_ERA5_LAND_MODEL, lat=52.5,  lon=13.5,  window_hours=168, agg="avg", api_decimals=1),
-    dict(key="berlin_soilmoist_24h",   variable="soil_moisture_0_to_7cm",   model=_ERA5_LAND_MODEL, lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=3),
-    dict(key="nairobi_soilmoist_72h",  variable="soil_moisture_0_to_7cm",   model=_ERA5_LAND_MODEL, lat=-1.5,  lon=37.0,  window_hours=72,  agg="avg", api_decimals=3),
-    dict(key="nairobi_soiltemp_24h",   variable="soil_temperature_0_to_7cm",model=_ERA5_LAND_MODEL, lat=-1.5,  lon=37.0,  window_hours=24,  agg="avg", api_decimals=1),
+    dict(key="berlin_dewpoint_24h",   variable="dew_point_2m",              model=_ERA5_LAND_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=1),
+    dict(key="berlin_soiltemp_24h",   variable="soil_temperature_0_to_7cm", model=_ERA5_LAND_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=1),
+    dict(key="berlin_soiltemp_168h",  variable="soil_temperature_0_to_7cm", model=_ERA5_LAND_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=168, agg="avg", api_decimals=1),
+    dict(key="berlin_soilmoist_24h",  variable="soil_moisture_0_to_7cm",    model=_ERA5_LAND_MODEL,
+         lat=52.5,  lon=13.5,  window_hours=24,  agg="avg", api_decimals=3),
+    dict(key="nairobi_soilmoist_72h", variable="soil_moisture_0_to_7cm",    model=_ERA5_LAND_MODEL,
+         lat=-1.5,  lon=37.0,  window_hours=72,  agg="avg", api_decimals=3),
+    dict(key="nairobi_soiltemp_24h",  variable="soil_temperature_0_to_7cm", model=_ERA5_LAND_MODEL,
+         lat=-1.5,  lon=37.0,  window_hours=24,  agg="avg", api_decimals=1),
 ]
 
 
@@ -193,7 +206,7 @@ def _api_window_value(case: dict[str, Any], obs_ts: int) -> float:
 # Pipeline: call accumulate_raster, extract cell value
 # ---------------------------------------------------------------------------
 
-def _pipeline_value(case: dict[str, Any], obs_ts: int, tmp_dir: str) -> float:
+def _pipeline_value(case: dict[str, Any], obs_ts: int) -> float:
     """Run accumulate_raster on real S3 data and return the cell value."""
     model = case["model"]
     variable = case["variable"]
@@ -212,7 +225,7 @@ def _pipeline_value(case: dict[str, Any], obs_ts: int, tmp_dir: str) -> float:
     end_ts   = float(obs_hour)
 
     chunk_index = build_chunk_index(model, variable)
-    sum_grid, n_steps = accumulate_raster(model, variable, start_ts, end_ts, chunk_index, tmp_dir)
+    sum_grid, n_steps = accumulate_raster(model, variable, start_ts, end_ts, chunk_index)
 
     if n_steps == 0:
         return float("nan")
@@ -230,7 +243,6 @@ def _pipeline_value(case: dict[str, Any], obs_ts: int, tmp_dir: str) -> float:
 def test_raster_pipeline_matches_api(
     key: str,
     live_raster_expected: dict[str, Any],
-    tmp_path: Path,
 ) -> None:
     obs_ts = live_raster_expected.get("obs_ts")
     if obs_ts is None:
@@ -241,7 +253,7 @@ def test_raster_pipeline_matches_api(
         pytest.skip(f"no expected value for {key!r} — regenerate with --regenerate-live")
 
     case = next(t for t in _CASE_TEMPLATES if t["key"] == key)
-    result = _pipeline_value(case, int(obs_ts), str(tmp_path))
+    result = _pipeline_value(case, int(obs_ts))
 
     assert not np.isnan(result), (
         f"{key}: raster pipeline returned NaN "

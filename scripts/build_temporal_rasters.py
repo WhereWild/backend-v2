@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import fsspec
@@ -38,7 +38,6 @@ from util.temporal import (
     accumulate_raster,
     accumulate_raster_mode,
     build_chunk_index,
-    compute_raster_final,
     load_raster_state,
     reproject_to_grid,
     save_raster_state,
@@ -131,9 +130,9 @@ def _gfs_raw_vars(cfg: dict) -> list[str]:
     return list(cfg.get("gfs_derived_needs", []))
 
 
-def _derive_dew_point(T: np.ndarray, RH: np.ndarray) -> np.ndarray:
-    RH_c = np.clip(RH, 1.0, 100.0)
-    gamma = np.log(RH_c / 100.0) + 17.625 * T / (243.04 + T)
+def _derive_dew_point(t: np.ndarray, rh: np.ndarray) -> np.ndarray:
+    rh_c = np.clip(rh, 1.0, 100.0)
+    gamma = np.log(rh_c / 100.0) + 17.625 * t / (243.04 + t)
     return (243.04 * gamma / (17.625 - gamma)).astype(np.float32)
 
 
@@ -191,7 +190,7 @@ def _full_build(
         temp_grid_025: np.ndarray | None = None
         if t_cidx:
             t_sum, t_n = accumulate_raster("copernicus_era5_land", "temperature_2m",
-                                           w_start, era5_end_ts, t_cidx, out_dir + "/.cache")
+                                           w_start, era5_end_ts, t_cidx)
             if t_n > 0:
                 t_avg = (t_sum / t_n).astype(np.float32)
                 temp_grid_025 = _reproject_gfs_to(t_avg, "copernicus_era5")
@@ -199,7 +198,6 @@ def _full_build(
         era5_counts = accumulate_raster_mode(
             era5_model, w_start, era5_end_ts,
             cc_cidx, pr_cidx, sw_cidx,  # type: ignore[arg-type]
-            out_dir + "/.cache",
             temp_grid_025=temp_grid_025,
         )
         for c in RASTER_WC_CODES:
@@ -215,7 +213,6 @@ def _full_build(
             gfs_counts = accumulate_raster_mode(
                 "ncep_gfs013", gfs_mode_start, gfs_end_ts,
                 gfs_cc, gfs_pr, gfs_sw,
-                out_dir + "/.cache",
             )
             era5_grid = RASTER_GRIDS["copernicus_era5"]
             for c in RASTER_WC_CODES:
@@ -236,7 +233,7 @@ def _full_build(
             cidx = era5_cidx.get(rv)
             if not cidx:
                 continue
-            acc, n = accumulate_raster(era5_model, rv, w_start, era5_end_ts, cidx, out_dir + "/.cache")
+            acc, n = accumulate_raster(era5_model, rv, w_start, era5_end_ts, cidx)
             sums[f"era5_{rv}"] = acc
             n_era5 = max(n_era5, n)
 
@@ -254,8 +251,8 @@ def _full_build(
             t_cidx = gfs_cidx.get("temperature_2m")
             rh_cidx = gfs_cidx.get("relative_humidity_2m")
             if t_cidx and rh_cidx and gfs_start < gfs_end_ts:
-                t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", gfs_start, gfs_end_ts, t_cidx, out_dir + "/.cache")
-                rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", gfs_start, gfs_end_ts, rh_cidx, out_dir + "/.cache")
+                t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", gfs_start, gfs_end_ts, t_cidx)
+                rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", gfs_start, gfs_end_ts, rh_cidx)
                 n = min(t_n, rh_n)
                 if n > 0:
                     t_avg = (t_sum / n).astype(np.float32)
@@ -274,15 +271,29 @@ def _full_build(
             t_cidx = gfs_cidx.get("temperature_2m")
             rh_cidx = gfs_cidx.get("relative_humidity_2m")
             if t_cidx and rh_cidx and gfs_start < gfs_end_ts:
-                t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", gfs_start, gfs_end_ts, t_cidx, out_dir + "/.cache")
-                rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", gfs_start, gfs_end_ts, rh_cidx, out_dir + "/.cache")
+                t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", gfs_start, gfs_end_ts, t_cidx)
+                rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", gfs_start, gfs_end_ts, rh_cidx)
                 n = min(t_n, rh_n)
                 if n > 0:
                     t_avg = (t_sum / n).astype(np.float32)
                     rh_avg = (rh_sum / n).astype(np.float32)
                     td_gfs = _derive_dew_point(t_avg, rh_avg)
-                    t_repr = reproject_to_grid(t_avg, gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"], dst_g["ny"], dst_g["nx"], dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"])
-                    td_repr = reproject_to_grid(td_gfs, gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"], dst_g["ny"], dst_g["nx"], dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"])
+                    t_repr = reproject_to_grid(
+                        t_avg,
+                        gfs_g["lat_min"], gfs_g["lat_max"],
+                        gfs_g["lon_min"], gfs_g["lon_max"],
+                        dst_g["ny"], dst_g["nx"],
+                        dst_g["lat_min"], dst_g["lat_max"],
+                        dst_g["lon_min"], dst_g["lon_max"],
+                    )
+                    td_repr = reproject_to_grid(
+                        td_gfs,
+                        gfs_g["lat_min"], gfs_g["lat_max"],
+                        gfs_g["lon_min"], gfs_g["lon_max"],
+                        dst_g["ny"], dst_g["nx"],
+                        dst_g["lat_min"], dst_g["lat_max"],
+                        dst_g["lon_min"], dst_g["lon_max"],
+                    )
                     sums["gfs_temperature_2m"] = t_repr.astype(np.float64) * n
                     sums["gfs_dew_point_2m"] = td_repr.astype(np.float64) * n
                     n_gfs = n
@@ -292,7 +303,7 @@ def _full_build(
                 cidx = gfs_cidx.get(gv)
                 if not cidx or gfs_start >= gfs_end_ts:
                     continue
-                acc, n = accumulate_raster("ncep_gfs013", gv, gfs_start, gfs_end_ts, cidx, out_dir + "/.cache")
+                acc, n = accumulate_raster("ncep_gfs013", gv, gfs_start, gfs_end_ts, cidx)
                 reproj = reproject_to_grid(
                     acc.astype(np.float32),
                     gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
@@ -308,7 +319,7 @@ def _full_build(
         "gfs_start_ts": max(era5_end_ts, w_start),
         "gfs_end_ts": gfs_end_ts,
         "n_era5": n_era5, "n_gfs": n_gfs,
-        "built_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+        "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
     }
     save_raster_state(out_dir, var_id, window_label, agg, sums, meta, suffix=suffix)
     print(f"  [{window_label}] {var_id}: {n_era5}h ERA5 + {n_gfs}h GFS → {out_dir}/{var_id}_{window_label}{suffix}.npy")
@@ -364,7 +375,7 @@ def _incremental_update(
             _sw = gfs_cidx.get("snowfall_water_equivalent") if use_gfs else sw_cidx
             if not _cc or not _pr or not _sw:
                 return None
-            delta = accumulate_raster_mode(model, start, end, _cc, _pr, _sw, out_dir + "/.cache")
+            delta = accumulate_raster_mode(model, start, end, _cc, _pr, _sw)
             if use_gfs:
                 era5_g = RASTER_GRIDS["copernicus_era5"]
                 for c in RASTER_WC_CODES:
@@ -426,14 +437,14 @@ def _incremental_update(
             cidx = era5_cidx.get(rv)
             if not cidx or end <= start:
                 return None
-            acc, _ = accumulate_raster(era5_model, rv, start, end, cidx, out_dir + "/.cache")
+            acc, _ = accumulate_raster(era5_model, rv, start, end, cidx)
             return acc.astype(np.float32)
 
         def _accum_gfs_reproj(gv: str, start: float, end: float) -> np.ndarray | None:
             cidx = gfs_cidx.get(gv)
             if not cidx or end <= start:
                 return None
-            acc, _ = accumulate_raster("ncep_gfs013", gv, start, end, cidx, out_dir + "/.cache")
+            acc, _ = accumulate_raster("ncep_gfs013", gv, start, end, cidx)
             return reproject_to_grid(
                 acc.astype(np.float32),
                 gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
@@ -506,7 +517,7 @@ def _incremental_update(
         "gfs_start_ts": max(era5_end_ts, new_w_start),
         "gfs_end_ts": gfs_end_ts,
         "n_era5": n_era5, "n_gfs": n_gfs,
-        "built_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+        "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
     }
     save_raster_state(out_dir, var_id, window_label, agg, sums, meta)
 
@@ -567,7 +578,7 @@ def _build_forecast_aggregates(
                     cidx = era5_cidx.get(rv)
                     if not cidx:
                         continue
-                    dropped, _ = accumulate_raster(era5_model, rv, old_w_start, era5_drop_end, cidx, out_dir + "/.cache")
+                    dropped, _ = accumulate_raster(era5_model, rv, old_w_start, era5_drop_end, cidx)
                     key = f"era5_{rv}"
                     if key in sums:
                         sums[key] = np.maximum(0.0, sums[key] - dropped)
@@ -580,7 +591,7 @@ def _build_forecast_aggregates(
                     cidx = gfs_cidx.get(gv)
                     if not cidx:
                         continue
-                    dropped, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_start, gfs_drop_end, cidx, out_dir + "/.cache")
+                    dropped, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_start, gfs_drop_end, cidx)
                     reproj = reproject_to_grid(
                         dropped.astype(np.float32),
                         gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
@@ -599,7 +610,7 @@ def _build_forecast_aggregates(
                     cidx = gfs_cidx.get(gv)
                     if not cidx:
                         continue
-                    added, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_end, gfs_end_for_fc, cidx, out_dir + "/.cache")
+                    added, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_end, gfs_end_for_fc, cidx)
                     reproj = reproject_to_grid(
                         added.astype(np.float32),
                         gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
@@ -618,7 +629,7 @@ def _build_forecast_aggregates(
                 "gfs_start_ts": max(era5_end_ts, new_w_start),
                 "gfs_end_ts": gfs_end_for_fc,
                 "n_era5": n_era5, "n_gfs": n_gfs,
-                "built_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).isoformat(),
+                "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
             }
             save_raster_state(out_dir, vid, wl, agg, sums, fc_meta, suffix=suffix)
 
@@ -639,13 +650,11 @@ def _build_forecast_aggregates(
 def main() -> None:
     cfg = load_config("global")
     out_dir = cfg.temporal_raster_out_dir
-    cache_dir = out_dir + "/.cache"
     force = cfg.temporal_raster_force_rebuild
     only_vars = [v.strip() for v in cfg.temporal_raster_vars.split(",") if v.strip()] or None
     only_windows = [w.strip() for w in cfg.temporal_raster_windows.split(",") if w.strip()] or None
 
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
     t_main = time.perf_counter()
 
@@ -675,14 +684,14 @@ def main() -> None:
     era5_land_end_ts = float(era5_land_meta["data_end_time"])
     gfs_data_end_ts = float(gfs_meta["data_end_time"])
 
-    now_ts = round(datetime.now(timezone.utc).timestamp() / 3600) * 3600
+    now_ts = round(datetime.now(UTC).timestamp() / 3600) * 3600
     gfs_end_ts = min(gfs_data_end_ts, now_ts)
     max_window_h = max(h for h, _ in windows)
 
-    print(f"ERA5      ends: {datetime.fromtimestamp(era5_end_ts, tz=timezone.utc).strftime('%Y-%m-%dT%HZ')}")
-    print(f"ERA5-land ends: {datetime.fromtimestamp(era5_land_end_ts, tz=timezone.utc).strftime('%Y-%m-%dT%HZ')}")
-    print(f"GFS       ends: {datetime.fromtimestamp(gfs_end_ts, tz=timezone.utc).strftime('%Y-%m-%dT%HZ')}")
-    print(f"Now:            {datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime('%Y-%m-%dT%HZ')}")
+    print(f"ERA5      ends: {datetime.fromtimestamp(era5_end_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}")
+    print(f"ERA5-land ends: {datetime.fromtimestamp(era5_land_end_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}")
+    print(f"GFS       ends: {datetime.fromtimestamp(gfs_end_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}")
+    print(f"Now:            {datetime.fromtimestamp(now_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}")
     print(f"Max window: {max_window_h}h  Force: {force}\n")
 
     # ── Skip if S3 data unchanged ─────────────────────────────────────────

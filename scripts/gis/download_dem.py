@@ -172,8 +172,8 @@ def _build_region_cog(
     tmp_out.replace(out_path)
 
 
-def main() -> None:
-    if VARS_TO_DOWNLOAD is not None and "elevation" not in VARS_TO_DOWNLOAD:
+def main(force: bool = False) -> None:
+    if not force and VARS_TO_DOWNLOAD is not None and "elevation" not in VARS_TO_DOWNLOAD:
         print("[download_dem] skipped (elevation not in VARS_TO_DOWNLOAD)")
         return
 
@@ -238,4 +238,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Download FABDEM elevation tiles")
+    parser.add_argument("--force", action="store_true", help="Run even if elevation is not in VARS_TO_DOWNLOAD")
+    args = parser.parse_args()
+    main(force=args.force)

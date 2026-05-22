@@ -793,5 +793,5 @@ def main() -> None:
             print("  upload complete")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

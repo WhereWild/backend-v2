@@ -1,0 +1,17 @@
+{
+  "obs_ts": 1773792000,
+  "berlin_temp_24h": 4.0,
+  "berlin_temp_168h": 7.7,
+  "berlin_precip_24h": 0.0,
+  "berlin_precip_168h": 5.1,
+  "sydney_precip_24h": 3.1,
+  "nairobi_temp_72h": 20.5,
+  "berlin_cloud_24h": 17.5,
+  "berlin_snowfall_24h": 0.0,
+  "berlin_dewpoint_24h": -0.1,
+  "berlin_soiltemp_24h": 5.4,
+  "berlin_soiltemp_168h": 7.5,
+  "berlin_soilmoist_24h": 0.337,
+  "nairobi_soilmoist_72h": 0.391,
+  "nairobi_soiltemp_24h": 23.0
+}

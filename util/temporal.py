@@ -504,11 +504,29 @@ def _chunk_filename(chunk_entry: ChunkRange) -> str:
     return f"chunk_{chunk_entry.chunk_num}.om"
 
 
-def _open_chunk(entry: ChunkRange, model: str, variable: str):
-    """Return an fsspec context manager streaming the .om chunk directly from S3."""
+# When set, accumulate_raster downloads chunks here before reading (faster for large grids).
+_RASTER_CHUNK_CACHE_DIR: str | None = None
+
+
+def set_raster_chunk_cache(path: str) -> None:
+    global _RASTER_CHUNK_CACHE_DIR
+    Path(path).mkdir(parents=True, exist_ok=True)
+    _RASTER_CHUNK_CACHE_DIR = path
+
+
+def _open_chunk(entry: ChunkRange, model: str, variable: str) -> OmFileReader:
+    """Return an OmFileReader for the chunk.
+
+    If _RASTER_CHUNK_CACHE_DIR is set, downloads to disk first (fast local reads).
+    Otherwise streams directly from S3 via from_fsspec.
+    """
+    if _RASTER_CHUNK_CACHE_DIR is not None:
+        local = _download_chunk(entry, model, variable, _RASTER_CHUNK_CACHE_DIR)
+        return OmFileReader(str(local))
     filename = _chunk_filename(entry)
-    uri = f"s3://openmeteo/data/{model}/{variable}/{filename}"
-    return fsspec.open(uri, mode="rb", s3={"anon": True})
+    path = f"openmeteo/data/{model}/{variable}/{filename}"
+    fs = fsspec.filesystem("s3", anon=True)
+    return OmFileReader.from_fsspec(fs, path)
 
 
 def _download_chunk(
@@ -1241,10 +1259,11 @@ RASTER_GRIDS: dict[str, dict] = {
         "step": 0.1, "flipud": False,
     },
     "ncep_gfs013": {
-        # ny/nx filled at runtime; bounds are non-standard
+        # GFS .om files are stored flat: (ny*nx, time). ny=1536, nx=3072 confirmed from shape.
+        "ny": 1536, "nx": 3072,
         "lat_min": -89.912125, "lat_max": 89.912125,
         "lon_min": -180.0, "lon_max": 179.88281,
-        "step": 0.125, "flipud": False,
+        "step": 0.117188, "flipud": False,
     },
 }
 
@@ -1286,19 +1305,20 @@ def accumulate_raster(
         if t1 <= t0:
             continue
 
-        with _open_chunk(entry, model, variable) as fh:
-            reader = OmFileReader(fh)
-            ny, nx, _ = reader.shape
+        reader = _open_chunk(entry, model, variable)
+        ny, nx, _ = reader.shape
 
-            if total_sum is None:
-                total_sum = np.zeros((ny, nx), dtype=np.float64)
+        if total_sum is None:
+            total_sum = np.zeros((ny, nx), dtype=np.float64)
 
-            # Read in 24-step sub-slices to cap peak memory
-            sub = 24
-            for ts in range(t0, t1, sub):
-                te = min(ts + sub, t1)
-                chunk_data = np.asarray(reader[0:ny, 0:nx, ts:te], dtype=np.float64)
-                total_sum += np.nansum(chunk_data, axis=2)
+        sub = 24
+        for ts in range(t0, t1, sub):
+            te = min(ts + sub, t1)
+            chunk_data = np.asarray(
+                reader.read_array((slice(0, ny), slice(0, nx), slice(ts, te))),
+                dtype=np.float64,
+            )
+            total_sum += np.nansum(chunk_data, axis=2)
 
         n_steps += t1 - t0
 
@@ -1342,11 +1362,12 @@ def accumulate_raster_mode(
     counts: dict[int, np.ndarray | None] = {c: None for c in RASTER_WC_CODES}
 
     def _load_slice(cidx: ChunkIndex, var: str, entry: ChunkRange, t0: int, t1: int) -> np.ndarray:
-        with _open_chunk(entry, model, var) as fh:
-            reader = OmFileReader(fh)
-            ny, nx, _ = reader.shape
-            data = np.asarray(reader[0:ny, 0:nx, t0:t1], dtype=np.float64)
-        return data  # (ny, nx, steps)
+        reader = _open_chunk(entry, model, var)
+        rny, rnx, _ = reader.shape
+        return np.asarray(
+            reader.read_array((slice(0, rny), slice(0, rnx), slice(t0, t1))),
+            dtype=np.float64,
+        )  # (ny, nx, steps)
 
     def _cidx_entry_for(cidx: ChunkIndex, ts: float) -> tuple[ChunkRange | None, int]:
         for entry in cidx.ranges:
@@ -1377,14 +1398,18 @@ def accumulate_raster_mode(
             step_ts = cc_entry.start + (t0 + i) * resolution
             pr_entry, pr_idx = _cidx_entry_for(precip_index, step_ts)
             if pr_entry is not None:
-                with _open_chunk(pr_entry, model, "precipitation") as fh:
-                    r = OmFileReader(fh)
-                    pr_data[:, :, i] = np.asarray(r[0:ny, 0:nx, pr_idx:pr_idx + 1], dtype=np.float64)[:, :, 0]
+                r = _open_chunk(pr_entry, model, "precipitation")
+                pr_data[:, :, i] = np.asarray(
+                    r.read_array((slice(0, ny), slice(0, nx), slice(pr_idx, pr_idx + 1))),
+                    dtype=np.float64,
+                )[:, :, 0]
             sw_entry, sw_idx = _cidx_entry_for(swe_index, step_ts)
             if sw_entry is not None:
-                with _open_chunk(sw_entry, model, "snowfall_water_equivalent") as fh:
-                    r = OmFileReader(fh)
-                    sw_data[:, :, i] = np.asarray(r[0:ny, 0:nx, sw_idx:sw_idx + 1], dtype=np.float64)[:, :, 0]
+                r = _open_chunk(sw_entry, model, "snowfall_water_equivalent")
+                sw_data[:, :, i] = np.asarray(
+                    r.read_array((slice(0, ny), slice(0, nx), slice(sw_idx, sw_idx + 1))),
+                    dtype=np.float64,
+                )[:, :, 0]
 
         if counts[0] is None:
             for c in RASTER_WC_CODES:
@@ -1512,7 +1537,13 @@ def load_raster_state(
         return None, None
     with open(meta_path) as fh:
         meta = json.load(fh)
-    sums = dict(np.load(sums_path))
+    raw = dict(np.load(sums_path))
+    sums: dict = {}
+    for k, v in raw.items():
+        try:
+            sums[int(k)] = v
+        except ValueError:
+            sums[k] = v
     return sums, meta
 
 
@@ -1536,5 +1567,5 @@ def save_raster_state(
     np.save(npy_path, final)
     with open(meta_path, "w") as fh:
         json.dump(meta, fh, indent=2)
-    np.savez(sums_path, **sums)
+    np.savez(sums_path, **{str(k): v for k, v in sums.items()})
 

@@ -550,11 +550,17 @@ def _build_forecast_aggregates(
 
         def _process(vid: str, cfg: dict, wh: int, wl: str) -> None:
             agg = cfg["agg"]
-            now_sums, now_meta = load_raster_state(out_dir, vid, wl)
+            # Try the existing forecast state first (incremental update path).
+            # Fall back to base state only if no forecast state exists yet.
+            now_sums, now_meta = load_raster_state(out_dir, vid, wl, suffix=suffix)
+            if now_sums is None:
+                now_sums, now_meta = load_raster_state(out_dir, vid, wl)
             if now_sums is None:
                 _full_build(vid, cfg, wh, wl, future_ts, era5_end_ts, gfs_end_for_fc,
                             era5_cidx_by_var.get(vid, {}), gfs_cidx, out_dir, suffix=suffix)
                 return
+            if float(now_meta.get("gfs_end_ts", 0)) >= gfs_end_for_fc:
+                return  # forecast state already up to date
 
             sums = {k: v.copy() for k, v in now_sums.items()}
             n_era5 = int(now_meta["n_era5"])
@@ -562,7 +568,9 @@ def _build_forecast_aggregates(
             old_w_start = float(now_meta["era5_window_start_ts"])
             old_gfs_end = float(now_meta["gfs_end_ts"])
             old_gfs_start = float(now_meta["gfs_start_ts"])
-            new_w_start = old_w_start + forecast_h * 3600
+            # Target window start for this forecast horizon — works whether we
+            # loaded from the base state or from an existing forecast state.
+            new_w_start = future_ts - wh * 3600
 
             era5_cidx = era5_cidx_by_var.get(vid, {})
             era5_model = cfg["era5_model"]

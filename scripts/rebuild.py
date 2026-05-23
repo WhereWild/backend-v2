@@ -19,6 +19,7 @@ The 4am system reboot is delayed via systemd-inhibit until the pipeline
 finishes.
 """
 
+import argparse
 import importlib
 import json
 import os
@@ -143,11 +144,23 @@ def _run_download_gis(gis_dir: Path | None = None) -> None:
         mod.main()
 
 
+TAXONOMY_CACHE_DIR = DATA_DIR / "taxonomy" / "cache"
+
+# Directories under DATA_DIR that survive a wipe. data/gis/ is excluded from
+# the loop directly; taxonomy/cache is backed up and restored so that ETag-
+# cached downloads (inat_dwca.zip, gbif_vernacular.tsv) aren't re-fetched when
+# the remote files haven't changed — the ETags live in sync_state.json (also
+# preserved) and are useless without the matching local files.
 def wipe_data_dir() -> None:
-    """Delete GBIF-derived data in DATA_DIR, preserving sync_state.json and data/gis/."""
+    """Delete GBIF-derived data in DATA_DIR, preserving sync_state.json, data/gis/, and data/taxonomy/cache/."""
     if not DATA_DIR.exists():
         return
     sync_state_backup = SYNC_STATE_PATH.read_bytes() if SYNC_STATE_PATH.exists() else None
+    taxonomy_cache_backup: dict[str, bytes] = {}
+    if TAXONOMY_CACHE_DIR.exists():
+        for f in TAXONOMY_CACHE_DIR.iterdir():
+            if f.is_file():
+                taxonomy_cache_backup[f.name] = f.read_bytes()
 
     for child in DATA_DIR.iterdir():
         if child.name == "gis":
@@ -159,18 +172,73 @@ def wipe_data_dir() -> None:
 
     if sync_state_backup is not None:
         SYNC_STATE_PATH.write_bytes(sync_state_backup)
-    print(f"Wiped {DATA_DIR}/ (sync_state.json and data/gis/ preserved)")
+    if taxonomy_cache_backup:
+        TAXONOMY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        for name, data in taxonomy_cache_backup.items():
+            (TAXONOMY_CACHE_DIR / name).write_bytes(data)
+    print(f"Wiped {DATA_DIR}/ (sync_state.json, data/gis/, and data/taxonomy/cache/ preserved)")
 
 
 # ---------------------------------------------------------------------------
 # pipeline
 # ---------------------------------------------------------------------------
 
+def _pid_alive(pid: int | None) -> bool:
+    """Return True if a process with the given PID is currently running."""
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _sync_gbif_stage() -> None:
+    sync_gbif.main()
+    sync_gbif.sync_occurrences()
+
+
+STAGES: list[tuple[str, str, object]] = [
+    ("sync_gbif",       "Syncing GBIF (taxonomy + occurrences)",              lambda: _sync_gbif_stage()),
+    ("build_tree",      "Building tree (catalog + ID maps + names + images)", lambda: build_tree.main()),
+    ("populate_tree",   "Populating tree (routing occurrences to parquet)",   lambda: populate_tree.main()),
+    ("process_gadm",    "Processing GADM (download + location tables)",       lambda: process_gadm.main()),
+    ("download_gis",    "Downloading GIS layers",                             lambda: _run_download_gis()),
+    ("build_overviews", "Building COG overviews",                             lambda: build_overviews.main()),
+    ("enrich_tree",     "Enriching tree (GIS sampling)",                      lambda: enrich_tree.main()),
+    ("enrich_temporal", "Enriching tree (temporal ERA5 weather)",              lambda: enrich_temporal.main()),
+    ("process_tree",    "Processing tree (summary stats + KDE)",              lambda: process_tree.main()),
+]
+
+
 def main() -> None:
-    # Detect a previous crash: if a prior run left status=in_progress it
-    # never finished cleanly (OOM, power loss, etc.).
+    stage_ids = [s[0] for s in STAGES]
+    parser = argparse.ArgumentParser(description="WhereWild rebuild pipeline")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip the GBIF freshness check and run a full rebuild immediately.",
+    )
+    parser.add_argument(
+        "--stage",
+        metavar="STAGE",
+        choices=stage_ids,
+        help=f"Start the pipeline at this stage, skipping all prior stages. One of: {', '.join(stage_ids)}",
+    )
+    args = parser.parse_args()
+
+    # Detect a previous crash: if a prior run left status=in_progress but its
+    # PID is gone, it never finished cleanly (OOM, power loss, etc.).
+    # If the PID is still alive, another instance is already running — exit.
     existing = _read_sync_state().get("pipeline", {})
+    resuming = False
+
     if existing.get("status") == "in_progress":
+        running_pid = existing.get("pid")
+        if _pid_alive(running_pid):
+            print(f"Pipeline already running (pid {running_pid}), exiting.")
+            return
         crashed_at = _now()
         _update_pipeline({"status": "crashed", "finished_at": crashed_at})
         print("WARNING: previous pipeline run did not finish — marked as crashed")
@@ -179,77 +247,71 @@ def main() -> None:
             "started_at": existing.get("started_at"),
             "crashed_at": crashed_at,
         })
+        resuming = True
 
-    # Check for new crawl before acquiring inhibitor or touching pipeline state.
-    print("Checking for new GBIF crawl...")
-    crawl_ts = sync_gbif.latest_crawl_finished()
-    state = sync_gbif.load_sync_state()
-    taxonomy_current = state.get("gbif_taxonomy", {}).get("crawl_finished") == crawl_ts
-    occurrences_current = state.get("gbif_occurrences", {}).get("crawl_finished") == crawl_ts
-    if taxonomy_current and occurrences_current:
-        print("Already up to date")
-        return
-    print(f"New crawl detected: {crawl_ts}")
+    if args.stage:
+        # Jump directly to the given stage — no freshness check, no wipe.
+        idx = stage_ids.index(args.stage)
+        completed_stages = set(stage_ids[:idx])
+        print(f"--stage {args.stage}: skipping {sorted(completed_stages) or 'nothing'}")
+    elif not resuming:
+        if args.force:
+            print("--force: skipping freshness check, running full rebuild")
+        else:
+            # Only check for new crawl data on a fresh (non-resume) run.
+            print("Checking for new GBIF crawl...")
+            crawl_ts = sync_gbif.latest_crawl_finished()
+            state = sync_gbif.load_sync_state()
+            taxonomy_current = state.get("gbif_taxonomy", {}).get("crawl_finished") == crawl_ts
+            occurrences_current = state.get("gbif_occurrences", {}).get("crawl_finished") == crawl_ts
+            if taxonomy_current and occurrences_current:
+                print("Already up to date")
+                return
+            print(f"New crawl detected: {crawl_ts}")
+
+    if not args.stage:
+        completed_stages = set()
+        if resuming:
+            completed_stages = {
+                name
+                for name, info in existing.get("stages", {}).items()
+                if isinstance(info, dict) and info.get("status") == "completed"
+            }
+            print(f"Resuming — skipping already-completed stages: {sorted(completed_stages)}\n")
 
     inhibitor = _acquire_shutdown_inhibitor()
     try:
-        started_at = _now()
+        started_at = (existing.get("started_at") if resuming else None) or _now()
         _update_pipeline({
             "status": "in_progress",
+            "pid": os.getpid(),
             "stage": None,
             "started_at": started_at,
             "finished_at": None,
-            "stages": {},
+            "stages": existing.get("stages", {}) if resuming else {},
             "error": None,
         })
 
-        print("\n--- Wiping data directory ---")
-        wipe_data_dir()
+        if not resuming and not args.stage:
+            print("\n--- Wiping data directory ---")
+            wipe_data_dir()
+            if args.force:
+                # sync_state.json is preserved through the wipe, but its GBIF
+                # crawl timestamps would cause sync_gbif to skip the download.
+                # Clear them so it re-fetches.
+                state = _read_sync_state()
+                state.pop("gbif_taxonomy", None)
+                state.pop("gbif_occurrences", None)
+                _write_sync_state(state)
 
-        _set_stage("sync_gbif", "in_progress")
-        sync_gbif.main()
-        sync_gbif.sync_occurrences()
-        _set_stage("sync_gbif", "completed")
-
-        print("\n--- Building tree (catalog + ID maps + names + images) ---")
-        _set_stage("build_tree", "in_progress")
-        build_tree.main()
-        _set_stage("build_tree", "completed")
-
-        print("\n--- Populating tree (routing occurrences to parquet) ---")
-        _set_stage("populate_tree", "in_progress")
-        populate_tree.main()
-        _set_stage("populate_tree", "completed")
-
-        print("\n--- Processing GADM (download + location tables + catalog) ---")
-        _set_stage("process_gadm", "in_progress")
-        process_gadm.main()
-        _set_stage("process_gadm", "completed")
-
-        print("\n--- Downloading GIS layers ---")
-        _set_stage("download_gis", "in_progress")
-        _run_download_gis()
-        _set_stage("download_gis", "completed")
-
-        print("\n--- Building COG overviews ---")
-        _set_stage("build_overviews", "in_progress")
-        build_overviews.main()
-        _set_stage("build_overviews", "completed")
-
-        print("\n--- Enriching tree (GIS sampling) ---")
-        _set_stage("enrich_tree", "in_progress")
-        enrich_tree.main()
-        _set_stage("enrich_tree", "completed")
-
-        print("\n--- Enriching tree (temporal ERA5 weather) ---")
-        _set_stage("enrich_temporal", "in_progress")
-        enrich_temporal.main()
-        _set_stage("enrich_temporal", "completed")
-
-        print("\n--- Processing tree (summary stats + KDE) ---")
-        _set_stage("process_tree", "in_progress")
-        process_tree.main()
-        _set_stage("process_tree", "completed")
+        for stage_id, label, fn in STAGES:
+            if stage_id in completed_stages:
+                print(f"\n--- Skipping {label} (already completed) ---")
+                continue
+            print(f"\n--- {label} ---")
+            _set_stage(stage_id, "in_progress")
+            fn()
+            _set_stage(stage_id, "completed")
 
         finished_at = _now()
         elapsed = int((datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds())

@@ -1,4 +1,5 @@
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,7 +12,9 @@ def patch_paths(monkeypatch, tmp_path):
     data_dir = tmp_path / "data"
     monkeypatch.setattr(rebuild, "DATA_DIR", data_dir)
     monkeypatch.setattr(rebuild, "SYNC_STATE_PATH", data_dir / "sync_state.json")
+    monkeypatch.setattr(rebuild, "TAXONOMY_CACHE_DIR", data_dir / "taxonomy" / "cache")
     monkeypatch.setattr(rebuild, "NOTIFY_URL", "")
+    monkeypatch.setattr("sys.argv", ["rebuild"])
 
 
 @pytest.fixture(autouse=True)
@@ -324,23 +327,33 @@ def test_main_errored_on_exception(tmp_path):
 def test_main_crash_detected_on_next_run(tmp_path, capsys):
     sync_state_path = tmp_path / "data" / "sync_state.json"
     sync_state_path.parent.mkdir(parents=True, exist_ok=True)
-    ts = "2026-05-15T15:54:14.220+00:00"
     sync_state_path.write_text(json.dumps({
         "pipeline": {"status": "in_progress", "stage": "build_tree", "stages": {}}
     }))
 
-    check1, check2 = _patch_sync_check(new_crawl_ts=ts, existing_ts=ts)
-    with check1, check2, \
+    with patch("scripts.sync_gbif.main"), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.rebuild.wipe_data_dir"), \
+         patch("scripts.build_tree.main"), \
+         patch("scripts.populate_tree.main"), \
+         patch("scripts.gis.process_gadm.main"), \
+         patch("scripts.rebuild._run_download_gis"), \
+         patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.enrich_tree.main"), \
+         patch("scripts.enrich_temporal.main"), \
+         patch("scripts.process_tree.main"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"), \
          patch("scripts.rebuild.notify") as mock_notify:
         rebuild.main()
 
-    assert "crashed" in capsys.readouterr().out
-    mock_notify.assert_called_once()
-    event, payload = mock_notify.call_args[0]
-    assert event == "crashed"
-    assert payload["stage"] == "build_tree"
+    out = capsys.readouterr().out
+    assert "crashed" in out
+    # notify is called twice: once for "crashed", once for "completed" (resume ran)
+    calls = {call[0][0] for call in mock_notify.call_args_list}
+    assert "crashed" in calls
+    crashed_call = next(c for c in mock_notify.call_args_list if c[0][0] == "crashed")
+    assert crashed_call[0][1]["stage"] == "build_tree"
 
 
 def test_main_crash_overwrites_pipeline_state(tmp_path):
@@ -350,12 +363,12 @@ def test_main_crash_overwrites_pipeline_state(tmp_path):
         "pipeline": {"status": "in_progress", "stage": "build_tree", "stages": {}}
     }))
 
-    check1, check2 = _patch_sync_check()
-    with check1, check2, \
-         patch("scripts.sync_gbif.main", side_effect=RuntimeError("sync fail")), \
+    with patch("scripts.sync_gbif.main", side_effect=RuntimeError("sync fail")), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"), \
+         patch("scripts.rebuild.notify"), \
          pytest.raises(RuntimeError):
         rebuild.main()
 
@@ -400,3 +413,169 @@ def test_main_inhibitor_released_on_success():
         rebuild.main()
 
     mock_release.assert_called_once_with(mock_proc)
+
+
+def test_wipe_data_dir_preserves_taxonomy_cache(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    cache_dir = data_dir / "taxonomy" / "cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "inat_dwca.zip").write_bytes(b"zipdata")
+    (cache_dir / "gbif_vernacular.tsv").write_bytes(b"tsvdata")
+    (data_dir / "taxonomy" / "catalog.pkl").write_bytes(b"other")
+    monkeypatch.setattr(rebuild, "DATA_DIR", data_dir)
+    monkeypatch.setattr(rebuild, "SYNC_STATE_PATH", data_dir / "sync_state.json")
+    monkeypatch.setattr(rebuild, "TAXONOMY_CACHE_DIR", cache_dir)
+
+    rebuild.wipe_data_dir()
+
+    assert (cache_dir / "inat_dwca.zip").read_bytes() == b"zipdata"
+    assert (cache_dir / "gbif_vernacular.tsv").read_bytes() == b"tsvdata"
+    assert not (data_dir / "taxonomy" / "catalog.pkl").exists()
+
+
+def test_pid_alive_current_process():
+    assert rebuild._pid_alive(os.getpid()) is True
+
+
+def test_pid_alive_dead_pid():
+    assert rebuild._pid_alive(99999999) is False
+
+
+def test_pid_alive_none():
+    assert rebuild._pid_alive(None) is False
+
+
+def test_main_already_running_exits(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["rebuild"])
+    sync_state_path = tmp_path / "data" / "sync_state.json"
+    sync_state_path.parent.mkdir(parents=True, exist_ok=True)
+    sync_state_path.write_text(json.dumps({
+        "pipeline": {"status": "in_progress", "pid": 99999, "stage": "build_tree", "stages": {}}
+    }))
+
+    with patch("scripts.rebuild._pid_alive", return_value=True), \
+         patch("scripts.rebuild._acquire_shutdown_inhibitor") as mock_inhibitor:
+        rebuild.main()
+
+    mock_inhibitor.assert_not_called()
+    p = json.loads(sync_state_path.read_text())["pipeline"]
+    assert p["status"] == "in_progress"  # unchanged — exited before touching it
+
+
+def test_main_force_skips_freshness_check(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["rebuild", "--force"])
+    with patch("scripts.sync_gbif.latest_crawl_finished") as mock_check, \
+         patch("scripts.sync_gbif.main"), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.rebuild.wipe_data_dir"), \
+         patch("scripts.build_tree.main"), \
+         patch("scripts.populate_tree.main"), \
+         patch("scripts.gis.process_gadm.main"), \
+         patch("scripts.rebuild._run_download_gis"), \
+         patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.enrich_tree.main"), \
+         patch("scripts.enrich_temporal.main"), \
+         patch("scripts.process_tree.main"), \
+         patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
+         patch("scripts.rebuild._release_inhibitor"), \
+         patch("scripts.rebuild.notify"):
+        rebuild.main()
+
+    mock_check.assert_not_called()
+    assert "--force" in capsys.readouterr().out
+
+
+def test_main_force_clears_gbif_crawl_timestamps(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["rebuild", "--force"])
+    sync_state_path = tmp_path / "data" / "sync_state.json"
+    sync_state_path.parent.mkdir(parents=True, exist_ok=True)
+    sync_state_path.write_text(json.dumps({
+        "gbif_taxonomy": {"crawl_finished": "2026-01-01"},
+        "gbif_occurrences": {"crawl_finished": "2026-01-01"},
+    }))
+
+    with patch("scripts.rebuild.wipe_data_dir"), \
+         patch("scripts.sync_gbif.main"), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.build_tree.main"), \
+         patch("scripts.populate_tree.main"), \
+         patch("scripts.gis.process_gadm.main"), \
+         patch("scripts.rebuild._run_download_gis"), \
+         patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.enrich_tree.main"), \
+         patch("scripts.enrich_temporal.main"), \
+         patch("scripts.process_tree.main"), \
+         patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
+         patch("scripts.rebuild._release_inhibitor"), \
+         patch("scripts.rebuild.notify"):
+        rebuild.main()
+
+    state = json.loads(sync_state_path.read_text())
+    assert "gbif_taxonomy" not in state
+    assert "gbif_occurrences" not in state
+
+
+def test_main_stage_flag_skips_prior_stages(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["rebuild", "--stage", "enrich_tree"])
+    call_order = []
+
+    with patch("scripts.sync_gbif.main", side_effect=lambda: call_order.append("sync_gbif")), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
+         patch("scripts.build_tree.main", side_effect=lambda: call_order.append("build_tree")), \
+         patch("scripts.populate_tree.main", side_effect=lambda: call_order.append("populate_tree")), \
+         patch("scripts.gis.process_gadm.main"), \
+         patch("scripts.rebuild._run_download_gis"), \
+         patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.enrich_tree.main", side_effect=lambda: call_order.append("enrich_tree")), \
+         patch("scripts.enrich_temporal.main", side_effect=lambda: call_order.append("enrich_temporal")), \
+         patch("scripts.process_tree.main", side_effect=lambda: call_order.append("process_tree")), \
+         patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
+         patch("scripts.rebuild._release_inhibitor"), \
+         patch("scripts.rebuild.notify"):
+        rebuild.main()
+
+    assert "wipe" not in call_order
+    assert "sync_gbif" not in call_order
+    assert "build_tree" not in call_order
+    assert "enrich_tree" in call_order
+    assert "enrich_temporal" in call_order
+    assert "process_tree" in call_order
+
+
+def test_main_resume_skips_completed_stages(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["rebuild"])
+    sync_state_path = tmp_path / "data" / "sync_state.json"
+    sync_state_path.parent.mkdir(parents=True, exist_ok=True)
+    sync_state_path.write_text(json.dumps({
+        "pipeline": {
+            "status": "in_progress",
+            "stage": "build_tree",
+            "stages": {
+                "sync_gbif": {"status": "completed"},
+                "build_tree": {"status": "completed"},
+            },
+        }
+    }))
+
+    call_order = []
+    with patch("scripts.rebuild._pid_alive", return_value=False), \
+         patch("scripts.rebuild.wipe_data_dir"), \
+         patch("scripts.sync_gbif.main", side_effect=lambda: call_order.append("sync_gbif")), \
+         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.build_tree.main", side_effect=lambda: call_order.append("build_tree")), \
+         patch("scripts.populate_tree.main", side_effect=lambda: call_order.append("populate_tree")), \
+         patch("scripts.gis.process_gadm.main"), \
+         patch("scripts.rebuild._run_download_gis"), \
+         patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.enrich_tree.main"), \
+         patch("scripts.enrich_temporal.main"), \
+         patch("scripts.process_tree.main"), \
+         patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
+         patch("scripts.rebuild._release_inhibitor"), \
+         patch("scripts.rebuild.notify"):
+        rebuild.main()
+
+    assert "sync_gbif" not in call_order
+    assert "build_tree" not in call_order
+    assert "populate_tree" in call_order

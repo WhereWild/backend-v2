@@ -47,7 +47,28 @@ def _catalog() -> dict:
         return json.load(f)
 
 
+TEMPORAL_RASTERS_DIR = Path("data/gis/temporal/rasters")
+
 _WINDOW_LABELS = {1: "1h", 8: "8h", 24: "24h", 72: "3d", 168: "7d", 720: "30d", 2160: "90d"}
+
+_MODEL_GRID_PARAMS: dict[str, dict] = {
+    "copernicus_era5":      {"ny": 721,  "nx": 1440, "lat_min": -90.0, "lat_max": 90.0, "lon_min": -180.0, "lon_max": 180.0},
+    "copernicus_era5_land": {"ny": 1801, "nx": 3600, "lat_min": -90.0, "lat_max": 90.0, "lon_min": -180.0, "lon_max": 180.0},
+}
+
+_npy_cache: dict[Path, tuple[float, np.ndarray]] = {}
+
+
+def _load_temporal_npy(path: Path) -> np.ndarray | None:
+    if not path.exists():
+        return None
+    mtime = path.stat().st_mtime
+    cached = _npy_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    arr = np.load(path).astype(np.float32)
+    _npy_cache[path] = (mtime, arr)
+    return arr
 
 
 def _expand_temporal_layers(category: dict) -> list[dict]:
@@ -62,6 +83,7 @@ def _expand_temporal_layers(category: dict) -> list[dict]:
             expanded.append({
                 **layer,
                 "id": f"{layer['id']}_{agg}_{w}h",
+                "var_id": layer["id"],
                 "display_name": layer.get("display_name", layer["id"]),
                 "window_hours": w,
                 "window_label": label,
@@ -153,6 +175,66 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
 # Tile renderer
 # ---------------------------------------------------------------------------
 
+def render_temporal_tile_bytes(
+    layer_id: str,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = 256,
+) -> bytes:
+    layer = get_layer(layer_id)
+    var_id = layer["var_id"]
+    window_label = layer["window_label"]
+    model = layer.get("model", "copernicus_era5")
+
+    npy_path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}.npy"
+    arr = _load_temporal_npy(npy_path)
+
+    dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+    vmin = layer.get("render_min")
+    vmax = layer.get("render_max")
+
+    if arr is not None:
+        finite = np.isfinite(arr)
+        if vmin is None:
+            vmin = float(np.nanpercentile(arr[finite], 2)) if finite.any() else 0.0
+        if vmax is None:
+            vmax = float(np.nanpercentile(arr[finite], 98)) if finite.any() else 1.0
+
+        # Detect grid from array shape (more reliable than catalog model field)
+        shape_to_model = {(721, 1440): "copernicus_era5", (1801, 3600): "copernicus_era5_land"}
+        detected = shape_to_model.get(arr.shape, model)
+        grid = _MODEL_GRID_PARAMS.get(detected, _MODEL_GRID_PARAMS["copernicus_era5"])
+        # arr is lat-ascending (row 0 = south); flipud for rasterio north-up convention
+        arr_nu = np.flipud(arr)
+        src_transform = from_bounds(
+            grid["lon_min"], grid["lat_min"], grid["lon_max"], grid["lat_max"],
+            grid["nx"], grid["ny"],
+        )
+        mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
+        dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+        warp_reproject(
+            source=arr_nu,
+            destination=dest,
+            src_transform=src_transform,
+            src_crs=WGS84,
+            src_nodata=np.nan,
+            dst_transform=dst_transform,
+            dst_crs=WEB_MERCATOR,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
+    else:
+        vmin = vmin if vmin is not None else 0.0
+        vmax = vmax if vmax is not None else 1.0
+
+    rgba = _colorize(dest, vmin, vmax)
+    img = Image.fromarray(rgba, mode="RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def render_layer_tile_bytes(
     layer_id: str,
     z: int,
@@ -160,7 +242,9 @@ def render_layer_tile_bytes(
     y: int,
     tile_size: int = 256,
 ) -> bytes:
-    layer   = get_layer(layer_id)
+    layer = get_layer(layer_id)
+    if layer.get("window_hours") is not None:
+        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size)
     path    = LAYERS_DIR / layer["filename"]
     scale   = layer.get("scale_factor") or 1.0
     offset  = layer.get("add_offset")   or 0.0

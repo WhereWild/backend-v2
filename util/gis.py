@@ -10,6 +10,12 @@ from util.tiles import (
     TEMPORAL_RASTERS_DIR,
     _load_temporal_npy,
 )
+from util.temporal import (
+    ELEVATION_CORRECTABLE_VARS,
+    _LAPSE_RATE,
+    _read_model_elevation,
+    grid_indices,
+)
 
 
 def sample_point(layer: dict, lat: float, lon: float) -> float | None:
@@ -67,7 +73,57 @@ def _sample_temporal_point(layer: dict, lat: float, lon: float) -> float | None:
         return None
 
     val = float(arr[row, col])
-    return None if not np.isfinite(val) else val
+    if not np.isfinite(val):
+        return None
+
+    if var_id in ELEVATION_CORRECTABLE_VARS:
+        step = layer.get("grid_step", 0.25)
+        mode = layer.get("grid_mode", "lat_asc_lon_pm180")
+        val = _apply_point_elevation_correction(val, lat, lon, model, step, mode)
+
+    return val
+
+
+def _apply_point_elevation_correction(
+    val: float, lat: float, lon: float, model: str, step: float, mode: str,
+) -> float:
+    """Apply lapse-rate correction to a temporal value at a single point.
+
+    Samples the elevation COG for the true surface elevation, then looks up
+    the model's smoothed grid elevation (HSURF) at the same grid cell.
+    Correction = (model_elev - obs_elev) * LAPSE_RATE.
+    Returns val unchanged if either elevation is unavailable.
+    """
+    elev_layer = LAYERS_DIR / "elevation.tif"
+    if not elev_layer.exists():
+        return val
+
+    try:
+        with rasterio.open(elev_layer) as ds:
+            r, c = ds.index(lon, lat)
+            if not (0 <= r < ds.height and 0 <= c < ds.width):
+                return val
+            window = rasterio.windows.Window(c, r, 1, 1)
+            data = ds.read(1, window=window, masked=True)
+            if data.mask.all():
+                return val
+            obs_elev = float(data.data.flat[0])
+    except Exception:
+        return val
+
+    if not np.isfinite(obs_elev) or obs_elev <= -9000:
+        return val
+
+    ny = int(round(180.0 / step)) + 1
+    nx = int(round(360.0 / step)) + 1
+    li, lo = grid_indices(lat, lon, ny, nx, mode, step)
+    lat_arr = np.array([li], dtype=np.int32)
+    lon_arr = np.array([lo], dtype=np.int32)
+    model_elev = float(_read_model_elevation(model, lat_arr, lon_arr)[0])
+    if not np.isfinite(model_elev):
+        return val
+
+    return val + (model_elev - obs_elev) * _LAPSE_RATE
 
 
 # ---------------------------------------------------------------------------

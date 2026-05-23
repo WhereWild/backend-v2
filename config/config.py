@@ -90,7 +90,7 @@ class GlobalConfig:
     temporal_cache_dir: str = "data/cache/temporal"
     temporal_overwrite_all: bool = False
     temporal_elevation_correctable_vars: tuple[str, ...] = (
-        "temperature_2m", "dew_point_2m",
+        "temperature_2m", "dew_point_2m", "soil_temperature_0_to_7cm"
     )
 
     # Temporal raster builder

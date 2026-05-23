@@ -172,7 +172,7 @@ def _full_build(
 ) -> None:
     era5_model = cfg["era5_model"]
     agg = cfg["agg"]
-    w_start = now_ts - (window_h - 1) * 3600
+    w_start = now_ts - max(window_h - 1, 1) * 3600
 
     sums: dict[str, np.ndarray] = {}
     n_era5, n_gfs = 0, 0
@@ -549,8 +549,6 @@ def _build_forecast_aggregates(
 
         def _process(vid: str, cfg: dict, wh: int, wl: str) -> None:
             agg = cfg["agg"]
-            if agg == "mode":
-                return  # mode forecasts not supported yet
             now_sums, now_meta = load_raster_state(out_dir, vid, wl)
             if now_sums is None:
                 _full_build(vid, cfg, wh, wl, future_ts, era5_end_ts, gfs_end_for_fc,
@@ -569,58 +567,107 @@ def _build_forecast_aggregates(
             era5_model = cfg["era5_model"]
             dst_g = RASTER_GRIDS[era5_model]
             gfs_g = RASTER_GRIDS["ncep_gfs013"]
-            resolution = next(iter(era5_cidx.values())).resolution if era5_cidx else 3600.0
+            resolution = next((v.resolution for k, v in era5_cidx.items() if not k.startswith("_")), 3600.0)
 
-            # Drop oldest forecast_h hours from ERA5 tail
-            era5_drop_end = min(new_w_start, era5_end_ts)
-            if era5_drop_end > old_w_start:
-                drop_n = int(round((era5_drop_end - old_w_start) / resolution))
-                for rv in _era5_raw_vars(cfg):
-                    cidx = era5_cidx.get(rv)
-                    if not cidx:
-                        continue
-                    dropped, _ = accumulate_raster(era5_model, rv, old_w_start, era5_drop_end, cidx)
-                    key = f"era5_{rv}"
-                    if key in sums:
-                        sums[key] = np.maximum(0.0, sums[key] - dropped)
-                n_era5 -= drop_n
+            if agg == "mode":
+                cc_cidx = era5_cidx.get("cloud_cover")
+                pr_cidx = era5_cidx.get("precipitation")
+                sw_cidx = era5_cidx.get("snowfall_water_equivalent")
+                gfs_cc = gfs_cidx.get("cloud_cover")
+                gfs_pr = gfs_cidx.get("precipitation")
+                gfs_sw = gfs_cidx.get("snowfall_water_equivalent")
 
-            gfs_drop_end = min(new_w_start, old_gfs_end)
-            if gfs_drop_end > old_gfs_start:
-                drop_n = int(round((gfs_drop_end - old_gfs_start) / resolution))
-                for gv in _gfs_raw_vars(cfg):
-                    cidx = gfs_cidx.get(gv)
-                    if not cidx:
-                        continue
-                    dropped, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_start, gfs_drop_end, cidx)
-                    reproj = reproject_to_grid(
-                        dropped.astype(np.float32),
+                def _mode_delta_era5(start: float, end: float) -> dict | None:
+                    if end <= start or not cc_cidx:
+                        return None
+                    return accumulate_raster_mode(era5_model, start, end, cc_cidx, pr_cidx, sw_cidx)
+
+                def _mode_delta_gfs(start: float, end: float) -> dict | None:
+                    if end <= start or not (gfs_cc and gfs_pr and gfs_sw):
+                        return None
+                    d = accumulate_raster_mode("ncep_gfs013", start, end, gfs_cc, gfs_pr, gfs_sw)
+                    era5_g = RASTER_GRIDS["copernicus_era5"]
+                    return {c: np.round(reproject_to_grid(
+                        d[c].astype(np.float32),
                         gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                        dst_g["ny"], dst_g["nx"],
-                        dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
-                    )
-                    key = f"gfs_{gv}"
-                    if key in sums:
-                        sums[key] = np.maximum(0.0, sums[key] - reproj)
-                n_gfs -= drop_n
+                        era5_g["ny"], era5_g["nx"],
+                        era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
+                    )).astype(np.int32) for c in RASTER_WC_CODES}
 
-            # Add GFS forecast hours [old_gfs_end → future_ts]
-            if gfs_end_for_fc > old_gfs_end:
-                add_n = int(round((gfs_end_for_fc - old_gfs_end) / resolution))
-                for gv in _gfs_raw_vars(cfg):
-                    cidx = gfs_cidx.get(gv)
-                    if not cidx:
-                        continue
-                    added, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_end, gfs_end_for_fc, cidx)
-                    reproj = reproject_to_grid(
-                        added.astype(np.float32),
-                        gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                        dst_g["ny"], dst_g["nx"],
-                        dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
-                    )
-                    key = f"gfs_{gv}"
-                    sums[key] = sums.get(key, np.zeros_like(reproj)) + reproj
-                n_gfs += add_n
+                era5_drop_end = min(new_w_start, era5_end_ts)
+                if era5_drop_end > old_w_start:
+                    delta = _mode_delta_era5(old_w_start, era5_drop_end)
+                    if delta:
+                        for c in RASTER_WC_CODES:
+                            sums[c] = np.maximum(0, sums[c] - delta[c])
+                    n_era5 -= int(round((era5_drop_end - old_w_start) / resolution))
+
+                gfs_drop_end = min(new_w_start, old_gfs_end)
+                if gfs_drop_end > old_gfs_start:
+                    delta = _mode_delta_gfs(old_gfs_start, gfs_drop_end)
+                    if delta:
+                        for c in RASTER_WC_CODES:
+                            sums[c] = np.maximum(0, sums[c] - delta[c])
+                    n_gfs -= int(round((gfs_drop_end - old_gfs_start) / resolution))
+
+                if gfs_end_for_fc > old_gfs_end:
+                    delta = _mode_delta_gfs(old_gfs_end, gfs_end_for_fc)
+                    if delta:
+                        for c in RASTER_WC_CODES:
+                            sums[c] = sums.get(c, np.zeros_like(delta[c])) + delta[c]
+                    n_gfs += int(round((gfs_end_for_fc - old_gfs_end) / resolution))
+
+            else:
+                # Drop oldest forecast_h hours from ERA5 tail
+                era5_drop_end = min(new_w_start, era5_end_ts)
+                if era5_drop_end > old_w_start:
+                    drop_n = int(round((era5_drop_end - old_w_start) / resolution))
+                    for rv in _era5_raw_vars(cfg):
+                        cidx = era5_cidx.get(rv)
+                        if not cidx:
+                            continue
+                        dropped, _ = accumulate_raster(era5_model, rv, old_w_start, era5_drop_end, cidx)
+                        key = f"era5_{rv}"
+                        if key in sums:
+                            sums[key] = np.maximum(0.0, sums[key] - dropped)
+                    n_era5 -= drop_n
+
+                gfs_drop_end = min(new_w_start, old_gfs_end)
+                if gfs_drop_end > old_gfs_start:
+                    drop_n = int(round((gfs_drop_end - old_gfs_start) / resolution))
+                    for gv in _gfs_raw_vars(cfg):
+                        cidx = gfs_cidx.get(gv)
+                        if not cidx:
+                            continue
+                        dropped, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_start, gfs_drop_end, cidx)
+                        reproj = reproject_to_grid(
+                            dropped.astype(np.float32),
+                            gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                            dst_g["ny"], dst_g["nx"],
+                            dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
+                        )
+                        key = f"gfs_{gv}"
+                        if key in sums:
+                            sums[key] = np.maximum(0.0, sums[key] - reproj)
+                    n_gfs -= drop_n
+
+                # Add GFS forecast hours [old_gfs_end → future_ts]
+                if gfs_end_for_fc > old_gfs_end:
+                    add_n = int(round((gfs_end_for_fc - old_gfs_end) / resolution))
+                    for gv in _gfs_raw_vars(cfg):
+                        cidx = gfs_cidx.get(gv)
+                        if not cidx:
+                            continue
+                        added, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_end, gfs_end_for_fc, cidx)
+                        reproj = reproject_to_grid(
+                            added.astype(np.float32),
+                            gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                            dst_g["ny"], dst_g["nx"],
+                            dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
+                        )
+                        key = f"gfs_{gv}"
+                        sums[key] = sums.get(key, np.zeros_like(reproj)) + reproj
+                    n_gfs += add_n
 
             n_era5 = max(n_era5, 0)
             n_gfs = max(n_gfs, 0)

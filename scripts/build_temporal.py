@@ -22,6 +22,7 @@ Output resolutions match the primary source (no blanket 0.25° downsampling).
 from __future__ import annotations
 
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -754,6 +755,19 @@ def main() -> None:
         except Exception:
             pass
 
+    # If a prior run is still in-progress and its PID is alive, exit cleanly.
+    if prior_state.get("status") == "running":
+        running_pid = prior_state.get("pid")
+        if running_pid is not None:
+            try:
+                os.kill(int(running_pid), 0)
+                alive = True
+            except (ProcessLookupError, PermissionError):
+                alive = False
+            if alive:
+                print(f"build_temporal already running (pid {running_pid}), exiting.")
+                return
+
     same_data = (
         prior_state.get("era5_end_ts") == era5_end_ts
         and prior_state.get("gfs_end_ts") == gfs_end_ts
@@ -779,6 +793,7 @@ def main() -> None:
     def _write_state(status: str, *, skipped: bool = False, error: str | None = None) -> None:
         state: dict = {
             "status": status,
+            "pid": os.getpid() if status == "running" else None,
             "started_at": started_at.isoformat(),
             "era5_end_ts": era5_end_ts,
             "gfs_end_ts": gfs_end_ts,

@@ -1361,14 +1361,6 @@ def accumulate_raster_mode(
 
     counts: dict[int, np.ndarray | None] = {c: None for c in RASTER_WC_CODES}
 
-    def _load_slice(cidx: ChunkIndex, var: str, entry: ChunkRange, t0: int, t1: int) -> np.ndarray:
-        reader = _open_chunk(entry, model, var)
-        rny, rnx, _ = reader.shape
-        return np.asarray(
-            reader.read_array((slice(0, rny), slice(0, rnx), slice(t0, t1))),
-            dtype=np.float64,
-        )  # (ny, nx, steps)
-
     def _cidx_entry_for(cidx: ChunkIndex, ts: float) -> tuple[ChunkRange | None, int]:
         for entry in cidx.ranges:
             if entry.start <= ts <= entry.end:
@@ -1387,39 +1379,55 @@ def accumulate_raster_mode(
         if t1 <= t0:
             continue
 
-        cc_data = _load_slice(cloud_index, "cloud_cover", cc_entry, t0, t1)
-        ny, nx = cc_data.shape[:2]
-
-        # Load corresponding precip and swe slices (may span different chunks)
-        pr_data = np.zeros((ny, nx, t1 - t0), dtype=np.float64)
-        sw_data = np.zeros((ny, nx, t1 - t0), dtype=np.float64)
-
-        for i in range(t1 - t0):
-            step_ts = cc_entry.start + (t0 + i) * resolution
-            pr_entry, pr_idx = _cidx_entry_for(precip_index, step_ts)
-            if pr_entry is not None:
-                r = _open_chunk(pr_entry, model, "precipitation")
-                pr_data[:, :, i] = np.asarray(
-                    r.read_array((slice(0, ny), slice(0, nx), slice(pr_idx, pr_idx + 1))),
-                    dtype=np.float64,
-                )[:, :, 0]
-            sw_entry, sw_idx = _cidx_entry_for(swe_index, step_ts)
-            if sw_entry is not None:
-                r = _open_chunk(sw_entry, model, "snowfall_water_equivalent")
-                sw_data[:, :, i] = np.asarray(
-                    r.read_array((slice(0, ny), slice(0, nx), slice(sw_idx, sw_idx + 1))),
-                    dtype=np.float64,
-                )[:, :, 0]
+        # Open cc reader once for the whole chunk but read one step at a time to
+        # avoid materialising a (ny, nx, n_steps) float64 array for large windows.
+        cc_reader = _open_chunk(cc_entry, model, "cloud_cover")
+        rny, rnx, _ = cc_reader.shape
+        ny, nx = rny, rnx
 
         if counts[0] is None:
             for c in RASTER_WC_CODES:
                 counts[c] = np.zeros((ny, nx), dtype=np.int32)
 
+        # Cache open readers for pr/sw so we don't reopen the same file every step.
+        _pr_readers: dict[int, object] = {}
+        _sw_readers: dict[int, object] = {}
+
         for i in range(t1 - t0):
-            temp_slice = temp_grid_025 if temp_grid_025 is not None else None
+            step_ts = cc_entry.start + (t0 + i) * resolution
+
+            cc_slice = np.asarray(
+                cc_reader.read_array((slice(0, ny), slice(0, nx), slice(t0 + i, t0 + i + 1))),
+                dtype=np.float64,
+            )[:, :, 0]
+
+            pr_slice = np.zeros((ny, nx), dtype=np.float64)
+            pr_entry, pr_idx = _cidx_entry_for(precip_index, step_ts)
+            if pr_entry is not None:
+                if pr_entry.chunk_num not in _pr_readers:
+                    _pr_readers[pr_entry.chunk_num] = _open_chunk(pr_entry, model, "precipitation")
+                pr_slice = np.asarray(
+                    _pr_readers[pr_entry.chunk_num].read_array(
+                        (slice(0, ny), slice(0, nx), slice(pr_idx, pr_idx + 1))
+                    ),
+                    dtype=np.float64,
+                )[:, :, 0]
+
+            sw_slice = np.zeros((ny, nx), dtype=np.float64)
+            sw_entry, sw_idx = _cidx_entry_for(swe_index, step_ts)
+            if sw_entry is not None:
+                if sw_entry.chunk_num not in _sw_readers:
+                    _sw_readers[sw_entry.chunk_num] = _open_chunk(sw_entry, model, "snowfall_water_equivalent")
+                sw_slice = np.asarray(
+                    _sw_readers[sw_entry.chunk_num].read_array(
+                        (slice(0, ny), slice(0, nx), slice(sw_idx, sw_idx + 1))
+                    ),
+                    dtype=np.float64,
+                )[:, :, 0]
+
             codes = weather_code_array(
-                cc_data[:, :, i], pr_data[:, :, i], sw_data[:, :, i],
-                resolution, temp=temp_slice,
+                cc_slice, pr_slice, sw_slice,
+                resolution, temp=temp_grid_025,
             )
             for c in RASTER_WC_CODES:
                 counts[c] += (np.round(codes) == c).astype(np.int32)

@@ -136,15 +136,11 @@ def _live_gate(request: pytest.FixtureRequest) -> None:
 
 @pytest.fixture(scope="module")
 def live_expected(request: pytest.FixtureRequest) -> dict[str, float]:
-    if request.config.getoption("--regenerate-live"):
+    if request.config.getoption("--regenerate-live") or not _FIXTURES_PATH.exists():
         data = _regenerate()
         _FIXTURES_PATH.write_text(json.dumps(data, indent=2))
         print(f"\n[live] wrote {_FIXTURES_PATH}")
         return data
-    if not _FIXTURES_PATH.exists():
-        pytest.skip(
-            "live_fixtures.json missing — generate it with: pt --temporal --regenerate-live"
-        )
     return json.loads(_FIXTURES_PATH.read_text())
 
 

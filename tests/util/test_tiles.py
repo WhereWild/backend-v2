@@ -382,3 +382,122 @@ def test_catalog_reads_real_file():
     finally:
         tiles.CATALOG_PATH = saved
     os.unlink(tmp.name)
+
+
+# ---------------------------------------------------------------------------
+# _load_temporal_npy  (lines 63-71)
+# ---------------------------------------------------------------------------
+
+def test_load_temporal_npy_missing(tmp_path):
+    tiles._npy_cache.clear()
+    result = tiles._load_temporal_npy(tmp_path / "nonexistent.npy")
+    assert result is None
+
+
+def test_load_temporal_npy_loads_and_caches(tmp_path):
+    tiles._npy_cache.clear()
+    arr = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    p = tmp_path / "test.npy"
+    np.save(p, arr)
+    result = tiles._load_temporal_npy(p)
+    assert result is not None
+    np.testing.assert_array_almost_equal(result, arr)
+    # second call returns cached value
+    result2 = tiles._load_temporal_npy(p)
+    assert result2 is result
+
+
+# ---------------------------------------------------------------------------
+# render_temporal_tile_bytes  (lines 185-235) and render_layer_tile_bytes
+# temporal dispatch (line 247)
+# ---------------------------------------------------------------------------
+
+_TEMPORAL_CATALOG_FOR_RENDER = {
+    "categories": [
+        {
+            "id": "temporal",
+            "display_name": "Recent Weather",
+            "windows": [24],
+            "layers": [
+                {
+                    "id": "temperature_2m",
+                    "display_name": "Air Temperature",
+                    "units": "°C",
+                    "value_type": "interval",
+                    "agg": "avg",
+                    "render_min": -30.0,
+                    "render_max": 40.0,
+                },
+            ],
+        }
+    ]
+}
+
+
+@pytest.fixture
+def patch_temporal_render_catalog():
+    tiles._catalog.cache_clear()
+    with patch.object(tiles, "_catalog", return_value=_TEMPORAL_CATALOG_FOR_RENDER):
+        yield
+    tiles._catalog.cache_clear()
+
+
+def test_render_temporal_tile_no_npy(patch_temporal_render_catalog, tmp_path, monkeypatch):
+    """Missing npy → transparent PNG (arr is None path, lines 227-229)."""
+    monkeypatch.setattr(tiles, "TEMPORAL_RASTERS_DIR", tmp_path)
+    tiles._npy_cache.clear()
+    result = tiles.render_temporal_tile_bytes("temperature_2m_avg_24h", z=2, x=2, y=1)
+    assert result[:4] == b"\x89PNG"
+
+
+def test_render_temporal_tile_with_npy(patch_temporal_render_catalog, tmp_path, monkeypatch):
+    """Valid npy → warp + colorize path (lines 197-226)."""
+    monkeypatch.setattr(tiles, "TEMPORAL_RASTERS_DIR", tmp_path)
+    tiles._npy_cache.clear()
+    arr = np.linspace(-10.0, 30.0, 721 * 1440, dtype=np.float32).reshape(721, 1440)
+    np.save(tmp_path / "temperature_2m_24h.npy", arr)
+    result = tiles.render_temporal_tile_bytes("temperature_2m_avg_24h", z=2, x=2, y=1)
+    assert result[:4] == b"\x89PNG"
+
+
+_TEMPORAL_CATALOG_NO_RANGE = {
+    "categories": [
+        {
+            "id": "temporal",
+            "display_name": "Recent Weather",
+            "windows": [24],
+            "layers": [
+                {
+                    "id": "temperature_2m",
+                    "display_name": "Air Temperature",
+                    "units": "°C",
+                    "value_type": "interval",
+                    "agg": "avg",
+                    "render_min": None,
+                    "render_max": None,
+                },
+            ],
+        }
+    ]
+}
+
+
+def test_render_temporal_tile_auto_range(tmp_path, monkeypatch):
+    """render_min/render_max None → auto percentile path (lines 200, 202)."""
+    tiles._catalog.cache_clear()
+    tiles._npy_cache.clear()
+    with patch.object(tiles, "_catalog", return_value=_TEMPORAL_CATALOG_NO_RANGE):
+        monkeypatch.setattr(tiles, "TEMPORAL_RASTERS_DIR", tmp_path)
+        arr = np.linspace(-10.0, 30.0, 721 * 1440, dtype=np.float32).reshape(721, 1440)
+        np.save(tmp_path / "temperature_2m_24h.npy", arr)
+        result = tiles.render_temporal_tile_bytes("temperature_2m_avg_24h", z=2, x=2, y=1)
+    tiles._catalog.cache_clear()
+    assert result[:4] == b"\x89PNG"
+
+
+def test_render_layer_tile_dispatches_temporal(patch_temporal_render_catalog, tmp_path, monkeypatch):
+    """render_layer_tile_bytes routes temporal layers through render_temporal_tile_bytes (line 247)."""
+    monkeypatch.setattr(tiles, "TEMPORAL_RASTERS_DIR", tmp_path)
+    tiles._npy_cache.clear()
+    result = tiles.render_layer_tile_bytes("temperature_2m_avg_24h", z=2, x=2, y=1)
+    assert result[:4] == b"\x89PNG"

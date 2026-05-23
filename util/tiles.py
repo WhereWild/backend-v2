@@ -235,6 +235,63 @@ def render_temporal_tile_bytes(
     return buf.getvalue()
 
 
+def _render_derived_elevation_tile_bytes(
+    layer: dict,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    derive_fn,
+) -> bytes:
+    """Render a tile for a layer derived on-the-fly from elevation.tif."""
+    elev_path = LAYERS_DIR / "elevation.tif"
+    vmin = layer.get("render_min", 0.0)
+    vmax = layer.get("render_max", 90.0)
+
+    lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
+    mx0,  my0,  mx1,  my1  = tile_bounds_mercator(z, x, y)
+    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+    dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+
+    if elev_path.exists():
+        with rasterio.open(elev_path) as ds:
+            db = ds.bounds
+            rl0 = max(lon0, db.left)
+            rl1 = min(lon1, db.right)
+            rb0 = max(lat0, db.bottom)
+            rb1 = min(lat1, db.top)
+            if rl0 < rl1 and rb0 < rb1:
+                src_window = window_from_bounds(rl0, rb0, rl1, rb1, ds.transform)
+                src_px_w = ds.width  * (rl1 - rl0) / (db.right - db.left)
+                src_px_h = ds.height * (rb1 - rb0) / (db.top   - db.bottom)
+                # Read at native resolution (slope needs actual pixel values, not overviews)
+                read_w = max(1, round(src_px_w))
+                read_h = max(1, round(src_px_h))
+                raw = ds.read(1, window=src_window, out_shape=(read_h, read_w),
+                              resampling=Resampling.bilinear).astype(np.float32)
+                if ds.nodata is not None:
+                    raw[raw == ds.nodata] = np.nan
+
+                src_tf = window_transform(src_window, ds.transform) * Affine.scale(
+                    src_window.width / read_w, src_window.height / read_h,
+                )
+                derived = derive_fn(raw, src_tf)
+                warp_reproject(
+                    source=derived, destination=dest,
+                    src_transform=src_tf, src_crs=ds.crs,
+                    src_nodata=np.nan,
+                    dst_transform=dst_transform, dst_crs=WEB_MERCATOR,
+                    dst_nodata=np.nan,
+                    resampling=Resampling.bilinear,
+                )
+
+    rgba = _colorize(dest, vmin or 0.0, vmax or 90.0)
+    img  = Image.fromarray(rgba, mode="RGBA")
+    buf  = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def render_layer_tile_bytes(
     layer_id: str,
     z: int,
@@ -242,9 +299,12 @@ def render_layer_tile_bytes(
     y: int,
     tile_size: int = 256,
 ) -> bytes:
+    from util.gis import DERIVED_FROM_ELEVATION, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
         return render_temporal_tile_bytes(layer_id, z, x, y, tile_size)
+    if layer_id in DERIVED_FROM_ELEVATION:
+        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_slope_array)
     path    = LAYERS_DIR / layer["filename"]
     scale   = layer.get("scale_factor") or 1.0
     offset  = layer.get("add_offset")   or 0.0

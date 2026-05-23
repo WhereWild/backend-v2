@@ -1138,6 +1138,21 @@
           "add_offset": null,
           "render_min": -430.0,
           "render_max": 8849.0
+        },
+        {
+          "id": "slope",
+          "source": "fabdem",
+          "display_name": "Slope",
+          "units": "°",
+          "value_type": "ratio",
+          "domain": "continuous",
+          "derived": true,
+          "filename": null,
+          "download_url": null,
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 0.0,
+          "render_max": 90.0
         }
       ]
     }

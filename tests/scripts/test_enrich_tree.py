@@ -546,6 +546,63 @@ def test_main_nothing_to_do(tmp_path, capsys):
     assert "Completed" in out
 
 
+# ---------------------------------------------------------------------------
+# _process_batch — derived elevation (slope) paths
+# ---------------------------------------------------------------------------
+
+FAKE_CATALOG_JSON_WITH_SLOPE = {
+    "categories": [
+        {
+            "id": "terrain",
+            "layers": [
+                {
+                    "id": "slope",
+                    "filename": None,
+                    "derived": True,
+                    "value_type": "ratio",
+                    "scale_factor": None,
+                    "add_offset": None,
+                },
+            ],
+        }
+    ]
+}
+
+
+def test_process_batch_derived_elevation_not_found(tmp_path, capsys):
+    # slope layer present but elevation.tif missing → skip with message
+    path = tmp_path / "occ.parquet"
+    _make_occurrence_parquet(path)
+    worklist = _make_worklist("tk1", str(path), ["slope"])
+    layers = [{"id": "slope", "filename": None, "scale_factor": None, "add_offset": None}]
+    layers_dir = tmp_path / "layers"
+    layers_dir.mkdir()
+    with patch.object(et, "LAYERS_DIR", layers_dir), \
+         patch.object(et, "DERIVED_FROM_ELEVATION", frozenset({"slope"})):
+        et._process_batch(worklist, layers)
+    out = capsys.readouterr().out
+    assert "elevation.tif not found" in out
+
+
+def test_process_batch_derived_slope_success(tmp_path):
+    path = tmp_path / "occ.parquet"
+    _make_occurrence_parquet(path)
+    worklist = _make_worklist("tk1", str(path), ["slope"])
+    layers = [{"id": "slope", "filename": None, "scale_factor": None, "add_offset": None}]
+    layers_dir = tmp_path / "layers"
+    layers_dir.mkdir()
+    (layers_dir / "elevation.tif").touch()
+
+    with patch.object(et, "LAYERS_DIR", layers_dir), \
+         patch.object(et, "DERIVED_FROM_ELEVATION", frozenset({"slope"})), \
+         patch.object(et, "sample_slope_batch", return_value=[5.5, 12.0]):
+        et._process_batch(worklist, layers)
+    df = pq.read_table(path).to_pandas()
+    assert "slope" in df.columns
+    assert pytest.approx(df.loc[df["catalogNumber"] == "obs1", "slope"].iloc[0]) == 5.5
+    assert pytest.approx(df.loc[df["catalogNumber"] == "obs2", "slope"].iloc[0]) == 12.0
+
+
 def test_main_processes_batch(tmp_path, capsys):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))

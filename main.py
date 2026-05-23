@@ -14,7 +14,7 @@ from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
 from config.config import load_config
-from util import citations, taxa, tiles
+from util import citations, gis, taxa, tiles
 from util.rankings import POSITION_FILE
 from util.stats import (
     NOMINAL_STATS_FILE,
@@ -59,6 +59,33 @@ def _load_legend(layer_id: str) -> list:
     if not path.exists():
         return []
     return json.loads(path.read_text()).get("classes", [])
+
+
+def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
+    """Read a precomputed env value for a known observation from occurrence_index.parquet.
+
+    Preferred over raster sampling for static variables: avoids the FP sensitivity
+    that can cause mismatches on derived variables like aspect near flat terrain.
+    Returns None if the index doesn't exist, the column is absent, or the row is missing.
+    """
+    index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
+    if not index_path.exists():
+        return None
+    schema = pq.read_schema(index_path)
+    if variable_id not in schema.names:
+        return None
+    try:
+        df = pq.read_table(
+            index_path,
+            columns=["catalogNumber", variable_id],
+            filters=[("catalogNumber", "=", catalog_number)],
+        ).to_pandas()
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    val = df.iloc[0][variable_id]
+    return float(val) if pd.notna(val) else None
 
 
 def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -116,6 +143,64 @@ def list_variables():
 @app.get("/api/layers")
 def list_layers():
     return tiles.load_layers()
+
+
+@app.get("/gis/point")
+async def gis_point_value(
+    lat: float = Query(...),
+    lon: float = Query(...),
+    variable: str = Query(...),
+    taxon_id: str | None = Query(None),
+    catalog_number: str | None = Query(None),
+):
+    """Return the raster value for a variable at a lat/lon coordinate.
+
+    For static layers, if taxon_id and catalog_number are both provided the value
+    is read from occurrence_index.parquet instead of the raster — this avoids FP
+    mismatches on sensitive derived variables (e.g. aspect on flat terrain) and
+    ensures the returned value is identical to what the stats were computed from.
+    Falls back to raster sampling when the index row is missing.
+
+    For temporal layers the index is ignored; always returns the current
+    (no-forecast-offset) aggregate for the requested window.
+    """
+    if not math.isfinite(lat) or not math.isfinite(lon):
+        raise HTTPException(status_code=400, detail="lat and lon must be finite numbers")
+
+    variable = _resolve_variable_id(variable.strip())
+    try:
+        layer = tiles.get_layer(variable)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Variable '{variable}' not found")
+
+    is_temporal = layer.get("window_hours") is not None
+    value: float | None = None
+
+    if not is_temporal and taxon_id and catalog_number:
+        taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+        if taxon is not None:
+            value = _lookup_index_value(taxon, variable, catalog_number)
+
+    if value is None:
+        value = await run_in_threadpool(gis.sample_point, layer, lat, lon)
+
+    class_name: str | None = None
+    if value is not None and layer.get("value_type") == "nominal":
+        legend = _load_legend(variable)
+        int_val = int(value) if value == int(value) else None
+        for entry in legend:
+            if entry.get("id") == int_val:
+                class_name = entry.get("name")
+                break
+
+    return {
+        "variable": variable,
+        "units": layer.get("units") or None,
+        "lat": lat,
+        "lon": lon,
+        "value": value,
+        "class_name": class_name,
+    }
 
 
 @app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")

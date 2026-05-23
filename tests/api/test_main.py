@@ -1904,3 +1904,202 @@ def test_ranking_options_returns_options(tmp_path, monkeypatch):
     # label populated
     assert all(isinstance(o["label"], str) and o["label"] for o in options)
     assert all(o["count"] > 0 for o in options)
+
+
+# ---------------------------------------------------------------------------
+# _lookup_index_value
+# ---------------------------------------------------------------------------
+
+def test_lookup_index_value_missing_file(tmp_path):
+    from main import _lookup_index_value
+    taxon = {**TAXON, "path": "no_such_path"}
+    with patch.object(main_module, "TREE_ROOT", tmp_path):
+        result = _lookup_index_value(taxon, "bio1", "12345")
+    assert result is None
+
+
+def test_lookup_index_value_column_absent(tmp_path):
+    from main import _lookup_index_value
+    taxon_dir = tmp_path / TAXON["path"]
+    taxon_dir.mkdir(parents=True)
+    pq.write_table(pa.table({"catalogNumber": pa.array(["12345"])}), taxon_dir / "occurrence_index.parquet")
+    with patch.object(main_module, "TREE_ROOT", tmp_path):
+        result = _lookup_index_value(TAXON, "bio1", "12345")
+    assert result is None
+
+
+def test_lookup_index_value_catalog_number_not_found(tmp_path):
+    from main import _lookup_index_value
+    taxon_dir = tmp_path / TAXON["path"]
+    taxon_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({"catalogNumber": pa.array(["99999"]), "bio1": pa.array([14.35])}),
+        taxon_dir / "occurrence_index.parquet",
+    )
+    with patch.object(main_module, "TREE_ROOT", tmp_path):
+        result = _lookup_index_value(TAXON, "bio1", "12345")
+    assert result is None
+
+
+def test_lookup_index_value_returns_float(tmp_path):
+    from main import _lookup_index_value
+    taxon_dir = tmp_path / TAXON["path"]
+    taxon_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({"catalogNumber": pa.array(["12345"]), "bio1": pa.array([14.35])}),
+        taxon_dir / "occurrence_index.parquet",
+    )
+    with patch.object(main_module, "TREE_ROOT", tmp_path):
+        result = _lookup_index_value(TAXON, "bio1", "12345")
+    assert result == pytest.approx(14.35)
+
+
+def test_lookup_index_value_read_error_returns_none(tmp_path):
+    from main import _lookup_index_value
+    taxon_dir = tmp_path / TAXON["path"]
+    taxon_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({"catalogNumber": pa.array(["12345"]), "bio1": pa.array([14.35])}),
+        taxon_dir / "occurrence_index.parquet",
+    )
+    with patch.object(main_module, "TREE_ROOT", tmp_path), \
+         patch("main.pq.read_table", side_effect=Exception("corrupt")):
+        result = _lookup_index_value(TAXON, "bio1", "12345")
+    assert result is None
+
+
+def test_lookup_index_value_null_value_returns_none(tmp_path):
+    from main import _lookup_index_value
+    taxon_dir = tmp_path / TAXON["path"]
+    taxon_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table({"catalogNumber": pa.array(["12345"]), "bio1": pa.array([None], type=pa.float64())}),
+        taxon_dir / "occurrence_index.parquet",
+    )
+    with patch.object(main_module, "TREE_ROOT", tmp_path):
+        result = _lookup_index_value(TAXON, "bio1", "12345")
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# /gis/point endpoint
+# ---------------------------------------------------------------------------
+
+_STATIC_LAYER = {
+    "id": "bio1",
+    "filename": "bio1.tif",
+    "scale_factor": 0.1,
+    "add_offset": -273.15,
+    "units": "°C",
+    "value_type": "interval",
+    "window_hours": None,
+}
+
+_NOMINAL_LAYER = {
+    "id": "kg0",
+    "filename": "kg0.tif",
+    "scale_factor": None,
+    "add_offset": None,
+    "units": "",
+    "value_type": "nominal",
+    "window_hours": None,
+}
+
+_TEMPORAL_LAYER = {
+    "id": "temperature_2m_avg_1h",
+    "var_id": "temperature_2m",
+    "window_hours": 1,
+    "window_label": "1h",
+    "model": "copernicus_era5",
+    "units": "°C",
+    "value_type": "interval",
+}
+
+
+def test_gis_point_nonfinite_lat():
+    r = client.get("/gis/point?lat=inf&lon=0&variable=bio1")
+    assert r.status_code == 400
+
+
+def test_gis_point_unknown_variable():
+    with patch.object(tiles, "get_layer", side_effect=KeyError("nope")):
+        r = client.get("/gis/point?lat=40&lon=-105&variable=nope")
+    assert r.status_code == 404
+
+
+def test_gis_point_raster_lookup():
+    import util.gis as gis_module
+    with patch.object(tiles, "get_layer", return_value=_STATIC_LAYER), \
+         patch.object(gis_module, "sample_point", return_value=9.5):
+        r = client.get("/gis/point?lat=40&lon=-105&variable=bio1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["value"] == pytest.approx(9.5)
+    assert body["variable"] == "bio1"
+    assert body["units"] == "°C"
+    assert body["class_name"] is None
+
+
+def test_gis_point_index_hit_used_over_raster():
+    """When taxon_id + catalog_number are supplied and the index has the value,
+    _lookup_index_value result is returned without calling sample_point."""
+    import util.gis as gis_module
+    with patch.object(tiles, "get_layer", return_value=_STATIC_LAYER), \
+         patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(main_module, "_lookup_index_value", return_value=14.35) as mock_lookup, \
+         patch.object(gis_module, "sample_point", return_value=0.0) as mock_sample:
+        r = client.get("/gis/point?lat=40&lon=-105&variable=bio1&taxon_id=2923970&catalog_number=12345")
+    assert r.status_code == 200
+    assert r.json()["value"] == pytest.approx(14.35)
+    mock_lookup.assert_called_once()
+    mock_sample.assert_not_called()
+
+
+def test_gis_point_index_miss_falls_back_to_raster():
+    import util.gis as gis_module
+    with patch.object(tiles, "get_layer", return_value=_STATIC_LAYER), \
+         patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(main_module, "_lookup_index_value", return_value=None), \
+         patch.object(gis_module, "sample_point", return_value=8.1):
+        r = client.get("/gis/point?lat=40&lon=-105&variable=bio1&taxon_id=2923970&catalog_number=12345")
+    assert r.status_code == 200
+    assert r.json()["value"] == pytest.approx(8.1)
+
+
+def test_gis_point_nominal_resolves_class_name():
+    import util.gis as gis_module
+    fake_legend = [{"id": 9, "name": "Cold semi-arid", "traits": {"color": "#F00"}}]
+    with patch.object(tiles, "get_layer", return_value=_NOMINAL_LAYER), \
+         patch.object(gis_module, "sample_point", return_value=9.0), \
+         patch.object(main_module, "_load_legend", return_value=fake_legend):
+        r = client.get("/gis/point?lat=40&lon=-105&variable=kg0")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["value"] == pytest.approx(9.0)
+    assert body["class_name"] == "Cold semi-arid"
+
+
+def test_gis_point_temporal_ignores_taxon_params():
+    """Temporal layers always sample the raster even when taxon_id is provided."""
+    import util.gis as gis_module
+    with patch.object(tiles, "get_layer", return_value=_TEMPORAL_LAYER), \
+         patch.object(gis_module, "sample_point", return_value=22.0) as mock_sample, \
+         patch.object(main_module, "_lookup_index_value", return_value=99.0) as mock_lookup:
+        r = client.get("/gis/point?lat=40&lon=-105&variable=temperature_2m_avg_1h"
+                       "&taxon_id=2923970&catalog_number=12345")
+    assert r.status_code == 200
+    assert r.json()["value"] == pytest.approx(22.0)
+    mock_lookup.assert_not_called()
+    mock_sample.assert_called_once()
+
+
+def test_gis_point_nodata_returns_null_value():
+    import util.gis as gis_module
+    with patch.object(tiles, "get_layer", return_value=_STATIC_LAYER), \
+         patch.object(gis_module, "sample_point", return_value=None):
+        r = client.get("/gis/point?lat=40&lon=-105&variable=bio1")
+    assert r.status_code == 200
+    assert r.json()["value"] is None
+    assert r.json()["class_name"] is None

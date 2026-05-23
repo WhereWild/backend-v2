@@ -1,28 +1,25 @@
 """
 Download FABDEM V1-2 tiles from the University of Bristol data repository,
-extract 1°×1° GeoTIFFs, and stitch them into 10°×10° region COGs.
+extract 1°×1° GeoTIFFs, and stitch them into a single global COG.
 
 Steps:
   1. Download the single FABDEM ZIP from the Bristol dataset page
-  2. Extract 1°×1° FABDEM TIFs to data/gis/dem_raw_tiles/
-  3. Group tiles into 10°×10° regions
-  4. Build region COG: VRT → gdalwarp (clip + resample) → gdal_translate (COG)
+  2. Extract 1°×1° FABDEM TIFs to data/gis/dem_raw_tiles/  (atomic: tmp→rename)
+  3. Build a VRT spanning all tiles
+  4. gdal_translate -of COG → data/gis/layers/elevation.tif
 
-Output: data/gis/regions/lat{lat}_lon{lon}/elevation.tif
-
-Re-running is safe: already-downloaded ZIPs, already-extracted tiles, and
-already-built region COGs are all skipped unless OVERWRITE = True.
+Re-running is safe: already-extracted tiles and the final COG are skipped
+unless --force is passed.
 """
 
 from __future__ import annotations
 
-import math
+import io
 import os
 import re
 import subprocess
 import tempfile
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path
 
 _raw_vars = os.environ.get("VARS_TO_DOWNLOAD", "")
@@ -33,23 +30,13 @@ ZIP_FILENAME = "FABDEM_V1-2.zip"
 
 RAW_ZIPS_DIR  = Path("data/gis/dem_raw_zips")
 RAW_TILES_DIR = Path("data/gis/dem_raw_tiles")
-REGIONS_DIR   = Path("data/gis/regions")
-REGION_FILENAME = "elevation.tif"
+LAYERS_DIR    = Path("data/gis/layers")
+OUT_PATH      = LAYERS_DIR / "elevation.tif"
 
 TILE_PATTERN = re.compile(
     r"^([NS])(\d{1,2})([EW])(\d{1,3})_FABDEM_V1-2\.tif$",
     re.IGNORECASE,
 )
-
-OVERWRITE: bool = False
-REGION_LIMIT: int | None = None
-
-
-@dataclass(frozen=True)
-class Tile:
-    path: Path
-    lat: int
-    lon: int
 
 
 def _run(cmd: list[str]) -> None:
@@ -58,22 +45,6 @@ def _run(cmd: list[str]) -> None:
         raise RuntimeError(
             f"Command failed (exit {result.returncode}): {' '.join(cmd)}\n{result.stderr}"
         )
-
-
-def _region_origin(v: int) -> int:
-    return math.floor(v / 10) * 10
-
-
-def _parse_tile(path: Path) -> Tile | None:
-    m = TILE_PATTERN.match(path.name)
-    if not m:
-        return None
-    lat_dir, lat_val, lon_dir, lon_val = m.groups()
-    lat = int(lat_val) * (1 if lat_dir.upper() == "N" else -1)
-    lon = int(lon_val) * (1 if lon_dir.upper() == "E" else -1)
-    return Tile(path=path, lat=lat, lon=lon)
-
-
 
 
 def _download_zip(url: str, dest: Path) -> None:
@@ -97,18 +68,40 @@ def _download_zip(url: str, dest: Path) -> None:
     )
 
 
-def _extract_zip(zip_path: Path, out_dir: Path) -> list[Path]:
+def _extract_tiles(zip_path: Path, out_dir: Path) -> list[Path]:
+    """Extract 1°×1° TIF tiles from the outer zip-of-zips.
+
+    Checks disk first — if tiles already exist in out_dir, skips opening the
+    outer zip entirely. Writes atomically (tmp → rename) so a killed process
+    never leaves a partial tile that would be silently skipped on re-run.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = [p for p in out_dir.iterdir() if TILE_PATTERN.match(p.name)]
+    if existing:
+        print(f"  Found {len(existing)} tiles already on disk, skipping extraction.")
+        return existing
+
     extracted: list[Path] = []
-    with zipfile.ZipFile(zip_path) as zf:
-        for member in zf.namelist():
-            name = Path(member).name
-            if not TILE_PATTERN.match(name):
-                continue
-            dest = out_dir / name
-            if not dest.exists():
-                dest.write_bytes(zf.read(member))
-            extracted.append(dest)
+    with zipfile.ZipFile(zip_path) as outer:
+        inner_zips = [m for m in outer.namelist() if m.endswith(".zip")]
+        total = len(inner_zips)
+        for i, member in enumerate(inner_zips, 1):
+            print(f"  [{i}/{total}] {Path(member).name}", flush=True)
+            inner_data = outer.read(member)
+            with zipfile.ZipFile(io.BytesIO(inner_data)) as inner:
+                for tile_member in inner.namelist():
+                    name = Path(tile_member).name
+                    if not TILE_PATTERN.match(name):
+                        continue
+                    dest = out_dir / name
+                    if dest.exists():
+                        extracted.append(dest)
+                        continue
+                    tmp = dest.with_suffix(".tif.tmp")
+                    tmp.write_bytes(inner.read(tile_member))
+                    tmp.replace(dest)
+                    extracted.append(dest)
     return extracted
 
 
@@ -121,51 +114,34 @@ def _detect_nodata(path: Path) -> float | None:
         return None
 
 
-def _build_region_cog(
-    tile_paths: list[Path],
-    out_path: Path,
-    bounds: tuple[int, int, int, int],
-    nodata: float | None,
-) -> None:
+def _build_global_cog(tile_paths: list[Path], out_path: Path, nodata: float | None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = out_path.with_suffix(".tif.tmp")
-    west, south, east, north = bounds
 
-    with tempfile.TemporaryDirectory(dir=str(out_path.parent)) as tmp_dir:
-        tmp_dir_path = Path(tmp_dir)
-        vrt_path = tmp_dir_path / "region.vrt"
-        tmp_warp = tmp_dir_path / "region.tif"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        vrt_path = Path(tmp_dir) / "global.vrt"
 
+        print(f"Building VRT from {len(tile_paths)} tiles...", flush=True)
         _run([
             "gdalbuildvrt", "-overwrite", "-resolution", "highest",
-            str(vrt_path), *[str(p) for p in tile_paths],
+            str(vrt_path), *[str(p) for p in sorted(tile_paths)],
         ])
 
-        warp_cmd = [
-            "gdalwarp", "-overwrite",
-            "-multi", "-wo", "NUM_THREADS=ALL_CPUS",
-            "-r", "near",
-            "-te", str(west), str(south), str(east), str(north),
-            "-te_srs", "EPSG:4326",
+        print("Translating to GeoTIFF...", flush=True)
+        translate_cmd = [
+            "gdal_translate",
+            "-of", "GTiff",
             "-co", "COMPRESS=DEFLATE",
             "-co", "TILED=YES",
-            "-co", "BLOCKXSIZE=512",
-            "-co", "BLOCKYSIZE=512",
+            "-co", "BLOCKXSIZE=256",
+            "-co", "BLOCKYSIZE=256",
             "-co", "BIGTIFF=YES",
-            str(vrt_path), str(tmp_warp),
+            "-co", "NUM_THREADS=4",
         ]
         if nodata is not None:
-            warp_cmd[1:1] = ["-srcnodata", str(nodata), "-dstnodata", str(nodata)]
-        _run(warp_cmd)
-
-        _run([
-            "gdal_translate", "-of", "COG",
-            "-co", "COMPRESS=DEFLATE",
-            "-co", "BLOCKSIZE=512",
-            "-co", "BIGTIFF=YES",
-            "-r", "average",
-            str(tmp_warp), str(tmp_out),
-        ])
+            translate_cmd += ["-a_nodata", str(nodata)]
+        translate_cmd += [str(vrt_path), str(tmp_out)]
+        _run(translate_cmd)
 
     if out_path.exists():
         out_path.unlink()
@@ -185,61 +161,30 @@ def main(force: bool = False) -> None:
     else:
         print(f"ZIP already downloaded: {zip_dest}")
 
+    if OUT_PATH.exists() and not force:
+        print(f"COG already exists: {OUT_PATH} (use --force to rebuild)")
+        return
+
     print("Extracting tiles...")
-    extracted = _extract_zip(zip_dest, RAW_TILES_DIR)
+    tile_paths = _extract_tiles(zip_dest, RAW_TILES_DIR)
+    print(f"Collected {len(tile_paths)} 1°×1° tiles")
 
-    all_tiles: list[Tile] = []
-    for path in extracted:
-        tile = _parse_tile(path)
-        if tile:
-            all_tiles.append(tile)
+    if not tile_paths:
+        print("No tiles found — aborting.")
+        return
 
-    print(f"\nCollected {len(all_tiles)} 1°×1° tiles")
+    nodata = _detect_nodata(tile_paths[0])
+    if nodata is not None:
+        print(f"Detected nodata value: {nodata}")
 
-    tiles_by_region: dict[tuple[int, int], list[Path]] = {}
-    for tile in all_tiles:
-        key = (_region_origin(tile.lat), _region_origin(tile.lon))
-        tiles_by_region.setdefault(key, []).append(tile.path)
-
-    region_keys = sorted(tiles_by_region)
-    if REGION_LIMIT:
-        region_keys = region_keys[:REGION_LIMIT]
-        print(f"Limited to first {len(region_keys)} regions for debugging")
-
-    nodata: float | None = None
-    if all_tiles:
-        nodata = _detect_nodata(all_tiles[0].path)
-        if nodata is not None:
-            print(f"Detected nodata value: {nodata}")
-
-    total = len(region_keys)
-    print(f"\nBuilding {total} region COGs...\n")
-
-    for idx, (lat0, lon0) in enumerate(region_keys, 1):
-        out_dir  = REGIONS_DIR / f"lat{lat0}_lon{lon0}"
-        out_path = out_dir / REGION_FILENAME
-        tmp_out  = out_path.with_suffix(".tif.tmp")
-
-        if tmp_out.exists() and not out_path.exists():
-            print(f"[{idx}/{total}] removing stale tmp for lat{lat0}_lon{lon0}")
-            tmp_out.unlink()
-
-        if out_path.exists() and not OVERWRITE:
-            print(f"[{idx}/{total}] skip lat{lat0}_lon{lon0} (exists)")
-            continue
-
-        tile_paths = sorted(tiles_by_region[(lat0, lon0)])
-        bounds = (lon0, lat0, lon0 + 10, lat0 + 10)
-        print(f"[{idx}/{total}] building lat{lat0}_lon{lon0} ({len(tile_paths)} tiles)...")
-        _build_region_cog(tile_paths, out_path, bounds, nodata)
-        print(f"[{idx}/{total}] wrote {out_path}")
-
-    print("\nDone.")
+    print(f"\nBuilding global COG → {OUT_PATH}")
+    _build_global_cog(tile_paths, OUT_PATH, nodata)
+    print(f"\nDone. Wrote {OUT_PATH}")
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Download FABDEM elevation tiles")
-    parser.add_argument("--force", action="store_true", help="Run even if elevation is not in VARS_TO_DOWNLOAD")
+    parser.add_argument("--force", action="store_true", help="Rebuild even if output already exists")
     args = parser.parse_args()
     main(force=args.force)

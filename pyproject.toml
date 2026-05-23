@@ -16,6 +16,7 @@ dependencies = [
     "uvicorn[standard]>=0.46.0",
     "fsspec[s3]>=2024.1.0",
     "omfiles>=0.4.0",
+    "python-multipart>=0.0.29",
 ]
 
 [tool.ruff]

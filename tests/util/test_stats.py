@@ -1,6 +1,7 @@
 import math
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -229,7 +230,8 @@ def test_nominal_stats_uniform_max_entropy():
 def test_nominal_cat_entries_structure():
     counts = Counter({1: 80, 2: 20})
     summary = {"unique_samples": 50, "total_samples": 100, "unique_classes": 2, "entropy": 0.5, "mode": 1}
-    entries = st._nominal_cat_entries("kg0", counts, summary)
+    layer = {"id": "kg0", "display_name": "Köppen-Geiger", "source": "chelsa_v2_1"}
+    entries = st._nominal_cat_entries("kg0", layer, counts, summary)
     metrics = {e["metric"] for e in entries}
     assert "unique_samples" in metrics
     assert "total_samples" in metrics
@@ -241,6 +243,19 @@ def test_nominal_cat_entries_structure():
     fracs = {e["metric"]: e["value"] for e in entries if e["metric"].startswith("class_")}
     assert fracs["class_1"] == pytest.approx(0.8)
     assert fracs["class_2"] == pytest.approx(0.2)
+    assert all(e["variableName"] == "Köppen-Geiger" for e in entries)
+    assert all(e["variableCategory"] == "chelsa_v2_1" for e in entries)
+
+
+def test_process_observations_df_delegates_to_leaf(tmp_path):
+    df = pd.DataFrame({
+        "catalogNumber": ["A"],
+        "decimalLatitude": [45.0],
+        "decimalLongitude": [-120.0],
+    })
+    with patch("util.stats._process_leaf_df") as mock_leaf:
+        st.process_observations_df(tmp_path, df, {})
+    mock_leaf.assert_called_once_with(tmp_path, df, {})
 
 
 

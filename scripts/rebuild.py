@@ -200,15 +200,15 @@ def _sync_gbif_stage() -> None:
 
 
 STAGES: list[tuple[str, str, object]] = [
-    ("sync_gbif",       "Syncing GBIF (taxonomy + occurrences)",              lambda: _sync_gbif_stage()),
-    ("build_tree",      "Building tree (catalog + ID maps + names + images)", lambda: build_tree.main()),
-    ("populate_tree",   "Populating tree (routing occurrences to parquet)",   lambda: populate_tree.main()),
-    ("process_gadm",    "Processing GADM (download + location tables)",       lambda: process_gadm.main()),
-    ("download_gis",    "Downloading GIS layers",                             lambda: _run_download_gis()),
-    ("build_overviews", "Building COG overviews",                             lambda: build_overviews.main()),
-    ("enrich_tree",     "Enriching tree (GIS sampling)",                      lambda: enrich_tree.main()),
-    ("enrich_temporal", "Enriching tree (temporal ERA5 weather)",              lambda: enrich_temporal.main()),
-    ("process_tree",    "Processing tree (summary stats + KDE)",              lambda: process_tree.main()),
+    ("sync_gbif",       "Syncing GBIF (taxonomy + occurrences)",              _sync_gbif_stage),
+    ("build_tree",      "Building tree (catalog + ID maps + names + images)", build_tree.main),
+    ("populate_tree",   "Populating tree (routing occurrences to parquet)",   populate_tree.main),
+    ("process_gadm",    "Processing GADM (download + location tables)",       process_gadm.main),
+    ("download_gis",    "Downloading GIS layers",                             _run_download_gis),
+    ("build_overviews", "Building COG overviews",                             build_overviews.main),
+    ("enrich_tree",     "Enriching tree (GIS sampling)",                      enrich_tree.main),
+    ("enrich_temporal", "Enriching tree (temporal ERA5 weather)",              enrich_temporal.main),
+    ("process_tree",    "Processing tree (summary stats + KDE)",              process_tree.main),
 ]
 
 

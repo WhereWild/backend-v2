@@ -26,10 +26,6 @@ from util.temporal import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-_ERA5_NY = RASTER_GRIDS["copernicus_era5"]["ny"]
-_ERA5_NX = RASTER_GRIDS["copernicus_era5"]["nx"]
-_LAND_NY = RASTER_GRIDS["copernicus_era5_land"]["ny"]
-_LAND_NX = RASTER_GRIDS["copernicus_era5_land"]["nx"]
 
 _T0 = 1_560_000_000.0  # arbitrary epoch anchor
 
@@ -138,7 +134,7 @@ class TestAccumulateRaster:
             shape = (ny, nx, 3)
 
             def __getitem__(self, key):
-                r_sl, c_sl, t_sl = key
+                _ = key
                 out = np.zeros((ny, nx, 3))
                 out[0, :, :] = row0[:, np.newaxis]
                 out[ny - 1, :, :] = row_last[:, np.newaxis]

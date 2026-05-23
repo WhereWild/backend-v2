@@ -21,6 +21,7 @@ import pyarrow.parquet as pq
 import rasterio
 
 from config.config import load_config
+from util.gis import DERIVED_FROM_ELEVATION, sample_slope_batch
 from util.taxa import TaxonRecord, load_catalog
 
 CONFIG = load_config("global")
@@ -46,12 +47,12 @@ _REQUIRED_COLS = ("decimalLatitude", "decimalLongitude", "catalogNumber", "hilbe
 def _load_layers() -> list[dict]:
     with open(CATALOG_PATH) as f:
         cat = json.load(f)
-    # Skip temporal/non-raster layers (they have no filename and are handled by enrich_temporal)
     return [
         layer
         for category in cat["categories"]
         for layer in category["layers"]
-        if layer.get("filename")
+        # Include raster layers (have a filename) and derived-from-elevation layers
+        if layer.get("filename") or layer.get("id") in DERIVED_FROM_ELEVATION
     ]
 
 
@@ -234,14 +235,23 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
         if layer is None:
             print(f"[process] unknown layer {layer_id!r}, skipping")
             continue
-        cog_path = LAYERS_DIR / layer["filename"]
-        if not cog_path.exists():
-            print(f"[process] {layer['filename']} not found, skipping")
-            continue
-        scale = layer["scale_factor"] if layer["scale_factor"] is not None else 1.0
-        offset = layer["add_offset"] if layer["add_offset"] is not None else 0.0
         arr = np.array(row_indices, dtype=int)
-        values = _sample_cog(cog_path, layer_id, lats[arr], lons[arr], scale, offset)
+
+        if layer_id in DERIVED_FROM_ELEVATION:
+            elev_path = LAYERS_DIR / "elevation.tif"
+            if not elev_path.exists():
+                print(f"[process] elevation.tif not found, skipping {layer_id}")
+                continue
+            values: list[float | None] = sample_slope_batch(lats[arr], lons[arr])
+        else:
+            cog_path = LAYERS_DIR / layer["filename"]
+            if not cog_path.exists():
+                print(f"[process] {layer['filename']} not found, skipping")
+                continue
+            scale = layer["scale_factor"] if layer["scale_factor"] is not None else 1.0
+            offset = layer["add_offset"] if layer["add_offset"] is not None else 0.0
+            values = _sample_cog(cog_path, layer_id, lats[arr], lons[arr], scale, offset)
+
         for row_idx, value in zip(arr, values):
             if value is None:
                 continue

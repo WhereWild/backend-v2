@@ -4,6 +4,12 @@ import numpy as np
 import rasterio
 import rasterio.windows
 
+from util.temporal import (
+    _LAPSE_RATE,
+    ELEVATION_CORRECTABLE_VARS,
+    _read_model_elevation,
+    grid_indices,
+)
 from util.tiles import (
     _MODEL_GRID_PARAMS,
     LAYERS_DIR,
@@ -21,6 +27,8 @@ def sample_point(layer: dict, lat: float, lon: float) -> float | None:
     """
     if layer.get("window_hours") is not None:
         return _sample_temporal_point(layer, lat, lon)
+    if layer["id"] in DERIVED_FROM_ELEVATION:
+        return compute_slope_at_point(lat, lon)
     return _sample_cog_point(layer, lat, lon)
 
 
@@ -67,7 +75,172 @@ def _sample_temporal_point(layer: dict, lat: float, lon: float) -> float | None:
         return None
 
     val = float(arr[row, col])
-    return None if not np.isfinite(val) else val
+    if not np.isfinite(val):
+        return None
+
+    if var_id in ELEVATION_CORRECTABLE_VARS:
+        step = layer.get("grid_step", 0.25)
+        mode = layer.get("grid_mode", "lat_asc_lon_pm180")
+        val = _apply_point_elevation_correction(val, lat, lon, model, step, mode)
+
+    return val
+
+
+def _apply_point_elevation_correction(
+    val: float, lat: float, lon: float, model: str, step: float, mode: str,
+) -> float:
+    """Apply lapse-rate correction to a temporal value at a single point.
+
+    Samples the elevation COG for the true surface elevation, then looks up
+    the model's smoothed grid elevation (HSURF) at the same grid cell.
+    Correction = (model_elev - obs_elev) * LAPSE_RATE.
+    Returns val unchanged if either elevation is unavailable.
+    """
+    elev_layer = LAYERS_DIR / "elevation.tif"
+    if not elev_layer.exists():
+        return val
+
+    try:
+        with rasterio.open(elev_layer) as ds:
+            r, c = ds.index(lon, lat)
+            if not (0 <= r < ds.height and 0 <= c < ds.width):
+                return val
+            window = rasterio.windows.Window(c, r, 1, 1)
+            data = ds.read(1, window=window, masked=True)
+            if data.mask.all():
+                return val
+            obs_elev = float(data.data.flat[0])
+    except Exception:
+        return val
+
+    if not np.isfinite(obs_elev) or obs_elev <= -9000:
+        return val
+
+    ny = int(round(180.0 / step)) + 1
+    nx = int(round(360.0 / step)) + 1
+    li, lo = grid_indices(lat, lon, ny, nx, mode, step)
+    lat_arr = np.array([li], dtype=np.int32)
+    lon_arr = np.array([lo], dtype=np.int32)
+    model_elev = float(_read_model_elevation(model, lat_arr, lon_arr)[0])
+    if not np.isfinite(model_elev):
+        return val
+
+    return val + (model_elev - obs_elev) * _LAPSE_RATE
+
+
+# ---------------------------------------------------------------------------
+# Terrain derivation helpers
+# ---------------------------------------------------------------------------
+
+_EARTH_A = 6378137.0        # WGS84 semi-major axis (m)
+_EARTH_B = 6356752.3142     # WGS84 semi-minor axis (m)
+
+# Layers derived on-the-fly from elevation.tif (no separate COG stored).
+DERIVED_FROM_ELEVATION: frozenset[str] = frozenset({"slope"})
+
+
+def _meters_per_degree(lat: float) -> tuple[float, float]:
+    """Return (m_per_deg_lat, m_per_deg_lon) at the given latitude."""
+    lat_rad = np.radians(lat)
+    m_per_deg_lat = (
+        111132.954
+        - 559.822 * np.cos(2 * lat_rad)
+        + 1.175 * np.cos(4 * lat_rad)
+        - 0.0023 * np.cos(6 * lat_rad)
+    )
+    m_per_deg_lon = (
+        111412.84 * np.cos(lat_rad)
+        - 93.5 * np.cos(3 * lat_rad)
+        + 0.118 * np.cos(5 * lat_rad)
+    )
+    return float(m_per_deg_lat), float(m_per_deg_lon)
+
+
+def compute_slope_at_point(lat: float, lon: float) -> float | None:
+    """Compute slope (degrees) at a single lat/lon. For batch use, prefer sample_slope_batch."""
+    result = sample_slope_batch(np.array([lat]), np.array([lon]))
+    return result[0]
+
+
+def _horn_slope(w: np.ndarray, dx_m: float, dy_m: float) -> float:
+    z1, z2, z3 = w[0, 0], w[0, 1], w[0, 2]
+    z4, z6     = w[1, 0],           w[1, 2]
+    z7, z8, z9 = w[2, 0], w[2, 1], w[2, 2]
+    dzdx = ((z3 + 2*z6 + z9) - (z1 + 2*z4 + z7)) / (8.0 * dx_m)
+    dzdy = ((z7 + 2*z8 + z9) - (z1 + 2*z2 + z3)) / (8.0 * dy_m)
+    return float(np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2))))
+
+
+def sample_slope_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]:
+    """Compute slope (degrees) for many points with a single file open.
+
+    Points should be pre-sorted by Hilbert index for cache locality.
+    Returns a list of float | None aligned with the input arrays.
+    """
+    elev_path = LAYERS_DIR / "elevation.tif"
+    results: list[float | None] = [None] * len(lats)
+    if not elev_path.exists() or len(lats) == 0:
+        return results
+    try:
+        with rasterio.open(elev_path) as ds:
+            nodata = ds.nodata
+            pixel_deg = abs(ds.transform.a)
+            h, w = ds.height, ds.width
+            for i, (lat, lon) in enumerate(zip(lats.tolist(), lons.tolist())):
+                try:
+                    row, col = ds.index(lon, lat)
+                    if row < 1 or col < 1 or row >= h - 1 or col >= w - 1:
+                        continue
+                    win = rasterio.windows.Window(col - 1, row - 1, 3, 3)
+                    patch = ds.read(1, window=win).astype(np.float64)
+                    if patch.shape != (3, 3):
+                        continue
+                    if nodata is not None and np.any(patch == nodata):
+                        continue
+                    if np.any(~np.isfinite(patch)):
+                        continue
+                    m_per_deg_lat, m_per_deg_lon = _meters_per_degree(lat)
+                    dx_m = pixel_deg * m_per_deg_lon
+                    dy_m = pixel_deg * m_per_deg_lat
+                    if dx_m == 0 or dy_m == 0:
+                        continue
+                    results[i] = _horn_slope(patch, dx_m, dy_m)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return results
+
+
+def derive_slope_array(dem: np.ndarray, transform) -> np.ndarray:
+    """Derive slope (degrees) from a 2-D DEM array using np.gradient.
+
+    Uses the pixel resolution from `transform` and a latitude-aware unit
+    conversion.  NaN cells in `dem` propagate to NaN in the output.
+    Returns a float32 array of the same shape as `dem`.
+    """
+    from rasterio.transform import xy as tf_xy
+    finite = np.isfinite(dem)
+    if not np.any(finite):
+        return np.full(dem.shape, np.nan, dtype=np.float32)
+
+    fill = float(np.nanmedian(dem[finite]))
+    filled = np.where(finite, dem, fill).astype(np.float64)
+
+    pixel_deg_x = abs(transform.a)
+    pixel_deg_y = abs(transform.e)
+    # Use centre-row latitude for the whole tile (good enough for a 256-px tile)
+    centre_row = dem.shape[0] // 2
+    centre_col = dem.shape[1] // 2
+    lon_c, lat_c = tf_xy(transform, centre_row, centre_col)
+    m_per_deg_lat, m_per_deg_lon = _meters_per_degree(float(lat_c))
+    dx_m = pixel_deg_x * m_per_deg_lon
+    dy_m = pixel_deg_y * m_per_deg_lat
+
+    dz_dy, dz_dx = np.gradient(filled, dy_m, dx_m)
+    slope = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy))).astype(np.float32)
+    slope[~finite] = np.nan
+    return slope
 
 
 # ---------------------------------------------------------------------------

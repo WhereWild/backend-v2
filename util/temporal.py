@@ -1269,7 +1269,7 @@ RASTER_GRIDS: dict[str, dict] = {
 
 # WC code values in the order used for mode count stacks.
 RASTER_WC_CODES: tuple[int, ...] = (0, 1, 2, 3, 51, 53, 55, 61, 63, 65, 71, 73, 75)
-
+_WC_CODE_TO_IDX: dict[int, int] = {c: i for i, c in enumerate(RASTER_WC_CODES)}
 
 
 def accumulate_raster(

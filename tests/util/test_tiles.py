@@ -368,6 +368,105 @@ def test_render_tile_overview_path():
     assert result[:4] == b"\x89PNG"
 
 
+# ---------------------------------------------------------------------------
+# _render_derived_elevation_tile_bytes / render_layer_tile_bytes derived path
+# ---------------------------------------------------------------------------
+
+_SLOPE_CATALOG = {
+    "categories": [
+        {
+            "id": "terrain",
+            "display_name": "Terrain",
+            "layers": [
+                {
+                    "id": "slope",
+                    "display_name": "Slope",
+                    "filename": None,
+                    "derived": True,
+                    "units": "°",
+                    "value_type": "ratio",
+                    "scale_factor": None,
+                    "add_offset": None,
+                    "render_min": 0.0,
+                    "render_max": 90.0,
+                }
+            ],
+        }
+    ]
+}
+
+
+@pytest.fixture
+def patch_slope_catalog():
+    tiles._catalog.cache_clear()
+    with patch.object(tiles, "_catalog", return_value=_SLOPE_CATALOG):
+        yield
+    tiles._catalog.cache_clear()
+
+
+def test_render_derived_tile_no_elevation_file(patch_slope_catalog, tmp_path):
+    # elev_path does not exist → returns transparent PNG without opening any file
+    with patch.object(tiles, "LAYERS_DIR", tmp_path):
+        result = tiles.render_layer_tile_bytes("slope", z=4, x=3, y=5, tile_size=32)
+    assert result[:4] == b"\x89PNG"
+
+
+def test_render_derived_tile_with_elevation(patch_slope_catalog, tmp_path):
+    from rasterio.coords import BoundingBox
+    from rasterio.crs import CRS
+    from rasterio.transform import from_bounds
+
+    elev_file = tmp_path / "elevation.tif"
+    elev_file.touch()
+
+    raw = np.full((8, 8), 500.0, dtype=np.float32)
+    src_tf = from_bounds(-180, -90, 180, 90, 8, 8)
+
+    mock_ds = MagicMock()
+    mock_ds.__enter__ = lambda s: s
+    mock_ds.__exit__ = MagicMock(return_value=False)
+    mock_ds.bounds = BoundingBox(-180, -90, 180, 90)
+    mock_ds.width = 8
+    mock_ds.height = 8
+    mock_ds.nodata = None
+    mock_ds.crs = CRS.from_epsg(4326)
+    mock_ds.transform = src_tf
+    mock_ds.read.return_value = raw
+
+    with patch.object(tiles, "LAYERS_DIR", tmp_path), \
+         patch("util.tiles.rasterio.open", return_value=mock_ds):
+        result = tiles.render_layer_tile_bytes("slope", z=4, x=3, y=5, tile_size=32)
+    assert result[:4] == b"\x89PNG"
+
+
+def test_render_derived_tile_nodata_masked(patch_slope_catalog, tmp_path):
+    from rasterio.coords import BoundingBox
+    from rasterio.crs import CRS
+    from rasterio.transform import from_bounds
+
+    elev_file = tmp_path / "elevation.tif"
+    elev_file.touch()
+
+    raw = np.full((8, 8), -9999.0, dtype=np.float32)
+    src_tf = from_bounds(-180, -90, 180, 90, 8, 8)
+
+    mock_ds = MagicMock()
+    mock_ds.__enter__ = lambda s: s
+    mock_ds.__exit__ = MagicMock(return_value=False)
+    mock_ds.bounds = BoundingBox(-180, -90, 180, 90)
+    mock_ds.width = 8
+    mock_ds.height = 8
+    mock_ds.nodata = -9999.0
+    mock_ds.crs = CRS.from_epsg(4326)
+    mock_ds.transform = src_tf
+    mock_ds.read.return_value = raw
+
+    with patch.object(tiles, "LAYERS_DIR", tmp_path), \
+         patch("util.tiles.rasterio.open", return_value=mock_ds):
+        result = tiles.render_layer_tile_bytes("slope", z=4, x=3, y=5, tile_size=32)
+    assert result[:4] == b"\x89PNG"
+
+
 def test_catalog_reads_real_file():
     # Lines 46-47: call the real _catalog body via __wrapped__ (captured before patching).
     import os

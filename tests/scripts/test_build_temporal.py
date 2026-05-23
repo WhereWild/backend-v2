@@ -927,6 +927,36 @@ def test_forecast_mode_slides_counts(monkeypatch):
         assert saved["sums"][c] is not None
 
 
+def test_forecast_state_already_up_to_date_skips(monkeypatch):
+    """Forecast state gfs_end_ts >= gfs_end_for_fc → early return, no save."""
+    # gfs_end_for_fc = min(GFS_END, NOW_TS + forecast_h). For forecast_h=1,
+    # gfs_end_for_fc = min(NOW_TS+2h, NOW_TS+1h) = NOW_TS+1h.
+    # Set gfs_end_ts = GFS_END = NOW_TS+2h so it's already past gfs_end_for_fc.
+    now_sums = {"era5_temperature_2m": _zeros4()}
+    now_meta = {
+        "era5_window_start_ts": NOW_TS,
+        "era5_end_ts": ERA5_END,
+        "gfs_start_ts": ERA5_END,
+        "gfs_end_ts": GFS_END,  # already ahead of any gfs_end_for_fc
+        "n_era5": 0, "n_gfs": 1,
+    }
+    monkeypatch.setattr("scripts.build_temporal.load_raster_state",
+                        lambda *a, **kw: (now_sums, now_meta))
+    saved = []
+    monkeypatch.setattr("scripts.build_temporal.save_raster_state",
+                        lambda *a, **kw: saved.append(1))
+
+    bt._build_forecast_aggregates(
+        {"temperature_2m": bt.VAR_CONFIGS["temperature_2m"]},
+        _minimal_windows(),
+        NOW_TS, ERA5_END, GFS_END,
+        {"temperature_2m": {"temperature_2m": _make_chunk_index()}},
+        {"temperature_2m": _make_chunk_index()},
+        "/tmp/test_out",
+    )
+    assert saved == []
+
+
 def test_forecast_no_existing_state_calls_full_build(monkeypatch):
     """No existing state → _full_build is called."""
     full_build_called = []
@@ -1671,7 +1701,7 @@ def test_forecast_era5_cidx_missing_for_rv(monkeypatch):
         "era5_window_start_ts": NOW_TS - 10 * 3600,
         "era5_end_ts": ERA5_END,
         "gfs_start_ts": ERA5_END,
-        "gfs_end_ts": GFS_END,
+        "gfs_end_ts": ERA5_END,  # stale so guard doesn't short-circuit
         "n_era5": 5,
         "n_gfs": 3,
     }

@@ -850,8 +850,8 @@ def _minimal_windows():
     return [(1, "1h")]
 
 
-def test_forecast_mode_skipped(monkeypatch):
-    """mode agg → _process returns early, no save."""
+def test_forecast_mode_uses_full_build_when_no_state(monkeypatch):
+    """mode agg with no existing state → _full_build is called."""
     full_build_called = []
     monkeypatch.setattr("scripts.build_temporal._full_build",
                         lambda *a, **kw: full_build_called.append(a[0]))
@@ -868,8 +868,62 @@ def test_forecast_mode_skipped(monkeypatch):
         {},
         "/tmp/test_out",
     )
-    # mode var should not trigger full_build
-    assert "weather_code_simple" not in full_build_called
+    assert "weather_code_simple" in full_build_called
+
+
+def test_forecast_mode_slides_counts(monkeypatch):
+    """mode agg with existing state → per-code counts are updated via add/subtract."""
+    grid_shape = (2, 4)
+    existing_sums = {c: np.ones(grid_shape, dtype=np.int32) * 5 for c in RASTER_WC_CODES}
+    existing_meta = {
+        "var_id": "weather_code_simple", "window_h": 1, "window_label": "1h",
+        "era5_window_start_ts": ERA5_END - 3600,
+        "era5_end_ts": ERA5_END,
+        "gfs_start_ts": ERA5_END,
+        "gfs_end_ts": ERA5_END + 3600,
+        "n_era5": 1, "n_gfs": 1,
+        "built_at": "2023-01-01T00:00:00+00:00",
+    }
+
+    fake_delta = {c: np.ones(grid_shape, dtype=np.int32) for c in RASTER_WC_CODES}
+    monkeypatch.setattr("scripts.build_temporal.load_raster_state",
+                        lambda *a, **kw: ({**existing_sums}, {**existing_meta}))
+    monkeypatch.setattr("scripts.build_temporal.accumulate_raster_mode",
+                        lambda *a, **kw: fake_delta)
+    monkeypatch.setattr("scripts.build_temporal.reproject_to_grid",
+                        lambda arr, *a, **kw: arr)
+    saved = {}
+    monkeypatch.setattr("scripts.build_temporal.save_raster_state",
+                        lambda od, vid, wl, agg, sums, meta, suffix="": saved.update({"sums": sums, "meta": meta}))
+
+    fake_cc_cidx = ChunkIndex(
+        latest_end_time=1.0,
+        ranges=[ChunkRange(chunk_num=2023, start=0, end=1, time_len=1, source="year")],
+        resolution=3600.0,
+    )
+    era5_cidx_by_var = {"weather_code_simple": {
+        "cloud_cover": fake_cc_cidx,
+        "precipitation": fake_cc_cidx,
+        "snowfall_water_equivalent": fake_cc_cidx,
+    }}
+    gfs_cidx = {
+        "cloud_cover": fake_cc_cidx,
+        "precipitation": fake_cc_cidx,
+        "snowfall_water_equivalent": fake_cc_cidx,
+    }
+
+    bt._build_forecast_aggregates(
+        {"weather_code_simple": bt.VAR_CONFIGS["weather_code_simple"]},
+        _minimal_windows(),
+        NOW_TS, ERA5_END, NOW_TS + 8 * 3600,
+        era5_cidx_by_var,
+        gfs_cidx,
+        "/tmp/test_out",
+    )
+    assert saved, "save_raster_state was not called"
+    # counts should have changed (drop old + add new)
+    for c in RASTER_WC_CODES:
+        assert saved["sums"][c] is not None
 
 
 def test_forecast_no_existing_state_calls_full_build(monkeypatch):
@@ -943,6 +997,37 @@ def test_forecast_exception_in_process_printed(monkeypatch, capsys):
     )
     out = capsys.readouterr().out
     assert "ERROR" in out
+
+
+def test_forecast_mode_slides_counts_missing_cidx(monkeypatch):
+    """mode agg with missing era5/gfs cidx → None guards on lines 582, 587 are hit."""
+    grid_shape = (2, 4)
+    existing_sums = {c: np.ones(grid_shape, dtype=np.int32) * 5 for c in RASTER_WC_CODES}
+    existing_meta = {
+        "var_id": "weather_code_simple", "window_h": 1, "window_label": "1h",
+        "era5_window_start_ts": ERA5_END - 3600,
+        "era5_end_ts": ERA5_END,
+        "gfs_start_ts": ERA5_END,
+        "gfs_end_ts": ERA5_END + 3600,
+        "n_era5": 1, "n_gfs": 1,
+        "built_at": "2023-01-01T00:00:00+00:00",
+    }
+    saved = {}
+    monkeypatch.setattr("scripts.build_temporal.load_raster_state",
+                        lambda *a, **kw: ({**existing_sums}, {**existing_meta}))
+    monkeypatch.setattr("scripts.build_temporal.save_raster_state",
+                        lambda od, vid, wl, agg, sums, meta, suffix="": saved.update({"sums": sums}))
+
+    # Empty cidx → cc_cidx=None, gfs_cc=None → both delta functions return None early
+    bt._build_forecast_aggregates(
+        {"weather_code_simple": bt.VAR_CONFIGS["weather_code_simple"]},
+        _minimal_windows(),
+        NOW_TS, ERA5_END, NOW_TS + 8 * 3600,
+        {"weather_code_simple": {}},
+        {},
+        "/tmp/test_out",
+    )
+    assert saved  # save was still called, counts unchanged
 
 
 def test_forecast_era5_drop_end_lte_old_w_start(monkeypatch):

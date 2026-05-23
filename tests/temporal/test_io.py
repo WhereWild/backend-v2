@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from io import BytesIO
@@ -177,11 +176,44 @@ class TestOpenS3Json:
 
 
 # ---------------------------------------------------------------------------
-# _download_chunk
+# _chunk_filename / _open_chunk / _download_chunk
 # ---------------------------------------------------------------------------
 
-class TestDownloadChunk:
-    def test_returns_existing_file(self, tmp_path):
+class TestChunkHelpers:
+    def test_chunk_filename_year(self):
+        entry = util.temporal.ChunkRange(chunk_num=2022, start=0, end=0, time_len=1, source="year")
+        assert util.temporal._chunk_filename(entry) == "year_2022.om"
+
+    def test_chunk_filename_chunk(self):
+        entry = util.temporal.ChunkRange(chunk_num=5, start=0, end=0, time_len=1, source="chunk")
+        assert util.temporal._chunk_filename(entry) == "chunk_5.om"
+
+    def test_open_chunk_builds_correct_uri(self, monkeypatch):
+        captured = {}
+        mock_fs = MagicMock()
+
+        def _fake_from_fsspec(fs, path):
+            captured["path"] = path
+            return MagicMock()
+
+        monkeypatch.setattr(fsspec, "filesystem", lambda *a, **kw: mock_fs)
+        monkeypatch.setattr("util.temporal.OmFileReader.from_fsspec", staticmethod(_fake_from_fsspec))
+        monkeypatch.setattr("util.temporal._RASTER_CHUNK_CACHE_DIR", None)
+        entry = util.temporal.ChunkRange(chunk_num=2023, start=0, end=0, time_len=1, source="year")
+        util.temporal._open_chunk(entry, "copernicus_era5", "precipitation")
+        assert captured["path"] == "openmeteo/data/copernicus_era5/precipitation/year_2023.om"
+
+    def test_open_chunk_uses_cache_dir(self, monkeypatch, tmp_path):
+        fake_local = tmp_path / "copernicus_era5_precipitation_year_2023.om"
+        fake_local.write_bytes(b"")
+        monkeypatch.setattr("util.temporal._RASTER_CHUNK_CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr("util.temporal._download_chunk", lambda e, m, v, d: fake_local)
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda path: path)
+        entry = util.temporal.ChunkRange(chunk_num=2023, start=0, end=0, time_len=1, source="year")
+        result = util.temporal._open_chunk(entry, "copernicus_era5", "precipitation")
+        assert result == str(fake_local)
+
+    def test_download_chunk_returns_cached(self, tmp_path):
         entry = util.temporal.ChunkRange(chunk_num=2019, start=0, end=0, time_len=1, source="chunk")
         dest_dir = tmp_path / "chunks"
         dest_dir.mkdir()
@@ -190,116 +222,29 @@ class TestDownloadChunk:
         result = util.temporal._download_chunk(entry, "copernicus_era5", "precipitation", str(tmp_path))
         assert result == dest
 
-    def test_downloads_year_file(self, tmp_path, monkeypatch):
+    def test_download_chunk_fetches_missing(self, tmp_path, monkeypatch):
         entry = util.temporal.ChunkRange(chunk_num=2022, start=0, end=0, time_len=1, source="year")
+        fetched = {}
 
-        def _fake_run(cmd, **kw):
-            # Write fake data to the .tmp file aria2c would create
-            dest_dir = tmp_path / "chunks"
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            (dest_dir / "copernicus_era5_precipitation_year_2022.om.tmp").write_bytes(b"omdata")
+        def _fake_get(uri, dest):
+            fetched["uri"] = uri
+            Path(dest).write_bytes(b"omdata")
 
-        monkeypatch.setattr("util.temporal.subprocess.run", _fake_run)
+        mock_fs = MagicMock()
+        mock_fs.get = _fake_get
+        monkeypatch.setattr(fsspec, "filesystem", lambda *a, **kw: mock_fs)
         result = util.temporal._download_chunk(entry, "copernicus_era5", "precipitation", str(tmp_path))
         assert result.name == "copernicus_era5_precipitation_year_2022.om"
         assert result.read_bytes() == b"omdata"
+        assert "year_2022.om" in fetched["uri"]
 
-    def test_failure_removes_tmp_file(self, tmp_path, monkeypatch):
-        entry = util.temporal.ChunkRange(chunk_num=0, start=0, end=0, time_len=1, source="chunk")
-
-        def _raise(*a, **kw):
-            dest_dir = tmp_path / "chunks"
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            (dest_dir / "copernicus_era5_precipitation_chunk_0.om.tmp").write_bytes(b"partial")
-            raise subprocess.CalledProcessError(1, "aria2c")
-
-        monkeypatch.setattr("util.temporal.subprocess.run", _raise)
-        with pytest.raises(subprocess.CalledProcessError):
-            util.temporal._download_chunk(entry, "copernicus_era5", "precipitation", str(tmp_path))
-        chunks_dir = tmp_path / "chunks"
-        tmp_files = list(chunks_dir.glob("*.tmp")) if chunks_dir.exists() else []
-        assert tmp_files == []
-
-    def test_download_layer_chunk_calls_download_for_each_var(self, tmp_path, monkeypatch) -> None:
+    def test_download_layer_chunk_downloads_each_var(self, monkeypatch):
         entry = util.temporal.ChunkRange(chunk_num=2020, start=0, end=0, time_len=1, source="year")
         called = []
-
-        def _fake_dl(e, model, var, cache_dir):
-            called.append(var)
-            return Path(cache_dir) / "chunks" / f"{model}_{var}_year_2020.om"
-
-        monkeypatch.setattr("util.temporal._download_chunk", _fake_dl)
-        result = util.temporal._download_layer_chunk(entry, "copernicus_era5", ["cloud_cover", "precipitation"], str(tmp_path))
+        monkeypatch.setattr("util.temporal._download_chunk", lambda e, model, var, cache_dir: called.append(var))
+        result = util.temporal._download_layer_chunk(entry, "copernicus_era5", ["cloud_cover", "precipitation"], "/tmp")
         assert called == ["cloud_cover", "precipitation"]
         assert result is entry
-
-
-# ---------------------------------------------------------------------------
-# prefetch_chunks
-# ---------------------------------------------------------------------------
-
-class TestPrefetchChunks:
-    def _entry(self, year: int) -> util.temporal.ChunkRange:
-        return util.temporal.ChunkRange(chunk_num=year, start=0.0, end=0.0, time_len=8760, source="year")
-
-    def test_no_tasks_when_all_cached(self, tmp_path, monkeypatch) -> None:
-        dest_dir = tmp_path / "chunks"
-        dest_dir.mkdir()
-        entry = self._entry(2020)
-        target = dest_dir / "copernicus_era5_temperature_2m_year_2020.om"
-        target.write_bytes(b"cached")
-        called = []
-        monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: called.append(1))
-        util.temporal.prefetch_chunks([entry], "copernicus_era5", ["temperature_2m"], str(tmp_path))
-        assert called == []
-
-    def test_downloads_missing_files(self, tmp_path, monkeypatch) -> None:
-        downloaded = []
-
-        def _fake_dl(entry, model, var, cache_dir):
-            downloaded.append((entry.chunk_num, var))
-            target = Path(cache_dir) / "chunks" / f"{model}_{var}_year_{entry.chunk_num}.om"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"data")
-            return target
-
-        monkeypatch.setattr("util.temporal._download_chunk", _fake_dl)
-        entries = [self._entry(2020), self._entry(2021)]
-        util.temporal.prefetch_chunks(entries, "copernicus_era5", ["temperature_2m"], str(tmp_path))
-        assert len(downloaded) == 2
-
-    def test_failed_download_warns_but_continues(self, tmp_path, monkeypatch, capsys) -> None:
-        def _fake_dl(entry, model, var, cache_dir):
-            raise RuntimeError("S3 timeout")
-
-        monkeypatch.setattr("util.temporal._download_chunk", _fake_dl)
-        util.temporal.prefetch_chunks([self._entry(2020)], "copernicus_era5", ["temperature_2m"], str(tmp_path))
-        assert "warning" in capsys.readouterr().out
-
-    def test_disk_limit_raises(self, tmp_path, monkeypatch) -> None:
-        monkeypatch.setattr("util.temporal._PREFETCH_DISK_LIMIT_GB", 0)
-        dest_dir = tmp_path / "chunks"
-        dest_dir.mkdir()
-        (dest_dir / "big.om").write_bytes(b"x")  # any file makes used > 0
-
-        def _fake_dl(entry, model, var, cache_dir):
-            raise RuntimeError("disk limit reached")
-
-        monkeypatch.setattr("util.temporal._download_chunk", _fake_dl)
-        util.temporal.prefetch_chunks([self._entry(2020)], "copernicus_era5", ["temperature_2m"], str(tmp_path))
-        # Should complete without raising — failure is caught and warned
-
-    def test_progress_printed_every_10(self, tmp_path, monkeypatch, capsys) -> None:
-        def _fake_dl(entry, model, var, cache_dir):
-            target = Path(cache_dir) / "chunks" / f"{model}_{var}_year_{entry.chunk_num}.om"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"x")
-            return target
-
-        monkeypatch.setattr("util.temporal._download_chunk", _fake_dl)
-        entries = [self._entry(2000 + i) for i in range(11)]
-        util.temporal.prefetch_chunks(entries, "copernicus_era5", ["temperature_2m"], str(tmp_path))
-        assert "10/11" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

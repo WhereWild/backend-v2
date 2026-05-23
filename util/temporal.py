@@ -19,9 +19,7 @@ no-op: obs_elev is NaN → offset is 0.
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +30,10 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from omfiles import OmFileReader
+from rasterio.crs import CRS as _CRS
+from rasterio.transform import from_bounds as _from_bounds
+from rasterio.warp import Resampling as _Resampling
+from rasterio.warp import reproject as _reproject
 
 from config.config import load_config
 from util.taxa import get_taxon_by_id, iter_descendants
@@ -42,9 +44,6 @@ _LAT_COL = "decimalLatitude"
 _LON_COL = "decimalLongitude"
 _TIME_COL = "eventTimestamp"
 
-_S3_BASE_URL = "https://openmeteo.s3.amazonaws.com/data"
-_PREFETCH_WORKERS = 8
-_PREFETCH_DISK_LIMIT_GB = 1000
 
 # Variables that receive lapse-rate elevation correction (°C/m × 0.0065).
 # Precipitation, cloud cover, and other flux/ratio variables are unaffected.
@@ -505,15 +504,40 @@ def _chunk_filename(chunk_entry: ChunkRange) -> str:
     return f"chunk_{chunk_entry.chunk_num}.om"
 
 
+# When set, accumulate_raster downloads chunks here before reading (faster for large grids).
+_RASTER_CHUNK_CACHE_DIR: str | None = None
+
+
+def set_raster_chunk_cache(path: str) -> None:
+    global _RASTER_CHUNK_CACHE_DIR
+    Path(path).mkdir(parents=True, exist_ok=True)
+    _RASTER_CHUNK_CACHE_DIR = path
+
+
+def _open_chunk(entry: ChunkRange, model: str, variable: str) -> OmFileReader:
+    """Return an OmFileReader for the chunk.
+
+    If _RASTER_CHUNK_CACHE_DIR is set, downloads to disk first (fast local reads).
+    Otherwise streams directly from S3 via from_fsspec.
+    """
+    if _RASTER_CHUNK_CACHE_DIR is not None:
+        local = _download_chunk(entry, model, variable, _RASTER_CHUNK_CACHE_DIR)
+        return OmFileReader(str(local))
+    filename = _chunk_filename(entry)
+    path = f"openmeteo/data/{model}/{variable}/{filename}"
+    fs = fsspec.filesystem("s3", anon=True)
+    return OmFileReader.from_fsspec(fs, path)
+
+
 def _download_chunk(
     chunk_entry: ChunkRange,
     model: str,
     variable: str,
     cache_dir: str,
 ) -> Path:
-    """Download a single .om chunk via aria2c and return the local path."""
+    """Download a single .om chunk to local disk via fsspec and return the path."""
     filename = _chunk_filename(chunk_entry)
-    url = f"{_S3_BASE_URL}/{model}/{variable}/{filename}"
+    uri = f"s3://openmeteo/data/{model}/{variable}/{filename}"
 
     dest_dir = Path(cache_dir) / "chunks"
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -522,33 +546,12 @@ def _download_chunk(
     if target.exists():
         return target
 
-    print(f"[download] {url}", flush=True)
-    tmp_name = target.name + ".tmp"
-    tmp = dest_dir / tmp_name
-    try:
-        subprocess.run(
-            [
-                "aria2c",
-                "--split=8",
-                "--max-connection-per-server=8",
-                "--continue=true",
-                "--max-tries=12",
-                "--retry-wait=15",
-                "--connect-timeout=60",
-                f"--dir={dest_dir}",
-                f"--out={tmp_name}",
-                url,
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        tmp.replace(target)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-    print(f"[download] done {target.name} ({target.stat().st_size // 1024 // 1024}MB)", flush=True)
+    fs = fsspec.filesystem("s3", anon=True)
+    fs.get(uri, str(target))
     return target
+
+
+_PREFETCH_WORKERS = 8
 
 
 def _download_layer_chunk(
@@ -557,57 +560,10 @@ def _download_layer_chunk(
     variables: list[str],
     cache_dir: str,
 ) -> ChunkRange:
-    """Download all .om files for one chunk/layer combination; return the entry."""
+    """Download all variable files for one chunk; return the entry (for futures)."""
     for var in variables:
         _download_chunk(chunk_entry, model, var, cache_dir)
     return chunk_entry
-
-
-def prefetch_chunks(
-    chunk_entries: list[ChunkRange],
-    model: str,
-    variables: list[str],
-    cache_dir: str,
-) -> None:
-    """Download all needed chunks in parallel, respecting a disk space limit."""
-    dest_dir = Path(cache_dir) / "chunks"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    limit_bytes = _PREFETCH_DISK_LIMIT_GB * 1024 ** 3
-    tasks: list[tuple[ChunkRange, str, str]] = []
-    for entry in chunk_entries:
-        for var in variables:
-            target = dest_dir / f"{model}_{var}_{_chunk_filename(entry)}"
-            if not target.exists():
-                tasks.append((entry, model, var))
-
-    if not tasks:
-        return
-
-    used = sum(f.stat().st_size for f in dest_dir.glob("*.om") if f.exists())
-    print(f"[prefetch] {len(tasks)} files to download, cache={used // 1024 // 1024}MB used", flush=True)
-
-    def _fetch(args: tuple[ChunkRange, str, str]) -> Path:
-        entry, mdl, var = args
-        # Re-check disk usage before each download
-        current = sum(f.stat().st_size for f in dest_dir.glob("*.om") if f.exists())
-        if current >= limit_bytes:
-            raise RuntimeError(f"Prefetch disk limit ({_PREFETCH_DISK_LIMIT_GB}GB) reached")
-        return _download_chunk(entry, mdl, var, cache_dir)
-
-    with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
-        futures = {pool.submit(_fetch, t): t for t in tasks}
-        done = 0
-        for fut in as_completed(futures):
-            try:
-                fut.result()
-            except Exception as exc:
-                entry, _, var = futures[fut]
-                print(f"[prefetch] warning: {var} chunk={entry.chunk_num} failed — {exc}", flush=True)
-            done += 1
-            if done % 10 == 0:
-                print(f"[prefetch] {done}/{len(tasks)} done", flush=True)
-    print("[prefetch] complete", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1278,4 +1234,338 @@ def derive_vpd(
 
         if updated_any:
             _atomic_write(path, pa.Table.from_pandas(df, preserve_index=False))
+
+
+# ---------------------------------------------------------------------------
+# Raster builder helpers
+# ---------------------------------------------------------------------------
+
+
+_WGS84 = _CRS.from_epsg(4326)
+
+# Per-model grid metadata. GFS ny/nx are determined at runtime from the .om shape
+# because its bounds don't align to exact integer steps.
+RASTER_GRIDS: dict[str, dict] = {
+    "copernicus_era5": {
+        "ny": 721, "nx": 1440,
+        "lat_min": -90.0, "lat_max": 90.0,
+        "lon_min": -180.0, "lon_max": 180.0,
+        "step": 0.25, "flipud": False,
+    },
+    "copernicus_era5_land": {
+        "ny": 1801, "nx": 3600,
+        "lat_min": -90.0, "lat_max": 90.0,
+        "lon_min": -180.0, "lon_max": 180.0,
+        "step": 0.1, "flipud": False,
+    },
+    "ncep_gfs013": {
+        # GFS .om files are stored flat: (ny*nx, time). ny=1536, nx=3072 confirmed from shape.
+        "ny": 1536, "nx": 3072,
+        "lat_min": -89.912125, "lat_max": 89.912125,
+        "lon_min": -180.0, "lon_max": 179.88281,
+        "step": 0.117188, "flipud": False,
+    },
+}
+
+# WC code values in the order used for mode count stacks.
+RASTER_WC_CODES: tuple[int, ...] = (0, 1, 2, 3, 51, 53, 55, 61, 63, 65, 71, 73, 75)
+_WC_CODE_TO_IDX: dict[int, int] = {c: i for i, c in enumerate(RASTER_WC_CODES)}
+
+
+def accumulate_raster(
+    model: str,
+    variable: str,
+    start_ts: float,
+    end_ts: float,
+    chunk_index: ChunkIndex,
+) -> tuple[np.ndarray, int]:
+    """Sum all hourly slices in [start_ts, end_ts] across the full native grid.
+
+    Streams each chunk directly from S3 via fsspec (no local download).
+
+    Returns:
+        (sum_grid: float64 shape (ny, nx), n_steps: int)
+        NaN values in the source are excluded from the sum.
+    """
+    grid = RASTER_GRIDS[model]
+    flipud = grid["flipud"]
+
+    total_sum: np.ndarray | None = None
+    n_steps = 0
+    resolution = chunk_index.resolution
+
+    for entry in chunk_index.ranges:
+        if entry.end < start_ts:
+            continue
+        if entry.start > end_ts:
+            break
+
+        t0 = max(0, int(round((max(entry.start, start_ts) - entry.start) / resolution)))
+        t1 = min(entry.time_len, int(round((min(entry.end, end_ts) - entry.start) / resolution)) + 1)
+        if t1 <= t0:
+            continue
+
+        reader = _open_chunk(entry, model, variable)
+        ny, nx, _ = reader.shape
+
+        if total_sum is None:
+            total_sum = np.zeros((ny, nx), dtype=np.float64)
+
+        sub = 24
+        for ts in range(t0, t1, sub):
+            te = min(ts + sub, t1)
+            chunk_data = np.asarray(
+                reader.read_array((slice(0, ny), slice(0, nx), slice(ts, te))),
+                dtype=np.float64,
+            )
+            total_sum += np.nansum(chunk_data, axis=2)
+
+        n_steps += t1 - t0
+
+    if total_sum is None:
+        g = RASTER_GRIDS[model]
+        ny, nx = g.get("ny", 1), g.get("nx", 1)
+        return np.zeros((ny, nx), dtype=np.float64), 0
+
+    if flipud:
+        total_sum = np.flipud(total_sum)
+    return total_sum, n_steps
+
+
+def accumulate_raster_mode(
+    model: str,
+    start_ts: float,
+    end_ts: float,
+    cloud_index: ChunkIndex,
+    precip_index: ChunkIndex,
+    swe_index: ChunkIndex,
+    temp_grid_025: np.ndarray | None = None,
+) -> dict[int, np.ndarray]:
+    """Accumulate per-code timestep counts across the full native ERA5 0.25° grid.
+
+    For each timestep in [start_ts, end_ts]: derives weather_code_array from
+    cloud/precip/snow, then increments the count grid for the resulting code.
+
+    Args:
+        temp_grid_025: Optional temperature grid already on the ERA5 0.25° grid
+                       (reprojected from ERA5-land 0.1°). Passed to weather_code_array
+                       for the snow/rain temperature cutoff.
+
+    Returns:
+        {wc_code: count_array (ny, nx)} for each code in RASTER_WC_CODES.
+        Arrays are lat-ascending (flipud applied).
+    """
+    grid = RASTER_GRIDS[model]
+    flipud = grid["flipud"]
+    resolution = cloud_index.resolution
+
+    counts: dict[int, np.ndarray | None] = {c: None for c in RASTER_WC_CODES}
+
+    def _load_slice(cidx: ChunkIndex, var: str, entry: ChunkRange, t0: int, t1: int) -> np.ndarray:
+        reader = _open_chunk(entry, model, var)
+        rny, rnx, _ = reader.shape
+        return np.asarray(
+            reader.read_array((slice(0, rny), slice(0, rnx), slice(t0, t1))),
+            dtype=np.float64,
+        )  # (ny, nx, steps)
+
+    def _cidx_entry_for(cidx: ChunkIndex, ts: float) -> tuple[ChunkRange | None, int]:
+        for entry in cidx.ranges:
+            if entry.start <= ts <= entry.end:
+                idx = int(round((ts - entry.start) / cidx.resolution))
+                return entry, idx
+        return None, -1
+
+    for cc_entry in cloud_index.ranges:
+        if cc_entry.end < start_ts:
+            continue
+        if cc_entry.start > end_ts:
+            break
+
+        t0 = max(0, int(round((max(cc_entry.start, start_ts) - cc_entry.start) / resolution)))
+        t1 = min(cc_entry.time_len, int(round((min(cc_entry.end, end_ts) - cc_entry.start) / resolution)) + 1)
+        if t1 <= t0:
+            continue
+
+        cc_data = _load_slice(cloud_index, "cloud_cover", cc_entry, t0, t1)
+        ny, nx = cc_data.shape[:2]
+
+        # Load corresponding precip and swe slices (may span different chunks)
+        pr_data = np.zeros((ny, nx, t1 - t0), dtype=np.float64)
+        sw_data = np.zeros((ny, nx, t1 - t0), dtype=np.float64)
+
+        for i in range(t1 - t0):
+            step_ts = cc_entry.start + (t0 + i) * resolution
+            pr_entry, pr_idx = _cidx_entry_for(precip_index, step_ts)
+            if pr_entry is not None:
+                r = _open_chunk(pr_entry, model, "precipitation")
+                pr_data[:, :, i] = np.asarray(
+                    r.read_array((slice(0, ny), slice(0, nx), slice(pr_idx, pr_idx + 1))),
+                    dtype=np.float64,
+                )[:, :, 0]
+            sw_entry, sw_idx = _cidx_entry_for(swe_index, step_ts)
+            if sw_entry is not None:
+                r = _open_chunk(sw_entry, model, "snowfall_water_equivalent")
+                sw_data[:, :, i] = np.asarray(
+                    r.read_array((slice(0, ny), slice(0, nx), slice(sw_idx, sw_idx + 1))),
+                    dtype=np.float64,
+                )[:, :, 0]
+
+        if counts[0] is None:
+            for c in RASTER_WC_CODES:
+                counts[c] = np.zeros((ny, nx), dtype=np.int32)
+
+        for i in range(t1 - t0):
+            temp_slice = temp_grid_025 if temp_grid_025 is not None else None
+            codes = weather_code_array(
+                cc_data[:, :, i], pr_data[:, :, i], sw_data[:, :, i],
+                resolution, temp=temp_slice,
+            )
+            for c in RASTER_WC_CODES:
+                counts[c] += (np.round(codes) == c).astype(np.int32)
+
+    # Initialise to zero arrays if no data was found
+    g = RASTER_GRIDS[model]
+    ny0, nx0 = g.get("ny", 1), g.get("nx", 1)
+    result: dict[int, np.ndarray] = {}
+    for c in RASTER_WC_CODES:
+        arr = counts[c] if counts[c] is not None else np.zeros((ny0, nx0), dtype=np.int32)
+        result[c] = np.flipud(arr) if (flipud and counts[c] is not None) else arr
+    return result
+
+
+def reproject_to_grid(
+    src: np.ndarray,
+    src_lat_min: float,
+    src_lat_max: float,
+    src_lon_min: float,
+    src_lon_max: float,
+    dst_ny: int,
+    dst_nx: int,
+    dst_lat_min: float,
+    dst_lat_max: float,
+    dst_lon_min: float,
+    dst_lon_max: float,
+) -> np.ndarray:
+    """Bilinear reproject src (lat-ascending float array) onto a new WGS84 grid.
+
+    Both grids must be in geographic coordinates (degrees).  src must already
+    be lat-ascending (flipud applied before calling).
+    """
+    src_f = np.asarray(src, dtype=np.float32)
+    src_ny, src_nx = src_f.shape
+
+    src_transform = _from_bounds(src_lon_min, src_lat_min, src_lon_max, src_lat_max, src_nx, src_ny)
+    dst_transform = _from_bounds(dst_lon_min, dst_lat_min, dst_lon_max, dst_lat_max, dst_nx, dst_ny)
+
+    dst = np.empty((dst_ny, dst_nx), dtype=np.float32)
+    _reproject(
+        source=src_f, destination=dst,
+        src_transform=src_transform, src_crs=_WGS84,
+        dst_transform=dst_transform, dst_crs=_WGS84,
+        resampling=_Resampling.bilinear,
+        src_nodata=np.nan, dst_nodata=np.nan,
+    )
+    return dst
+
+
+def compute_raster_final(
+    var_id: str,
+    agg: str,
+    sums: dict[str, np.ndarray],
+    n_era5: int,
+    n_gfs: int,
+) -> np.ndarray:
+    """Compute the final output raster from accumulated sums.
+
+    For mode vars sums contains {wc_code: count_grid}.
+    For scalar vars sums contains {era5_{raw_var}: sum_grid, gfs_{raw_var}: sum_grid}.
+    For VPD, sums contains era5_temperature_2m, era5_dew_point_2m (and optionally gfs_* variants).
+    """
+    n_total = max(n_era5 + n_gfs, 1)
+
+    if agg == "mode":
+        stack = np.stack([sums.get(c, np.zeros_like(next(iter(sums.values()))))
+                          for c in RASTER_WC_CODES], axis=0)
+        best = np.argmax(stack, axis=0)
+        return np.array(RASTER_WC_CODES, dtype=np.float32)[best]
+
+    zero = np.zeros_like(next(iter(sums.values())), dtype=np.float64)
+
+    if var_id == "vapor_pressure_deficit":
+        t_e = sums.get("era5_temperature_2m", zero) / max(n_era5, 1)
+        td_e = sums.get("era5_dew_point_2m", zero) / max(n_era5, 1)
+        val = vpd_kpa(t_e, td_e) * n_era5
+        if n_gfs > 0 and "gfs_temperature_2m" in sums:
+            t_g = sums["gfs_temperature_2m"] / n_gfs
+            td_g = sums["gfs_dew_point_2m"] / n_gfs  # derived from RH before accumulating
+            val = val + vpd_kpa(t_g, td_g) * n_gfs
+        result = val / n_total
+        return np.maximum(result, 0.0).astype(np.float32)
+
+    if var_id == "dew_point_2m":
+        era5_val = sums.get("era5_dew_point_2m", zero) / max(n_era5, 1)
+        if n_gfs > 0 and "gfs_dew_point_2m" in sums:
+            gfs_val = sums["gfs_dew_point_2m"] / n_gfs
+            return ((era5_val * n_era5 + gfs_val * n_gfs) / n_total).astype(np.float32)
+        return era5_val.astype(np.float32)
+
+    # Generic avg / sum
+    combined = zero.copy()
+    for key, arr in sums.items():
+        combined = combined + arr
+
+    if agg == "avg":
+        return (combined / n_total).astype(np.float32)
+    return combined.astype(np.float32)
+
+
+def load_raster_state(
+    out_dir: str,
+    var_id: str,
+    window_label: str,
+    suffix: str = "",
+) -> tuple[dict[str, np.ndarray] | None, dict | None]:
+    """Load existing sums and meta for a var+window combination.
+
+    Returns (sums, meta) or (None, None) if either file is missing.
+    """
+    base = Path(out_dir) / f"{var_id}_{window_label}{suffix}"
+    meta_path = base.with_suffix(".meta.json")
+    sums_path = Path(str(base) + ".sums.npz")
+    if not meta_path.exists() or not sums_path.exists():
+        return None, None
+    with open(meta_path) as fh:
+        meta = json.load(fh)
+    raw = dict(np.load(sums_path))
+    sums: dict = {}
+    for k, v in raw.items():
+        try:
+            sums[int(k)] = v
+        except ValueError:
+            sums[k] = v
+    return sums, meta
+
+
+def save_raster_state(
+    out_dir: str,
+    var_id: str,
+    window_label: str,
+    agg: str,
+    sums: dict[str, np.ndarray],
+    meta: dict,
+    suffix: str = "",
+) -> None:
+    """Write final .npy, .meta.json, and .sums.npz for a var+window combination."""
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    base = Path(out_dir) / f"{var_id}_{window_label}{suffix}"
+    npy_path = base.with_suffix(".npy")
+    meta_path = base.with_suffix(".meta.json")
+    sums_path = Path(str(base) + ".sums.npz")
+
+    final = compute_raster_final(var_id, agg, sums, meta["n_era5"], meta["n_gfs"])
+    np.save(npy_path, final)
+    with open(meta_path, "w") as fh:
+        json.dump(meta, fh, indent=2)
+    np.savez(sums_path, **{str(k): v for k, v in sums.items()})
 

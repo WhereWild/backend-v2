@@ -1,20 +1,22 @@
 import csv
+import io
 import json
 import math
 import re
+import shutil
 from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
 from config.config import load_config
-from util import citations, gis, taxa, tiles
+from util import citations, gis, taxa, tiles, upload
 from util.rankings import POSITION_FILE
 from util.stats import (
     NOMINAL_STATS_FILE,
@@ -984,3 +986,55 @@ def query_taxa(
         "offset": offset,
         "results": serialized,
     }
+
+
+@app.post("/upload/raw-observations")
+async def upload_raw_observations(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+) -> FileResponse:
+    """Accept a CSV, TSV, or Parquet file of observations and return a ZIP archive.
+
+    The archive contains the original observations enriched with all static GIS
+    layer values, pre-computed summary statistics, density curves, and a flat
+    occurrence index — all in both Parquet and CSV formats.
+
+    Temporal enrichment is not included: historical weather aggregates require
+    per-observation timestamps and the full ERA5 archive.
+    """
+    filename = file.filename or ""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".csv", ".tsv", ".parquet"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{suffix}'. Accepted: CSV, TSV, Parquet.",
+        )
+
+    contents = await file.read()
+    buf = io.BytesIO(contents)
+    try:
+        if suffix == ".parquet":
+            df = pd.read_parquet(buf)
+        elif suffix == ".tsv":
+            df = pd.read_csv(buf, sep="\t")
+        else:
+            df = pd.read_csv(buf)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}") from exc
+
+    static_layer_ids = {
+        layer["id"] for layer in tiles.load_layers()
+        if layer.get("filename") and layer.get("window_hours") is None
+    }
+
+    df = upload.normalize_coordinate_columns(df)
+    df = upload.ensure_catalog_numbers(df)
+    df = upload.ensure_observation_names(df)
+    df = upload.validate_coordinates(df)
+    upload.check_reserved_columns(df, static_layer_ids)
+
+    df = await run_in_threadpool(upload.enrich_with_gis, df)
+    archive_path, archive_name, work_dir = await run_in_threadpool(upload.build_archive, df)
+
+    background_tasks.add_task(shutil.rmtree, work_dir, True)
+    return FileResponse(path=archive_path, media_type="application/zip", filename=archive_name)

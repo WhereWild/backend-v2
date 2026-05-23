@@ -234,18 +234,21 @@ def _nominal_stats(counts: Counter, unique_samples: int) -> tuple[dict, list[dic
     return summary, distribution
 
 
-def _nominal_cat_entries(layer_id: str, counts: Counter, summary: dict) -> list[dict]:
+def _nominal_cat_entries(layer_id: str, layer: dict, counts: Counter, summary: dict) -> list[dict]:
     total = summary["total_samples"]
+    variable_name = layer.get("display_name", layer_id)
+    variable_category = layer.get("category_display_name", layer.get("source", ""))
+    base = {"variableName": variable_name, "variableCategory": variable_category}
     entries: list[dict] = [
-        {"variable": layer_id, "metric": "unique_samples", "value": float(summary["unique_samples"])},
-        {"variable": layer_id, "metric": "total_samples",  "value": float(total)},
-        {"variable": layer_id, "metric": "unique_classes", "value": float(summary["unique_classes"])},
-        {"variable": layer_id, "metric": "entropy",        "value": float(summary["entropy"])},
+        {**base, "variable": layer_id, "metric": "unique_samples", "value": float(summary["unique_samples"])},
+        {**base, "variable": layer_id, "metric": "total_samples",  "value": float(total)},
+        {**base, "variable": layer_id, "metric": "unique_classes", "value": float(summary["unique_classes"])},
+        {**base, "variable": layer_id, "metric": "entropy",        "value": float(summary["entropy"])},
     ]
-    entries.append({"variable": layer_id, "metric": "mode", "value": float(summary["mode"])})
+    entries.append({**base, "variable": layer_id, "metric": "mode", "value": float(summary["mode"])})
     for cls_id, count in counts.items():
         fraction = count / total if total else 0.0
-        entries.append({"variable": layer_id, "metric": f"class_{cls_id}", "value": fraction})
+        entries.append({**base, "variable": layer_id, "metric": f"class_{cls_id}", "value": fraction})
     return entries
 
 
@@ -296,6 +299,9 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
         if vtype is None:
             continue
 
+        variable_name = layer.get("display_name", col)
+        variable_category = layer.get("category_display_name", layer.get("source", ""))
+
         match vtype:
             case ValueType.RATIO | ValueType.INTERVAL:
                 series = pd.to_numeric(df[col], errors="coerce").dropna()
@@ -315,6 +321,8 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                     total = int(bin_counts.sum())
                     density_rows.append({
                         "variable": col,
+                        "variableName": variable_name,
+                        "variableCategory": variable_category,
                         "count": stats["count"],
                         "sampleCount": len(values),
                         "pointCount": len(bin_counts),
@@ -330,6 +338,8 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                     if kde:
                         density_rows.append({
                             "variable": col,
+                            "variableName": variable_name,
+                            "variableCategory": variable_category,
                             "count": stats["count"],
                             "sampleCount": len(values),
                             "pointCount": len(kde["points"]),
@@ -339,6 +349,9 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                             "max": kde["max"],
                             "bandwidth": kde["bandwidth"],
                         })
+                stats["variableName"] = variable_name
+                stats["variableCategory"] = variable_category
+                stats["domain"] = layer.get("domain", "continuous")
                 numerical_stats[col] = stats
 
             case ValueType.NOMINAL:
@@ -350,7 +363,7 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                 for v in series:
                     raw_counts[int(float(v))] += 1
                 summary, _ = _nominal_stats(raw_counts, unique)
-                nominal_entries.extend(_nominal_cat_entries(col, raw_counts, summary))
+                nominal_entries.extend(_nominal_cat_entries(col, layer, raw_counts, summary))
 
             case _:
                 raise NotImplementedError(f"Stats not implemented for value type {vtype!r}")
@@ -360,6 +373,16 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_numerical_density(taxon_dir, density_rows)
     _write_index_from_df(taxon_dir, df)
+
+
+def process_observations_df(directory: Path, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:
+    """Compute stats and write all outputs for an arbitrary observations DataFrame.
+
+    Public entry point used by the upload pipeline. Behaves identically to the
+    normal per-taxon leaf processing but operates on a caller-supplied DataFrame
+    rather than reading from a fixed occurrence.parquet path.
+    """
+    _process_leaf_df(directory, df, layer_meta)
 
 
 def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
@@ -578,6 +601,8 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
         reservoir = reservoir[np.isfinite(reservoir)]
         layer = layer_meta[col]
         vtype = _layer_value_type(layer)
+        variable_name = layer.get("display_name", col)
+        variable_category = layer.get("category_display_name", layer.get("source", ""))
         if _is_discrete(layer):
             counts = Counter(int(v) for v in reservoir)
             mode_val = counts.most_common(1)[0][0] if counts else None
@@ -589,6 +614,8 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
                 all_bins = [(k, counts.get(k, 0)) for k in range(min_val, max_val + 1)]
                 density_rows.append({
                     "variable": col,
+                    "variableName": variable_name,
+                    "variableCategory": variable_category,
                     "count": int(digest.n_values),
                     "sampleCount": len(reservoir),
                     "pointCount": len(all_bins),
@@ -604,6 +631,8 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
             if kde:
                 density_rows.append({
                     "variable": col,
+                    "variableName": variable_name,
+                    "variableCategory": variable_category,
                     "count": stats["count"],
                     "sampleCount": len(reservoir),
                     "pointCount": len(kde["points"]),
@@ -613,11 +642,15 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
                     "max": kde["max"],
                     "bandwidth": kde["bandwidth"],
                 })
+        stats["variableName"] = variable_name
+        stats["variableCategory"] = variable_category
+        stats["domain"] = layer.get("domain", "continuous")
         numerical_stats[col] = stats
 
     for col, acc in nominal_acc.items():
+        layer = layer_meta[col]
         summary, _ = _nominal_stats(acc["counts"], acc["unique"])
-        nominal_entries.extend(_nominal_cat_entries(col, acc["counts"], summary))
+        nominal_entries.extend(_nominal_cat_entries(col, layer, acc["counts"], summary))
 
     if not numerical_stats and not nominal_entries:
         return

@@ -62,6 +62,25 @@
       }
     ]
   },
+  "fabdem": {
+    "name": "FABDEM V1-2",
+    "url": "https://data.bris.ac.uk/data/dataset/s5hqmjcdj8yo2ibzi9b4ew3sn",
+    "license": "CC BY-NC-SA 4.0",
+    "license_url": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+    "citation": "Hawker, L., Uhe, P., Paulo, L., Sosa, J., Savage, J., Sampson, C., and Neal, J. (2022). A 30 m global map of elevation with forests and buildings removed. Environmental Research Letters, 17(2), 024016.",
+    "doi": "https://doi.org/10.1088/1748-9326/ac4d4f",
+    "references": [
+      {
+        "authors": "Hawker, L., Uhe, P., Paulo, L., Sosa, J., Savage, J., Sampson, C., and Neal, J.",
+        "year": 2022,
+        "title": "A 30 m global map of elevation with forests and buildings removed",
+        "journal": "Environmental Research Letters",
+        "volume_issue": "17(2)",
+        "pages": "024016",
+        "doi": "https://doi.org/10.1088/1748-9326/ac4d4f"
+      }
+    ]
+  },
   "chelsa_v2_1": {
     "name": "CHELSA v2.1",
     "url": "https://chelsa-climate.org/",

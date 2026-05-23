@@ -1762,3 +1762,47 @@ def test_main_writes_completed_state(monkeypatch, tmp_path: Path):
     assert state["status"] == "completed"
     assert "completed_at" in state
     assert state["skipped"] is False
+
+
+def test_main_exits_if_pid_alive(monkeypatch, tmp_path: Path, capsys):
+    """status=running with a live PID → exit immediately, no build."""
+    import os
+    _patch_main_base(monkeypatch, tmp_path, force=False)
+    (tmp_path / "temporal_state.json").write_text(json.dumps({
+        "status": "running",
+        "pid": os.getpid(),
+        "era5_end_ts": NOW_TS - 5 * 3600,
+        "gfs_end_ts": NOW_TS - 5 * 3600,
+        "completed_vars": [],
+        "forecast_completed": False,
+    }))
+
+    full_build_calls = []
+    monkeypatch.setattr("scripts.build_temporal._full_build",
+                        lambda *a, **kw: full_build_calls.append(a[0]))
+    bt.main()
+
+    assert full_build_calls == []
+    assert "already running" in capsys.readouterr().out
+
+
+def test_main_resumes_if_pid_dead(monkeypatch, tmp_path: Path):
+    """status=running with a dead PID → treat as crashed, proceed with run."""
+    _patch_main_base(monkeypatch, tmp_path, force=False)
+    era5_end = NOW_TS - 5 * 3600
+    gfs_end = NOW_TS - 5 * 3600
+    (tmp_path / "temporal_state.json").write_text(json.dumps({
+        "status": "running",
+        "pid": 99999999,
+        "era5_end_ts": era5_end,
+        "gfs_end_ts": gfs_end,
+        "completed_vars": [],
+        "forecast_completed": False,
+    }))
+
+    full_build_calls = []
+    monkeypatch.setattr("scripts.build_temporal._full_build",
+                        lambda *a, **kw: full_build_calls.append(a[0]))
+    bt.main()
+
+    assert "temperature_2m" in full_build_calls

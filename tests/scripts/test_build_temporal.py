@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 import scripts.build_temporal as bt
 from util.temporal import RASTER_WC_CODES, ChunkIndex, ChunkRange
@@ -1159,29 +1160,84 @@ def test_main_force_true_skips_stale_check(monkeypatch, tmp_path: Path):
 
 
 def test_main_force_false_data_unchanged_skips(monkeypatch, tmp_path: Path):
-    """force=False, data unchanged (same era5+gfs timestamps) → early return."""
-    # The S3 mock returns data_end_time = NOW_TS - 5 * 3600 for all models
-    # now_ts is computed as round(datetime.now(...).timestamp() / 3600) * 3600
-    # gfs_end_ts = min(gfs_data_end_ts, now_ts)
-    # We set gfs_data_end_ts = NOW_TS - 5 * 3600 (in the mock) and now_ts >> that,
-    # so gfs_end_ts = gfs_data_end_ts = NOW_TS - 5 * 3600.
-    # Write meta file with exactly those values.
+    """force=False, prior state completed with same timestamps → early return."""
     era5_end = NOW_TS - 5 * 3600
-    gfs_end = NOW_TS - 5 * 3600  # = min(gfs_data_end_ts, now_ts) = gfs_data_end_ts
+    gfs_end = NOW_TS - 5 * 3600
 
     _patch_main_base(monkeypatch, tmp_path, force=False)
 
-    sample_meta = {"era5_end_ts": era5_end, "gfs_end_ts": gfs_end}
-    meta_file = tmp_path / "temperature_2m_1h.meta.json"
-    meta_file.write_text(json.dumps(sample_meta))
+    # Write a completed state file with matching timestamps
+    state_file = tmp_path / "temporal_state.json"
+    state_file.write_text(json.dumps({
+        "status": "completed",
+        "era5_end_ts": era5_end,
+        "gfs_end_ts": gfs_end,
+    }))
 
     full_build_calls = []
     monkeypatch.setattr("scripts.build_temporal._full_build",
                         lambda *a, **kw: full_build_calls.append(a[0]))
 
     bt.main()
-    # Because timestamps match, should skip
     assert full_build_calls == []
+
+
+def test_main_prior_state_corrupt_runs_normally(monkeypatch, tmp_path: Path):
+    """Corrupt temporal_state.json → prior_state={} → runs normally."""
+    _patch_main_base(monkeypatch, tmp_path, force=True)
+    (tmp_path / "temporal_state.json").write_text("{not valid json{{")
+
+    full_build_calls = []
+    monkeypatch.setattr("scripts.build_temporal._full_build",
+                        lambda *a, **kw: full_build_calls.append(a[0]))
+    bt.main()
+    assert "temperature_2m" in full_build_calls
+
+
+def test_main_resumes_skips_completed_vars(monkeypatch, tmp_path: Path):
+    """Prior run was interrupted (status=running) with same timestamps → resume skips done vars."""
+    era5_end = NOW_TS - 5 * 3600
+    gfs_end = NOW_TS - 5 * 3600
+
+    _patch_main_base(monkeypatch, tmp_path, force=False)
+
+    (tmp_path / "temporal_state.json").write_text(json.dumps({
+        "status": "running",
+        "era5_end_ts": era5_end,
+        "gfs_end_ts": gfs_end,
+        "completed_vars": ["temperature_2m_1h"],
+        "forecast_completed": False,
+    }))
+
+    full_build_calls = []
+    monkeypatch.setattr("scripts.build_temporal._full_build",
+                        lambda *a, **kw: full_build_calls.append(a[0]))
+    bt.main()
+    # temperature_2m_1h was already done → should NOT be in full_build_calls
+    assert "temperature_2m" not in full_build_calls
+
+
+def test_main_resumes_skips_forecast_if_done(monkeypatch, tmp_path: Path):
+    """Prior run completed vars but not forecast → forecast skipped on resume."""
+    era5_end = NOW_TS - 5 * 3600
+    gfs_end = NOW_TS - 5 * 3600
+
+    _patch_main_base(monkeypatch, tmp_path, force=False)
+
+    (tmp_path / "temporal_state.json").write_text(json.dumps({
+        "status": "running",
+        "era5_end_ts": era5_end,
+        "gfs_end_ts": gfs_end,
+        "completed_vars": [],
+        "forecast_completed": True,
+    }))
+
+    forecast_calls = []
+    monkeypatch.setattr("scripts.build_temporal._full_build", lambda *a, **kw: None)
+    monkeypatch.setattr("scripts.build_temporal._build_forecast_aggregates",
+                        lambda *a, **kw: forecast_calls.append(1))
+    bt.main()
+    assert forecast_calls == []
 
 
 def test_main_force_false_no_existing_meta_runs(monkeypatch, tmp_path: Path, capsys):
@@ -1678,3 +1734,31 @@ def test_forecast_gfs_cidx_missing_for_gv(monkeypatch):
         "/tmp/test_out",
     )
     assert len(saved) >= 1
+
+
+def test_main_writes_failed_state_on_exception(monkeypatch, tmp_path: Path):
+    """Unhandled exception in main work block → temporal_state.json written with status=failed."""
+    _patch_main_base(monkeypatch, tmp_path, force=True)
+    monkeypatch.setattr("scripts.build_temporal._full_build", lambda *a, **kw: None)
+    monkeypatch.setattr("scripts.build_temporal._build_forecast_aggregates",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        bt.main()
+
+    state = json.loads((tmp_path / "temporal_state.json").read_text())
+    assert state["status"] == "failed"
+    assert state["error"] == "boom"
+
+
+def test_main_writes_completed_state(monkeypatch, tmp_path: Path):
+    """Successful run → temporal_state.json written with status=completed."""
+    _patch_main_base(monkeypatch, tmp_path, force=True)
+    monkeypatch.setattr("scripts.build_temporal._full_build", lambda *a, **kw: None)
+
+    bt.main()
+
+    state = json.loads((tmp_path / "temporal_state.json").read_text())
+    assert state["status"] == "completed"
+    assert "completed_at" in state
+    assert state["skipped"] is False

@@ -743,102 +743,164 @@ def main() -> None:
     print(f"Now:            {datetime.fromtimestamp(now_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}")
     print(f"Max window: {max_window_h}h  Force: {force}\n")
 
-    # ── Skip if S3 data unchanged ─────────────────────────────────────────
-    if not force:
-        existing = sorted(Path(out_dir).glob("*.meta.json"))
-        if existing:
-            with open(existing[0]) as fh:
-                sample = json.load(fh)
-            if sample.get("era5_end_ts") == era5_end_ts and sample.get("gfs_end_ts") == gfs_end_ts:
-                print("=== no new S3 data since last run, skipping ===")
-                return
+    state_path = Path(out_dir) / "temporal_state.json"
+    started_at = datetime.now(UTC)
 
-    # ── Build chunk indices ────────────────────────────────────────────────
-    print("=== building chunk indices ===")
-
-    # Collect all GFS vars needed
-    gfs_raw_needed: set[str] = set()
-    for vcfg in var_configs.values():
-        gfs_raw_needed.update(_gfs_raw_vars(vcfg))
-    # weather_code needs mode GFS sources
-    if "weather_code_simple" in var_configs:
-        gfs_raw_needed.update(["cloud_cover", "precipitation", "snowfall_water_equivalent"])
-
-    gfs_cidx: dict[str, ChunkIndex] = {}
-    for gv in sorted(gfs_raw_needed):
+    # Read prior state before overwriting it
+    prior_state: dict = {}
+    if state_path.exists():
         try:
-            gfs_cidx[gv] = build_chunk_index("ncep_gfs013", gv)
-            print(f"  GFS {gv}: {len(gfs_cidx[gv].ranges)} range(s)")
-        except Exception as e:
-            print(f"  GFS {gv}: unavailable ({e})")
+            prior_state = json.loads(state_path.read_text())
+        except Exception:
+            pass
 
-    era5_cidx_by_var: dict[str, dict[str, ChunkIndex]] = {}
-    for var_id, vcfg in var_configs.items():
-        era5_model = vcfg["era5_model"]
-        era5_cidx: dict[str, ChunkIndex] = {}
-        raw_vars = _era5_raw_vars(vcfg)
-        # For weather_code, also pre-fetch temperature from ERA5-land
-        if var_id == "weather_code_simple":
-            raw_vars = ["cloud_cover", "precipitation", "snowfall_water_equivalent"]
-            try:
-                era5_cidx["_temperature_for_wc"] = build_chunk_index("copernicus_era5_land", "temperature_2m")
-            except Exception as e:
-                print(f"  ERA5-land temperature_2m (for weather_code): {e}")
-        for rv in raw_vars:
-            try:
-                era5_cidx[rv] = build_chunk_index(era5_model, rv)
-                print(f"  ERA5 {var_id}/{rv}: {len(era5_cidx[rv].ranges)} range(s)")
-            except Exception as e:
-                print(f"  ERA5 {var_id}/{rv}: {e}")
-        era5_cidx_by_var[var_id] = era5_cidx
-
-    # ── Main window loop ───────────────────────────────────────────────────
-    def _process_var(var_id: str, vcfg: dict, window_h: int, wl: str) -> None:
-        era5_model = vcfg["era5_model"]
-        era5_end = era5_land_end_ts if era5_model == "copernicus_era5_land" else era5_end_ts
-        era5_cidx = era5_cidx_by_var.get(var_id, {})
-        existing_sums, existing_meta = load_raster_state(out_dir, var_id, wl)
-        if force or existing_sums is None:
-            print(f"  [{wl}] {var_id} full build …", flush=True)
-            _full_build(var_id, vcfg, window_h, wl, now_ts, era5_end, gfs_end_ts,
-                        era5_cidx, gfs_cidx, out_dir)
-        else:
-            stale_h = (now_ts - float(existing_meta["gfs_end_ts"])) / 3600
-            print(f"  [{wl}] {var_id} incremental ({stale_h:.1f}h stale) …", flush=True)
-            _incremental_update(var_id, vcfg, window_h, wl, existing_sums, existing_meta,
-                                now_ts, era5_end, gfs_end_ts, era5_cidx, gfs_cidx, out_dir)
-
-    t_windows = time.perf_counter()
-    for window_h, wl in windows:
-        print(f"\n=== window {wl} ===")
-        for vid, vcfg in var_configs.items():
-            try:
-                _process_var(vid, vcfg, window_h, wl)
-            except Exception as exc:
-                print(f"  ERROR {vid}: {exc}", flush=True)
-    print(f"\n=== windows done in {time.perf_counter() - t_windows:.1f}s ===")
-
-    # ── Forecast aggregates ────────────────────────────────────────────────
-    _build_forecast_aggregates(
-        var_configs, windows, now_ts, era5_end_ts, gfs_data_end_ts,
-        era5_cidx_by_var, gfs_cidx, out_dir,
+    same_data = (
+        prior_state.get("era5_end_ts") == era5_end_ts
+        and prior_state.get("gfs_end_ts") == gfs_end_ts
     )
 
-    print(f"\n=== total {time.perf_counter() - t_main:.1f}s ===")
+    # Skip entirely only if last run completed successfully with the same data
+    if not force and prior_state.get("status") == "completed" and same_data:
+        print("=== no new S3 data since last completed run, skipping ===")
+        return
 
-    # ── Optional B2 upload ─────────────────────────────────────────────────
-    if cfg.temporal_raster_upload_enabled and cfg.temporal_raster_b2_dest:
-        import subprocess
-        print("\n=== uploading to B2 ===")
-        result = subprocess.run(
-            ["rclone", "sync", out_dir, cfg.temporal_raster_b2_dest,
-             "--include", "*.npy", "--include", "*.meta.json",
-             "--include", "*.sums.npz", "--stats-one-line"],
-        )
-        if result.returncode != 0:
-            print(f"  rclone exited {result.returncode}")
+    # Resume vars already finished in a prior interrupted run with the same data
+    resume_completed: set[str] = set()
+    if same_data and prior_state.get("status") in ("running", "failed"):
+        resume_completed = set(prior_state.get("completed_vars", []))
+        if resume_completed:
+            print(f"=== resuming: skipping {len(resume_completed)} already-completed var(s) ===")
+
+    completed_vars: list[str] = list(resume_completed)
+    forecast_done: list[bool] = [
+        same_data and bool(prior_state.get("forecast_completed"))
+    ]
+
+    def _write_state(status: str, *, skipped: bool = False, error: str | None = None) -> None:
+        state: dict = {
+            "status": status,
+            "started_at": started_at.isoformat(),
+            "era5_end_ts": era5_end_ts,
+            "gfs_end_ts": gfs_end_ts,
+            "skipped": skipped,
+            "completed_vars": completed_vars,
+            "forecast_completed": forecast_done[0],
+        }
+        if status == "completed":
+            state["completed_at"] = datetime.now(UTC).isoformat()
+            state["duration_s"] = round(time.perf_counter() - t_main)
+        if error is not None:
+            state["error"] = error
+        tmp = state_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(state_path)
+
+    _write_state("running")
+
+    try:
+        # ── Build chunk indices ────────────────────────────────────────────────
+        print("=== building chunk indices ===")
+
+        # Collect all GFS vars needed
+        gfs_raw_needed: set[str] = set()
+        for vcfg in var_configs.values():
+            gfs_raw_needed.update(_gfs_raw_vars(vcfg))
+        # weather_code needs mode GFS sources
+        if "weather_code_simple" in var_configs:
+            gfs_raw_needed.update(["cloud_cover", "precipitation", "snowfall_water_equivalent"])
+
+        gfs_cidx: dict[str, ChunkIndex] = {}
+        for gv in sorted(gfs_raw_needed):
+            try:
+                gfs_cidx[gv] = build_chunk_index("ncep_gfs013", gv)
+                print(f"  GFS {gv}: {len(gfs_cidx[gv].ranges)} range(s)")
+            except Exception as e:
+                print(f"  GFS {gv}: unavailable ({e})")
+
+        era5_cidx_by_var: dict[str, dict[str, ChunkIndex]] = {}
+        for var_id, vcfg in var_configs.items():
+            era5_model = vcfg["era5_model"]
+            era5_cidx: dict[str, ChunkIndex] = {}
+            raw_vars = _era5_raw_vars(vcfg)
+            # For weather_code, also pre-fetch temperature from ERA5-land
+            if var_id == "weather_code_simple":
+                raw_vars = ["cloud_cover", "precipitation", "snowfall_water_equivalent"]
+                try:
+                    era5_cidx["_temperature_for_wc"] = build_chunk_index("copernicus_era5_land", "temperature_2m")
+                except Exception as e:
+                    print(f"  ERA5-land temperature_2m (for weather_code): {e}")
+            for rv in raw_vars:
+                try:
+                    era5_cidx[rv] = build_chunk_index(era5_model, rv)
+                    print(f"  ERA5 {var_id}/{rv}: {len(era5_cidx[rv].ranges)} range(s)")
+                except Exception as e:
+                    print(f"  ERA5 {var_id}/{rv}: {e}")
+            era5_cidx_by_var[var_id] = era5_cidx
+
+        # ── Main window loop ───────────────────────────────────────────────────
+        def _process_var(var_id: str, vcfg: dict, window_h: int, wl: str) -> None:
+            var_key = f"{var_id}_{wl}"
+            if var_key in resume_completed:
+                print(f"  [{wl}] {var_id} already completed, skipping", flush=True)
+                return
+            era5_model = vcfg["era5_model"]
+            era5_end = era5_land_end_ts if era5_model == "copernicus_era5_land" else era5_end_ts
+            era5_cidx = era5_cidx_by_var.get(var_id, {})
+            existing_sums, existing_meta = load_raster_state(out_dir, var_id, wl)
+            if force or existing_sums is None:
+                print(f"  [{wl}] {var_id} full build …", flush=True)
+                _full_build(var_id, vcfg, window_h, wl, now_ts, era5_end, gfs_end_ts,
+                            era5_cidx, gfs_cidx, out_dir)
+            else:
+                stale_h = (now_ts - float(existing_meta["gfs_end_ts"])) / 3600
+                print(f"  [{wl}] {var_id} incremental ({stale_h:.1f}h stale) …", flush=True)
+                _incremental_update(var_id, vcfg, window_h, wl, existing_sums, existing_meta,
+                                    now_ts, era5_end, gfs_end_ts, era5_cidx, gfs_cidx, out_dir)
+            completed_vars.append(var_key)
+            _write_state("running")
+
+        t_windows = time.perf_counter()
+        for window_h, wl in windows:
+            print(f"\n=== window {wl} ===")
+            for vid, vcfg in var_configs.items():
+                try:
+                    _process_var(vid, vcfg, window_h, wl)
+                except Exception as exc:
+                    print(f"  ERROR {vid}: {exc}", flush=True)
+        print(f"\n=== windows done in {time.perf_counter() - t_windows:.1f}s ===")
+
+        # ── Forecast aggregates ────────────────────────────────────────────────
+        if forecast_done[0]:
+            print("=== forecast aggregates already completed, skipping ===")
         else:
-            print("  upload complete")
+            _build_forecast_aggregates(
+                var_configs, windows, now_ts, era5_end_ts, gfs_data_end_ts,
+                era5_cidx_by_var, gfs_cidx, out_dir,
+            )
+            forecast_done[0] = True
+            _write_state("running")
+
+        print(f"\n=== total {time.perf_counter() - t_main:.1f}s ===")
+
+        # ── Optional B2 upload ─────────────────────────────────────────────────
+        if cfg.temporal_raster_upload_enabled and cfg.temporal_raster_b2_dest:
+            import subprocess
+            print("\n=== uploading to B2 ===")
+            result = subprocess.run(
+                ["rclone", "sync", out_dir, cfg.temporal_raster_b2_dest,
+                 "--include", "*.npy", "--include", "*.meta.json",
+                 "--include", "*.sums.npz", "--stats-one-line"],
+            )
+            if result.returncode != 0:
+                print(f"  rclone exited {result.returncode}")
+            else:
+                print("  upload complete")
+
+        _write_state("completed")
+
+    except Exception as exc:
+        _write_state("failed", error=str(exc))
+        raise
 
 
 if __name__ == "__main__":  # pragma: no cover

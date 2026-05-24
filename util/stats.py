@@ -27,9 +27,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from fastdigest import TDigest
 from scipy.optimize import minimize_scalar
-from scipy.stats import circmean, circstd, circvar
+from scipy.stats import circmean, circstd, circvar, gaussian_kde, vonmises
 from scipy.stats import entropy as _scipy_entropy
-from scipy.stats import gaussian_kde, vonmises
 
 from config.config import ValueType, load_config
 from util.taxa import TaxonRecord, get_children, iter_descendants

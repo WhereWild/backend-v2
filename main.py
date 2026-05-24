@@ -21,8 +21,8 @@ from util import citations, gis, taxa, tiles, upload
 from util.rankings import POSITION_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
-    NOMINAL_STATS_FILE,
     DENSITY_FILE,
+    NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
     OCCURRENCE_INDEX_FILE,
     TREE_ROOT,
@@ -643,7 +643,7 @@ def get_species_environment(
             "summary": summary,
             "density_curve": density_curve,
             "categorical_distribution": None,
-            "relative_ranks": [],
+            "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
         }
 
     num_path = taxon_dir / NUMERICAL_STATS_FILE
@@ -1056,6 +1056,11 @@ _METRIC_LABELS: dict[str, str] = {
     "min": "Minimum",
     "max": "Maximum",
     "std": "Standard deviation",
+    "circular_mean": "Directional mean",
+    "mode": "Mode",
+    "rbar": "Concentration (R̄)",
+    "circular_std": "Circular std dev",
+    "circular_var": "Circular variance",
 }
 _METRIC_ORDER = ["mean", "median", "min", "max", "std"]
 _METRIC_RANK = {m: i for i, m in enumerate(_METRIC_ORDER)}
@@ -1127,6 +1132,8 @@ def query_taxa(
     include_species_like: bool = Query(False),
     location: str | None = Query(None),
     unit_system: str | None = Query(None),
+    sort_reference: float | None = Query(None, ge=0.0, lt=360.0),
+    min_rbar: float | None = Query(None, ge=0.0, le=1.0),
 ):
     normalized_q = normalize_name(q or "") or None
 
@@ -1153,6 +1160,8 @@ def query_taxa(
         min_samples=min_samples,
         include_species_like=include_species_like,
         location_gid=location,
+        reference_value=sort_reference,
+        min_rbar=min_rbar,
     )
 
     serialized: list[dict] = []

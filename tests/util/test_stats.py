@@ -154,7 +154,7 @@ def test_continuous_stats_exact_keys():
     stats = st._continuous_stats_exact(series, 200, kde)
     expected = {"count", "unique_samples", "min", "10th_percentile", "25th_percentile",
                 "median", "75th_percentile", "90th_percentile", "max",
-                "mean", "std", "iqr", "10_90_range", "range", "mode"}
+                "mean", "std", "variance", "iqr", "10_90_range", "range", "mode"}
     assert expected.issubset(set(stats.keys()))
 
 
@@ -182,7 +182,7 @@ def test_continuous_stats_streaming_keys():
     stats = st._continuous_stats_streaming(digest, 1000, kde)
     expected = {"count", "unique_samples", "min", "10th_percentile", "25th_percentile",
                 "median", "75th_percentile", "90th_percentile", "max",
-                "mean", "std", "iqr", "10_90_range", "range", "mode"}
+                "mean", "std", "variance", "iqr", "10_90_range", "range", "mode"}
     assert expected.issubset(set(stats.keys()))
 
 

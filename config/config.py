@@ -18,7 +18,7 @@ _CONTINUOUS_METRICS: tuple[str, ...] = (
     "count", "unique_samples", "min",
     "10th_percentile", "25th_percentile", "median",
     "75th_percentile", "90th_percentile", "max",
-    "mean", "std", "iqr", "10_90_range", "range", "mode",
+    "mean", "std", "variance", "iqr", "10_90_range", "range", "mode",
 )
 
 _NOMINAL_METRICS: tuple[str, ...] = (

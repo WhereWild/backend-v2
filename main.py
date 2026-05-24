@@ -4,6 +4,7 @@ import json
 import math
 import re
 import shutil
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 
@@ -28,6 +29,8 @@ from util.stats import (
     apply_timestamp_filter,
     collect_taxon_df,
     compute_location_filtered_stats,
+    compute_phenology_counts,
+    read_phenology_counts,
 )
 from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
 
@@ -633,11 +636,14 @@ def get_species_occurrences(
     filter_col = _location_filter_col(location) if location is not None else None
     has_loc_or_pheno = filter_col is not None or phenology_norm is not None
     has_ts = start_ts is not None or end_ts is not None
+    # When no filters at all, use precomputed phenology counts from process_tree
+    use_precomputed_pheno = not has_loc_or_pheno and not has_ts
 
     extra_cols: list[str] = []
     if filter_col:
         extra_cols.append(filter_col)
-    if phenology_norm:
+    # rcs needed for phenology filter OR for live phenology counting
+    if phenology_norm or not use_precomputed_pheno:
         extra_cols.append("rcs")
     # Need eventTimestamp in data when filtering by it, or when computing range
     # from row-filtered data (loc/pheno active).
@@ -649,6 +655,7 @@ def get_species_occurrences(
     seen: set[str] = set()
     ts_min: int | None = None
     ts_max: int | None = None
+    pheno_acc: Counter = Counter()
 
     def _read_occ(path: Path) -> None:
         nonlocal ts_min, ts_max
@@ -661,7 +668,10 @@ def get_species_occurrences(
                 lo, hi = result
                 ts_min = lo if ts_min is None else min(ts_min, lo)
                 ts_max = hi if ts_max is None else max(ts_max, hi)
-        df = _filter_occ_df(pq.read_table(path, columns=occ_columns).to_pandas())
+        table = pq.read_table(path, columns=occ_columns)
+        if table.num_rows == 0:
+            return
+        df = _filter_occ_df(table.to_pandas())
         if filter_col is not None:
             df = df[df[filter_col].astype(str) == str(location)]
         if phenology_norm is not None:
@@ -675,6 +685,8 @@ def get_species_occurrences(
                 ts_max = hi if ts_max is None else max(ts_max, hi)
         if has_ts:
             df = apply_timestamp_filter(df, start_ts, end_ts)
+        if not use_precomputed_pheno and "rcs" in df.columns:
+            pheno_acc.update(compute_phenology_counts(df))
         df = df[["catalogNumber", "decimalLatitude", "decimalLongitude"]].dropna()
         for r in df.to_dict("records"):
             cid = str(r["catalogNumber"])
@@ -692,7 +704,17 @@ def get_species_occurrences(
         for desc in iter_descendants(taxon, include_self=False):
             _read_occ(TREE_ROOT / desc["path"] / _OCC_FILE)
 
-    return {"occurrences": collected, "min_timestamp": ts_min, "max_timestamp": ts_max}
+    if use_precomputed_pheno:
+        pheno_counts = read_phenology_counts(TREE_ROOT / taxon["path"])
+    else:
+        pheno_counts = dict(sorted(pheno_acc.items(), key=lambda kv: kv[1], reverse=True))
+
+    return {
+        "occurrences": collected,
+        "min_timestamp": ts_min,
+        "max_timestamp": ts_max,
+        "phenology_counts": pheno_counts,
+    }
 
 
 @lru_cache(maxsize=1)

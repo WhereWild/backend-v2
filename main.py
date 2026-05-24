@@ -20,6 +20,7 @@ from config.config import load_config
 from util import citations, gis, taxa, tiles, upload
 from util.rankings import POSITION_FILE
 from util.stats import (
+    CIRCULAR_STATS_FILE,
     NOMINAL_STATS_FILE,
     DENSITY_FILE,
     NUMERICAL_STATS_FILE,
@@ -273,6 +274,13 @@ def get_taxon_env_stats(taxon_id: str):
             var = row.pop("variable")
             numerical_stats[var] = row
 
+    circular_stats: dict[str, dict] = {}
+    circ_path = taxon_dir / CIRCULAR_STATS_FILE
+    if circ_path.exists():
+        for row in pq.read_table(circ_path).to_pylist():
+            var = row.pop("variable")
+            circular_stats[var] = row
+
     nominal_stats: dict[str, dict] = {}
     nominal_classes: dict[str, list] = {}
     nom_path = taxon_dir / NOMINAL_STATS_FILE
@@ -294,7 +302,7 @@ def get_taxon_env_stats(taxon_id: str):
             var = row.pop("variable")
             density_by_var[var] = row
 
-    all_var_ids = list(dict.fromkeys(list(numerical_stats) + list(nominal_stats)))
+    all_var_ids = list(dict.fromkeys(list(numerical_stats) + list(circular_stats) + list(nominal_stats)))
     variables = []
     for var_id in all_var_ids:
         layer = layer_index.get(var_id, {})
@@ -307,6 +315,10 @@ def get_taxon_env_stats(taxon_id: str):
         }
         if var_id in numerical_stats:
             entry["stats"] = numerical_stats[var_id]
+            entry["density"] = density_by_var.get(var_id)
+            entry["classes"] = None
+        elif var_id in circular_stats:
+            entry["stats"] = circular_stats[var_id]
             entry["density"] = density_by_var.get(var_id)
             entry["classes"] = None
         else:
@@ -584,6 +596,37 @@ def get_species_environment(
             "density_curve": None,
             "categorical_distribution": categorical_distribution,
             "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
+        }
+
+    if value_type == "circular":
+        circ_path = taxon_dir / CIRCULAR_STATS_FILE
+        if not circ_path.exists():
+            raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
+        row = next((r for r in pq.read_table(circ_path).to_pylist() if r["variable"] == variable_id), None)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
+        count = int(row.get("count") or 0)
+        summary = {
+            "count": count,
+            "circular_mean": row.get("circular_mean"),
+            "rbar": row.get("rbar"),
+            "circular_std": row.get("circular_std"),
+        }
+        density_curve = None
+        den_path = taxon_dir / DENSITY_FILE
+        if den_path.exists():
+            den_row = next((r for r in pq.read_table(den_path).to_pylist() if r["variable"] == variable_id), None)
+            if den_row:
+                density_curve = {"points": den_row["points"], "density": den_row["density"]}
+        return {
+            "species_id": taxon.get("taxon_key"),
+            "variable": variable_id,
+            "variable_metadata": variable_metadata,
+            "observation_count": count,
+            "summary": summary,
+            "density_curve": density_curve,
+            "categorical_distribution": None,
+            "relative_ranks": [],
         }
 
     num_path = taxon_dir / NUMERICAL_STATS_FILE

@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 import rasterio
 
 from config.config import load_config
-from util.gis import DERIVED_FROM_ELEVATION, sample_slope_batch
+from util.gis import DERIVED_FROM_ELEVATION, sample_aspect_batch, sample_slope_batch
 from util.taxa import TaxonRecord, load_catalog
 
 CONFIG = load_config("global")
@@ -242,7 +242,10 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
             if not elev_path.exists():
                 print(f"[process] elevation.tif not found, skipping {layer_id}")
                 continue
-            values: list[float | None] = sample_slope_batch(lats[arr], lons[arr])
+            if layer_id == "aspect":
+                values: list[float | None] = sample_aspect_batch(lats[arr], lons[arr])
+            else:
+                values = sample_slope_batch(lats[arr], lons[arr])
         else:
             cog_path = LAYERS_DIR / layer["filename"]
             if not cog_path.exists():

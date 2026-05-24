@@ -299,12 +299,13 @@ def render_layer_tile_bytes(
     y: int,
     tile_size: int = 256,
 ) -> bytes:
-    from util.gis import DERIVED_FROM_ELEVATION, derive_slope_array
+    from util.gis import DERIVED_FROM_ELEVATION, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
         return render_temporal_tile_bytes(layer_id, z, x, y, tile_size)
     if layer_id in DERIVED_FROM_ELEVATION:
-        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_slope_array)
+        derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
+        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn)
     path    = LAYERS_DIR / layer["filename"]
     scale   = layer.get("scale_factor") or 1.0
     offset  = layer.get("add_offset")   or 0.0

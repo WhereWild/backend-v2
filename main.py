@@ -472,7 +472,11 @@ def _class_samples_from_raw_occ(
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}")
-def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | None = None, location: str | None = None, phenology: str | None = None, start_ts: int | None = None, end_ts: int | None = None):
+def get_species_environment(
+    taxon_id: str, variable_id: str, unit_system: str | None = None,
+    location: str | None = None, phenology: str | None = None,
+    start_ts: int | None = None, end_ts: int | None = None,
+):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -495,7 +499,10 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
     if (location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None) and layer is not None:
         filter_col = _location_filter_col(location) if location is not None else None
         if location is None or filter_col is not None:
-            result = compute_location_filtered_stats(taxon, variable_id, filter_col, location, layer, phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts)
+            result = compute_location_filtered_stats(
+                taxon, variable_id, filter_col, location, layer,
+                phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+            )
             if result is not None:
                 if result["type"] == "continuous":
                     stats = result["stats"]
@@ -668,7 +675,12 @@ def get_species_occurrences(
                 lo, hi = result
                 ts_min = lo if ts_min is None else min(ts_min, lo)
                 ts_max = hi if ts_max is None else max(ts_max, hi)
-        table = pq.read_table(path, columns=occ_columns)
+        try:
+            schema_names = set(pq.read_schema(path).names)
+            cols_to_read = [c for c in occ_columns if c in schema_names]
+        except Exception:
+            cols_to_read = list(_OCC_COLUMNS)
+        table = pq.read_table(path, columns=cols_to_read)
         if table.num_rows == 0:
             return
         df = _filter_occ_df(table.to_pandas())
@@ -893,7 +905,9 @@ def get_species_environment_slice(
         filter_col = _location_filter_col(location) if location is not None else None
         if location is None or filter_col is not None:
             observations = _slice_from_raw_occ(
-                taxon, variable_id, filter_col, location, min_value, max_value, circular_wrap, limit, phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+                taxon, variable_id, filter_col, location,
+                min_value, max_value, circular_wrap, limit,
+                phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
             )
             return {
                 "species_id": taxon.get("taxon_key"),

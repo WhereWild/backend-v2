@@ -21,7 +21,7 @@ from util import citations, gis, taxa, tiles, upload
 from util.rankings import POSITION_FILE
 from util.stats import (
     NOMINAL_STATS_FILE,
-    NUMERICAL_DENSITY_FILE,
+    DENSITY_FILE,
     NUMERICAL_STATS_FILE,
     OCCURRENCE_INDEX_FILE,
     TREE_ROOT,
@@ -288,7 +288,7 @@ def get_taxon_env_stats(taxon_id: str):
             nominal_classes[var].sort(key=lambda e: -e["fraction"])
 
     density_by_var: dict[str, dict] = {}
-    den_path = taxon_dir / NUMERICAL_DENSITY_FILE
+    den_path = taxon_dir / DENSITY_FILE
     if den_path.exists():
         for row in pq.read_table(den_path).to_pylist():
             var = row.pop("variable")
@@ -605,7 +605,7 @@ def get_species_environment(
     }
 
     density_curve = None
-    den_path = taxon_dir / NUMERICAL_DENSITY_FILE
+    den_path = taxon_dir / DENSITY_FILE
     if den_path.exists():
         den_row = next((r for r in pq.read_table(den_path).to_pylist() if r["variable"] == variable_id), None)
         if den_row:

@@ -590,7 +590,7 @@ def _env_stats_read(path, **kw):
     return {
         st_module.NUMERICAL_STATS_FILE: _NUM_STATS_TABLE,
         st_module.NOMINAL_STATS_FILE: _NOM_STATS_TABLE,
-        st_module.NUMERICAL_DENSITY_FILE: _DENSITY_TABLE,
+        st_module.DENSITY_FILE: _DENSITY_TABLE,
     }.get(Path(str(path)).name, pa.table({}))
 
 

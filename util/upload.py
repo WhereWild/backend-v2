@@ -27,6 +27,7 @@ from fastapi import HTTPException
 
 from util.gis import hilbert_index
 from util.stats import (
+    CIRCULAR_STATS_FILE,
     NOMINAL_STATS_FILE,
     DENSITY_FILE,
     NUMERICAL_STATS_FILE,
@@ -271,7 +272,8 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
             (occ_path,                              "occurrence.parquet"),
             (work_dir / NUMERICAL_STATS_FILE,       NUMERICAL_STATS_FILE),
             (work_dir / NOMINAL_STATS_FILE,         NOMINAL_STATS_FILE),
-            (work_dir / DENSITY_FILE,     DENSITY_FILE),
+            (work_dir / CIRCULAR_STATS_FILE,        CIRCULAR_STATS_FILE),
+            (work_dir / DENSITY_FILE,               DENSITY_FILE),
             (work_dir / OCCURRENCE_INDEX_FILE,      OCCURRENCE_INDEX_FILE),
             (lookup_path,                           "categorical_value_lookup.parquet"),
         ]

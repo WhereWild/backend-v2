@@ -536,6 +536,23 @@ def get_species_environment(
                         "categorical_distribution": None,
                         "relative_ranks": [],
                     }
+                if result["type"] == "circular":
+                    stats = result["stats"]
+                    return {
+                        "species_id": taxon.get("taxon_key"),
+                        "variable": variable_id,
+                        "variable_metadata": variable_metadata,
+                        "observation_count": result["observation_count"],
+                        "summary": {
+                            "count": stats["count"],
+                            "circular_mean": stats.get("circular_mean"),
+                            "rbar": stats.get("rbar"),
+                            "circular_std": stats.get("circular_std"),
+                        },
+                        "density_curve": result["density_curve"],
+                        "categorical_distribution": None,
+                        "relative_ranks": [],
+                    }
                 total_samples = result["observation_count"]
                 class_index = {c["id"]: c for c in _load_legend(variable_id)}
                 categorical_distribution = [

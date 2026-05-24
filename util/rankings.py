@@ -24,7 +24,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from config.config import METRICS_BY_TYPE, ValueType, load_config
-from util.stats import NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE
+from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
 
 CONFIG = load_config("global")
@@ -98,10 +98,14 @@ def _descendant_rank_targets(ancestor_rank: str) -> list[str]:
     return list(_RANK_ORDER[idx + 1:])
 
 
+# Circular metrics that are angular bearings — included in the sort index but
+# excluded from relative_ranks_positions.parquet (no percentile/position display).
+_ANGULAR_METRICS: frozenset[str] = frozenset({"circular_mean", "mode"})
+
+
 def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
     """Return rankable metric names for a value type.
 
-    Raises NotImplementedError for CIRCULAR (not yet supported).
     Returns () for types with no ranking metrics (ORDINAL, AGGREGATE).
     """
     match vtype:
@@ -110,7 +114,7 @@ def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
         case ValueType.NOMINAL:
             return METRICS_BY_TYPE[ValueType.NOMINAL]
         case ValueType.CIRCULAR:
-            return ()
+            return METRICS_BY_TYPE[ValueType.CIRCULAR]
         case _:
             return ()
 
@@ -234,10 +238,9 @@ def _collect_entries_from_numerical_stats(
             vtype = ValueType(layer.get("value_type", ""))
         except ValueError:
             continue
-        try:
-            metrics = _metrics_for_vtype(layer, vtype)
-        except NotImplementedError:
-            continue
+        if vtype not in (ValueType.RATIO, ValueType.INTERVAL):
+            continue  # circular → _collect_entries_from_circular_stats; others → not rankable
+        metrics = _metrics_for_vtype(layer, vtype)
         for metric in metrics:
             val = row.get(metric)
             if val is None:
@@ -295,6 +298,53 @@ def _collect_entries_from_nominal_stats(
     return entries
 
 
+def _collect_entries_from_circular_stats(
+    taxon_key: str,
+    taxon_dir: Path,
+    sample_count: int,
+    layers: list[dict],
+) -> dict[str, dict[str, Any]]:
+    """Read circular_stats.parquet → {variable::metric: entry dict}."""
+    stats_path = taxon_dir / CIRCULAR_STATS_FILE
+    if not stats_path.exists():
+        return {}
+    try:
+        df = pq.read_table(stats_path).to_pandas()
+    except Exception:
+        return {}
+
+    layer_by_id = {lay["id"]: lay for lay in layers}
+    entries: dict[str, dict[str, Any]] = {}
+
+    for _, row in df.iterrows():
+        variable = str(row.get("variable") or "")
+        if not variable or variable not in layer_by_id:
+            continue
+        layer = layer_by_id[variable]
+        try:
+            vtype = ValueType(layer.get("value_type", ""))
+        except ValueError:
+            continue
+        if vtype != ValueType.CIRCULAR:
+            continue
+        for metric in METRICS_BY_TYPE[ValueType.CIRCULAR]:
+            val = row.get(metric)
+            if val is None:
+                continue
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(fval):
+                continue
+            entries[f"{variable}::{metric}"] = {
+                "taxon_key": taxon_key,
+                "value": fval,
+                "sample_count": sample_count,
+            }
+    return entries
+
+
 def _collect_all_entries(
     taxon_key: str,
     taxon_dir: Path,
@@ -303,6 +353,7 @@ def _collect_all_entries(
 ) -> dict[str, dict[str, Any]]:
     entries = _collect_entries_from_numerical_stats(taxon_key, taxon_dir, sample_count, layers)
     entries.update(_collect_entries_from_nominal_stats(taxon_key, taxon_dir, sample_count, layers))
+    entries.update(_collect_entries_from_circular_stats(taxon_key, taxon_dir, sample_count, layers))
     return entries
 
 
@@ -436,6 +487,8 @@ def _distribute_positions(ancestor: TaxonRecord, index_path: Path) -> None:
     rows_by_taxon: dict[str, list[dict[str, Any]]] = {}
     for col_name in metric_columns:
         variable, metric = col_name.split("::", 1)
+        if metric in _ANGULAR_METRICS:
+            continue  # bearings have no meaningful percentile position
         column = table.column(col_name).combine_chunks()
         col_len = min(column_lengths.get(col_name, len(column)), len(column))
         if col_len <= 0:
@@ -611,6 +664,19 @@ def _taxon_metric_value(taxon_dir: Path, variable_id: str, metric_id: str) -> fl
                         return fval
         except Exception:
             pass
+    circ_path = taxon_dir / CIRCULAR_STATS_FILE
+    if circ_path.exists():
+        try:
+            df = pq.read_table(circ_path).to_pandas()
+            rows = df[df["variable"] == variable_id]
+            if not rows.empty and metric_id in rows.columns:
+                val = rows.iloc[0][metric_id]
+                if val is not None:
+                    fval = float(val)
+                    if math.isfinite(fval):
+                        return fval
+        except Exception:
+            pass
     return None
 
 
@@ -647,6 +713,8 @@ def _query_ranked_scoped(
     include_species_like: bool,
     loc_keys: frozenset[str] | None,
     loc_counts: dict[str, int],
+    reference_value: float | None = None,
+    min_rbar: float | None = None,
 ) -> dict:
     rank_lower = "subspecies" if descendant_rank in CONFIG.subspecies_equivalents else descendant_rank.lower()
     ancestor_dir = TREE_ROOT / within_taxon["path"]
@@ -681,6 +749,19 @@ def _query_ranked_scoped(
 
     accepted_ranks = _accepted_ranks(descendant_rank, include_species_like)
 
+    is_circular_bearing = sort_metric in _ANGULAR_METRICS and reference_value is not None
+
+    # For circular sorts, optionally load rbar values for min_rbar filtering
+    rbar_map: dict[str, float] = {}
+    if is_circular_bearing and min_rbar is not None:
+        rbar_col = f"{sort_variable}::rbar"
+        rbar_col_len = _load_column_lengths(index_path).get(rbar_col)
+        if rbar_col_len:
+            for entry in _read_index_entries(index_path, rbar_col, rbar_col_len):
+                tk = str(entry.get("taxonKey") or "")
+                if tk:
+                    rbar_map[tk] = float(entry.get("value") or 0.0)
+
     # Filter
     filtered: list[tuple[int, str, float, int]] = []  # (raw_pos, taxon_key, value, sample_count)
     for tk, (pos, val, sc) in index_map.items():
@@ -691,14 +772,23 @@ def _query_ranked_scoped(
         effective_sc = loc_counts.get(tk, 0) if loc_counts else sc
         if effective_sc < min_samples:
             continue
+        if rbar_map and rbar_map.get(tk, 0.0) < min_rbar:
+            continue
         if accepted_ranks is not None:
             taxon = get_taxon_by_id(tk)
             if taxon is None or taxon.get("rank") not in accepted_ranks:
                 continue
         filtered.append((pos, tk, val, sc))
 
-    reverse = (sort_order == "desc")
-    filtered.sort(key=lambda e: (e[2], e[1]), reverse=reverse)
+    if is_circular_bearing:
+        ref = float(reference_value)  # type: ignore[arg-type]
+        if sort_order == "desc":
+            filtered.sort(key=lambda e: ((ref - e[2]) % 360.0, e[1]))
+        else:
+            filtered.sort(key=lambda e: ((e[2] - ref) % 360.0, e[1]))
+    else:
+        reverse = (sort_order == "desc")
+        filtered.sort(key=lambda e: (e[2], e[1]), reverse=reverse)
 
     total = len(filtered)
     page = filtered[offset:offset + limit]
@@ -740,10 +830,14 @@ def _query_ranked_text(
     include_species_like: bool,
     loc_keys: frozenset[str] | None,
     loc_counts: dict[str, int],
+    reference_value: float | None = None,
+    min_rbar: float | None = None,
 ) -> dict:
     candidates = search_taxa_by_name(q, limit=max((limit + offset) * 5, 200))
     if not candidates:
         return _empty_result("no_text_matches")
+
+    is_circular_bearing = sort_metric in _ANGULAR_METRICS and reference_value is not None
 
     enriched: list[tuple[TaxonRecord, float, float, int]] = []  # taxon, score, sort_val, sc
     for taxon, score, _ in candidates:
@@ -758,10 +852,21 @@ def _query_ranked_text(
         effective_sc = loc_counts.get(tk, 0) if loc_counts else sc
         if effective_sc < min_samples:
             continue
+        if is_circular_bearing and min_rbar is not None:
+            rbar = _taxon_metric_value(taxon_dir, sort_variable, "rbar")
+            if rbar is None or rbar < min_rbar:
+                continue
         enriched.append((taxon, score, val, sc))
 
-    reverse = (sort_order == "desc")
-    enriched.sort(key=lambda e: (e[2], str(e[0]["taxon_key"])), reverse=reverse)
+    if is_circular_bearing:
+        ref = float(reference_value)  # type: ignore[arg-type]
+        if sort_order == "desc":
+            enriched.sort(key=lambda e: ((ref - e[2]) % 360.0, str(e[0]["taxon_key"])))
+        else:
+            enriched.sort(key=lambda e: ((e[2] - ref) % 360.0, str(e[0]["taxon_key"])))
+    else:
+        reverse = (sort_order == "desc")
+        enriched.sort(key=lambda e: (e[2], str(e[0]["taxon_key"])), reverse=reverse)
 
     total = len(enriched)
     page = enriched[offset:offset + limit]
@@ -955,11 +1060,17 @@ def query_taxa(
     min_samples: int,
     include_species_like: bool,
     location_gid: str | None,
+    reference_value: float | None = None,
+    min_rbar: float | None = None,
 ) -> dict:
     """Search and rank taxa.
 
     Returns a dict with keys: total, matched_total, eligible_total, empty_reason, results.
     Each result has: taxon, match_score, sample_count, sort_value, location_count, position, percentile.
+
+    ``reference_value`` and ``min_rbar`` are used when sorting by a circular bearing metric
+    (circular_mean or mode): results are ordered by forward clockwise distance from
+    reference_value, and taxa with rbar below min_rbar are excluded.
     """
     has_q = bool(q)
     has_scope = within_taxon is not None and bool(descendant_rank)
@@ -977,6 +1088,7 @@ def query_taxa(
             sort_order=sort_order, limit=limit, offset=offset,
             min_samples=min_samples, include_species_like=include_species_like,
             loc_keys=loc_keys, loc_counts=loc_counts,
+            reference_value=reference_value, min_rbar=min_rbar,
         )
     if has_q and has_sort:
         return _query_ranked_text(
@@ -984,6 +1096,7 @@ def query_taxa(
             sort_order=sort_order, limit=limit, offset=offset,
             min_samples=min_samples, include_species_like=include_species_like,
             loc_keys=loc_keys, loc_counts=loc_counts,
+            reference_value=reference_value, min_rbar=min_rbar,
         )
     if has_q:
         return _query_text(

@@ -28,8 +28,8 @@ from fastapi import HTTPException
 from util.gis import hilbert_index
 from util.stats import (
     CIRCULAR_STATS_FILE,
-    NOMINAL_STATS_FILE,
     DENSITY_FILE,
+    NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
     OCCURRENCE_INDEX_FILE,
     _filter_df,

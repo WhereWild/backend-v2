@@ -110,10 +110,7 @@ def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
         case ValueType.NOMINAL:
             return METRICS_BY_TYPE[ValueType.NOMINAL]
         case ValueType.CIRCULAR:
-            raise NotImplementedError(
-                f"Relative ranking not implemented for circular layers"
-                f" (layer: {layer.get('id')!r})"
-            )
+            return ()
         case _:
             return ()
 

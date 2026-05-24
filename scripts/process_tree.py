@@ -6,7 +6,7 @@ Runs after enrich_tree has populated occurrence.parquets with GIS values.
 Pass 1 — Stats (bottom-up, deepest first):
   Leaves use exact pandas/numpy stats; non-leaves stream descendant occurrence
   parquets with T-Digest approximations. Writes numerical_stats.parquet,
-  nominal_stats.parquet, numerical_density.parquet, and occurrence_index.parquet.
+  nominal_stats.parquet, density.parquet, and occurrence_index.parquet.
 
 Pass 2 — Rankings (top-down, shallowest first):
   Builds descendant rank catalogs ({rank}.parquet), rank index parquets

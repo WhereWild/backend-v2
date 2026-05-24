@@ -24,6 +24,7 @@ from util.stats import (
     NUMERICAL_STATS_FILE,
     OCCURRENCE_INDEX_FILE,
     TREE_ROOT,
+    apply_phenology_filter,
     collect_taxon_df,
     compute_location_filtered_stats,
 )
@@ -33,6 +34,7 @@ _CONFIG = load_config("global")
 _LEGEND_DIR = Path("config/gis/legends")
 _OCC_FILE = "occurrence.parquet"
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
+_PHENOLOGY_VALUES: frozenset[str] = frozenset(_CONFIG.phenology_values)
 _LOCATIONS_DIR = Path("data/gis/locations")
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
@@ -145,6 +147,14 @@ def list_variables():
 @app.get("/api/layers")
 def list_layers():
     return tiles.load_layers()
+
+
+@app.get("/phenology_values")
+def list_phenology_values():
+    return [
+        {"value": v, "label": v.capitalize()}
+        for v in sorted(_CONFIG.phenology_values)
+    ]
 
 
 @app.get("/gis/point")
@@ -350,17 +360,23 @@ def _location_filter_col(gid: str) -> str | None:
 def _slice_from_raw_occ(
     taxon: dict,
     variable_id: str,
-    filter_col: str,
-    gid: str,
+    filter_col: str | None,
+    gid: str | None,
     value_min: float,
     value_max: float,
     circular_wrap: bool,
     limit: int | None,
+    phenology: str | None = None,
 ) -> list[dict]:
     df = collect_taxon_df(taxon)
-    if df is None or filter_col not in df.columns or variable_id not in df.columns:
+    if df is None or variable_id not in df.columns:
         return []
-    df = df[df[filter_col].astype(str) == str(gid)]
+    if filter_col is not None:
+        if filter_col not in df.columns:
+            return []
+        df = df[df[filter_col].astype(str) == str(gid)]
+    if phenology is not None:
+        df = apply_phenology_filter(df, phenology)
     if df.empty:
         return []
     col = pd.to_numeric(df[variable_id], errors="coerce")
@@ -385,15 +401,21 @@ def _slice_from_raw_occ(
 def _class_samples_from_raw_occ(
     taxon: dict,
     variable_id: str,
-    filter_col: str,
-    gid: str,
+    filter_col: str | None,
+    gid: str | None,
     class_value: float,
     limit: int | None,
+    phenology: str | None = None,
 ) -> list[dict]:
     df = collect_taxon_df(taxon)
-    if df is None or filter_col not in df.columns or variable_id not in df.columns:
+    if df is None or variable_id not in df.columns:
         return []
-    df = df[df[filter_col].astype(str) == str(gid)]
+    if filter_col is not None:
+        if filter_col not in df.columns:
+            return []
+        df = df[df[filter_col].astype(str) == str(gid)]
+    if phenology is not None:
+        df = apply_phenology_filter(df, phenology)
     if df.empty:
         return []
     col = pd.to_numeric(df[variable_id], errors="coerce")
@@ -412,10 +434,14 @@ def _class_samples_from_raw_occ(
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}")
-def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | None = None, location: str | None = None):
+def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | None = None, location: str | None = None, phenology: str | None = None):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
+
+    phenology_norm = phenology.strip().lower() if phenology else None
+    if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
+        raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
 
     variable_id = _resolve_variable_id(variable_id)
     taxon_dir = TREE_ROOT / taxon["path"]
@@ -428,10 +454,10 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
     }
     value_type = layer.get("value_type") if layer else None
 
-    if location is not None and layer is not None:
-        filter_col = _location_filter_col(location)
-        if filter_col is not None:
-            result = compute_location_filtered_stats(taxon, variable_id, filter_col, location, layer)
+    if (location is not None or phenology_norm is not None) and layer is not None:
+        filter_col = _location_filter_col(location) if location is not None else None
+        if location is None or filter_col is not None:
+            result = compute_location_filtered_stats(taxon, variable_id, filter_col, location, layer, phenology=phenology_norm)
             if result is not None:
                 if result["type"] == "continuous":
                     stats = result["stats"]
@@ -553,14 +579,23 @@ def get_species_environment(taxon_id: str, variable_id: str, unit_system: str | 
 
 
 @app.get("/species/{taxon_id}/occurrences")
-def get_species_occurrences(taxon_id: str, location: str | None = None):
+def get_species_occurrences(taxon_id: str, location: str | None = None, phenology: str | None = None):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
 
+    phenology_norm = phenology.strip().lower() if phenology else None
+    if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
+        raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+
     is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
     filter_col = _location_filter_col(location) if location is not None else None
-    occ_columns = list(_OCC_COLUMNS) + ([filter_col] if filter_col else [])
+    extra_cols: list[str] = []
+    if filter_col:
+        extra_cols.append(filter_col)
+    if phenology_norm:
+        extra_cols.append("rcs")
+    occ_columns = list(_OCC_COLUMNS) + extra_cols
     collected: list[dict] = []
 
     seen: set[str] = set()
@@ -571,6 +606,8 @@ def get_species_occurrences(taxon_id: str, location: str | None = None):
         df = _filter_occ_df(pq.read_table(path, columns=occ_columns).to_pandas())
         if filter_col is not None:
             df = df[df[filter_col].astype(str) == str(location)]
+        if phenology_norm is not None:
+            df = apply_phenology_filter(df, phenology_norm)
         df = df[["catalogNumber", "decimalLatitude", "decimalLongitude"]].dropna()
         for r in df.to_dict("records"):
             cid = str(r["catalogNumber"])
@@ -742,12 +779,16 @@ def get_species_environment_slice(
     max_value: float = Query(..., alias="max"),
     limit: int | None = Query(None, ge=1, le=10000),
     location: str | None = None,
+    phenology: str | None = None,
 ):
     if not math.isfinite(min_value) or not math.isfinite(max_value):
         raise HTTPException(status_code=400, detail="min and max must be finite numbers")
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
+    phenology_norm = phenology.strip().lower() if phenology else None
+    if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
+        raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
     variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
@@ -757,11 +798,11 @@ def get_species_environment_slice(
     circular_wrap = variable_id == "aspect_deg" and max_value < min_value
     if max_value < min_value and not circular_wrap:
         min_value, max_value = max_value, min_value
-    if location is not None:
-        filter_col = _location_filter_col(location)
-        if filter_col is not None:
+    if location is not None or phenology_norm is not None:
+        filter_col = _location_filter_col(location) if location is not None else None
+        if location is None or filter_col is not None:
             observations = _slice_from_raw_occ(
-                taxon, variable_id, filter_col, location, min_value, max_value, circular_wrap, limit,
+                taxon, variable_id, filter_col, location, min_value, max_value, circular_wrap, limit, phenology=phenology_norm,
             )
             return {
                 "species_id": taxon.get("taxon_key"),
@@ -794,10 +835,14 @@ def get_species_environment_class_samples(
     class_value: str,
     limit: int | None = Query(None, ge=1, le=10000),
     location: str | None = None,
+    phenology: str | None = None,
 ):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
+    phenology_norm = phenology.strip().lower() if phenology else None
+    if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
+        raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
     variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
@@ -810,11 +855,11 @@ def get_species_environment_class_samples(
             parsed = int(parsed)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid class value: {class_value!r}")
-    if location is not None:
-        filter_col = _location_filter_col(location)
-        if filter_col is not None:
+    if location is not None or phenology_norm is not None:
+        filter_col = _location_filter_col(location) if location is not None else None
+        if location is None or filter_col is not None:
             observations = _class_samples_from_raw_occ(
-                taxon, variable_id, filter_col, location, float(parsed), limit,
+                taxon, variable_id, filter_col, location, float(parsed), limit, phenology=phenology_norm,
             )
             return {
                 "species_id": taxon.get("taxon_key"),

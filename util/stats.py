@@ -27,8 +27,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from fastdigest import TDigest
 from scipy.optimize import minimize_scalar
+from scipy.stats import circmean, circstd, circvar
 from scipy.stats import entropy as _scipy_entropy
-from scipy.stats import gaussian_kde
+from scipy.stats import gaussian_kde, vonmises
 
 from config.config import ValueType, load_config
 from util.taxa import TaxonRecord, get_children, iter_descendants
@@ -40,7 +41,8 @@ OCCURRENCE_FILE = "occurrence.parquet"
 OCCURRENCE_INDEX_FILE = "occurrence_index.parquet"
 NUMERICAL_STATS_FILE = "numerical_stats.parquet"
 NOMINAL_STATS_FILE = "nominal_stats.parquet"
-NUMERICAL_DENSITY_FILE = "numerical_density.parquet"
+CIRCULAR_STATS_FILE = "circular_stats.parquet"
+DENSITY_FILE = "density.parquet"
 PHENOLOGY_COUNTS_FILE = "phenology_counts.json"
 
 _KDE_MAX_SAMPLES = 20_000
@@ -192,6 +194,36 @@ def _gaussian_kde_curve(values: np.ndarray) -> dict | None:
         return None
 
 
+def _von_mises_kde_curve(values_deg: np.ndarray) -> dict | None:
+    if values_deg.size < 2:
+        return None
+    try:
+        n = len(values_deg)
+        values_rad = np.deg2rad(values_deg)
+        cstd_rad = float(circstd(values_rad, high=2 * np.pi, low=0.0, nan_policy="omit"))
+        if not np.isfinite(cstd_rad) or cstd_rad < 1e-6:
+            return None
+        h = max((4.0 / (3.0 * n)) ** 0.2 * cstd_rad, 0.05)
+        kappa = 1.0 / h ** 2
+        grid_deg = np.linspace(0.0, 360.0, _KDE_N_POINTS, endpoint=False)
+        grid_rad = np.deg2rad(grid_deg)
+        density = np.zeros(_KDE_N_POINTS)
+        for theta_i in values_rad:
+            density += vonmises.pdf(grid_rad, kappa, loc=theta_i)
+        density /= n
+        mode_deg = float(grid_deg[int(np.argmax(density))])
+        return {
+            "points": grid_deg.tolist(),
+            "density": density.tolist(),
+            "min": 0.0,
+            "max": 360.0,
+            "bandwidth": float(np.degrees(h)),
+            "mode": mode_deg,
+        }
+    except Exception:
+        return None
+
+
 def build_density_curve(values: np.ndarray, value_type: ValueType) -> dict | None:
     """Build a density curve for the given values and value type.
 
@@ -203,10 +235,53 @@ def build_density_curve(values: np.ndarray, value_type: ValueType) -> dict | Non
             arr = arr[np.isfinite(arr)]
             return _gaussian_kde_curve(arr)
         case ValueType.CIRCULAR:
-            raise NotImplementedError("Von Mises KDE not yet implemented for circular data")
+            arr = np.asarray(values, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            return _von_mises_kde_curve(arr)
         case _:
             return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Stats computation — circular
+# ---------------------------------------------------------------------------
+
+_CIRC_KW = dict(high=360.0, low=0.0, nan_policy="omit")
+
+
+def _circ_stats_exact(series: pd.Series, unique_samples: int, kde: dict | None) -> dict:
+    values = series.to_numpy(dtype=float)
+    var_ = float(circvar(values, **_CIRC_KW))
+    return {
+        "count": int(series.size),
+        "unique_samples": unique_samples,
+        "circular_mean": float(circmean(values, **_CIRC_KW)),
+        "rbar": 1.0 - var_,
+        "circular_var": var_,
+        "circular_std": float(circstd(values, **_CIRC_KW)),
+        "mode": kde["mode"] if kde else None,
+    }
+
+
+def _circ_stats_streaming(
+    cos_sum: float, sin_sum: float, n: int, unique_samples: int, kde: dict | None
+) -> dict:
+    xbar = cos_sum / n
+    ybar = sin_sum / n
+    rbar = float(np.sqrt(xbar ** 2 + ybar ** 2))
+    mean_deg = float(np.degrees(np.arctan2(ybar, xbar)) % 360.0)
+    var_ = 1.0 - rbar
+    std_deg = float(np.degrees(np.sqrt(-2.0 * np.log(max(rbar, 1e-10)))))
+    return {
+        "count": n,
+        "unique_samples": unique_samples,
+        "circular_mean": mean_deg,
+        "rbar": rbar,
+        "circular_var": var_,
+        "circular_std": std_deg,
+        "mode": kde["mode"] if kde else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -297,19 +372,16 @@ def _nominal_stats(counts: Counter, unique_samples: int) -> tuple[dict, list[dic
 
 def _nominal_cat_entries(layer_id: str, layer: dict, counts: Counter, summary: dict) -> list[dict]:
     total = summary["total_samples"]
-    variable_name = layer.get("display_name", layer_id)
-    variable_category = layer.get("category_display_name", layer.get("source", ""))
-    base = {"variableName": variable_name, "variableCategory": variable_category}
     entries: list[dict] = [
-        {**base, "variable": layer_id, "metric": "unique_samples", "value": float(summary["unique_samples"])},
-        {**base, "variable": layer_id, "metric": "total_samples",  "value": float(total)},
-        {**base, "variable": layer_id, "metric": "unique_classes", "value": float(summary["unique_classes"])},
-        {**base, "variable": layer_id, "metric": "entropy",        "value": float(summary["entropy"])},
+        {"variable": layer_id, "metric": "unique_samples", "value": float(summary["unique_samples"])},
+        {"variable": layer_id, "metric": "total_samples",  "value": float(total)},
+        {"variable": layer_id, "metric": "unique_classes", "value": float(summary["unique_classes"])},
+        {"variable": layer_id, "metric": "entropy",        "value": float(summary["entropy"])},
     ]
-    entries.append({**base, "variable": layer_id, "metric": "mode", "value": float(summary["mode"])})
+    entries.append({"variable": layer_id, "metric": "mode", "value": float(summary["mode"])})
     for cls_id, count in counts.items():
         fraction = count / total if total else 0.0
-        entries.append({**base, "variable": layer_id, "metric": f"class_{cls_id}", "value": fraction})
+        entries.append({"variable": layer_id, "metric": f"class_{cls_id}", "value": fraction})
     return entries
 
 
@@ -333,11 +405,11 @@ def _write_nominal_stats(directory: Path, entries: list[dict]) -> None:
     _atomic_write(directory / NOMINAL_STATS_FILE, pa.Table.from_pandas(frame, preserve_index=False))
 
 
-def _write_numerical_density(directory: Path, rows: list[dict]) -> None:
+def _write_density(directory: Path, rows: list[dict]) -> None:
     if not rows:
         return
     table = pa.Table.from_pylist(rows)
-    _atomic_write(directory / NUMERICAL_DENSITY_FILE, table)
+    _atomic_write(directory / DENSITY_FILE, table)
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +423,7 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
         return
 
     numerical_stats: dict[str, dict] = {}
+    circular_stats: dict[str, dict] = {}
     nominal_entries: list[dict] = []
     density_rows: list[dict] = []
 
@@ -359,9 +432,6 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
         vtype = _layer_value_type(layer)
         if vtype is None:
             continue
-
-        variable_name = layer.get("display_name", col)
-        variable_category = layer.get("category_display_name", layer.get("source", ""))
 
         match vtype:
             case ValueType.RATIO | ValueType.INTERVAL:
@@ -382,8 +452,6 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                     total = int(bin_counts.sum())
                     density_rows.append({
                         "variable": col,
-                        "variableName": variable_name,
-                        "variableCategory": variable_category,
                         "count": stats["count"],
                         "sampleCount": len(values),
                         "pointCount": len(bin_counts),
@@ -399,8 +467,6 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                     if kde:
                         density_rows.append({
                             "variable": col,
-                            "variableName": variable_name,
-                            "variableCategory": variable_category,
                             "count": stats["count"],
                             "sampleCount": len(values),
                             "pointCount": len(kde["points"]),
@@ -410,9 +476,6 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                             "max": kde["max"],
                             "bandwidth": kde["bandwidth"],
                         })
-                stats["variableName"] = variable_name
-                stats["variableCategory"] = variable_category
-                stats["domain"] = layer.get("domain", "continuous")
                 numerical_stats[col] = stats
 
             case ValueType.NOMINAL:
@@ -426,13 +489,39 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                 summary, _ = _nominal_stats(raw_counts, unique)
                 nominal_entries.extend(_nominal_cat_entries(col, layer, raw_counts, summary))
 
+            case ValueType.CIRCULAR:
+                series = pd.to_numeric(df[col], errors="coerce").dropna()
+                if series.empty:
+                    continue
+                values = series.to_numpy(dtype=float)
+                values = values[np.isfinite(values)]
+                if values.size == 0:
+                    continue
+                unique = int(df[df[col].notna()]["catalogNumber"].nunique())
+                kde = build_density_curve(values, vtype)
+                stats = _circ_stats_exact(series[np.isfinite(series)], unique, kde)
+                if kde:
+                    density_rows.append({
+                        "variable": col,
+                        "count": stats["count"],
+                        "sampleCount": len(values),
+                        "pointCount": len(kde["points"]),
+                        "points": kde["points"],
+                        "density": kde["density"],
+                        "min": kde["min"],
+                        "max": kde["max"],
+                        "bandwidth": kde["bandwidth"],
+                    })
+                circular_stats[col] = stats
+
             case _:
                 raise NotImplementedError(f"Stats not implemented for value type {vtype!r}")
 
     taxon_dir.mkdir(parents=True, exist_ok=True)
     _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats)
+    _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
     _write_nominal_stats(taxon_dir, nominal_entries)
-    _write_numerical_density(taxon_dir, density_rows)
+    _write_density(taxon_dir, density_rows)
     _write_index_from_df(taxon_dir, df)
     write_phenology_counts(taxon_dir, compute_phenology_counts(df))
 
@@ -596,6 +685,18 @@ def compute_location_filtered_stats(
         raw_counts: Counter = Counter(int(float(v)) for v in series)
         summary, distribution = _nominal_stats(raw_counts, unique)
         return {"type": "nominal", "observation_count": summary["total_samples"], "summary": summary, "distribution": distribution}
+    if vtype == ValueType.CIRCULAR:
+        series = pd.to_numeric(df[variable_id], errors="coerce").dropna()
+        if series.empty:
+            return None
+        values = series.to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return None
+        kde = build_density_curve(values, ValueType.CIRCULAR)
+        stats = _circ_stats_exact(series[np.isfinite(series)], unique, kde)
+        density_curve = {"points": kde["points"], "density": kde["density"]} if kde else None
+        return {"type": "circular", "observation_count": stats["count"], "stats": stats, "density_curve": density_curve}
     return None
 
 
@@ -618,6 +719,8 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
     continuous_acc: dict[str, dict] = {}
     # nominal_acc: layer_id → {counts, unique}
     nominal_acc: dict[str, dict] = {}
+    # circular_acc: layer_id → {cos_sum, sin_sum, n, reservoir, n_seen, unique}
+    circular_acc: dict[str, dict] = {}
     pheno_acc: Counter = Counter()
     # index accumulation: deduplicated rows for occurrence_index.parquet
     for desc in iter_descendants(taxon, include_self=True):
@@ -663,6 +766,25 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
                         acc["counts"][int(float(v))] += 1
                     acc["unique"] += int(df[df[col].notna()]["catalogNumber"].nunique())
 
+                case ValueType.CIRCULAR:
+                    series = pd.to_numeric(df[col], errors="coerce").dropna()
+                    if series.empty:
+                        continue
+                    values = series.to_numpy(dtype=float)
+                    values = values[np.isfinite(values)]
+                    if values.size == 0:
+                        continue
+                    acc = circular_acc.setdefault(col, {
+                        "cos_sum": 0.0, "sin_sum": 0.0, "n": 0,
+                        "reservoir": [], "n_seen": 0, "unique": 0,
+                    })
+                    rad = np.deg2rad(values)
+                    acc["cos_sum"] += float(np.sum(np.cos(rad)))
+                    acc["sin_sum"] += float(np.sum(np.sin(rad)))
+                    acc["n"] += len(values)
+                    acc["n_seen"] = _reservoir_update(acc["reservoir"], acc["n_seen"], values)
+                    acc["unique"] += int(df[df[col].notna()]["catalogNumber"].nunique())
+
                 case _:
                     continue  # skip unimplemented types in streaming
 
@@ -678,8 +800,6 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
         reservoir = reservoir[np.isfinite(reservoir)]
         layer = layer_meta[col]
         vtype = _layer_value_type(layer)
-        variable_name = layer.get("display_name", col)
-        variable_category = layer.get("category_display_name", layer.get("source", ""))
         if _is_discrete(layer):
             counts = Counter(int(v) for v in reservoir)
             mode_val = counts.most_common(1)[0][0] if counts else None
@@ -691,8 +811,6 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
                 all_bins = [(k, counts.get(k, 0)) for k in range(min_val, max_val + 1)]
                 density_rows.append({
                     "variable": col,
-                    "variableName": variable_name,
-                    "variableCategory": variable_category,
                     "count": int(digest.n_values),
                     "sampleCount": len(reservoir),
                     "pointCount": len(all_bins),
@@ -708,8 +826,6 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
             if kde:
                 density_rows.append({
                     "variable": col,
-                    "variableName": variable_name,
-                    "variableCategory": variable_category,
                     "count": stats["count"],
                     "sampleCount": len(reservoir),
                     "pointCount": len(kde["points"]),
@@ -719,9 +835,6 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
                     "max": kde["max"],
                     "bandwidth": kde["bandwidth"],
                 })
-        stats["variableName"] = variable_name
-        stats["variableCategory"] = variable_category
-        stats["domain"] = layer.get("domain", "continuous")
         numerical_stats[col] = stats
 
     for col, acc in nominal_acc.items():
@@ -729,12 +842,36 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
         summary, _ = _nominal_stats(acc["counts"], acc["unique"])
         nominal_entries.extend(_nominal_cat_entries(col, layer, acc["counts"], summary))
 
-    if not numerical_stats and not nominal_entries:
+    circular_stats: dict[str, dict] = {}
+    for col, acc in circular_acc.items():
+        if acc["n"] == 0:
+            continue
+        layer = layer_meta[col]
+        reservoir = np.array(acc["reservoir"], dtype=float)
+        reservoir = reservoir[np.isfinite(reservoir)]
+        kde = build_density_curve(reservoir, ValueType.CIRCULAR) if reservoir.size >= 2 else None
+        stats = _circ_stats_streaming(acc["cos_sum"], acc["sin_sum"], acc["n"], acc["unique"], kde)
+        if kde:
+            density_rows.append({
+                "variable": col,
+                "count": stats["count"],
+                "sampleCount": len(reservoir),
+                "pointCount": len(kde["points"]),
+                "points": kde["points"],
+                "density": kde["density"],
+                "min": kde["min"],
+                "max": kde["max"],
+                "bandwidth": kde["bandwidth"],
+            })
+        circular_stats[col] = stats
+
+    if not numerical_stats and not nominal_entries and not circular_stats:
         return
     taxon_dir.mkdir(parents=True, exist_ok=True)
     _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats)
+    _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
     _write_nominal_stats(taxon_dir, nominal_entries)
-    _write_numerical_density(taxon_dir, density_rows)
+    _write_density(taxon_dir, density_rows)
     write_phenology_counts(taxon_dir, pheno_acc)
 
 

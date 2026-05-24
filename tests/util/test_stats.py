@@ -127,9 +127,13 @@ def test_build_density_curve_constant_values():
     assert math.isfinite(curve["mode"])
 
 
-def test_build_density_curve_circular_raises():
-    with pytest.raises(NotImplementedError):
-        st.build_density_curve(np.array([0.0, 90.0, 180.0]), ValueType.CIRCULAR)
+def test_build_density_curve_circular_returns_curve():
+    curve = st.build_density_curve(np.array([0.0, 90.0, 180.0, 270.0]), ValueType.CIRCULAR)
+    assert curve is not None
+    assert len(curve["points"]) == len(curve["density"])
+    assert curve["min"] == 0.0
+    assert curve["max"] == 360.0
+    assert math.isfinite(curve["mode"])
 
 
 def test_build_density_curve_nominal_returns_none():
@@ -243,8 +247,8 @@ def test_nominal_cat_entries_structure():
     fracs = {e["metric"]: e["value"] for e in entries if e["metric"].startswith("class_")}
     assert fracs["class_1"] == pytest.approx(0.8)
     assert fracs["class_2"] == pytest.approx(0.2)
-    assert all(e["variableName"] == "Köppen-Geiger" for e in entries)
-    assert all(e["variableCategory"] == "chelsa_v2_1" for e in entries)
+    assert all("variableName" not in e for e in entries)
+    assert all("variableCategory" not in e for e in entries)
 
 
 def test_process_observations_df_delegates_to_leaf(tmp_path):
@@ -294,18 +298,18 @@ def test_write_nominal_stats_empty(tmp_path):
     assert not (tmp_path / st.NOMINAL_STATS_FILE).exists()
 
 
-def test_write_read_numerical_density(tmp_path):
+def test_write_read_density(tmp_path):
     rows = [{"variable": "bio1", "count": 50, "sampleCount": 50, "pointCount": 8,
              "points": [1.0, 2.0], "density": [0.3, 0.7], "min": 1.0, "max": 2.0,
              "bandwidth": 0.5}]
-    st._write_numerical_density(tmp_path, rows)
-    df = pd.read_parquet(tmp_path / st.NUMERICAL_DENSITY_FILE)
+    st._write_density(tmp_path, rows)
+    df = pd.read_parquet(tmp_path / st.DENSITY_FILE)
     assert df["variable"].iloc[0] == "bio1"
 
 
-def test_write_numerical_density_empty(tmp_path):
-    st._write_numerical_density(tmp_path, [])
-    assert not (tmp_path / st.NUMERICAL_DENSITY_FILE).exists()
+def test_write_density_empty(tmp_path):
+    st._write_density(tmp_path, [])
+    assert not (tmp_path / st.DENSITY_FILE).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +325,7 @@ def test_process_leaf_continuous(tmp_path, monkeypatch):
     taxon_dir = occ_path.parent
     st._process_leaf(taxon_dir, {"bio1": _CONTINUOUS_LAYER})
     assert (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-    assert (taxon_dir / st.NUMERICAL_DENSITY_FILE).exists()
+    assert (taxon_dir / st.DENSITY_FILE).exists()
     df = pd.read_parquet(taxon_dir / st.NUMERICAL_STATS_FILE)
     row = df[df["variable"] == "bio1"].iloc[0]
     assert row["count"] == 20
@@ -335,12 +339,12 @@ def test_process_leaf_discrete(tmp_path, monkeypatch):
     _make_occ_parquet(taxon_dir / st.OCCURRENCE_FILE, extra_cols={"gsl": [float(v) for v in vals]})
     st._process_leaf(taxon_dir, {"gsl": _DISCRETE_LAYER})
     assert (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-    assert (taxon_dir / st.NUMERICAL_DENSITY_FILE).exists()
+    assert (taxon_dir / st.DENSITY_FILE).exists()
     df = pd.read_parquet(taxon_dir / st.NUMERICAL_STATS_FILE)
     row = df[df["variable"] == "gsl"].iloc[0]
     assert row["mode"] == 42
     assert isinstance(row["mode"], (int, np.integer))
-    den = pd.read_parquet(taxon_dir / st.NUMERICAL_DENSITY_FILE)
+    den = pd.read_parquet(taxon_dir / st.DENSITY_FILE)
     hist_row = den[den["variable"] == "gsl"].iloc[0]
     assert hist_row["pointCount"] == 3
     assert list(hist_row["points"]) == [42.0, 43.0, 44.0]
@@ -356,11 +360,11 @@ def test_process_nonleaf_discrete(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
     st._process_nonleaf(FAKE_TAXON, taxon_dir, {"gsl": _DISCRETE_LAYER})
     assert (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-    assert (taxon_dir / st.NUMERICAL_DENSITY_FILE).exists()
+    assert (taxon_dir / st.DENSITY_FILE).exists()
     df = pd.read_parquet(taxon_dir / st.NUMERICAL_STATS_FILE)
     row = df[df["variable"] == "gsl"].iloc[0]
     assert row["mode"] == 10
-    den = pd.read_parquet(taxon_dir / st.NUMERICAL_DENSITY_FILE)
+    den = pd.read_parquet(taxon_dir / st.DENSITY_FILE)
     hist_row = den[den["variable"] == "gsl"].iloc[0]
     # integers 10..20 inclusive, zeros filled between observed values
     assert hist_row["pointCount"] == 11
@@ -410,11 +414,12 @@ def test_process_leaf_all_filtered_out(tmp_path):
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
-def test_process_leaf_unknown_value_type_raises(tmp_path):
-    taxon_dir = tmp_path / "unk"
+def test_process_leaf_circular_produces_stats(tmp_path):
+    taxon_dir = tmp_path / "circ"
     _make_occ_parquet(taxon_dir / st.OCCURRENCE_FILE, extra_cols={"circ": [45.0] * 20})
-    with pytest.raises(NotImplementedError):
-        st._process_leaf(taxon_dir, {"circ": {"id": "circ", "value_type": "circular"}})
+    st._process_leaf(taxon_dir, {"circ": {"id": "circ", "value_type": "circular"}})
+    assert (taxon_dir / st.CIRCULAR_STATS_FILE).exists()
+    assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
 def test_process_leaf_no_gis_cols(tmp_path):
@@ -470,7 +475,7 @@ def test_process_nonleaf_continuous(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
     st._process_nonleaf(FAKE_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
     assert (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-    assert (taxon_dir / st.NUMERICAL_DENSITY_FILE).exists()
+    assert (taxon_dir / st.DENSITY_FILE).exists()
 
 
 def test_process_nonleaf_nominal(tmp_path, monkeypatch):
@@ -492,14 +497,14 @@ def test_process_nonleaf_no_descendants(tmp_path, monkeypatch):
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
-def test_process_nonleaf_skips_unimplemented_type(tmp_path, monkeypatch):
+def test_process_nonleaf_handles_circular_type(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
     child_dir = tmp_path / CHILD_TAXON["path"]
-    _make_occ_parquet(child_dir / st.OCCURRENCE_FILE, extra_cols={"circ": [45.0] * 20})
+    _make_occ_parquet(child_dir / st.OCCURRENCE_FILE, extra_cols={"circ": [float(v) for v in range(0, 360, 18)]})
     taxon_dir = tmp_path / FAKE_TAXON["path"]
     monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
-    # should NOT raise — streaming silently skips unimplemented types
     st._process_nonleaf(FAKE_TAXON, taxon_dir, {"circ": {"id": "circ", "value_type": "circular"}})
+    assert (taxon_dir / st.CIRCULAR_STATS_FILE).exists()
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -1268,14 +1273,17 @@ def test_compute_loc_stats_nominal_all_null(tmp_path, monkeypatch):
     assert result is None
 
 
-def test_compute_loc_stats_circular_type_returns_none(tmp_path, monkeypatch):
+def test_compute_loc_stats_circular_type_returns_stats(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
     leaf_dir = tmp_path / LEAF_TAXON["path"]
-    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "circ", [45.0] * 20)
+    _make_occ_with_location(leaf_dir / st.OCCURRENCE_FILE, "level0Gid", "USA", "circ", [float(v) for v in range(0, 360, 18)])
     result = st.compute_location_filtered_stats(
         LEAF_TAXON, "circ", "level0Gid", "USA", {"id": "circ", "value_type": "circular"},
     )
-    assert result is None
+    assert result is not None
+    assert result["type"] == "circular"
+    assert "circular_mean" in result["stats"]
+    assert "rbar" in result["stats"]
 
 
 def test_compute_loc_stats_gbif_region_col(tmp_path, monkeypatch):

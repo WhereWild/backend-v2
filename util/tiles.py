@@ -153,6 +153,43 @@ def tile_bounds_wgs84(z: int, x: int, y: int) -> tuple[float, float, float, floa
 # Colorization
 # ---------------------------------------------------------------------------
 
+def _colorize_aspect(values: np.ndarray) -> np.ndarray:
+    """Colorize aspect (0–360°) with a cyclic HSV colormap.
+
+    Hue is rotated so N(0°/360°)=blue and S(180°)=yellow — placing the
+    ecologically meaningful cool/shaded vs. warm/sunny contrast at opposite
+    poles.  The mapping wraps cleanly: 359° and 1° render as nearly identical
+    blues.  NaN pixels (nodata) are fully transparent.
+    """
+    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return rgba
+
+    # hue = (0.667 - aspect/360) % 1:
+    #   N=0°  → 0.667 (blue)      E=90°  → 0.417 (cyan-green)
+    #   S=180° → 0.167 (yellow)   W=270° → 0.917 (magenta)
+    h = (0.667 - values[finite] / 360.0) % 1.0
+    s = np.full_like(h, 0.75)
+    v = np.full_like(h, 0.92)
+
+    i = np.floor(h * 6.0).astype(np.int32) % 6
+    f = h * 6.0 - np.floor(h * 6.0)
+    p = v * (1.0 - s)
+    q = v * (1.0 - f * s)
+    t = v * (1.0 - (1.0 - f) * s)
+
+    r = np.select([i==0, i==1, i==2, i==3, i==4], [v, q, p, p, t], default=v)
+    g = np.select([i==0, i==1, i==2, i==3, i==4], [t, v, v, q, p], default=p)
+    b = np.select([i==0, i==1, i==2, i==3, i==4], [p, p, t, v, v], default=q)
+
+    rgba[finite, 0] = (r * 255).astype(np.uint8)
+    rgba[finite, 1] = (g * 255).astype(np.uint8)
+    rgba[finite, 2] = (b * 255).astype(np.uint8)
+    rgba[finite, 3] = 200
+    return rgba
+
+
 def _colorize(values: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     rgba   = np.zeros((*values.shape, 4), dtype=np.uint8)
     finite = np.isfinite(values)
@@ -264,9 +301,15 @@ def _render_derived_elevation_tile_bytes(
                 src_window = window_from_bounds(rl0, rb0, rl1, rb1, ds.transform)
                 src_px_w = ds.width  * (rl1 - rl0) / (db.right - db.left)
                 src_px_h = ds.height * (rb1 - rb0) / (db.top   - db.bottom)
-                # Read at native resolution (slope needs actual pixel values, not overviews)
-                read_w = max(1, round(src_px_w))
-                read_h = max(1, round(src_px_h))
+                overviews = ds.overviews(1) or []
+                if overviews and src_px_w > tile_size:
+                    desired = src_px_w / tile_size
+                    factor  = min(overviews, key=lambda f: abs(f - desired))
+                    read_w  = max(1, round(src_px_w / factor))
+                    read_h  = max(1, round(src_px_h / factor))
+                else:
+                    read_w = max(1, round(src_px_w))
+                    read_h = max(1, round(src_px_h))
                 raw = ds.read(1, window=src_window, out_shape=(read_h, read_w),
                               resampling=Resampling.bilinear).astype(np.float32)
                 if ds.nodata is not None:
@@ -285,7 +328,10 @@ def _render_derived_elevation_tile_bytes(
                     resampling=Resampling.bilinear,
                 )
 
-    rgba = _colorize(dest, vmin or 0.0, vmax or 90.0)
+    if layer["id"] == "aspect":
+        rgba = _colorize_aspect(dest)
+    else:
+        rgba = _colorize(dest, vmin or 0.0, vmax or 90.0)
     img  = Image.fromarray(rgba, mode="RGBA")
     buf  = io.BytesIO()
     img.save(buf, format="PNG")
@@ -299,12 +345,13 @@ def render_layer_tile_bytes(
     y: int,
     tile_size: int = 256,
 ) -> bytes:
-    from util.gis import DERIVED_FROM_ELEVATION, derive_slope_array
+    from util.gis import DERIVED_FROM_ELEVATION, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
         return render_temporal_tile_bytes(layer_id, z, x, y, tile_size)
     if layer_id in DERIVED_FROM_ELEVATION:
-        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_slope_array)
+        derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
+        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn)
     path    = LAYERS_DIR / layer["filename"]
     scale   = layer.get("scale_factor") or 1.0
     offset  = layer.get("add_offset")   or 0.0

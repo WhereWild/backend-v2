@@ -1153,6 +1153,21 @@
           "add_offset": null,
           "render_min": 0.0,
           "render_max": 90.0
+        },
+        {
+          "id": "aspect",
+          "source": "fabdem",
+          "display_name": "Aspect",
+          "units": "°",
+          "value_type": "ratio",
+          "domain": "continuous",
+          "derived": true,
+          "filename": null,
+          "download_url": null,
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 0.0,
+          "render_max": 360.0
         }
       ]
     }

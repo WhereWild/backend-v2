@@ -140,13 +140,6 @@ _EARTH_B = 6356752.3142     # WGS84 semi-minor axis (m)
 # Layers derived on-the-fly from elevation.tif (no separate COG stored).
 DERIVED_FROM_ELEVATION: frozenset[str] = frozenset({"slope", "aspect"})
 
-# Aspect is undefined / noise-dominated below this slope.  When dzdx and dzdy
-# are both near zero, atan2 is chaotic: tiny float rounding differences can
-# flip the result by 90° or 180°, so a point lookup can disagree with the
-# batch-enriched value stored in the parquet even at identical coordinates.
-# Using 0.5° (vs the near-zero threshold common in the original) makes the
-# flat-terrain guard robust enough to prevent those mismatches in practice.
-_FLAT_SLOPE_THRESHOLD = 0.5  # degrees
 
 
 def _meters_per_degree(lat: float) -> tuple[float, float]:
@@ -223,19 +216,12 @@ def sample_slope_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]
 
 
 def _horn_aspect(w: np.ndarray, dx_m: float, dy_m: float) -> float | None:
-    """Compute aspect (°, N=0 clockwise) via Horn's method.
-
-    Returns None when slope is below _FLAT_SLOPE_THRESHOLD — aspect is
-    numerically meaningless on flat/near-flat terrain and the two sampling
-    paths (point vs batch) can disagree by an arbitrary amount there.
-    """
+    """Compute aspect (°, N=0 clockwise) via Horn's method."""
     z1, z2, z3 = w[0, 0], w[0, 1], w[0, 2]
     z4, z6     = w[1, 0],           w[1, 2]
     z7, z8, z9 = w[2, 0], w[2, 1], w[2, 2]
     dzdx = ((z3 + 2*z6 + z9) - (z1 + 2*z4 + z7)) / (8.0 * dx_m)
     dzdy = ((z7 + 2*z8 + z9) - (z1 + 2*z2 + z3)) / (8.0 * dy_m)
-    if np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2))) < _FLAT_SLOPE_THRESHOLD:
-        return None
     raw = np.degrees(np.arctan2(dzdy, -dzdx))
     return float((90.0 - raw) % 360.0)
 
@@ -250,8 +236,7 @@ def sample_aspect_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None
     """Compute aspect (°, N=0 clockwise) for many points with a single file open.
 
     Points should be pre-sorted by Hilbert index for cache locality.
-    Returns None for flat terrain (slope < _FLAT_SLOPE_THRESHOLD), out-of-bounds,
-    or nodata — consistent with what derive_aspect_array writes to tiles.
+    Returns None for out-of-bounds or nodata pixels.
     """
     elev_path = LAYERS_DIR / "elevation.tif"
     results: list[float | None] = [None] * len(lats)
@@ -344,11 +329,9 @@ def derive_aspect_array(dem: np.ndarray, transform) -> np.ndarray:
     dy_m = pixel_deg_y * m_per_deg_lat
 
     dz_dy, dz_dx = np.gradient(filled, dy_m, dx_m)
-    slope = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy)))
     raw = np.degrees(np.arctan2(dz_dy, -dz_dx))
     aspect = ((90.0 - raw) % 360.0).astype(np.float32)
     aspect[~finite] = np.nan
-    aspect[slope < _FLAT_SLOPE_THRESHOLD] = np.nan
     return aspect
 
 

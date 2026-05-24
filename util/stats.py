@@ -14,6 +14,7 @@ Outputs per taxon directory:
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import tempfile
@@ -40,6 +41,7 @@ OCCURRENCE_INDEX_FILE = "occurrence_index.parquet"
 NUMERICAL_STATS_FILE = "numerical_stats.parquet"
 NOMINAL_STATS_FILE = "nominal_stats.parquet"
 NUMERICAL_DENSITY_FILE = "numerical_density.parquet"
+PHENOLOGY_COUNTS_FILE = "phenology_counts.json"
 
 _KDE_MAX_SAMPLES = 20_000
 _KDE_N_POINTS = 128
@@ -53,7 +55,7 @@ def apply_phenology_filter(df: pd.DataFrame, phenology: str) -> pd.DataFrame:
     mask = df["rcs"].apply(
         lambda val: isinstance(val, str) and pheno_lower in {v.strip().lower() for v in val.split("|")}
     )
-    return df[mask]
+    return df.loc[mask]
 
 
 def apply_timestamp_filter(
@@ -97,6 +99,37 @@ def _layer_value_type(layer: dict) -> ValueType | None:
 
 def _is_discrete(layer: dict) -> bool:
     return layer.get("domain") == "discrete"
+
+
+def compute_phenology_counts(df: pd.DataFrame) -> Counter:
+    """Count occurrences per phenology value from the pipe-separated rcs column."""
+    counts: Counter = Counter()
+    if "rcs" not in df.columns:
+        return counts
+    for val in df["rcs"].dropna():
+        if isinstance(val, str):
+            for part in val.split("|"):
+                part = part.strip().lower()
+                if part:
+                    counts[part] += 1
+    return counts
+
+
+def write_phenology_counts(taxon_dir: Path, counts: Counter) -> None:
+    if not counts:
+        return
+    taxon_dir.mkdir(parents=True, exist_ok=True)
+    (taxon_dir / PHENOLOGY_COUNTS_FILE).write_text(json.dumps(dict(counts)))
+
+
+def read_phenology_counts(taxon_dir: Path) -> dict[str, int]:
+    p = taxon_dir / PHENOLOGY_COUNTS_FILE
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
 
 
 def _filter_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -401,6 +434,7 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_numerical_density(taxon_dir, density_rows)
     _write_index_from_df(taxon_dir, df)
+    write_phenology_counts(taxon_dir, compute_phenology_counts(df))
 
 
 def process_observations_df(directory: Path, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:
@@ -584,6 +618,7 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
     continuous_acc: dict[str, dict] = {}
     # nominal_acc: layer_id → {counts, unique}
     nominal_acc: dict[str, dict] = {}
+    pheno_acc: Counter = Counter()
     # index accumulation: deduplicated rows for occurrence_index.parquet
     for desc in iter_descendants(taxon, include_self=True):
         occ_path = TREE_ROOT / desc["path"] / OCCURRENCE_FILE
@@ -630,6 +665,8 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
 
                 case _:
                     continue  # skip unimplemented types in streaming
+
+        pheno_acc.update(compute_phenology_counts(df))
 
     numerical_stats: dict[str, dict] = {}
     nominal_entries: list[dict] = []
@@ -698,6 +735,7 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
     _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats)
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_numerical_density(taxon_dir, density_rows)
+    write_phenology_counts(taxon_dir, pheno_acc)
 
 
 def _build_nonleaf_index_from_children(taxon: TaxonRecord, taxon_dir: Path) -> None:

@@ -637,7 +637,10 @@ def _ancestor_gids(gid: str, by_gid: dict[str, dict]) -> set[str]:
             break
         seen.add(current)
         chain.add(current.lower())
-        current = by_gid.get(current, {}).get("parent_gid")
+        rec = by_gid.get(current)
+        if rec and rec.get("name"):
+            chain.add(rec["name"].lower())
+        current = rec.get("parent_gid") if rec else None
     return chain
 
 

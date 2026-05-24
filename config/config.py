@@ -30,7 +30,7 @@ METRICS_BY_TYPE: dict[ValueType, tuple[str, ...]] = {
     ValueType.INTERVAL:  _CONTINUOUS_METRICS,
     ValueType.NOMINAL:   _NOMINAL_METRICS,
     ValueType.ORDINAL:   (),
-    ValueType.CIRCULAR:  (),
+    ValueType.CIRCULAR:  ("count", "unique_samples", "circular_mean", "rbar", "circular_var", "circular_std", "mode"),
     ValueType.AGGREGATE: (),
 }
 

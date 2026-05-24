@@ -164,9 +164,12 @@ def test_metrics_for_vtype_nominal():
     assert "mean" not in metrics
 
 
-def test_metrics_for_vtype_circular_raises():
-    with pytest.raises(NotImplementedError):
-        rk._metrics_for_vtype(_CIRCULAR_LAYER, ValueType.CIRCULAR)
+def test_metrics_for_vtype_circular_returns_full_tuple():
+    metrics = rk._metrics_for_vtype(_CIRCULAR_LAYER, ValueType.CIRCULAR)
+    assert "rbar" in metrics
+    assert "circular_mean" in metrics
+    assert "circular_std" in metrics
+    assert "count" in metrics
 
 
 def test_metrics_for_vtype_ordinal_empty():

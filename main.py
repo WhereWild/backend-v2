@@ -20,8 +20,9 @@ from config.config import load_config
 from util import citations, gis, taxa, tiles, upload
 from util.rankings import POSITION_FILE
 from util.stats import (
+    CIRCULAR_STATS_FILE,
+    DENSITY_FILE,
     NOMINAL_STATS_FILE,
-    NUMERICAL_DENSITY_FILE,
     NUMERICAL_STATS_FILE,
     OCCURRENCE_INDEX_FILE,
     TREE_ROOT,
@@ -273,6 +274,13 @@ def get_taxon_env_stats(taxon_id: str):
             var = row.pop("variable")
             numerical_stats[var] = row
 
+    circular_stats: dict[str, dict] = {}
+    circ_path = taxon_dir / CIRCULAR_STATS_FILE
+    if circ_path.exists():
+        for row in pq.read_table(circ_path).to_pylist():
+            var = row.pop("variable")
+            circular_stats[var] = row
+
     nominal_stats: dict[str, dict] = {}
     nominal_classes: dict[str, list] = {}
     nom_path = taxon_dir / NOMINAL_STATS_FILE
@@ -288,13 +296,13 @@ def get_taxon_env_stats(taxon_id: str):
             nominal_classes[var].sort(key=lambda e: -e["fraction"])
 
     density_by_var: dict[str, dict] = {}
-    den_path = taxon_dir / NUMERICAL_DENSITY_FILE
+    den_path = taxon_dir / DENSITY_FILE
     if den_path.exists():
         for row in pq.read_table(den_path).to_pylist():
             var = row.pop("variable")
             density_by_var[var] = row
 
-    all_var_ids = list(dict.fromkeys(list(numerical_stats) + list(nominal_stats)))
+    all_var_ids = list(dict.fromkeys(list(numerical_stats) + list(circular_stats) + list(nominal_stats)))
     variables = []
     for var_id in all_var_ids:
         layer = layer_index.get(var_id, {})
@@ -307,6 +315,10 @@ def get_taxon_env_stats(taxon_id: str):
         }
         if var_id in numerical_stats:
             entry["stats"] = numerical_stats[var_id]
+            entry["density"] = density_by_var.get(var_id)
+            entry["classes"] = None
+        elif var_id in circular_stats:
+            entry["stats"] = circular_stats[var_id]
             entry["density"] = density_by_var.get(var_id)
             entry["classes"] = None
         else:
@@ -524,6 +536,23 @@ def get_species_environment(
                         "categorical_distribution": None,
                         "relative_ranks": [],
                     }
+                if result["type"] == "circular":
+                    stats = result["stats"]
+                    return {
+                        "species_id": taxon.get("taxon_key"),
+                        "variable": variable_id,
+                        "variable_metadata": variable_metadata,
+                        "observation_count": result["observation_count"],
+                        "summary": {
+                            "count": stats["count"],
+                            "circular_mean": stats.get("circular_mean"),
+                            "rbar": stats.get("rbar"),
+                            "circular_std": stats.get("circular_std"),
+                        },
+                        "density_curve": result["density_curve"],
+                        "categorical_distribution": None,
+                        "relative_ranks": [],
+                    }
                 total_samples = result["observation_count"]
                 class_index = {c["id"]: c for c in _load_legend(variable_id)}
                 categorical_distribution = [
@@ -586,6 +615,37 @@ def get_species_environment(
             "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
         }
 
+    if value_type == "circular":
+        circ_path = taxon_dir / CIRCULAR_STATS_FILE
+        if not circ_path.exists():
+            raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
+        row = next((r for r in pq.read_table(circ_path).to_pylist() if r["variable"] == variable_id), None)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
+        count = int(row.get("count") or 0)
+        summary = {
+            "count": count,
+            "circular_mean": row.get("circular_mean"),
+            "rbar": row.get("rbar"),
+            "circular_std": row.get("circular_std"),
+        }
+        density_curve = None
+        den_path = taxon_dir / DENSITY_FILE
+        if den_path.exists():
+            den_row = next((r for r in pq.read_table(den_path).to_pylist() if r["variable"] == variable_id), None)
+            if den_row:
+                density_curve = {"points": den_row["points"], "density": den_row["density"]}
+        return {
+            "species_id": taxon.get("taxon_key"),
+            "variable": variable_id,
+            "variable_metadata": variable_metadata,
+            "observation_count": count,
+            "summary": summary,
+            "density_curve": density_curve,
+            "categorical_distribution": None,
+            "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
+        }
+
     num_path = taxon_dir / NUMERICAL_STATS_FILE
     if not num_path.exists():
         raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
@@ -605,7 +665,7 @@ def get_species_environment(
     }
 
     density_curve = None
-    den_path = taxon_dir / NUMERICAL_DENSITY_FILE
+    den_path = taxon_dir / DENSITY_FILE
     if den_path.exists():
         den_row = next((r for r in pq.read_table(den_path).to_pylist() if r["variable"] == variable_id), None)
         if den_row:
@@ -898,7 +958,7 @@ def get_species_environment_slice(
         raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
     if layer.get("value_type") == "nominal":
         raise HTTPException(status_code=400, detail="Categorical variables must use the class samples endpoint")
-    circular_wrap = variable_id == "aspect_deg" and max_value < min_value
+    circular_wrap = variable_id == "aspect" and max_value < min_value
     if max_value < min_value and not circular_wrap:
         min_value, max_value = max_value, min_value
     if location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None:
@@ -996,6 +1056,11 @@ _METRIC_LABELS: dict[str, str] = {
     "min": "Minimum",
     "max": "Maximum",
     "std": "Standard deviation",
+    "circular_mean": "Directional mean",
+    "mode": "Mode",
+    "rbar": "Concentration (R̄)",
+    "circular_std": "Circular std dev",
+    "circular_var": "Circular variance",
 }
 _METRIC_ORDER = ["mean", "median", "min", "max", "std"]
 _METRIC_RANK = {m: i for i, m in enumerate(_METRIC_ORDER)}
@@ -1067,6 +1132,8 @@ def query_taxa(
     include_species_like: bool = Query(False),
     location: str | None = Query(None),
     unit_system: str | None = Query(None),
+    sort_reference: float | None = Query(None, ge=0.0, lt=360.0),
+    min_rbar: float | None = Query(None, ge=0.0, le=1.0),
 ):
     normalized_q = normalize_name(q or "") or None
 
@@ -1093,6 +1160,8 @@ def query_taxa(
         min_samples=min_samples,
         include_species_like=include_species_like,
         location_gid=location,
+        reference_value=sort_reference,
+        min_rbar=min_rbar,
     )
 
     serialized: list[dict] = []

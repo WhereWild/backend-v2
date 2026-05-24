@@ -689,9 +689,10 @@ def _query_ranked_scoped(
     for tk, (pos, val, sc) in index_map.items():
         if candidate_keys is not None and tk not in candidate_keys:
             continue
-        if sc < min_samples:
-            continue
         if loc_keys is not None and tk not in loc_keys:
+            continue
+        effective_sc = loc_counts.get(tk, 0) if loc_counts else sc
+        if effective_sc < min_samples:
             continue
         if accepted_ranks is not None:
             taxon = get_taxon_by_id(tk)
@@ -757,7 +758,8 @@ def _query_ranked_text(
         if val is None:
             continue
         sc = _infer_sample_count(taxon_dir)
-        if sc < min_samples:
+        effective_sc = loc_counts.get(tk, 0) if loc_counts else sc
+        if effective_sc < min_samples:
             continue
         enriched.append((taxon, score, val, sc))
 
@@ -821,7 +823,8 @@ def _query_text(
         if accepted_ranks is not None and taxon.get("rank") not in accepted_ranks:
             continue
         sc = _infer_sample_count(TREE_ROOT / taxon["path"])
-        if sc < min_samples:
+        effective_sc = loc_counts.get(tk, 0) if loc_counts else sc
+        if effective_sc < min_samples:
             continue
         filtered.append((taxon, score, sc))
 
@@ -902,9 +905,10 @@ def _query_catalog(
     for row in rows:
         tk = str(row.get("taxon_key") or "")
         sc = int(row.get("sample_count") or 0)
-        if sc < min_samples:
-            continue
         if loc_keys is not None and tk not in loc_keys:
+            continue
+        effective_sc = loc_counts.get(tk, 0) if loc_counts else sc
+        if effective_sc < min_samples:
             continue
         taxon = get_taxon_by_id(tk)
         if taxon is None:

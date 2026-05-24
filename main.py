@@ -898,7 +898,7 @@ def get_species_environment_slice(
         raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
     if layer.get("value_type") == "nominal":
         raise HTTPException(status_code=400, detail="Categorical variables must use the class samples endpoint")
-    circular_wrap = variable_id == "aspect_deg" and max_value < min_value
+    circular_wrap = variable_id == "aspect" and max_value < min_value
     if max_value < min_value and not circular_wrap:
         min_value, max_value = max_value, min_value
     if location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None:

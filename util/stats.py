@@ -55,6 +55,23 @@ def apply_phenology_filter(df: pd.DataFrame, phenology: str) -> pd.DataFrame:
     )
     return df[mask]
 
+
+def apply_timestamp_filter(
+    df: pd.DataFrame,
+    start_ts: int | None,
+    end_ts: int | None,
+) -> pd.DataFrame:
+    """Keep rows whose eventTimestamp falls within [start_ts, end_ts]."""
+    if "eventTimestamp" not in df.columns:
+        return df
+    col = pd.to_numeric(df["eventTimestamp"], errors="coerce")
+    if start_ts is not None:
+        df = df[col >= start_ts]
+        col = col[col >= start_ts]
+    if end_ts is not None:
+        df = df[col <= end_ts]
+    return df
+
 # Columns present in occurrence.parquet that are NOT GIS layer values and should
 # be stripped from the slice index (quality-filter cols are applied then dropped).
 _INDEX_STRIP_COLS = frozenset([
@@ -487,8 +504,10 @@ def compute_location_filtered_stats(
     gid: str | None,
     layer: dict,
     phenology: str | None = None,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
 ) -> dict | None:
-    """Compute stats on the fly for variable_id, restricted by location and/or phenology."""
+    """Compute stats on the fly for variable_id, restricted by location, phenology, and/or timestamp."""
     df = collect_taxon_df(taxon)
     if df is None:
         return None
@@ -500,6 +519,10 @@ def compute_location_filtered_stats(
             return None
     if phenology is not None:
         df = apply_phenology_filter(df, phenology)
+        if df.empty:
+            return None
+    if start_ts is not None or end_ts is not None:
+        df = apply_timestamp_filter(df, start_ts, end_ts)
         if df.empty:
             return None
     if variable_id not in df.columns:

@@ -80,6 +80,11 @@ class GlobalConfig:
         default_factory=lambda: {0: "gadm_level0", 1: "gadm_level1", 2: "gadm_level2"}
     )
 
+    # Phenology filter values (must match rcs column in occurrence.parquet, pipe-separated)
+    phenology_values: tuple[str, ...] = (
+        "flower buds", "flowers", "fruits or seeds", "no flowers or fruits"
+    )
+
     # Taxonomy / occurrence
     occurrence_parquet_filename: str = "occurrence.parquet"
     data_root: str = "data"

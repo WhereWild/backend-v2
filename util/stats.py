@@ -44,6 +44,17 @@ NUMERICAL_DENSITY_FILE = "numerical_density.parquet"
 _KDE_MAX_SAMPLES = 20_000
 _KDE_N_POINTS = 128
 
+
+def apply_phenology_filter(df: pd.DataFrame, phenology: str) -> pd.DataFrame:
+    """Keep rows where the rcs column contains phenology (pipe-separated match)."""
+    if "rcs" not in df.columns:
+        return df.iloc[0:0]
+    pheno_lower = phenology.strip().lower()
+    mask = df["rcs"].apply(
+        lambda val: isinstance(val, str) and pheno_lower in {v.strip().lower() for v in val.split("|")}
+    )
+    return df[mask]
+
 # Columns present in occurrence.parquet that are NOT GIS layer values and should
 # be stripped from the slice index (quality-filter cols are applied then dropped).
 _INDEX_STRIP_COLS = frozenset([
@@ -472,19 +483,25 @@ def collect_taxon_df(taxon: TaxonRecord) -> pd.DataFrame | None:
 def compute_location_filtered_stats(
     taxon: TaxonRecord,
     variable_id: str,
-    filter_col: str,
-    gid: str,
+    filter_col: str | None,
+    gid: str | None,
     layer: dict,
+    phenology: str | None = None,
 ) -> dict | None:
-    """Compute stats on the fly for variable_id, restricted to observations where filter_col == gid."""
+    """Compute stats on the fly for variable_id, restricted by location and/or phenology."""
     df = collect_taxon_df(taxon)
     if df is None:
         return None
-    if filter_col not in df.columns:
-        return None
-    df = df[df[filter_col].astype(str) == str(gid)]
-    if df.empty:
-        return None
+    if filter_col is not None:
+        if filter_col not in df.columns:
+            return None
+        df = df[df[filter_col].astype(str) == str(gid)]
+        if df.empty:
+            return None
+    if phenology is not None:
+        df = apply_phenology_filter(df, phenology)
+        if df.empty:
+            return None
     if variable_id not in df.columns:
         return None
     vtype = _layer_value_type(layer)

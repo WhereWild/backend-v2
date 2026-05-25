@@ -1,256 +1,258 @@
 {
   "layer_id": "landcover",
-  "source": "GLC_FCS30 2020",
+  "source": "GLC_FCS30D v2 (Liu et al. 2025 / Zenodo 15063683)",
   "classes": [
     {
       "id": 10,
       "name": "Rainfed cropland",
-      "description": "Cropland under rainfed agricultural management.",
       "group": "cropland",
-      "group_label": "Cropland"
+      "group_label": "Cropland",
+      "traits": { "color": "#FFFF64" }
     },
     {
       "id": 11,
       "name": "Herbaceous cover cropland",
-      "description": "Rainfed cropland dominated by herbaceous cover.",
       "group": "cropland",
-      "group_label": "Cropland"
+      "group_label": "Cropland",
+      "traits": { "color": "#FFFF64" }
     },
     {
       "id": 12,
       "name": "Tree or shrub cover cropland (orchard)",
-      "description": "Orchards and croplands dominated by tree or shrub cover.",
       "group": "cropland",
-      "group_label": "Cropland"
+      "group_label": "Cropland",
+      "traits": { "color": "#FFFF00" }
     },
     {
       "id": 20,
       "name": "Irrigated cropland",
-      "description": "Cropland supported primarily by irrigation.",
       "group": "cropland",
-      "group_label": "Cropland"
+      "group_label": "Cropland",
+      "traits": { "color": "#AAF0F0" }
     },
     {
       "id": 51,
       "name": "Open evergreen broadleaved forest",
-      "description": "Evergreen broadleaved forest with relatively open canopy.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "sparse",
-        "phenology": "evergreen"
-      }
+      "traits": { "openness": "open", "phenology": "evergreen", "leaf": "broadleaved", "color": "#4C7300" }
     },
     {
       "id": 52,
       "name": "Closed evergreen broadleaved forest",
-      "description": "Evergreen broadleaved forest with closed canopy.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "dense",
-        "phenology": "evergreen"
-      }
+      "traits": { "openness": "closed", "phenology": "evergreen", "leaf": "broadleaved", "color": "#006400" }
     },
     {
       "id": 61,
       "name": "Open deciduous broadleaved forest",
-      "description": "Deciduous broadleaved forest with fractional cover between 0.15 and 0.4.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "sparse",
-        "phenology": "deciduous"
-      }
+      "traits": { "openness": "open", "phenology": "deciduous", "leaf": "broadleaved", "color": "#AAC800" }
     },
     {
       "id": 62,
       "name": "Closed deciduous broadleaved forest",
-      "description": "Deciduous broadleaved forest with fractional cover above 0.4.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "dense",
-        "phenology": "deciduous"
-      }
+      "traits": { "openness": "closed", "phenology": "deciduous", "leaf": "broadleaved", "color": "#00A000" }
     },
     {
       "id": 71,
       "name": "Open evergreen needle-leaved forest",
-      "description": "Evergreen needle-leaved forest with fractional cover between 0.15 and 0.4.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "sparse",
-        "phenology": "evergreen"
-      }
+      "traits": { "openness": "open", "phenology": "evergreen", "leaf": "needle-leaved", "color": "#005000" }
     },
     {
       "id": 72,
       "name": "Closed evergreen needle-leaved forest",
-      "description": "Evergreen needle-leaved forest with fractional cover above 0.4.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "dense",
-        "phenology": "evergreen"
-      }
+      "traits": { "openness": "closed", "phenology": "evergreen", "leaf": "needle-leaved", "color": "#003C00" }
     },
     {
       "id": 81,
       "name": "Open deciduous needle-leaved forest",
-      "description": "Deciduous needle-leaved forest with fractional cover between 0.15 and 0.4.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "sparse",
-        "phenology": "deciduous"
-      }
+      "traits": { "openness": "open", "phenology": "deciduous", "leaf": "needle-leaved", "color": "#286400" }
     },
     {
       "id": 82,
       "name": "Closed deciduous needle-leaved forest",
-      "description": "Deciduous needle-leaved forest with fractional cover above 0.4.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "dense",
-        "phenology": "deciduous"
-      }
+      "traits": { "openness": "closed", "phenology": "deciduous", "leaf": "needle-leaved", "color": "#285000" }
     },
     {
       "id": 91,
       "name": "Open mixed leaf forest",
-      "description": "Mixed broadleaved and needle-leaved forest with open canopy.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "sparse",
-        "phenology": "mixed"
-      }
+      "traits": { "openness": "open", "phenology": "mixed", "leaf": "mixed", "color": "#A0B432" }
     },
     {
       "id": 92,
       "name": "Closed mixed leaf forest",
-      "description": "Mixed broadleaved and needle-leaved forest with closed canopy.",
       "group": "forest",
       "group_label": "Forest",
-      "traits": {
-        "openness": "dense",
-        "phenology": "mixed"
-      }
+      "traits": { "openness": "closed", "phenology": "mixed", "leaf": "mixed", "color": "#788200" }
     },
     {
       "id": 120,
       "name": "Shrubland",
-      "description": "Shrub-dominated vegetation.",
       "group": "shrubland",
-      "group_label": "Shrubland"
+      "group_label": "Shrubland",
+      "traits": { "color": "#966400" }
     },
     {
       "id": 121,
       "name": "Evergreen shrubland",
-      "description": "Shrubland dominated by evergreen species.",
       "group": "shrubland",
-      "group_label": "Shrubland"
+      "group_label": "Shrubland",
+      "traits": { "phenology": "evergreen", "color": "#964B00" }
     },
     {
       "id": 122,
       "name": "Deciduous shrubland",
-      "description": "Shrubland dominated by deciduous species.",
       "group": "shrubland",
-      "group_label": "Shrubland"
+      "group_label": "Shrubland",
+      "traits": { "phenology": "deciduous", "color": "#966400" }
     },
     {
       "id": 130,
       "name": "Grassland",
-      "description": "Areas dominated by grasses and herbaceous plants.",
       "group": "grassland",
-      "group_label": "Grassland"
+      "group_label": "Grassland",
+      "traits": { "color": "#FFB432" }
     },
     {
       "id": 140,
       "name": "Lichens and mosses",
-      "description": "Areas dominated by lichen and moss cover.",
       "group": "lichens_mosses",
-      "group_label": "Lichens and Mosses"
+      "group_label": "Lichens and Mosses",
+      "traits": { "color": "#FFDCD2" }
     },
     {
       "id": 150,
       "name": "Sparse vegetation",
-      "description": "Vegetation with fractional cover less than 0.15.",
       "group": "sparse_vegetation",
-      "group_label": "Sparse Vegetation"
+      "group_label": "Sparse Vegetation",
+      "traits": { "color": "#FFEBAF" }
     },
     {
       "id": 152,
       "name": "Sparse shrubland",
-      "description": "Shrubland with fractional cover less than 0.15.",
       "group": "sparse_vegetation",
-      "group_label": "Sparse Vegetation"
+      "group_label": "Sparse Vegetation",
+      "traits": { "color": "#FFD278" }
     },
     {
       "id": 153,
       "name": "Sparse herbaceous",
-      "description": "Herbaceous vegetation with fractional cover less than 0.15.",
       "group": "sparse_vegetation",
-      "group_label": "Sparse Vegetation"
+      "group_label": "Sparse Vegetation",
+      "traits": { "color": "#FFEBAF" }
     },
     {
-      "id": 180,
-      "name": "Wetlands",
-      "description": "Marshes, swamps, peatlands, or other wetlands.",
+      "id": 181,
+      "name": "Swamp",
       "group": "wetlands",
-      "group_label": "Wetlands"
+      "group_label": "Wetlands",
+      "traits": { "color": "#00A884" }
+    },
+    {
+      "id": 182,
+      "name": "Marsh",
+      "group": "wetlands",
+      "group_label": "Wetlands",
+      "traits": { "color": "#73FFDF" }
+    },
+    {
+      "id": 183,
+      "name": "Flooded flat",
+      "group": "wetlands",
+      "group_label": "Wetlands",
+      "traits": { "color": "#9EBBD7" }
+    },
+    {
+      "id": 184,
+      "name": "Saline",
+      "group": "wetlands",
+      "group_label": "Wetlands",
+      "traits": { "color": "#828282" }
+    },
+    {
+      "id": 185,
+      "name": "Mangrove",
+      "group": "wetlands",
+      "group_label": "Wetlands",
+      "traits": { "color": "#F57AB6" }
+    },
+    {
+      "id": 186,
+      "name": "Salt marsh",
+      "group": "wetlands",
+      "group_label": "Wetlands",
+      "traits": { "color": "#66CDAB" }
+    },
+    {
+      "id": 187,
+      "name": "Tidal flat",
+      "group": "wetlands",
+      "group_label": "Wetlands",
+      "traits": { "color": "#444F89" }
     },
     {
       "id": 190,
-      "name": "Urban",
-      "description": "Built-up or impervious urban surfaces.",
+      "name": "Urban / Impervious surfaces",
       "group": "urban",
-      "group_label": "Urban"
+      "group_label": "Urban",
+      "traits": { "color": "#C31400" }
     },
     {
       "id": 200,
       "name": "Bare areas",
-      "description": "General bare ground with minimal vegetation.",
       "group": "bare_areas",
-      "group_label": "Bare Areas"
+      "group_label": "Bare Areas",
+      "traits": { "color": "#FFF5D7" }
     },
     {
       "id": 201,
       "name": "Consolidated bare areas",
-      "description": "Bare areas with consolidated surfaces such as rock or pavement.",
       "group": "bare_areas",
-      "group_label": "Bare Areas"
+      "group_label": "Bare Areas",
+      "traits": { "color": "#DCDCDC" }
     },
     {
       "id": 202,
       "name": "Unconsolidated bare areas",
-      "description": "Bare areas composed of unconsolidated materials like sand.",
       "group": "bare_areas",
-      "group_label": "Bare Areas"
+      "group_label": "Bare Areas",
+      "traits": { "color": "#FFF5D7" }
     },
     {
       "id": 210,
       "name": "Water body",
-      "description": "Lakes, reservoirs, rivers, or other surface water.",
       "group": "water",
-      "group_label": "Water"
+      "group_label": "Water",
+      "traits": { "color": "#0046C8" }
     },
     {
       "id": 220,
       "name": "Permanent ice and snow",
-      "description": "Glaciers or perennial snow and ice.",
       "group": "ice_snow",
-      "group_label": "Ice and Snow"
+      "group_label": "Ice and Snow",
+      "traits": { "color": "#FFFFFF" }
     },
     {
       "id": 250,
       "name": "Filled value",
-      "description": "Landcover data not present.",
       "group": "filled",
-      "group_label": "Filled"
+      "group_label": "Filled",
+      "traits": { "color": "#FFFFFF" }
     }
   ]
 }

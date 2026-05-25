@@ -1,6 +1,6 @@
 {
   "layer_id": "kg0",
-  "source": "Karger et al. 2021 / CHELSA v2.1 \u2014 kg0 variant (As/Aw distinction)",
+  "source": "Karger et al. 2021 / CHELSA v2.1 — kg0 variant (As/Aw distinction)",
   "classes": [
     {
       "id": 1,
@@ -44,17 +44,6 @@
     },
     {
       "id": 5,
-      "name": "Arid, hot desert",
-      "group": "desert",
-      "group_label": "Desert",
-      "traits": {
-        "thermal": "hot",
-        "code": "BWH",
-        "color": "#FF0000"
-      }
-    },
-    {
-      "id": 6,
       "name": "Arid, cold desert",
       "group": "desert",
       "group_label": "Desert",
@@ -65,18 +54,18 @@
       }
     },
     {
-      "id": 7,
-      "name": "Arid, hot steppe",
-      "group": "steppe",
-      "group_label": "Steppe",
+      "id": 6,
+      "name": "Arid, hot desert",
+      "group": "desert",
+      "group_label": "Desert",
       "traits": {
         "thermal": "hot",
-        "code": "BSH",
-        "color": "#F5A500"
+        "code": "BWH",
+        "color": "#FF0000"
       }
     },
     {
-      "id": 8,
+      "id": 7,
       "name": "Arid, cold steppe",
       "group": "steppe",
       "group_label": "Steppe",
@@ -87,73 +76,18 @@
       }
     },
     {
+      "id": 8,
+      "name": "Arid, hot steppe",
+      "group": "steppe",
+      "group_label": "Steppe",
+      "traits": {
+        "thermal": "hot",
+        "code": "BSH",
+        "color": "#F5A500"
+      }
+    },
+    {
       "id": 9,
-      "name": "Temperate, Mediterranean hot summer",
-      "group": "mediterranean",
-      "group_label": "Mediterranean",
-      "traits": {
-        "thermal": "hot",
-        "code": "CSA",
-        "color": "#FFFF00"
-      }
-    },
-    {
-      "id": 10,
-      "name": "Temperate, Mediterranean warm summer",
-      "group": "mediterranean",
-      "group_label": "Mediterranean",
-      "traits": {
-        "thermal": "warm",
-        "code": "CSB",
-        "color": "#C8C800"
-      }
-    },
-    {
-      "id": 11,
-      "name": "Temperate, Mediterranean cold summer",
-      "group": "mediterranean",
-      "group_label": "Mediterranean",
-      "traits": {
-        "thermal": "cool",
-        "code": "CSC",
-        "color": "#969600"
-      }
-    },
-    {
-      "id": 12,
-      "name": "Temperate, dry winter hot summer",
-      "group": "temperate",
-      "group_label": "Temperate",
-      "traits": {
-        "thermal": "hot",
-        "code": "CWA",
-        "color": "#96FF96"
-      }
-    },
-    {
-      "id": 13,
-      "name": "Temperate, dry winter warm summer",
-      "group": "highland",
-      "group_label": "Highland",
-      "traits": {
-        "thermal": "warm",
-        "code": "CWB",
-        "color": "#64C864"
-      }
-    },
-    {
-      "id": 14,
-      "name": "Temperate, dry winter cold summer",
-      "group": "highland",
-      "group_label": "Highland",
-      "traits": {
-        "thermal": "cool",
-        "code": "CWC",
-        "color": "#329632"
-      }
-    },
-    {
-      "id": 15,
       "name": "Temperate, humid subtropical",
       "group": "temperate",
       "group_label": "Temperate",
@@ -164,7 +98,7 @@
       }
     },
     {
-      "id": 16,
+      "id": 10,
       "name": "Temperate, oceanic",
       "group": "temperate",
       "group_label": "Temperate",
@@ -175,7 +109,7 @@
       }
     },
     {
-      "id": 17,
+      "id": 11,
       "name": "Temperate, subpolar oceanic",
       "group": "temperate",
       "group_label": "Temperate",
@@ -186,95 +120,73 @@
       }
     },
     {
+      "id": 12,
+      "name": "Temperate, Mediterranean hot summer",
+      "group": "mediterranean",
+      "group_label": "Mediterranean",
+      "traits": {
+        "thermal": "hot",
+        "code": "CSA",
+        "color": "#FFFF00"
+      }
+    },
+    {
+      "id": 13,
+      "name": "Temperate, Mediterranean warm summer",
+      "group": "mediterranean",
+      "group_label": "Mediterranean",
+      "traits": {
+        "thermal": "warm",
+        "code": "CSB",
+        "color": "#C8C800"
+      }
+    },
+    {
+      "id": 14,
+      "name": "Temperate, Mediterranean cold summer",
+      "group": "mediterranean",
+      "group_label": "Mediterranean",
+      "traits": {
+        "thermal": "cool",
+        "code": "CSC",
+        "color": "#969600"
+      }
+    },
+    {
+      "id": 15,
+      "name": "Temperate, dry winter hot summer",
+      "group": "temperate",
+      "group_label": "Temperate",
+      "traits": {
+        "thermal": "hot",
+        "code": "CWA",
+        "color": "#96FF96"
+      }
+    },
+    {
+      "id": 16,
+      "name": "Temperate, dry winter warm summer",
+      "group": "highland",
+      "group_label": "Highland",
+      "traits": {
+        "thermal": "warm",
+        "code": "CWB",
+        "color": "#64C864"
+      }
+    },
+    {
+      "id": 17,
+      "name": "Temperate, dry winter cold summer",
+      "group": "highland",
+      "group_label": "Highland",
+      "traits": {
+        "thermal": "cool",
+        "code": "CWC",
+        "color": "#329632"
+      }
+    },
+    {
       "id": 18,
-      "name": "Continental, dry summer hot",
-      "group": "interior",
-      "group_label": "Interior",
-      "traits": {
-        "thermal": "hot",
-        "code": "DSA",
-        "color": "#FF00FF"
-      }
-    },
-    {
-      "id": 19,
-      "name": "Continental, dry summer warm",
-      "group": "interior",
-      "group_label": "Interior",
-      "traits": {
-        "thermal": "warm",
-        "code": "DSB",
-        "color": "#C800C8"
-      }
-    },
-    {
-      "id": 20,
-      "name": "Continental, dry summer cold",
-      "group": "interior",
-      "group_label": "Interior",
-      "traits": {
-        "thermal": "cool",
-        "code": "DSC",
-        "color": "#963296"
-      }
-    },
-    {
-      "id": 21,
-      "name": "Continental, dry summer severe winter",
-      "group": "interior",
-      "group_label": "Interior",
-      "traits": {
-        "thermal": "severe-winter",
-        "code": "DSD",
-        "color": "#966496"
-      }
-    },
-    {
-      "id": 22,
-      "name": "Continental, dry winter hot summer",
-      "group": "continental",
-      "group_label": "Continental",
-      "traits": {
-        "thermal": "hot",
-        "code": "DWA",
-        "color": "#ABABFF"
-      }
-    },
-    {
-      "id": 23,
-      "name": "Continental, dry winter warm summer",
-      "group": "continental",
-      "group_label": "Continental",
-      "traits": {
-        "thermal": "warm",
-        "code": "DWB",
-        "color": "#8282FF"
-      }
-    },
-    {
-      "id": 24,
-      "name": "Continental, dry winter cold summer",
-      "group": "subpolar",
-      "group_label": "Subpolar",
-      "traits": {
-        "thermal": "cool",
-        "code": "DWC",
-        "color": "#5959FF"
-      }
-    },
-    {
-      "id": 25,
-      "name": "Continental, dry winter severe",
-      "group": "subpolar",
-      "group_label": "Subpolar",
-      "traits": {
-        "thermal": "severe-winter",
-        "code": "DWD",
-        "color": "#2F2FFF"
-      }
-    },
-    {
-      "id": 26,
       "name": "Continental, humid hot summer",
       "group": "continental",
       "group_label": "Continental",
@@ -285,7 +197,7 @@
       }
     },
     {
-      "id": 27,
+      "id": 19,
       "name": "Continental, humid warm summer",
       "group": "continental",
       "group_label": "Continental",
@@ -296,7 +208,7 @@
       }
     },
     {
-      "id": 28,
+      "id": 20,
       "name": "Continental, subarctic",
       "group": "subpolar",
       "group_label": "Subpolar",
@@ -307,7 +219,7 @@
       }
     },
     {
-      "id": 29,
+      "id": 21,
       "name": "Continental, subarctic severe winter",
       "group": "subpolar",
       "group_label": "Subpolar",
@@ -315,6 +227,94 @@
         "thermal": "severe-winter",
         "code": "DFD",
         "color": "#3232C8"
+      }
+    },
+    {
+      "id": 22,
+      "name": "Continental, dry summer hot",
+      "group": "interior",
+      "group_label": "Interior",
+      "traits": {
+        "thermal": "hot",
+        "code": "DSA",
+        "color": "#FF00FF"
+      }
+    },
+    {
+      "id": 23,
+      "name": "Continental, dry summer warm",
+      "group": "interior",
+      "group_label": "Interior",
+      "traits": {
+        "thermal": "warm",
+        "code": "DSB",
+        "color": "#C800C8"
+      }
+    },
+    {
+      "id": 24,
+      "name": "Continental, dry summer cold",
+      "group": "interior",
+      "group_label": "Interior",
+      "traits": {
+        "thermal": "cool",
+        "code": "DSC",
+        "color": "#963296"
+      }
+    },
+    {
+      "id": 25,
+      "name": "Continental, dry summer severe winter",
+      "group": "interior",
+      "group_label": "Interior",
+      "traits": {
+        "thermal": "severe-winter",
+        "code": "DSD",
+        "color": "#966496"
+      }
+    },
+    {
+      "id": 26,
+      "name": "Continental, dry winter hot summer",
+      "group": "continental",
+      "group_label": "Continental",
+      "traits": {
+        "thermal": "hot",
+        "code": "DWA",
+        "color": "#ABABFF"
+      }
+    },
+    {
+      "id": 27,
+      "name": "Continental, dry winter warm summer",
+      "group": "continental",
+      "group_label": "Continental",
+      "traits": {
+        "thermal": "warm",
+        "code": "DWB",
+        "color": "#8282FF"
+      }
+    },
+    {
+      "id": 28,
+      "name": "Continental, dry winter cold summer",
+      "group": "subpolar",
+      "group_label": "Subpolar",
+      "traits": {
+        "thermal": "cool",
+        "code": "DWC",
+        "color": "#5959FF"
+      }
+    },
+    {
+      "id": 29,
+      "name": "Continental, dry winter severe",
+      "group": "subpolar",
+      "group_label": "Subpolar",
+      "traits": {
+        "thermal": "severe-winter",
+        "code": "DWD",
+        "color": "#2F2FFF"
       }
     },
     {

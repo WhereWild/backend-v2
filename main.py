@@ -1098,6 +1098,21 @@ def list_taxa_ranking_options(
 
     variable_order = {v["id"]: i for i, v in enumerate(tiles.load_layers())}
 
+    legend_cache: dict[str, dict[int, str]] = {}
+
+    def _class_label(variable: str, metric: str) -> str:
+        if variable not in legend_cache:
+            legend_cache[variable] = {
+                int(c["id"]): c.get("name", str(c["id"]))
+                for c in _load_legend(variable)
+                if "id" in c
+            }
+        try:
+            class_id = int(metric[6:])
+        except (ValueError, IndexError):
+            return metric
+        return legend_cache[variable].get(class_id, metric)
+
     options = []
     for col in schema.names:
         if "::" not in col:
@@ -1107,11 +1122,13 @@ def list_taxa_ranking_options(
             continue
         variable, metric = col.split("::", 1)
         if metric.startswith("class_"):
-            continue
+            label = _class_label(variable, metric)
+        else:
+            label = _METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize())
         options.append({
             "variable": variable,
             "metric": metric,
-            "label": _METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize()),
+            "label": label,
             "column": col,
             "count": count,
         })

@@ -281,7 +281,9 @@ def _collect_entries_from_nominal_stats(
     for _, row in df.iterrows():
         variable = str(row.get("variable") or "")
         metric = str(row.get("metric") or "")
-        if variable not in nominal_ids or metric not in nominal_metrics:
+        if variable not in nominal_ids:
+            continue
+        if metric not in nominal_metrics and not metric.startswith("class_"):
             continue
         val = row.get("value")
         try:

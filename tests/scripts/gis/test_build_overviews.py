@@ -154,7 +154,7 @@ def test_build_cog_interval_uses_average(tmp_path):
     assert "nearest" not in calls_str.lower()
 
 
-def test_build_cog_nominal_uses_nearest(tmp_path):
+def test_build_cog_nominal_uses_mode(tmp_path):
     src = tmp_path / "src.tif"
     dst = tmp_path / "dst.tif"
     src.touch()
@@ -164,7 +164,8 @@ def test_build_cog_nominal_uses_nearest(tmp_path):
         bo._build_cog(src, dst, nominal=True, overview_factors=[2, 4])
 
     calls_str = " ".join(str(c) for c in mock_run.call_args_list)
-    assert "nearest" in calls_str.lower()
+    assert "mode" in calls_str.lower()
+    assert "nearest" not in calls_str.lower()
 
 
 def test_build_cog_cleans_up_base_tif_on_error(tmp_path):

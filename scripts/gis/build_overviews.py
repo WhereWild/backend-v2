@@ -93,7 +93,7 @@ def _has_required_overviews(existing: list[int], desired: list[int]) -> bool:
 
 
 def _build_cog(src_path: Path, dst_path: Path, *, nominal: bool, overview_factors: list[int]) -> None:
-    resampling = "nearest" if nominal else "average"
+    resampling = "mode" if nominal else "average"
     base_tif = dst_path.with_suffix(".base.tif")
     try:
         subprocess.run(

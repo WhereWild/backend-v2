@@ -190,6 +190,59 @@ def _colorize_aspect(values: np.ndarray) -> np.ndarray:
     return rgba
 
 
+_LEGEND_DIR = Path("config/gis/legends")
+
+
+@lru_cache(maxsize=16)
+def _load_nominal_colormap(layer_id: str) -> dict[int, tuple[int, int, int]]:
+    """Return {class_id: (R, G, B)} from the layer's legend file."""
+    path = _LEGEND_DIR / f"{layer_id}_legend.json"
+    if not path.exists():
+        return {}
+    colormap: dict[int, tuple[int, int, int]] = {}
+    for cls in json.loads(path.read_text()).get("classes", []):
+        hex_color = (cls.get("traits") or {}).get("color", "")
+        if hex_color.startswith("#") and len(hex_color) == 7:
+            colormap[int(cls["id"])] = (
+                int(hex_color[1:3], 16),
+                int(hex_color[3:5], 16),
+                int(hex_color[5:7], 16),
+            )
+    return colormap
+
+
+def _nominal_fallback_color(class_id: int) -> tuple[int, int, int]:
+    """Generate a stable color for a class ID not present in the legend."""
+    import colorsys
+    hue = ((class_id * 137) % 360) / 360.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.92)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+def _colorize_nominal(values: np.ndarray, colormap: dict[int, tuple[int, int, int]]) -> np.ndarray:
+    """Map integer class IDs to RGBA using legend colors (fully opaque)."""
+    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+    if not colormap:
+        return rgba
+    max_id = max(colormap.keys()) + 1
+    lut = np.zeros((max_id, 4), dtype=np.uint8)
+    for cid, (r, g, b) in colormap.items():
+        if 0 <= cid < max_id:
+            lut[cid] = [r, g, b, 255]
+    finite = np.isfinite(values)
+    ids    = np.where(finite, np.round(values).astype(np.int32), -1)
+    known  = finite & (ids >= 0) & (ids < max_id)
+    rgba[known] = lut[ids[known]]
+    # Fall back to generated colors for any finite class ID not in the legend
+    unknown = finite & ~known
+    if np.any(unknown):
+        for cid in np.unique(ids[unknown]):
+            r, g, b = _nominal_fallback_color(int(cid))
+            mask = unknown & (ids == cid)
+            rgba[mask] = [r, g, b, 255]
+    return rgba
+
+
 def _colorize(values: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     rgba   = np.zeros((*values.shape, 4), dtype=np.uint8)
     finite = np.isfinite(values)
@@ -439,7 +492,11 @@ def render_layer_tile_bytes(
     vmin = vmin if vmin is not None else 0.0
     vmax = vmax if vmax is not None else 1.0
 
-    rgba = _colorize(dest, vmin, vmax)
+    if nominal:
+        colormap = _load_nominal_colormap(layer_id)
+        rgba = _colorize_nominal(dest, colormap) if colormap else _colorize(dest, vmin, vmax)
+    else:
+        rgba = _colorize(dest, vmin, vmax)
     img  = Image.fromarray(rgba, mode="RGBA")
     buf  = io.BytesIO()
     img.save(buf, format="PNG")

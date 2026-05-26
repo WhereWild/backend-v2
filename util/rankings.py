@@ -281,7 +281,9 @@ def _collect_entries_from_nominal_stats(
     for _, row in df.iterrows():
         variable = str(row.get("variable") or "")
         metric = str(row.get("metric") or "")
-        if variable not in nominal_ids or metric not in nominal_metrics:
+        if variable not in nominal_ids:
+            continue
+        if metric not in nominal_metrics and not metric.startswith("class_"):
             continue
         val = row.get("value")
         try:
@@ -489,10 +491,13 @@ def _distribute_positions(ancestor: TaxonRecord, index_path: Path) -> None:
         variable, metric = col_name.split("::", 1)
         if metric in _ANGULAR_METRICS:
             continue  # bearings have no meaningful percentile position
+        is_class_metric = metric.startswith("class_")
         column = table.column(col_name).combine_chunks()
         col_len = min(column_lengths.get(col_name, len(column)), len(column))
         if col_len <= 0:
             continue
+        prev_value: float | None = None
+        min_rank_pos = 0
         for position in range(col_len):
             entry = column[position].as_py()
             if entry is None:
@@ -500,11 +505,21 @@ def _distribute_positions(ancestor: TaxonRecord, index_path: Path) -> None:
             taxon_key = entry.get("taxonKey")
             if taxon_key is None:
                 continue
+            value = entry.get("value")
+            # Track min-rank position: all tied values share the first position
+            # in their group rather than getting arbitrary alphabetical positions.
+            if value != prev_value:
+                min_rank_pos = position
+                prev_value = value
+            # Zero-class entries exist in the index for search but are meaningless
+            # on the species page (the species was never observed in that class).
+            if is_class_metric and value == 0.0:
+                continue
             sample_count = entry.get("sampleCount")
             rows_by_taxon.setdefault(str(taxon_key), []).append({
                 "variable": variable,
                 "metric": metric,
-                "position": position,
+                "position": min_rank_pos,
                 "count": col_len,
                 "sampleCount": int(sample_count) if sample_count is not None else None,
                 "contextTaxonId": context_taxon_id,
@@ -517,14 +532,9 @@ def _distribute_positions(ancestor: TaxonRecord, index_path: Path) -> None:
             continue
         positions_path = TREE_ROOT / taxon["path"] / POSITION_FILE
         existing = _load_existing_positions(positions_path)
-        existing_keys = {(r["variable"], r["metric"], r["contextTaxonId"]) for r in existing}
-        unique_new = [
-            r for r in new_rows
-            if (r["variable"], r["metric"], r["contextTaxonId"]) not in existing_keys
-        ]
-        if not unique_new:
-            continue
-        merged = existing + unique_new
+        # Keep rows from other ancestor contexts; replace rows from this context.
+        kept = [r for r in existing if r["contextTaxonId"] != context_taxon_id]
+        merged = kept + new_rows
         tbl = pa.Table.from_arrays(
             [
                 pa.array([r["variable"] for r in merged], type=pa.string()),

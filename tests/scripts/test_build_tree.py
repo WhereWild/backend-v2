@@ -359,14 +359,6 @@ def _make_multimedia_tsv(rows: list[dict]) -> str:
     return buf.getvalue()
 
 
-def _make_remote_zip(target_filename: str, content: bytes) -> bytes:
-    """Build a real ZIP in memory to use as a fake remote archive."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(target_filename, content)
-    return buf.getvalue()
-
-
 # ===========================================================================
 # Sync state helpers
 # ===========================================================================
@@ -638,55 +630,6 @@ def test_apply_mapping_no_inat_taxon_url(tmp_path, monkeypatch):
 
 
 # ===========================================================================
-# _range_get
-# ===========================================================================
-
-def test_range_get_sends_range_header():
-    resp = MagicMock()
-    resp.read.return_value = b"chunk"
-    with patch("scripts.build_tree.urlopen", return_value=_make_cm(resp)) as mock_uo:
-        result = build_tree._range_get("http://example.com/file.zip", 100, 199)
-    assert result == b"chunk"
-    req = mock_uo.call_args[0][0]
-    assert req.headers.get("Range") == "bytes=100-199"
-
-
-# ===========================================================================
-# _extract_file_from_remote_zip
-# ===========================================================================
-
-def _serve_zip(zip_bytes: bytes, monkeypatch):
-    """Make _range_get serve slices of zip_bytes, HEAD returns its length."""
-    monkeypatch.setattr(build_tree, "_range_get", lambda url, s, e: zip_bytes[s:e + 1])
-    return _head_urlopen(etag="", content_length=len(zip_bytes))
-
-
-def test_extract_file_from_remote_zip(monkeypatch):
-    target = "VernacularName.tsv"
-    content = b"taxonID\tvernacularName\n1\tOak\n"
-    zip_bytes = _make_remote_zip(target, content)
-    head_cm = _serve_zip(zip_bytes, monkeypatch)
-    with patch("scripts.build_tree.urlopen", return_value=head_cm):
-        result = build_tree._extract_file_from_remote_zip("http://x.com/b.zip", target)
-    assert result == content
-
-
-def test_extract_file_from_remote_zip_not_found(monkeypatch):
-    zip_bytes = _make_remote_zip("other.tsv", b"data")
-    head_cm = _serve_zip(zip_bytes, monkeypatch)
-    with patch("scripts.build_tree.urlopen", return_value=head_cm), \
-         pytest.raises(FileNotFoundError, match="VernacularName.tsv"):
-        build_tree._extract_file_from_remote_zip("http://x.com/b.zip", "VernacularName.tsv")
-
-
-def test_extract_file_from_remote_zip_no_eocd(monkeypatch):
-    monkeypatch.setattr(build_tree, "_range_get", lambda url, s, e: b"\x00" * (e - s + 1))
-    with patch("scripts.build_tree.urlopen", return_value=_head_urlopen(content_length=1000)), \
-         pytest.raises(ValueError, match="EOCD not found"):
-        build_tree._extract_file_from_remote_zip("http://x.com/b.zip", "x.tsv")
-
-
-# ===========================================================================
 # fetch_backbone_vernacular
 # ===========================================================================
 
@@ -704,6 +647,15 @@ def test_fetch_backbone_vernacular_cache_hit(tmp_path, monkeypatch):
     assert result == b"cached-tsv"
 
 
+def _mock_remote_zip(data: bytes):
+    """Context manager mock for RemoteZip that returns data from .read()."""
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=cm)
+    cm.__exit__ = MagicMock(return_value=False)
+    cm.read.return_value = data
+    return cm
+
+
 def test_fetch_backbone_vernacular_download(tmp_path, monkeypatch):
     cache = tmp_path / "gbif_vernacular.tsv"
     state_path = tmp_path / "sync_state.json"
@@ -711,9 +663,9 @@ def test_fetch_backbone_vernacular_download(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "BACKBONE_VERNACULAR_CACHE", cache)
     monkeypatch.setattr(build_tree, "SYNC_STATE_PATH", state_path)
     monkeypatch.setattr(build_tree, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(build_tree, "_extract_file_from_remote_zip", lambda url, fname: b"tsv-data")
 
-    with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("etag-new")):
+    with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("etag-new")), \
+         patch("scripts.build_tree.RemoteZip", return_value=_mock_remote_zip(b"tsv-data")):
         result = build_tree.fetch_backbone_vernacular()
 
     assert result == b"tsv-data"
@@ -727,9 +679,9 @@ def test_fetch_backbone_vernacular_no_etag_saved(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "BACKBONE_VERNACULAR_CACHE", cache)
     monkeypatch.setattr(build_tree, "SYNC_STATE_PATH", state_path)
     monkeypatch.setattr(build_tree, "CACHE_DIR", tmp_path)
-    monkeypatch.setattr(build_tree, "_extract_file_from_remote_zip", lambda url, fname: b"data")
 
-    with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("")):
+    with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("")), \
+         patch("scripts.build_tree.RemoteZip", return_value=_mock_remote_zip(b"data")):
         build_tree.fetch_backbone_vernacular()
 
     assert "gbif_backbone" not in json.loads(state_path.read_text())

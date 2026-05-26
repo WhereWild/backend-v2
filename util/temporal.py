@@ -1573,7 +1573,11 @@ def save_raster_state(
 
     final = compute_raster_final(var_id, agg, sums, meta["n_era5"], meta["n_gfs"])
     np.save(npy_path, final)
+    meta_out = dict(meta)
+    if agg != "mode":
+        meta_out["render_min"] = float(np.nanmin(final)) if np.any(np.isfinite(final)) else 0.0
+        meta_out["render_max"] = float(np.nanmax(final)) if np.any(np.isfinite(final)) else 1.0
     with open(meta_path, "w") as fh:
-        json.dump(meta, fh, indent=2)
+        json.dump(meta_out, fh, indent=2)
     np.savez(sums_path, **{str(k): v for k, v in sums.items()})
 

@@ -153,39 +153,34 @@ def tile_bounds_wgs84(z: int, x: int, y: int) -> tuple[float, float, float, floa
 # Colorization
 # ---------------------------------------------------------------------------
 
-def _colorize_aspect(values: np.ndarray) -> np.ndarray:
-    """Colorize aspect (0–360°) with a cyclic HSV colormap.
+# 4-stop cyclic ramp peaking exactly at cardinal directions:
+# N=0°→red, E=90°→yellow, S=180°→green, W=270°→blue
+_ASPECT_STOPS = np.array(
+    [[220, 50, 50], [240, 195, 15], [45, 175, 65], [40, 95, 220]],
+    dtype=np.float32,
+)
 
-    Hue is rotated so N(0°/360°)=blue and S(180°)=yellow — placing the
-    ecologically meaningful cool/shaded vs. warm/sunny contrast at opposite
-    poles.  The mapping wraps cleanly: 359° and 1° render as nearly identical
-    blues.  NaN pixels (nodata) are fully transparent.
+
+def _colorize_aspect(values: np.ndarray) -> np.ndarray:
+    """Colorize aspect (0–360°) with a 4-stop cyclic ramp.
+
+    Cardinal peaks: N=red, E=yellow, S=green, W=blue.
+    Blends linearly between stops so transitions are unambiguous.
+    NaN pixels (nodata) are fully transparent.
     """
     rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
     finite = np.isfinite(values)
     if not np.any(finite):
         return rgba
 
-    # hue = (0.667 - aspect/360) % 1:
-    #   N=0°  → 0.667 (blue)      E=90°  → 0.417 (cyan-green)
-    #   S=180° → 0.167 (yellow)   W=270° → 0.917 (magenta)
-    h = (0.667 - values[finite] / 360.0) % 1.0
-    s = np.full_like(h, 0.75)
-    v = np.full_like(h, 0.92)
+    t = (values[finite] % 360.0) / 90.0  # [0, 4)
+    seg = np.floor(t).astype(np.int32) % 4
+    frac = (t - np.floor(t))[:, np.newaxis]
+    rgb = _ASPECT_STOPS[seg] + frac * (_ASPECT_STOPS[(seg + 1) % 4] - _ASPECT_STOPS[seg])
 
-    i = np.floor(h * 6.0).astype(np.int32) % 6
-    f = h * 6.0 - np.floor(h * 6.0)
-    p = v * (1.0 - s)
-    q = v * (1.0 - f * s)
-    t = v * (1.0 - (1.0 - f) * s)
-
-    r = np.select([i==0, i==1, i==2, i==3, i==4], [v, q, p, p, t], default=v)
-    g = np.select([i==0, i==1, i==2, i==3, i==4], [t, v, v, q, p], default=p)
-    b = np.select([i==0, i==1, i==2, i==3, i==4], [p, p, t, v, v], default=q)
-
-    rgba[finite, 0] = (r * 255).astype(np.uint8)
-    rgba[finite, 1] = (g * 255).astype(np.uint8)
-    rgba[finite, 2] = (b * 255).astype(np.uint8)
+    rgba[finite, 0] = rgb[:, 0].astype(np.uint8)
+    rgba[finite, 1] = rgb[:, 1].astype(np.uint8)
+    rgba[finite, 2] = rgb[:, 2].astype(np.uint8)
     rgba[finite, 3] = 200
     return rgba
 
@@ -323,6 +318,73 @@ def render_temporal_tile_bytes(
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def nominal_tile_range_classes(
+    layer_id: str, z: int, x0: int, y0: int, x1: int, y1: int
+) -> dict[int, int]:
+    """Return nominal class pixel counts visible across a viewport tile range.
+
+    Uses the same per-tile overview-selection logic as render_layer_tile_bytes so
+    the read scale exactly matches what was rendered.  Returns {} for non-nominal layers.
+    Keys are class IDs; values are total pixel counts across all tiles in the range.
+    """
+    layer = get_layer(layer_id)
+    if str(layer.get("value_type") or "").lower() != "nominal":
+        return {}
+
+    path = LAYERS_DIR / layer["filename"]
+    counts: dict[int, int] = {}
+
+    with rasterio.open(path) as ds:
+        db = ds.bounds
+        overviews = ds.overviews(1) or []
+
+        for tx in range(x0, x1 + 1):
+            for ty in range(y0, y1 + 1):
+                lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, tx, ty)
+                rl0 = max(lon0, db.left)
+                rl1 = min(lon1, db.right)
+                rb0 = max(lat0, db.bottom)
+                rb1 = min(lat1, db.top)
+                if rl0 >= rl1 or rb0 >= rb1:
+                    continue
+
+                src_window = window_from_bounds(rl0, rb0, rl1, rb1, ds.transform)
+                src_px_w = ds.width  * (rl1 - rl0) / (db.right - db.left)
+                src_px_h = ds.height * (rb1 - rb0) / (db.top   - db.bottom)
+
+                if overviews and src_px_w > 256:
+                    desired = src_px_w / 256
+                    factor  = min(overviews, key=lambda f: abs(f - desired))
+                    read_w  = max(1, round(src_px_w / factor))
+                    read_h  = max(1, round(src_px_h / factor))
+                else:
+                    read_w = max(1, round(src_px_w))
+                    read_h = max(1, round(src_px_h))
+
+                raw = ds.read(
+                    1,
+                    window=src_window,
+                    out_shape=(read_h, read_w),
+                    resampling=Resampling.nearest,
+                )
+
+                if np.issubdtype(raw.dtype, np.integer):
+                    dtype_max = int(np.iinfo(raw.dtype).max)
+                    nd_int = round(ds.nodata) if ds.nodata is not None else dtype_max
+                    mask = (raw != nd_int) & (raw < dtype_max - 3)
+                else:
+                    mask = np.isfinite(raw)
+                    if ds.nodata is not None:
+                        mask &= raw != ds.nodata
+
+                vals, tile_counts = np.unique(raw[mask], return_counts=True)
+                for v, c in zip(vals.tolist(), tile_counts.tolist()):
+                    k = int(v)
+                    counts[k] = counts.get(k, 0) + int(c)
+
+    return counts
 
 
 def _render_derived_elevation_tile_bytes(

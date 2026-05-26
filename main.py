@@ -159,6 +159,8 @@ def list_variables():
             "category": category.get("display_name", "Other"),
             "source_ids": [layer["source"]] if layer.get("source") else None,
             "legend_classes": legend_classes,
+            "render_min": layer.get("render_min"),
+            "render_max": layer.get("render_max"),
         })
     return result
 

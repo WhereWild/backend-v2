@@ -320,6 +320,73 @@ def render_temporal_tile_bytes(
     return buf.getvalue()
 
 
+def nominal_tile_range_classes(
+    layer_id: str, z: int, x0: int, y0: int, x1: int, y1: int
+) -> dict[int, int]:
+    """Return nominal class pixel counts visible across a viewport tile range.
+
+    Uses the same per-tile overview-selection logic as render_layer_tile_bytes so
+    the read scale exactly matches what was rendered.  Returns {} for non-nominal layers.
+    Keys are class IDs; values are total pixel counts across all tiles in the range.
+    """
+    layer = get_layer(layer_id)
+    if str(layer.get("value_type") or "").lower() != "nominal":
+        return {}
+
+    path = LAYERS_DIR / layer["filename"]
+    counts: dict[int, int] = {}
+
+    with rasterio.open(path) as ds:
+        db = ds.bounds
+        overviews = ds.overviews(1) or []
+
+        for tx in range(x0, x1 + 1):
+            for ty in range(y0, y1 + 1):
+                lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, tx, ty)
+                rl0 = max(lon0, db.left)
+                rl1 = min(lon1, db.right)
+                rb0 = max(lat0, db.bottom)
+                rb1 = min(lat1, db.top)
+                if rl0 >= rl1 or rb0 >= rb1:
+                    continue
+
+                src_window = window_from_bounds(rl0, rb0, rl1, rb1, ds.transform)
+                src_px_w = ds.width  * (rl1 - rl0) / (db.right - db.left)
+                src_px_h = ds.height * (rb1 - rb0) / (db.top   - db.bottom)
+
+                if overviews and src_px_w > 256:
+                    desired = src_px_w / 256
+                    factor  = min(overviews, key=lambda f: abs(f - desired))
+                    read_w  = max(1, round(src_px_w / factor))
+                    read_h  = max(1, round(src_px_h / factor))
+                else:
+                    read_w = max(1, round(src_px_w))
+                    read_h = max(1, round(src_px_h))
+
+                raw = ds.read(
+                    1,
+                    window=src_window,
+                    out_shape=(read_h, read_w),
+                    resampling=Resampling.nearest,
+                )
+
+                if np.issubdtype(raw.dtype, np.integer):
+                    dtype_max = int(np.iinfo(raw.dtype).max)
+                    nd_int = round(ds.nodata) if ds.nodata is not None else dtype_max
+                    mask = (raw != nd_int) & (raw < dtype_max - 3)
+                else:
+                    mask = np.isfinite(raw)
+                    if ds.nodata is not None:
+                        mask &= raw != ds.nodata
+
+                vals, tile_counts = np.unique(raw[mask], return_counts=True)
+                for v, c in zip(vals.tolist(), tile_counts.tolist()):
+                    k = int(v)
+                    counts[k] = counts.get(k, 0) + int(c)
+
+    return counts
+
+
 def _render_derived_elevation_tile_bytes(
     layer: dict,
     z: int,

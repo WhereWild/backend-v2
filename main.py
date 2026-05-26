@@ -218,12 +218,14 @@ async def gis_point_value(
         value = await run_in_threadpool(gis.sample_point, layer, lat, lon)
 
     class_name: str | None = None
+    class_color: str | None = None
     if value is not None and layer.get("value_type") == "nominal":
         legend = _load_legend(variable)
         int_val = int(value) if value == int(value) else None
         for entry in legend:
             if entry.get("id") == int_val:
                 class_name = entry.get("name")
+                class_color = (entry.get("traits") or {}).get("color") or None
                 break
 
     return {
@@ -233,6 +235,7 @@ async def gis_point_value(
         "lon": lon,
         "value": value,
         "class_name": class_name,
+        "class_color": class_color,
     }
 
 

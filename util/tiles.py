@@ -153,39 +153,34 @@ def tile_bounds_wgs84(z: int, x: int, y: int) -> tuple[float, float, float, floa
 # Colorization
 # ---------------------------------------------------------------------------
 
-def _colorize_aspect(values: np.ndarray) -> np.ndarray:
-    """Colorize aspect (0–360°) with a cyclic HSV colormap.
+# 4-stop cyclic ramp peaking exactly at cardinal directions:
+# N=0°→red, E=90°→yellow, S=180°→green, W=270°→blue
+_ASPECT_STOPS = np.array(
+    [[220, 50, 50], [240, 195, 15], [45, 175, 65], [40, 95, 220]],
+    dtype=np.float32,
+)
 
-    Hue is rotated so N(0°/360°)=blue and S(180°)=yellow — placing the
-    ecologically meaningful cool/shaded vs. warm/sunny contrast at opposite
-    poles.  The mapping wraps cleanly: 359° and 1° render as nearly identical
-    blues.  NaN pixels (nodata) are fully transparent.
+
+def _colorize_aspect(values: np.ndarray) -> np.ndarray:
+    """Colorize aspect (0–360°) with a 4-stop cyclic ramp.
+
+    Cardinal peaks: N=red, E=yellow, S=green, W=blue.
+    Blends linearly between stops so transitions are unambiguous.
+    NaN pixels (nodata) are fully transparent.
     """
     rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
     finite = np.isfinite(values)
     if not np.any(finite):
         return rgba
 
-    # hue = (0.667 - aspect/360) % 1:
-    #   N=0°  → 0.667 (blue)      E=90°  → 0.417 (cyan-green)
-    #   S=180° → 0.167 (yellow)   W=270° → 0.917 (magenta)
-    h = (0.667 - values[finite] / 360.0) % 1.0
-    s = np.full_like(h, 0.75)
-    v = np.full_like(h, 0.92)
+    t = (values[finite] % 360.0) / 90.0  # [0, 4)
+    seg = np.floor(t).astype(np.int32) % 4
+    frac = (t - np.floor(t))[:, np.newaxis]
+    rgb = _ASPECT_STOPS[seg] + frac * (_ASPECT_STOPS[(seg + 1) % 4] - _ASPECT_STOPS[seg])
 
-    i = np.floor(h * 6.0).astype(np.int32) % 6
-    f = h * 6.0 - np.floor(h * 6.0)
-    p = v * (1.0 - s)
-    q = v * (1.0 - f * s)
-    t = v * (1.0 - (1.0 - f) * s)
-
-    r = np.select([i==0, i==1, i==2, i==3, i==4], [v, q, p, p, t], default=v)
-    g = np.select([i==0, i==1, i==2, i==3, i==4], [t, v, v, q, p], default=p)
-    b = np.select([i==0, i==1, i==2, i==3, i==4], [p, p, t, v, v], default=q)
-
-    rgba[finite, 0] = (r * 255).astype(np.uint8)
-    rgba[finite, 1] = (g * 255).astype(np.uint8)
-    rgba[finite, 2] = (b * 255).astype(np.uint8)
+    rgba[finite, 0] = rgb[:, 0].astype(np.uint8)
+    rgba[finite, 1] = rgb[:, 1].astype(np.uint8)
+    rgba[finite, 2] = rgb[:, 2].astype(np.uint8)
     rgba[finite, 3] = 200
     return rgba
 

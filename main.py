@@ -135,18 +135,32 @@ def data_sources():
 
 @app.get("/variables")
 def list_variables():
-    return [
-        {
+    result = []
+    for layer, category in tiles.load_layers_with_category():
+        value_type = _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous")
+        legend_classes = None
+        if value_type == "categorical":
+            raw = _load_legend(layer["id"])
+            if raw:
+                legend_classes = [
+                    {
+                        "id": cls["id"],
+                        "name": cls.get("name", str(cls["id"])),
+                        "color": cls.get("traits", {}).get("color") or None,
+                    }
+                    for cls in raw
+                ]
+        result.append({
             "id": layer["id"],
             "name": layer.get("display_name"),
             "units": layer.get("units") or None,
-            "value_type": _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous"),
+            "value_type": value_type,
             "domain": layer.get("domain") or None,
             "category": category.get("display_name", "Other"),
             "source_ids": [layer["source"]] if layer.get("source") else None,
-        }
-        for layer, category in tiles.load_layers_with_category()
-    ]
+            "legend_classes": legend_classes,
+        })
+    return result
 
 
 @app.get("/api/layers")
@@ -288,6 +302,8 @@ def get_taxon_env_stats(taxon_id: str):
         for row in pq.read_table(nom_path).to_pylist():
             var, metric, value = row["variable"], row["metric"], row["value"]
             if metric.startswith("class_"):
+                if not value:
+                    continue
                 class_id = int(metric[6:])
                 nominal_classes.setdefault(var, []).append({"class_id": class_id, "fraction": value})
             else:
@@ -592,8 +608,10 @@ def get_species_environment(
             m = r["metric"]
             if not m.startswith("class_"):
                 continue
-            class_id = int(m[6:])
             fraction = float(r["value"])
+            if not fraction:
+                continue
+            class_id = int(m[6:])
             info = class_index.get(class_id, {})
             categorical_distribution.append({
                 "value": class_id,

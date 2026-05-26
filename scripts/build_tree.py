@@ -27,16 +27,16 @@ import csv
 import io
 import json
 import pickle
-import struct
 import subprocess
 import sys
 import time
 import zipfile
-import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from remotezip import RemoteZip
 
 from config.config import load_config
 
@@ -367,54 +367,8 @@ def apply_mapping(catalog: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
-# GBIF backbone VernacularName.tsv via range requests
+# GBIF backbone VernacularName.tsv via remote ZIP range requests
 # ---------------------------------------------------------------------------
-
-def _range_get(url: str, start: int, end: int) -> bytes:
-    req = Request(url, headers={"Range": f"bytes={start}-{end}", "User-Agent": _UA})
-    with urlopen(req, timeout=60) as r:
-        return r.read()
-
-
-def _extract_file_from_remote_zip(url: str, filename: str) -> bytes:
-    """Extract a single file from a remote ZIP using HTTP range requests."""
-    req = Request(url, method="HEAD", headers={"User-Agent": _UA})
-    with urlopen(req, timeout=30) as r:
-        content_length = int(r.headers.get("Content-Length", 0))
-
-    tail_size = min(65536, content_length)
-    tail = _range_get(url, content_length - tail_size, content_length - 1)
-
-    eocd_rel = tail.rfind(b"PK\x05\x06")
-    if eocd_rel == -1:
-        raise ValueError("EOCD not found in remote zip")
-
-    cd_size = struct.unpack_from("<I", tail, eocd_rel + 12)[0]
-    cd_offset = struct.unpack_from("<I", tail, eocd_rel + 16)[0]
-
-    cd_data = _range_get(url, cd_offset, cd_offset + cd_size - 1)
-
-    pos = 0
-    while pos + 46 <= len(cd_data):
-        comp_size = struct.unpack_from("<I", cd_data, pos + 20)[0]
-        fname_len = struct.unpack_from("<H", cd_data, pos + 28)[0]
-        extra_len = struct.unpack_from("<H", cd_data, pos + 30)[0]
-        comment_len = struct.unpack_from("<H", cd_data, pos + 32)[0]
-        lh_offset = struct.unpack_from("<I", cd_data, pos + 42)[0]
-        fname = cd_data[pos + 46:pos + 46 + fname_len].decode("utf-8", errors="replace")
-
-        if fname == filename:
-            lh = _range_get(url, lh_offset, lh_offset + 29)
-            lh_fname_len = struct.unpack_from("<H", lh, 26)[0]
-            lh_extra_len = struct.unpack_from("<H", lh, 28)[0]
-            data_start = lh_offset + 30 + lh_fname_len + lh_extra_len
-            compressed = _range_get(url, data_start, data_start + comp_size - 1)
-            return zlib.decompress(compressed, -15)
-
-        pos += 46 + fname_len + extra_len + comment_len
-
-    raise FileNotFoundError(f"{filename!r} not found in {url}")
-
 
 def fetch_backbone_vernacular() -> bytes:
     state = _load_state()
@@ -430,7 +384,8 @@ def fetch_backbone_vernacular() -> bytes:
         return BACKBONE_VERNACULAR_CACHE.read_bytes()
 
     print(f"Fetching {BACKBONE_VERNACULAR_FILENAME} from GBIF backbone...")
-    data = _extract_file_from_remote_zip(BACKBONE_URL, BACKBONE_VERNACULAR_FILENAME)
+    with RemoteZip(BACKBONE_URL) as rz:
+        data = rz.read(BACKBONE_VERNACULAR_FILENAME)
     print(f"  {len(data) / 1_048_576:.1f} MB")
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)

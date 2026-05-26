@@ -135,18 +135,32 @@ def data_sources():
 
 @app.get("/variables")
 def list_variables():
-    return [
-        {
+    result = []
+    for layer, category in tiles.load_layers_with_category():
+        value_type = _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous")
+        legend_classes = None
+        if value_type == "categorical":
+            raw = _load_legend(layer["id"])
+            if raw:
+                legend_classes = [
+                    {
+                        "id": cls["id"],
+                        "name": cls.get("name", str(cls["id"])),
+                        "color": cls.get("traits", {}).get("color") or None,
+                    }
+                    for cls in raw
+                ]
+        result.append({
             "id": layer["id"],
             "name": layer.get("display_name"),
             "units": layer.get("units") or None,
-            "value_type": _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous"),
+            "value_type": value_type,
             "domain": layer.get("domain") or None,
             "category": category.get("display_name", "Other"),
             "source_ids": [layer["source"]] if layer.get("source") else None,
-        }
-        for layer, category in tiles.load_layers_with_category()
-    ]
+            "legend_classes": legend_classes,
+        })
+    return result
 
 
 @app.get("/api/layers")
@@ -288,6 +302,8 @@ def get_taxon_env_stats(taxon_id: str):
         for row in pq.read_table(nom_path).to_pylist():
             var, metric, value = row["variable"], row["metric"], row["value"]
             if metric.startswith("class_"):
+                if not value:
+                    continue
                 class_id = int(metric[6:])
                 nominal_classes.setdefault(var, []).append({"class_id": class_id, "fraction": value})
             else:
@@ -592,8 +608,10 @@ def get_species_environment(
             m = r["metric"]
             if not m.startswith("class_"):
                 continue
-            class_id = int(m[6:])
             fraction = float(r["value"])
+            if not fraction:
+                continue
+            class_id = int(m[6:])
             info = class_index.get(class_id, {})
             categorical_distribution.append({
                 "value": class_id,
@@ -609,7 +627,15 @@ def get_species_environment(
             "variable": variable_id,
             "variable_metadata": variable_metadata,
             "observation_count": total_samples,
-            "summary": {"count": total_samples, "min": None, "mean": None, "max": None},
+            "summary": {
+                "count": total_samples,
+                "min": None,
+                "mean": None,
+                "max": None,
+                "unique_classes": int(metrics["unique_classes"]) if "unique_classes" in metrics else None,
+                "entropy": float(metrics["entropy"]) if "entropy" in metrics else None,
+                "mode": int(metrics["mode"]) if "mode" in metrics else None,
+            },
             "density_curve": None,
             "categorical_distribution": categorical_distribution,
             "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
@@ -1090,6 +1116,21 @@ def list_taxa_ranking_options(
 
     variable_order = {v["id"]: i for i, v in enumerate(tiles.load_layers())}
 
+    legend_cache: dict[str, dict[int, str]] = {}
+
+    def _class_label(variable: str, metric: str) -> str:
+        if variable not in legend_cache:
+            legend_cache[variable] = {
+                int(c["id"]): c.get("name", str(c["id"]))
+                for c in _load_legend(variable)
+                if "id" in c
+            }
+        try:
+            class_id = int(metric[6:])
+        except (ValueError, IndexError):
+            return metric
+        return legend_cache[variable].get(class_id, metric)
+
     options = []
     for col in schema.names:
         if "::" not in col:
@@ -1099,11 +1140,13 @@ def list_taxa_ranking_options(
             continue
         variable, metric = col.split("::", 1)
         if metric.startswith("class_"):
-            continue
+            label = _class_label(variable, metric)
+        else:
+            label = _METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize())
         options.append({
             "variable": variable,
             "metric": metric,
-            "label": _METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize()),
+            "label": label,
             "column": col,
             "count": count,
         })

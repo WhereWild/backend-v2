@@ -1880,7 +1880,7 @@ def test_ranking_options_returns_options(tmp_path, monkeypatch):
     index_path = tmp_path / TAXON["path"] / "species_index.parquet"
     _write_rank_index_for_main(index_path, {
         "bio1::mean": [("2923970", 10.0, 100)],
-        "bio1::class_0": [("2923970", 1.0, 100)],  # skipped: class_ metric
+        "bio1::class_0": [("2923970", 1.0, 100)],
         "bio12::median": [("2923970", 5.0, 100)],
         "no_double_colon": [("2923970", 1.0, 100)],  # skipped: no ::
         "bio12::p10": [],  # skipped: count == 0
@@ -1899,9 +1899,11 @@ def test_ranking_options_returns_options(tmp_path, monkeypatch):
     variables = [o["variable"] for o in options]
     assert "bio1" in variables
     assert "bio12" in variables
-    # class_ metric excluded
-    assert all(not o["metric"].startswith("class_") for o in options)
-    # label populated
+    # class_ metrics are now included as sort options
+    class_options = [o for o in options if o["metric"].startswith("class_")]
+    assert len(class_options) == 1
+    assert class_options[0]["variable"] == "bio1"
+    # label populated for all options
     assert all(isinstance(o["label"], str) and o["label"] for o in options)
     assert all(o["count"] > 0 for o in options)
 

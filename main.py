@@ -105,7 +105,7 @@ def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"], expose_headers=["X-Nominal-Classes"])
 
 
 def _image_fields(taxon: dict) -> dict:
@@ -159,6 +159,8 @@ def list_variables():
             "category": category.get("display_name", "Other"),
             "source_ids": [layer["source"]] if layer.get("source") else None,
             "legend_classes": legend_classes,
+            "render_min": layer.get("render_min"),
+            "render_max": layer.get("render_max"),
         })
     return result
 
@@ -216,12 +218,14 @@ async def gis_point_value(
         value = await run_in_threadpool(gis.sample_point, layer, lat, lon)
 
     class_name: str | None = None
+    class_color: str | None = None
     if value is not None and layer.get("value_type") == "nominal":
         legend = _load_legend(variable)
         int_val = int(value) if value == int(value) else None
         for entry in legend:
             if entry.get("id") == int_val:
                 class_name = entry.get("name")
+                class_color = (entry.get("traits") or {}).get("color") or None
                 break
 
     return {
@@ -231,6 +235,7 @@ async def gis_point_value(
         "lon": lon,
         "value": value,
         "class_name": class_name,
+        "class_color": class_color,
     }
 
 
@@ -244,7 +249,7 @@ async def variable_tile_compat(variable_id: str, z: int, x: int, y: int, tile_si
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
 async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024)):
     try:
-        tiles.get_layer(layer_id)
+        layer = tiles.get_layer(layer_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Layer '{layer_id}' not found")
 
@@ -252,7 +257,33 @@ async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Que
         tiles.render_layer_tile_bytes,
         layer_id, z, x, y, tile_size,
     )
-    return Response(content=payload, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
+    headers: dict[str, str] = {"Cache-Control": "public, max-age=3600"}
+    if str(layer.get("value_type") or "").lower() == "nominal":
+        class_counts = await run_in_threadpool(tiles.nominal_tile_range_classes, layer_id, z, x, y, x, y)
+        if class_counts:
+            ordered = sorted(class_counts.items(), key=lambda kv: kv[1], reverse=True)
+            headers["X-Nominal-Classes"] = ",".join(f"{cls}:{cnt}" for cls, cnt in ordered)
+    return Response(content=payload, media_type="image/png", headers=headers)
+
+
+@app.get("/api/layers/{layer_id}/tile-range/classes")
+async def layer_tile_range_classes(
+    layer_id: str,
+    z: int = Query(...),
+    x0: int = Query(...),
+    y0: int = Query(...),
+    x1: int = Query(...),
+    y1: int = Query(...),
+):
+    try:
+        tiles.get_layer(layer_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Layer '{layer_id}' not found")
+    class_counts = await run_in_threadpool(
+        tiles.nominal_tile_range_classes, layer_id, z, x0, y0, x1, y1
+    )
+    ordered = sorted(class_counts.keys(), key=lambda k: class_counts[k], reverse=True)
+    return {"classes": ordered}
 
 
 @app.get("/api/taxon/{taxon_id}")

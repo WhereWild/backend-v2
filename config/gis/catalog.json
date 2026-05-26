@@ -927,6 +927,20 @@
           "add_offset": null,
           "render_min": 1.0,
           "render_max": 31.0
+        },
+        {
+          "id": "landcover",
+          "source": "glc_fcs30d_v2",
+          "display_name": "Land Cover",
+          "units": "",
+          "value_type": "nominal",
+          "zenodo_record_id": "15063683",
+          "download_url": null,
+          "filename": "landcover.tif",
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 10.0,
+          "render_max": 220.0
         }
       ]
     },

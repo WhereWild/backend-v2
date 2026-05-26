@@ -383,6 +383,18 @@ def _nominal_cat_entries(layer_id: str, layer: dict, counts: Counter, summary: d
     for cls_id, count in counts.items():
         fraction = count / total if total else 0.0
         entries.append({"variable": layer_id, "metric": f"class_{cls_id}", "value": fraction})
+    # Add zero entries for all legend classes not observed, so every class
+    # appears in the rank index and search results include this taxon when
+    # sorting by that class ascending.
+    legend_path = Path("config/gis/legends") / f"{layer_id}_legend.json"
+    if legend_path.exists():
+        try:
+            known_ids = {int(c["id"]) for c in json.loads(legend_path.read_text()).get("classes", [])}
+            for cls_id in known_ids:
+                if cls_id not in counts:
+                    entries.append({"variable": layer_id, "metric": f"class_{cls_id}", "value": 0.0})
+        except Exception:
+            pass
     return entries
 
 

@@ -193,6 +193,11 @@ def _load_nominal_colormap(layer_id: str) -> dict[int, tuple[int, int, int]]:
     """Return {class_id: (R, G, B)} from the layer's legend file."""
     path = _LEGEND_DIR / f"{layer_id}_legend.json"
     if not path.exists():
+        import re
+        base_id = re.sub(r'_(avg|sum|mode|snapshot)_\d+h$', '', layer_id, flags=re.IGNORECASE)
+        if base_id != layer_id:
+            path = _LEGEND_DIR / f"{base_id}_legend.json"
+    if not path.exists():
         return {}
     colormap: dict[int, tuple[int, int, int]] = {}
     for cls in json.loads(path.read_text()).get("classes", []):
@@ -260,6 +265,27 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
 # Tile renderer
 # ---------------------------------------------------------------------------
 
+def _load_temporal_meta(var_id: str, window_label: str) -> dict:
+    path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}.meta.json"
+    if path.exists():
+        import json as _json
+        return _json.loads(path.read_text())
+    return {}
+
+
+def get_layer_render_range(layer: dict) -> tuple[float | None, float | None]:
+    """Return (render_min, render_max) for a layer, falling back to meta.json for temporal layers."""
+    rmin = layer.get("render_min")
+    rmax = layer.get("render_max")
+    if (rmin is None or rmax is None) and layer.get("window_hours") is not None:
+        meta = _load_temporal_meta(layer["var_id"], layer["window_label"])
+        if rmin is None:
+            rmin = meta.get("render_min")
+        if rmax is None:
+            rmax = meta.get("render_max")
+    return rmin, rmax
+
+
 def render_temporal_tile_bytes(
     layer_id: str,
     z: int,
@@ -271,6 +297,7 @@ def render_temporal_tile_bytes(
     var_id = layer["var_id"]
     window_label = layer["window_label"]
     model = layer.get("model", "copernicus_era5")
+    nominal = str(layer.get("value_type") or "").lower() == "nominal"
 
     npy_path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}.npy"
     arr = _load_temporal_npy(npy_path)
@@ -280,11 +307,20 @@ def render_temporal_tile_bytes(
     vmax = layer.get("render_max")
 
     if arr is not None:
-        finite = np.isfinite(arr)
-        if vmin is None:
-            vmin = float(np.nanpercentile(arr[finite], 2)) if finite.any() else 0.0
-        if vmax is None:
-            vmax = float(np.nanpercentile(arr[finite], 98)) if finite.any() else 1.0
+        # Load pre-computed render range from meta.json if catalog doesn't have it
+        if not nominal and (vmin is None or vmax is None):
+            meta = _load_temporal_meta(var_id, window_label)
+            if vmin is None:
+                vmin = meta.get("render_min")
+            if vmax is None:
+                vmax = meta.get("render_max")
+        # Last-resort: compute from the array
+        if not nominal:
+            finite = np.isfinite(arr)
+            if vmin is None:
+                vmin = float(np.nanpercentile(arr[finite], 2)) if finite.any() else 0.0
+            if vmax is None:
+                vmax = float(np.nanpercentile(arr[finite], 98)) if finite.any() else 1.0
 
         # Detect grid from array shape (more reliable than catalog model field)
         shape_to_model = {(721, 1440): "copernicus_era5", (1801, 3600): "copernicus_era5_land"}
@@ -298,6 +334,7 @@ def render_temporal_tile_bytes(
         )
         mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
         dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+        resample = Resampling.nearest if nominal else Resampling.bilinear
         warp_reproject(
             source=arr_nu,
             destination=dest,
@@ -307,17 +344,67 @@ def render_temporal_tile_bytes(
             dst_transform=dst_transform,
             dst_crs=WEB_MERCATOR,
             dst_nodata=np.nan,
-            resampling=Resampling.bilinear,
+            resampling=resample,
         )
     else:
         vmin = vmin if vmin is not None else 0.0
         vmax = vmax if vmax is not None else 1.0
 
-    rgba = _colorize(dest, vmin, vmax)
+    if nominal:
+        colormap = _load_nominal_colormap(layer_id)
+        rgba = _colorize_nominal(dest, colormap) if colormap else _colorize(dest, vmin or 0.0, vmax or 1.0)
+    else:
+        rgba = _colorize(dest, vmin, vmax)
     img = Image.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+def _nominal_tile_range_classes_temporal(
+    layer: dict, z: int, x0: int, y0: int, x1: int, y1: int
+) -> dict[int, int]:
+    """Class-count variant for temporal .npy nominal layers (e.g. weather_code_simple)."""
+    var_id = layer["var_id"]
+    window_label = layer["window_label"]
+    model = layer.get("model", "copernicus_era5")
+
+    arr = _load_temporal_npy(TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}.npy")
+    if arr is None:
+        return {}
+
+    shape_to_model = {(721, 1440): "copernicus_era5", (1801, 3600): "copernicus_era5_land"}
+    detected = shape_to_model.get(arr.shape, model)
+    grid = _MODEL_GRID_PARAMS.get(detected, _MODEL_GRID_PARAMS["copernicus_era5"])
+    arr_nu = np.flipud(arr)
+    src_transform = from_bounds(
+        grid["lon_min"], grid["lat_min"], grid["lon_max"], grid["lat_max"],
+        grid["nx"], grid["ny"],
+    )
+    counts: dict[int, int] = {}
+    for tx in range(x0, x1 + 1):
+        for ty in range(y0, y1 + 1):
+            mx0, my0, mx1, my1 = tile_bounds_mercator(z, tx, ty)
+            dst_transform = from_bounds(mx0, my0, mx1, my1, 256, 256)
+            dest = np.full((256, 256), np.nan, dtype=np.float32)
+            warp_reproject(
+                source=arr_nu,
+                destination=dest,
+                src_transform=src_transform,
+                src_crs=WGS84,
+                src_nodata=np.nan,
+                dst_transform=dst_transform,
+                dst_crs=WEB_MERCATOR,
+                dst_nodata=np.nan,
+                resampling=Resampling.nearest,
+            )
+            finite = np.isfinite(dest)
+            if not finite.any():
+                continue
+            vals, tile_counts = np.unique(np.round(dest[finite]).astype(np.int32), return_counts=True)
+            for v, c in zip(vals.tolist(), tile_counts.tolist()):
+                counts[int(v)] = counts.get(int(v), 0) + int(c)
+    return counts
 
 
 def nominal_tile_range_classes(
@@ -332,6 +419,9 @@ def nominal_tile_range_classes(
     layer = get_layer(layer_id)
     if str(layer.get("value_type") or "").lower() != "nominal":
         return {}
+
+    if layer.get("window_hours") is not None:
+        return _nominal_tile_range_classes_temporal(layer, z, x0, y0, x1, y1)
 
     path = LAYERS_DIR / layer["filename"]
     counts: dict[int, int] = {}

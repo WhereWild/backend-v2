@@ -1,4 +1,21 @@
 {
+  "hengl_landform_2018": {
+    "name": "Global Landform and Lithology",
+    "url": "https://zenodo.org/records/1464846",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Hengl, T. (2018). Global landform and lithology class at 250 m based on the USGS global ecosystem map (1.0). Zenodo. https://doi.org/10.5281/zenodo.1464846",
+    "doi": "https://doi.org/10.5281/zenodo.1464846",
+    "references": [
+      {
+        "authors": "Hengl, T.",
+        "year": 2018,
+        "title": "Global landform and lithology class at 250 m based on the USGS global ecosystem map (1.0)",
+        "journal": "Zenodo",
+        "doi": "https://doi.org/10.5281/zenodo.1464846"
+      }
+    ]
+  },
   "gbif_occurrence": {
     "name": "GBIF Occurrence Download",
     "url": "https://www.gbif.org/occurrence/download",

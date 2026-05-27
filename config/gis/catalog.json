@@ -1184,6 +1184,41 @@
           "render_max": 360.0
         }
       ]
+    },
+    {
+      "id": "geology",
+      "display_name": "Geology & Landform",
+      "description": "Global landform morphology and lithology classifications at 250 m resolution, derived from the USGS Global Ecosystem Map (EcoTapestry).",
+      "layers": [
+        {
+          "id": "landform",
+          "source": "hengl_landform_2018",
+          "display_name": "Landform Class",
+          "units": "",
+          "value_type": "nominal",
+          "zenodo_record_id": "1464846",
+          "download_url": null,
+          "filename": "landform.tif",
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 1.0,
+          "render_max": 7.0
+        },
+        {
+          "id": "lithology",
+          "source": "hengl_landform_2018",
+          "display_name": "Lithology Class",
+          "units": "",
+          "value_type": "nominal",
+          "zenodo_record_id": "1464846",
+          "download_url": null,
+          "filename": "lithology.tif",
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 1.0,
+          "render_max": 15.0
+        }
+      ]
     }
   ]
 }

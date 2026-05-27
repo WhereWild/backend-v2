@@ -7,49 +7,56 @@
       "name": "Breaks / Foothills",
       "description": "Transitional terrain between plains and uplands, with irregular slopes and dissected surfaces typical of piedmont zones.",
       "group": "hills",
-      "group_label": "Hills"
+      "group_label": "Hills",
+      "traits": { "color": "#C9A96E" }
     },
     {
       "id": 2,
       "name": "Flat Plains",
       "description": "Nearly level lowlands with very gentle gradients, such as river floodplains, deltaic plains, and low-lying coastal areas.",
       "group": "plains",
-      "group_label": "Plains"
+      "group_label": "Plains",
+      "traits": { "color": "#D6E8A0" }
     },
     {
       "id": 3,
       "name": "High Mountains / Deep Canyons",
       "description": "Highest-relief terrain featuring rugged peaks, steep ridges, and deeply incised gorges, as in the Himalayas, Andes, or Rocky Mountains.",
       "group": "mountains",
-      "group_label": "Mountains"
+      "group_label": "Mountains",
+      "traits": { "color": "#6B4C2A" }
     },
     {
       "id": 4,
       "name": "Hills",
       "description": "Moderately rolling terrain with rounded summits and gentle to moderate slopes, common across much of temperate Europe and eastern North America.",
       "group": "hills",
-      "group_label": "Hills"
+      "group_label": "Hills",
+      "traits": { "color": "#A4BF6A" }
     },
     {
       "id": 5,
       "name": "Low Hills",
       "description": "Gently undulating landscape with low relief and subdued slopes, often seen on eroded ancient plateaus or at the margins of plains.",
       "group": "hills",
-      "group_label": "Hills"
+      "group_label": "Hills",
+      "traits": { "color": "#C4D88E" }
     },
     {
       "id": 6,
       "name": "Low Mountains",
       "description": "Upland terrain with distinct ridges and valleys but modest elevation, such as the Appalachians, Vosges, or Ural Mountains.",
       "group": "mountains",
-      "group_label": "Mountains"
+      "group_label": "Mountains",
+      "traits": { "color": "#9E7850" }
     },
     {
       "id": 7,
       "name": "Smooth Plains",
       "description": "Extensive, nearly featureless flatlands with very low relief, typical of interior continental basins, glacial outwash plains, and alluvial fans.",
       "group": "plains",
-      "group_label": "Plains"
+      "group_label": "Plains",
+      "traits": { "color": "#EAF0C0" }
     }
   ]
 }

@@ -162,6 +162,8 @@ def list_variables():
             "legend_classes": legend_classes,
             "render_min": rmin,
             "render_max": rmax,
+            "group": layer.get("group") or None,
+            "group_label": layer.get("group_label") or None,
         })
     return result
 

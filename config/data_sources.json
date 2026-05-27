@@ -1,4 +1,23 @@
 {
+  "soilgrids_2_0": {
+    "name": "SoilGrids 2.0",
+    "url": "https://soilgrids.org/",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Poggio, L., de Sousa, L.M., Batjes, N.H., Heuvelink, G.B.M., Kempen, B., Ribeiro, E., and Rossiter, D. (2021). SoilGrids 2.0: producing soil information for the globe with quantified spatial uncertainty. SOIL, 7, 217–240.",
+    "doi": "https://doi.org/10.5194/soil-7-217-2021",
+    "references": [
+      {
+        "authors": "Poggio, L., de Sousa, L.M., Batjes, N.H., Heuvelink, G.B.M., Kempen, B., Ribeiro, E., and Rossiter, D.",
+        "year": 2021,
+        "title": "SoilGrids 2.0: producing soil information for the globe with quantified spatial uncertainty",
+        "journal": "SOIL",
+        "volume_issue": "7",
+        "pages": "217-240",
+        "doi": "https://doi.org/10.5194/soil-7-217-2021"
+      }
+    ]
+  },
   "hengl_landform_2018": {
     "name": "Global Landform and Lithology",
     "url": "https://zenodo.org/records/1464846",

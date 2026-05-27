@@ -15,9 +15,9 @@ Usage (inside the gdal container):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
-import json
 from pathlib import Path
 
 CATALOG_PATH  = Path("config/gis/catalog.json")

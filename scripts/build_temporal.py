@@ -178,6 +178,11 @@ def _full_build(
     sums: dict[str, np.ndarray] = {}
     n_era5, n_gfs = 0, 0
 
+    # GFS starts one step AFTER era5_end_ts so the boundary hour is not counted
+    # in both ERA5 and GFS sums simultaneously.
+    resolution = next((c.resolution for c in list(era5_cidx.values()) + list(gfs_cidx.values()) if c is not None), 3600.0)
+    gfs_start = max(era5_end_ts + resolution, w_start)
+
     if agg == "mode":
         cc_cidx = era5_cidx.get("cloud_cover")
         pr_cidx = era5_cidx.get("precipitation")
@@ -210,7 +215,7 @@ def _full_build(
         gfs_cc = gfs_cidx.get("cloud_cover")
         gfs_pr = gfs_cidx.get("precipitation")
         gfs_sw = gfs_cidx.get("snowfall_water_equivalent")
-        gfs_mode_start = max(era5_end_ts, w_start)
+        gfs_mode_start = gfs_start
         if gfs_cc and gfs_pr and gfs_sw and gfs_mode_start < gfs_end_ts:
             gfs_counts = accumulate_raster_mode(
                 "ncep_gfs013", gfs_mode_start, gfs_end_ts,
@@ -243,8 +248,7 @@ def _full_build(
             print(f"  [{window_label}] {var_id}: no ERA5 data, skipping")
             return
 
-        # GFS portion: starts where ERA5 ends (or at w_start if w_start > era5_end)
-        gfs_start = max(era5_end_ts, w_start)
+        # GFS portion: starts one step after era5_end_ts (gfs_start computed above)
         dst_g = RASTER_GRIDS[era5_model]
         gfs_g = RASTER_GRIDS["ncep_gfs013"]
 
@@ -318,7 +322,7 @@ def _full_build(
     meta = {
         "var_id": var_id, "window_h": window_h, "window_label": window_label,
         "era5_window_start_ts": w_start, "era5_end_ts": era5_end_ts,
-        "gfs_start_ts": max(era5_end_ts, w_start),
+        "gfs_start_ts": gfs_start,
         "gfs_end_ts": gfs_end_ts,
         "n_era5": n_era5, "n_gfs": n_gfs,
         "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
@@ -369,7 +373,7 @@ def _incremental_update(
         resolution = cc_cidx.resolution
 
         def _mode_accumulate(start: float, end: float, use_gfs: bool) -> dict[int, np.ndarray] | None:
-            if end <= start:
+            if end < start:
                 return None
             model = "ncep_gfs013" if use_gfs else era5_model
             _cc = gfs_cidx.get("cloud_cover") if use_gfs else cc_cidx
@@ -402,7 +406,7 @@ def _incremental_update(
                         sums[c] = np.maximum(0, sums[c] + add[c] - sub[c])
                 n_era5 += swap_n
                 n_gfs -= swap_n
-                old_gfs_start = era5_end_ts
+                old_gfs_start = era5_end_ts + resolution
 
         # Drop oldest hours — new_w_start is the first point of the new window, so drop up to new_w_start - 1h
         if new_w_start > old_w_start:
@@ -437,14 +441,14 @@ def _incremental_update(
 
         def _accum_era5(rv: str, start: float, end: float) -> np.ndarray | None:
             cidx = era5_cidx.get(rv)
-            if not cidx or end <= start:
+            if not cidx or end < start:
                 return None
             acc, _ = accumulate_raster(era5_model, rv, start, end, cidx)
             return acc.astype(np.float32)
 
         def _accum_gfs_reproj(gv: str, start: float, end: float) -> np.ndarray | None:
             cidx = gfs_cidx.get(gv)
-            if not cidx or end <= start:
+            if not cidx or end < start:
                 return None
             acc, _ = accumulate_raster("ncep_gfs013", gv, start, end, cidx)
             return reproject_to_grid(
@@ -470,10 +474,10 @@ def _incremental_update(
                     if dropped is not None:
                         key = f"gfs_{gv}"
                         if key in sums:
-                            sums[key] = np.maximum(0.0, sums[key] - dropped)
+                            sums[key] = sums[key] - dropped
                 n_era5 += swap_n
                 n_gfs -= swap_n
-                old_gfs_start = era5_end_ts
+                old_gfs_start = era5_end_ts + resolution
 
         # Drop oldest hours — new_w_start is the first point of the new window, so drop up to new_w_start - 1h
         if new_w_start > old_w_start:
@@ -485,7 +489,7 @@ def _incremental_update(
                     if dropped is not None:
                         key = f"era5_{rv}"
                         if key in sums:
-                            sums[key] = np.maximum(0.0, sums[key] - dropped)
+                            sums[key] = sums[key] - dropped
                 n_era5 -= drop_n
 
             gfs_drop_start = max(old_w_start, old_gfs_start)
@@ -497,7 +501,7 @@ def _incremental_update(
                     if dropped is not None:
                         key = f"gfs_{gv}"
                         if key in sums:
-                            sums[key] = np.maximum(0.0, sums[key] - dropped)
+                            sums[key] = sums[key] - dropped
                 n_gfs -= drop_n
 
         # Add newest GFS hours — start at old_gfs_end + 1h to avoid double-counting
@@ -516,7 +520,7 @@ def _incremental_update(
         **old_meta,
         "era5_end_ts": era5_end_ts,
         "era5_window_start_ts": new_w_start,
-        "gfs_start_ts": max(era5_end_ts, new_w_start),
+        "gfs_start_ts": max(era5_end_ts + resolution, new_w_start),
         "gfs_end_ts": gfs_end_ts,
         "n_era5": n_era5, "n_gfs": n_gfs,
         "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
@@ -587,12 +591,12 @@ def _build_forecast_aggregates(
                 gfs_sw = gfs_cidx.get("snowfall_water_equivalent")
 
                 def _mode_delta_era5(start: float, end: float) -> dict | None:
-                    if end <= start or not cc_cidx:
+                    if end < start or not cc_cidx:
                         return None
                     return accumulate_raster_mode(era5_model, start, end, cc_cidx, pr_cidx, sw_cidx)
 
                 def _mode_delta_gfs(start: float, end: float) -> dict | None:
-                    if end <= start or not (gfs_cc and gfs_pr and gfs_sw):
+                    if end < start or not (gfs_cc and gfs_pr and gfs_sw):
                         return None
                     d = accumulate_raster_mode("ncep_gfs013", start, end, gfs_cc, gfs_pr, gfs_sw)
                     era5_g = RASTER_GRIDS["copernicus_era5"]

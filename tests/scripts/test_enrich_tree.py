@@ -101,6 +101,10 @@ def _mock_rasterio_open(values: list[float], nodata: float | None = None):
     ds.__exit__ = MagicMock(return_value=False)
     ds.nodata = nodata
     ds.sample = MagicMock(return_value=iter([[v] for v in values]))
+    # Force _sample_cog_batch onto the ds.sample() path (not the in-memory path).
+    ds.dtypes = ["float32"]
+    ds.width = 100_000
+    ds.height = 100_000
     return ds
 
 
@@ -202,13 +206,13 @@ def test_missing_rows_missing_required_col(tmp_path):
     assert result is None
 
 
-def test_missing_rows_always_returns_all_layers(tmp_path):
+def test_missing_rows_returns_none_when_fully_enriched(tmp_path):
+    # All requested layers are already non-null → no work to do → None
     path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
     _make_occurrence_parquet(path, extra_cols={"bio1": [1.0, 2.0]})
     with patch.object(et, "TREE_ROOT", tmp_path):
         result = et._missing_rows_for_taxon(FAKE_TAXON, ["bio1"])
-    assert result is not None
-    assert result.column("missingLayers").to_pylist()[0] == ["bio1"]
+    assert result is None
 
 
 def test_missing_rows_returns_chunk(tmp_path):
@@ -224,13 +228,14 @@ def test_missing_rows_returns_chunk(tmp_path):
     assert result.column("taxonKey").to_pylist()[0] == "2923970"
 
 
-def test_missing_rows_includes_existing_layers(tmp_path):
+def test_missing_rows_excludes_present_layers(tmp_path):
+    # bio1 already non-null → only bio2 appears in missingLayers
     path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
     _make_occurrence_parquet(path, extra_cols={"bio1": [1.0, 2.0]})
     with patch.object(et, "TREE_ROOT", tmp_path):
         result = et._missing_rows_for_taxon(FAKE_TAXON, ["bio1", "bio2"])
     assert result is not None
-    assert result.column("missingLayers").to_pylist()[0] == ["bio1", "bio2"]
+    assert result.column("missingLayers").to_pylist()[0] == ["bio2"]
 
 
 # ---------------------------------------------------------------------------

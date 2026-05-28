@@ -394,10 +394,10 @@ def _incremental_update(
             return delta
 
         # ERA5 quality swap: replace GFS with ERA5 for [old_era5_end+1h, new_era5_end]
-        if era5_end_ts > old_era5_end + 3600:
+        if era5_end_ts > old_era5_end:
             swap_start = max(old_era5_end + resolution, old_w_start)
             swap_end = min(era5_end_ts, old_gfs_end)
-            if swap_end > swap_start:
+            if swap_end >= swap_start:
                 add = _mode_accumulate(swap_start, swap_end, use_gfs=False)
                 sub = _mode_accumulate(swap_start, swap_end, use_gfs=True)
                 swap_n = int(round((swap_end - swap_start) / resolution)) + 1
@@ -459,10 +459,10 @@ def _incremental_update(
             )
 
         # ERA5 quality swap: replace GFS with ERA5 for [old_era5_end+1h, new_era5_end]
-        if era5_end_ts > old_era5_end + 3600:
+        if era5_end_ts > old_era5_end:
             swap_start = max(old_era5_end + resolution, old_w_start)
             swap_end = min(era5_end_ts, old_gfs_end)
-            if swap_end > swap_start:
+            if swap_end >= swap_start:
                 swap_n = int(round((swap_end - swap_start) / resolution)) + 1
                 for rv in _era5_raw_vars(cfg):
                     added = _accum_era5(rv, swap_start, swap_end)

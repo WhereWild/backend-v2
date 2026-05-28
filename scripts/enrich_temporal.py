@@ -24,6 +24,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.compute as pc
 
 from config.config import load_config
@@ -107,7 +108,7 @@ def _run_layer(
     occ_table,
     cfg,
     stop: threading.Event,
-) -> None:
+) -> dict:
     print(
         f"[layer] id={layer.id} model={layer.model} agg={layer.agg} "
         f"windows={layer.windows} grid_mode={layer.grid_mode}"
@@ -120,7 +121,7 @@ def _run_layer(
         )
     except Exception as exc:
         print(f"[skip] {layer.id}: could not build chunk index — {exc}")
-        return
+        return {}
 
     print(
         f"[chunks] {layer.id}: {len(chunk_index.ranges)} chunks, "
@@ -130,22 +131,29 @@ def _run_layer(
     worklist = map_to_worklist(occ_table, chunk_index, layer.grid_mode, layer.grid_step)
     if worklist.num_rows == 0:
         print(f"[skip] {layer.id}: no observations mapped to any chunk")
-        return
+        return {}
 
     steps = window_steps(chunk_index.resolution, tuple(layer.windows))
     tail_buffer: TailBuffer = {}
 
-    chunks_with_obs = [
-        entry
-        for entry in chunk_index.ranges
-        if worklist.filter(pc.equal(worklist["chunk_num"], entry.chunk_num)).num_rows > 0
-    ]
+    # Pre-build per-chunk worklists in one pass (avoids a second filter scan per chunk).
+    chunk_worklists: dict[int, pa.Table] = {}
+    for entry in chunk_index.ranges:
+        slice_ = worklist.filter(pc.equal(worklist["chunk_num"], entry.chunk_num))
+        if slice_.num_rows > 0:
+            chunk_worklists[entry.chunk_num] = slice_
+
+    chunks_with_obs = [e for e in chunk_index.ranges if e.chunk_num in chunk_worklists]
     total_chunks = len(chunks_with_obs)
 
     prefetch_vars = layer.sources if layer.sources else [layer.id]
     total_rows = worklist.num_rows
     rows_done = 0
     t_start = time.monotonic()
+
+    # Accumulate updates across all chunks; write back once at the end to avoid
+    # reading and rewriting each parquet file once per chunk (42x reduction in disk I/O).
+    all_updates: dict[str, dict[str, list]] = {}
 
     # Submit all downloads upfront; process each chunk as its download finishes.
     # Pool limits to _PREFETCH_WORKERS concurrent downloads so chunks N+1..N+7
@@ -159,13 +167,11 @@ def _run_layer(
         for chunk_idx, (chunk_entry, dl_fut) in enumerate(zip(chunks_with_obs, dl_futures), 1):
             if stop.is_set():
                 print(f"[stop] {layer.id}: interrupted before chunk {chunk_entry.chunk_num}")
-                return
+                return all_updates
 
             dl_fut.result()  # wait for this chunk's files to be ready
 
-            chunk_worklist = worklist.filter(
-                pc.equal(worklist["chunk_num"], chunk_entry.chunk_num)
-            )
+            chunk_worklist = chunk_worklists[chunk_entry.chunk_num]
 
             try:
                 if layer.sources:
@@ -191,7 +197,10 @@ def _run_layer(
                         layer.agg,
                         cfg.temporal_cache_dir,
                     )
-                write_back(updates)
+                for tpath, colmap in updates.items():
+                    all_updates.setdefault(tpath, {})
+                    for col, chunks_list in colmap.items():
+                        all_updates[tpath].setdefault(col, []).extend(chunks_list)
             except Exception:
                 print(f"[error] {layer.id} chunk={chunk_entry.chunk_num}")
                 traceback.print_exc()
@@ -211,6 +220,7 @@ def _run_layer(
             )
 
     print(f"[done] {layer.id} rows={rows_done} elapsed={time.monotonic() - t_start:.1f}s")
+    return all_updates
 
 
 # ---------------------------------------------------------------------------
@@ -239,12 +249,22 @@ def main() -> None:
         active_ids = {layer.id for layer in active_layers}
         print(f"[init] active layers: {[layer.id for layer in active_layers]}")
 
+        # Compute output column names for all active non-derived layers so
+        # build_occ_index can skip rows already enriched by carry_forward.
+        skip_cols: list[str] = [
+            f"{layer.id}_{layer.agg}_{w}h"
+            for layer in active_layers
+            if not layer.derived
+            for w in layer.windows
+        ]
+
         print(f"[occ_index] scanning root={str(cfg.plantae_key)} min_year={cfg.temporal_min_year}")
         occ_table = build_occ_index(
             str(cfg.plantae_key),
             cfg.data_root,
             cfg.occurrence_parquet_filename,
             cfg.temporal_min_year,
+            skip_if_cols=skip_cols if skip_cols else None,
         )
         print(f"[occ_index] {occ_table.num_rows} observations")
 
@@ -253,10 +273,18 @@ def main() -> None:
             return
 
         # Non-derived layers first
+        merged_updates: dict[str, dict[str, list]] = {}
         for layer in active_layers:
             if layer.derived or stop.is_set():
                 continue
-            _run_layer(layer, occ_table, cfg, stop)
+            layer_updates = _run_layer(layer, occ_table, cfg, stop)
+            for tpath, colmap in layer_updates.items():
+                merged_updates.setdefault(tpath, {})
+                for col, chunks_list in colmap.items():
+                    merged_updates[tpath].setdefault(col, []).extend(chunks_list)
+
+        if not stop.is_set():
+            write_back(merged_updates)
 
         # Derived passes (only if their deps were processed or already present)
         if "vapor_pressure_deficit" in active_ids and not stop.is_set():

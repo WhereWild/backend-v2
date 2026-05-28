@@ -26,7 +26,6 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fastdigest import TDigest
-from scipy.optimize import minimize_scalar
 from scipy.stats import circmean, circstd, circvar, gaussian_kde, vonmises
 from scipy.stats import entropy as _scipy_entropy
 
@@ -180,14 +179,13 @@ def _gaussian_kde_curve(values: np.ndarray) -> dict | None:
         kde = gaussian_kde(values, bw_method="silverman")
         xs = np.linspace(min_val, max_val, _KDE_N_POINTS)
         density = kde(xs)
-        result = minimize_scalar(lambda x: -kde([x])[0], bounds=(min_val, max_val), method="bounded")
         return {
             "points": xs.tolist(),
             "density": density.tolist(),
             "min": min_val,
             "max": max_val,
             "bandwidth": float(kde.factor * float(values.std())),
-            "mode": float(result.x),
+            "mode": float(xs[int(np.argmax(density))]),
         }
     except Exception:
         return None
@@ -206,10 +204,10 @@ def _von_mises_kde_curve(values_deg: np.ndarray) -> dict | None:
         kappa = 1.0 / h ** 2
         grid_deg = np.linspace(0.0, 360.0, _KDE_N_POINTS, endpoint=False)
         grid_rad = np.deg2rad(grid_deg)
-        density = np.zeros(_KDE_N_POINTS)
-        for theta_i in values_rad:
-            density += vonmises.pdf(grid_rad, kappa, loc=theta_i)
-        density /= n
+        # Vectorised: evaluate all sample kernels at once (n × _KDE_N_POINTS broadcast)
+        density = vonmises.pdf(
+            grid_rad[np.newaxis, :], kappa, loc=values_rad[:, np.newaxis]
+        ).sum(axis=0) / n
         mode_deg = float(grid_deg[int(np.argmax(density))])
         return {
             "points": grid_deg.tolist(),
@@ -582,6 +580,8 @@ def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path) -> pd.DataFrame | N
             frames.append(df)
     if not frames:
         return None
+    if len(frames) == 1:
+        return frames[0]
     combined = pd.concat(frames, ignore_index=True)
     return combined.drop_duplicates(subset=["catalogNumber"])
 
@@ -747,6 +747,19 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
         if df.empty:
             continue
 
+        # Cache per-parquet unique catalog number count — reused across columns
+        # when the column has no nulls (the common case for fully-enriched data).
+        _total_unique: int | None = None
+
+        def _col_unique(col: str) -> int:
+            nonlocal _total_unique
+            null_mask = df[col].isna()
+            if not null_mask.any():
+                if _total_unique is None:
+                    _total_unique = int(df["catalogNumber"].nunique())
+                return _total_unique
+            return int(df.loc[~null_mask, "catalogNumber"].nunique())
+
         for col in df.columns:
             if col not in layer_meta:
                 continue
@@ -756,7 +769,9 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
 
             match vtype:
                 case ValueType.RATIO | ValueType.INTERVAL:
-                    series = pd.to_numeric(df[col], errors="coerce").dropna()
+                    raw = df[col]
+                    series = (raw.dropna() if raw.dtype == np.float64
+                              else pd.to_numeric(raw, errors="coerce").dropna())
                     if series.empty:
                         continue
                     values = series.to_numpy(dtype=float)
@@ -768,7 +783,7 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
                     })
                     acc["digest"].batch_update(values.tolist())
                     acc["n_seen"] = _reservoir_update(acc["reservoir"], acc["n_seen"], values)
-                    acc["unique"] += int(df[df[col].notna()]["catalogNumber"].nunique())
+                    acc["unique"] += _col_unique(col)
 
                 case ValueType.NOMINAL:
                     series = df[col].dropna()
@@ -777,10 +792,12 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
                     acc = nominal_acc.setdefault(col, {"counts": Counter(), "unique": 0})
                     for v in series:
                         acc["counts"][int(float(v))] += 1
-                    acc["unique"] += int(df[df[col].notna()]["catalogNumber"].nunique())
+                    acc["unique"] += _col_unique(col)
 
                 case ValueType.CIRCULAR:
-                    series = pd.to_numeric(df[col], errors="coerce").dropna()
+                    raw = df[col]
+                    series = (raw.dropna() if raw.dtype == np.float64
+                              else pd.to_numeric(raw, errors="coerce").dropna())
                     if series.empty:
                         continue
                     values = series.to_numpy(dtype=float)
@@ -796,7 +813,7 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
                     acc["sin_sum"] += float(np.sum(np.sin(rad)))
                     acc["n"] += len(values)
                     acc["n_seen"] = _reservoir_update(acc["reservoir"], acc["n_seen"], values)
-                    acc["unique"] += int(df[df[col].notna()]["catalogNumber"].nunique())
+                    acc["unique"] += _col_unique(col)
 
                 case _:
                     continue  # skip unimplemented types in streaming
@@ -911,7 +928,11 @@ def _build_nonleaf_index_from_children(taxon: TaxonRecord, taxon_dir: Path) -> N
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def compute_taxon_stats(taxon: TaxonRecord, layers: list[dict]) -> None:
+def compute_taxon_stats(
+    taxon: TaxonRecord,
+    layers: list[dict],
+    layer_meta: dict[str, dict] | None = None,
+) -> None:
     """Compute and write summary stats for one taxon node.
 
     SUBSPECIES/VARIETY/FORM use exact stats from their own occurrence file.
@@ -920,9 +941,12 @@ def compute_taxon_stats(taxon: TaxonRecord, layers: list[dict]) -> None:
     Higher taxa stream all descendant parquets via T-Digest approximations.
     Must be called in leaf-first (bottom-up) order so non-leaf index builds
     can read from already-completed children's occurrence_index.parquet files.
+
+    ``layer_meta`` may be pre-built and passed in to avoid rebuilding it for every taxon.
     """
     taxon_dir = TREE_ROOT / taxon["path"]
-    layer_meta = {layer["id"]: layer for layer in layers}
+    if layer_meta is None:
+        layer_meta = {layer["id"]: layer for layer in layers}
     rank = taxon["rank"]
     if rank in CONFIG.subspecies_equivalents:
         _process_leaf(taxon_dir, layer_meta)

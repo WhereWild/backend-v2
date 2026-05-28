@@ -43,8 +43,9 @@ def test_main_runs_compute_for_all(capsys, monkeypatch):
          patch("scripts.process_tree.compute_taxon_stats") as mock_stats, \
          patch("scripts.process_tree.compute_relative_ranks") as mock_ranks:
         pt.main()
-    mock_stats.assert_called_once_with(_FAKE_TAXON, _FAKE_LAYERS)
-    mock_ranks.assert_called_once_with(_FAKE_TAXON, _FAKE_LAYERS)
+    _FAKE_LAYER_META = {lay["id"]: lay for lay in _FAKE_LAYERS}
+    mock_stats.assert_called_once_with(_FAKE_TAXON, layers=_FAKE_LAYERS, layer_meta=_FAKE_LAYER_META)
+    mock_ranks.assert_called_once_with(_FAKE_TAXON, layers=_FAKE_LAYERS)
     out = capsys.readouterr().out
     assert "taxa" in out
     assert "done" in out

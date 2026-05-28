@@ -32,6 +32,7 @@ from pathlib import Path
 import httpx
 
 import scripts.build_tree as build_tree
+import scripts.carry_forward as carry_forward
 import scripts.enrich_temporal as enrich_temporal
 import scripts.enrich_tree as enrich_tree
 import scripts.gis.build_overviews as build_overviews
@@ -42,6 +43,7 @@ import scripts.sync_gbif as sync_gbif
 
 DATA_DIR = Path("data")
 SYNC_STATE_PATH = Path("data/sync_state.json")
+OLD_TREE_STAGE = Path("data/tmp/old_tree")
 NOTIFY_URL = os.environ.get("WHEREWILD_NOTIFY_URL", "")
 
 
@@ -151,8 +153,20 @@ TAXONOMY_CACHE_DIR = DATA_DIR / "taxonomy" / "cache"
 # cached downloads (inat_dwca.zip, gbif_vernacular.tsv) aren't re-fetched when
 # the remote files haven't changed — the ETags live in sync_state.json (also
 # preserved) and are useless without the matching local files.
+def _preserve_old_tree() -> None:
+    """Move data/taxonomy/tree/ to data/tmp/old_tree/ so carry_forward can use it."""
+    live_tree = DATA_DIR / "taxonomy" / "tree"
+    if not live_tree.exists():
+        return
+    OLD_TREE_STAGE.parent.mkdir(parents=True, exist_ok=True)
+    if OLD_TREE_STAGE.exists():
+        shutil.rmtree(OLD_TREE_STAGE)
+    shutil.move(str(live_tree), str(OLD_TREE_STAGE))
+    print(f"[rebuild] preserved old tree → {OLD_TREE_STAGE} ({sum(1 for _ in OLD_TREE_STAGE.rglob('*.parquet'))} parquets)")
+
+
 def wipe_data_dir() -> None:
-    """Delete GBIF-derived data in DATA_DIR, preserving sync_state.json, data/gis/, and data/taxonomy/cache/."""
+    """Delete GBIF-derived data in DATA_DIR, preserving sync_state.json, data/gis/, data/tmp/, and data/taxonomy/cache/."""
     if not DATA_DIR.exists():
         return
     sync_state_backup = SYNC_STATE_PATH.read_bytes() if SYNC_STATE_PATH.exists() else None
@@ -164,6 +178,9 @@ def wipe_data_dir() -> None:
 
     for child in DATA_DIR.iterdir():
         if child.name == "gis":
+            continue
+        if child.name == "tmp":
+            # Preserved for carry_forward (old tree lives here across the wipe)
             continue
         if child.is_dir():
             shutil.rmtree(child)
@@ -203,6 +220,7 @@ STAGES: list[tuple[str, str, object]] = [
     ("sync_gbif",       "Syncing GBIF (taxonomy + occurrences)",              lambda: _sync_gbif_stage()),
     ("build_tree",      "Building tree (catalog + ID maps + names + images)", lambda: build_tree.main()),
     ("populate_tree",   "Populating tree (routing occurrences to parquet)",   lambda: populate_tree.main()),
+    ("carry_forward",   "Carrying forward enrichment from prior tree",        lambda: carry_forward.main()),
     ("process_gadm",    "Processing GADM (download + location tables)",       lambda: process_gadm.main()),
     ("download_gis",    "Downloading GIS layers",                             lambda: _run_download_gis()),
     ("build_overviews", "Building COG overviews",                             lambda: build_overviews.main()),
@@ -210,6 +228,7 @@ STAGES: list[tuple[str, str, object]] = [
     ("enrich_temporal", "Enriching tree (temporal ERA5 weather)",              lambda: enrich_temporal.main()),
     ("process_tree",    "Processing tree (summary stats + KDE)",              lambda: process_tree.main()),
 ]
+
 
 
 def main() -> None:
@@ -225,6 +244,14 @@ def main() -> None:
         metavar="STAGE",
         choices=stage_ids,
         help=f"Start the pipeline at this stage, skipping all prior stages. One of: {', '.join(stage_ids)}",
+    )
+    parser.add_argument(
+        "--re-enrich",
+        action="store_true",
+        help=(
+            "Skip carry-forward and force full re-enrichment of all observations. "
+            "The old tree is not preserved before the wipe."
+        ),
     )
     args = parser.parse_args()
 
@@ -249,10 +276,16 @@ def main() -> None:
         })
         resuming = True
 
+    active_stages = STAGES
+    active_stage_ids = [s[0] for s in active_stages]
+    force_skip_stages: set[str] = {"carry_forward"} if args.re_enrich else set()
+
     if args.stage:
         # Jump directly to the given stage — no freshness check, no wipe.
         idx = stage_ids.index(args.stage)
         completed_stages = set(stage_ids[:idx])
+        # Translate to active stage ids (handles split process_tree stages).
+        completed_stages = {sid for sid in active_stage_ids if sid in completed_stages}
         print(f"--stage {args.stage}: skipping {sorted(completed_stages) or 'nothing'}")
     elif not resuming:
         if args.force:
@@ -293,7 +326,12 @@ def main() -> None:
         })
 
         if not resuming and not args.stage:
-            print("\n--- Wiping data directory ---")
+            if args.re_enrich:
+                print("\n--- Wiping data directory (--re-enrich: skipping carry-forward) ---")
+            else:
+                print("\n--- Preserving old tree for carry-forward ---")
+                _preserve_old_tree()
+                print("\n--- Wiping data directory ---")
             wipe_data_dir()
             if args.force:
                 # sync_state.json is preserved through the wipe, but its GBIF
@@ -304,9 +342,12 @@ def main() -> None:
                 state.pop("gbif_occurrences", None)
                 _write_sync_state(state)
 
-        for stage_id, label, fn in STAGES:
+        for stage_id, label, fn in active_stages:
             if stage_id in completed_stages:
                 print(f"\n--- Skipping {label} (already completed) ---")
+                continue
+            if stage_id in force_skip_stages:
+                print(f"\n--- Skipping {label} (--re-enrich) ---")
                 continue
             print(f"\n--- {label} ---")
             _set_stage(stage_id, "in_progress")

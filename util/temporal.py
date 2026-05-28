@@ -684,6 +684,7 @@ def build_occ_index(
     data_root: str,
     occ_filename: str,
     min_year: int | None = None,
+    skip_if_cols: list[str] | None = None,
 ) -> pa.Table:
     """Scan all descendant occurrence parquets and return a flat index table.
 
@@ -693,6 +694,10 @@ def build_occ_index(
     The `elevation` column is NaN when the DEM pipeline has not yet written an
     elevation column to the parquets; all downstream elevation corrections
     degrade gracefully to no-ops in that case.
+
+    skip_if_cols: if provided, rows where ALL of these columns are present and
+    non-null are excluded from the index (they were already enriched by
+    carry_forward and need no re-processing).
     """
     root = get_taxon_by_id(root_taxon_id)
     if root is None:
@@ -727,6 +732,19 @@ def build_occ_index(
         valid = df[_TIME_COL].notna() & df[_LAT_COL].notna() & df[_LON_COL].notna()
         if cutoff is not None:
             valid &= df[_TIME_COL] >= cutoff
+
+        # Skip rows already enriched by carry_forward (all requested cols present + non-null).
+        # Check against schema.names — skip cols are not in `df` (only base cols were read).
+        if skip_if_cols:
+            present = [c for c in skip_if_cols if c in schema.names]
+            if len(present) == len(skip_if_cols):
+                skip_df = pq.read_table(occ_path, columns=present).to_pandas()
+                # .any(): a row is done if ANY temporal col is non-null. Larger
+                # windows (e.g. 2160h) are NaN when data before TEMPORAL_MIN_YEAR
+                # wasn't downloaded — that's valid, re-enriching yields the same NaN.
+                already_done = skip_df.notna().any(axis=1)
+                valid &= ~already_done.values
+
         if not valid.any():
             continue
 

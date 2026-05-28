@@ -17,9 +17,11 @@ Pass 2 — Rankings (top-down, shallowest first):
 
 from __future__ import annotations
 
+import argparse
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 
 from config.config import load_config
 from util.rankings import compute_relative_ranks
@@ -38,16 +40,6 @@ def _load_layers() -> list[dict]:
     return load_layers()
 
 
-def _run_node(node: TaxonRecord, layers: list[dict]) -> str:
-    compute_taxon_stats(node, layers)
-    return node["taxon_key"]
-
-
-def _run_rankings(node: TaxonRecord, layers: list[dict]) -> str:
-    compute_relative_ranks(node, layers)
-    return node["taxon_key"]
-
-
 def _fmt_duration(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     return f"{m}m{s:02d}s" if m else f"{s}s"
@@ -57,13 +49,12 @@ def _level_pass(
     by_depth: dict[int, list[TaxonRecord]],
     levels: list[int],
     task_fn,
-    layers: list[dict],
     *,
     max_workers: int,
     label: str,
     total: int,
 ) -> tuple[int, int]:
-    """Run task_fn over all taxa level by level, returning (completed, failed)."""
+    """Run task_fn(node) over all taxa level by level, returning (completed, failed)."""
     completed = 0
     failed = 0
     t0 = time.monotonic()
@@ -71,7 +62,7 @@ def _level_pass(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for depth in levels:
             level_taxa = by_depth[depth]
-            futures = {executor.submit(task_fn, node, layers): node for node in level_taxa}
+            futures = {executor.submit(task_fn, node): node for node in level_taxa}
             for future in as_completed(futures):
                 node = futures[future]
                 try:
@@ -100,39 +91,73 @@ def _level_pass(
     return completed, failed
 
 
-def main() -> None:
+def _setup() -> tuple[list[dict], dict[str, dict], dict[int, list[TaxonRecord]], list[int], list[int], int]:
     layers = _load_layers()
+    layer_meta = {layer["id"]: layer for layer in layers}
     root = get_taxon_by_id(CONFIG.plantae_key)
     if root is None:
-        print(f"[process_tree] root taxon {CONFIG.plantae_key} not found")
-        return
-
+        raise RuntimeError(f"[process_tree] root taxon {CONFIG.plantae_key} not found")
     all_taxa = list(iter_descendants(root, include_self=True))
     total = len(all_taxa)
-
     by_depth: dict[int, list[TaxonRecord]] = defaultdict(list)
     for t in all_taxa:
         by_depth[t["path"].count("/")].append(t)
+    stats_levels = sorted(by_depth.keys(), reverse=True)
+    rank_levels = sorted(by_depth.keys())
+    return layers, layer_meta, by_depth, stats_levels, rank_levels, total
 
-    stats_levels = sorted(by_depth.keys(), reverse=True)   # deepest first
-    rank_levels = sorted(by_depth.keys())                   # shallowest first
+
+def run_stats() -> None:
+    layers, layer_meta, by_depth, stats_levels, _, total = _setup()
+    print(f"[process_tree] {total} taxa — stats:{STATS_WORKERS} workers")
+    task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta)
+    _level_pass(by_depth, stats_levels, task, max_workers=STATS_WORKERS, label="stats", total=total)
+
+
+def run_rankings() -> None:
+    layers, _, by_depth, _, rank_levels, total = _setup()
+    print(f"[process_tree] {total} taxa — rankings:{RANK_WORKERS} workers")
+    task = partial(compute_relative_ranks, layers=layers)
+    _level_pass(by_depth, rank_levels, task, max_workers=RANK_WORKERS, label="rankings", total=total)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--phase",
+        choices=["stats", "rankings", "all"],
+        default="all",
+        help="Run only the stats pass, only the rankings pass, or both (default: all).",
+    )
+    args, _ = parser.parse_known_args()
+
+    try:
+        layers, layer_meta, by_depth, stats_levels, rank_levels, total = _setup()
+    except RuntimeError as exc:
+        print(str(exc))
+        return
 
     print(
         f"[process_tree] {total} taxa across {len(stats_levels)} levels"
         f" — stats:{STATS_WORKERS} workers  rankings:{RANK_WORKERS} workers"
+        f" — phase:{args.phase}"
     )
 
-    _level_pass(
-        by_depth, stats_levels, _run_node, layers,
-        max_workers=STATS_WORKERS, label="stats", total=total,
-    )
+    if args.phase in ("stats", "all"):
+        task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta)
+        _level_pass(
+            by_depth, stats_levels, task,
+            max_workers=STATS_WORKERS, label="stats", total=total,
+        )
+        if args.phase == "all":
+            print("[process_tree] stats complete — starting rankings pass")
 
-    print("[process_tree] stats complete — starting rankings pass")
-
-    _level_pass(
-        by_depth, rank_levels, _run_rankings, layers,
-        max_workers=RANK_WORKERS, label="rankings", total=total,
-    )
+    if args.phase in ("rankings", "all"):
+        task = partial(compute_relative_ranks, layers=layers)
+        _level_pass(
+            by_depth, rank_levels, task,
+            max_workers=RANK_WORKERS, label="rankings", total=total,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

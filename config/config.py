@@ -116,6 +116,8 @@ class GlobalConfig:
             if hints.get(f.name) not in _SCALAR_TYPES:
                 continue
             val = os.environ.get(f.name.upper())
+            if val is None and f.name == "data_root":
+                val = os.environ.get("WHEREWILD_DATA_ROOT")
             if val is not None:
                 setattr(self, f.name, hints[f.name](val))
 

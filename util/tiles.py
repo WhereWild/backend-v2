@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from rasterio.windows import from_bounds as window_from_bounds
 from rasterio.windows import transform as window_transform
 
 CATALOG_PATH = Path("config/gis/catalog.json")
-LAYERS_DIR   = Path("data/gis/layers")
+LAYERS_DIR   = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "layers"
 
 WEB_MERCATOR      = CRS.from_epsg(3857)
 WGS84             = CRS.from_epsg(4326)
@@ -47,7 +48,7 @@ def _catalog() -> dict:
         return json.load(f)
 
 
-TEMPORAL_RASTERS_DIR = Path("data/gis/temporal/rasters")
+TEMPORAL_RASTERS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "temporal" / "rasters"
 
 _WINDOW_LABELS = {1: "1h", 8: "8h", 24: "24h", 72: "3d", 168: "7d", 720: "30d", 2160: "90d"}
 

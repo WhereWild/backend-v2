@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import math
+import os
 import re
 import shutil
 from collections import Counter
@@ -40,7 +41,7 @@ _LEGEND_DIR = Path("config/gis/legends")
 _OCC_FILE = "occurrence.parquet"
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
 _PHENOLOGY_VALUES: frozenset[str] = frozenset(_CONFIG.phenology_values)
-_LOCATIONS_DIR = Path("data/gis/locations")
+_LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
 

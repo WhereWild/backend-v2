@@ -266,6 +266,23 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
         if lookup_rows:
             pq.write_table(pa.Table.from_pylist(lookup_rows), lookup_path)
 
+        meta_rows = [
+            {
+                "id": layer["id"],
+                "name": layer.get("display_name") or layer["id"],
+                "units": layer.get("units") or None,
+                "value_type": layer.get("value_type") or None,
+                "category": layer.get("category_display_name") or None,
+                "group": layer.get("group") or None,
+                "group_label": layer.get("group_label") or None,
+                "sort_order": idx,
+            }
+            for idx, layer in enumerate(layer_meta.values())
+        ]
+        meta_path = work_dir / "variable_metadata.parquet"
+        if meta_rows:
+            pq.write_table(pa.Table.from_pylist(meta_rows), meta_path)
+
         archive_name = "processed_observations.zip"
         archive_path = work_dir / archive_name
         files_to_zip = [
@@ -276,6 +293,7 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
             (work_dir / DENSITY_FILE,               DENSITY_FILE),
             (work_dir / OCCURRENCE_INDEX_FILE,      OCCURRENCE_INDEX_FILE),
             (lookup_path,                           "categorical_value_lookup.parquet"),
+            (meta_path,                             "variable_metadata.parquet"),
         ]
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for parquet_path, arcname in files_to_zip:

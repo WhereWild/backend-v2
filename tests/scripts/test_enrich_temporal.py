@@ -298,7 +298,7 @@ class TestMain:
         self._patch_base(monkeypatch, tmp_path, empty)
         run_layer_calls: list[str] = []
         monkeypatch.setattr("scripts.enrich_temporal._run_layer",
-                            lambda *a, **kw: run_layer_calls.append(a[0].id))
+                            lambda *a, **kw: run_layer_calls.append(a[0].id) or {})
         et.main()
         assert run_layer_calls == []
         assert "[done] no observations" in capsys.readouterr().out
@@ -307,7 +307,7 @@ class TestMain:
         self._patch_base(monkeypatch, tmp_path, _make_occ_table())
         run_layer_calls: list[str] = []
         monkeypatch.setattr("scripts.enrich_temporal._run_layer",
-                            lambda *a, **kw: run_layer_calls.append(a[0].id))
+                            lambda *a, **kw: run_layer_calls.append(a[0].id) or {})
         vpd_called = []
         monkeypatch.setattr("scripts.enrich_temporal.derive_vpd",
                             lambda *a, **kw: vpd_called.append(1))
@@ -319,7 +319,7 @@ class TestMain:
 
     def test_derive_vpd_exception_handled(self, monkeypatch, tmp_path: Path) -> None:
         self._patch_base(monkeypatch, tmp_path, _make_occ_table())
-        monkeypatch.setattr("scripts.enrich_temporal._run_layer", lambda *a, **kw: None)
+        monkeypatch.setattr("scripts.enrich_temporal._run_layer", lambda *a, **kw: {})
 
         def _raise(*a, **kw):
             raise RuntimeError("vpd exploded")

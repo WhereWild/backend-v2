@@ -346,6 +346,25 @@ class TestIncrementalQualitySwap:
             loc_name="berlin", monkeypatch=monkeypatch, tmp_path=tmp_path,
         )
 
+    def test_temperature_swap_1h(self, require_fixtures, monkeypatch, tmp_path):
+        """ERA5 advances exactly 1h — the single-step swap case.
+
+        At t0=600 era5_end=580: w_start=577, ERA5[577..580]=4h, GFS[581..600]=20h.
+        At t1=601 era5_end=581: swap fires for [581..581] (1 step) replacing GFS[581]
+        with ERA5[581]; then drop ERA5[577], add GFS[602].
+        Since fixture data is the same for both sources, net swap change is zero and
+        the final value must equal expected_window(t1=601, 24h).
+        """
+        _run_full_then_incremental(
+            fixture=require_fixtures["berlin_early"],
+            var_id="temperature_2m", cfg=_TEMP_CFG,
+            window_h=24, window_label="24h",
+            t0_hour=600, t1_hour=601,
+            era5_end_hour=580,
+            era5_end_hour_t1=581,  # ERA5 advances exactly 1h → tests swap_end >= swap_start
+            loc_name="berlin", monkeypatch=monkeypatch, tmp_path=tmp_path,
+        )
+
     def test_temperature_swap_advances_past_window_start(self, require_fixtures, monkeypatch, tmp_path):
         """ERA5 end crosses the window start boundary during the swap."""
         # 24h window at t0=600: w_start=577, era5_end_t0=570 (7h before w_start)

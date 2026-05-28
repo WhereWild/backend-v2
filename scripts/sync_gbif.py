@@ -8,6 +8,7 @@ Credentials are read from environment variables loaded from .env
 
 import json
 import os
+import shutil
 import subprocess
 import time
 import zipfile
@@ -149,8 +150,22 @@ def extract(src_dir: Path | None = None, output_name: str = "species_list.csv") 
         if f.name != output_name:
             f.rename(d / output_name)
             break
+    zip_file.unlink(missing_ok=True)
     files = [f.name for f in d.iterdir()]
     print(f"Extracted to {d}/: {files}")
+
+
+def _cleanup_occurrences_dir() -> None:
+    """Delete everything in the occurrences dir except occurrence.txt."""
+    if not OCCURRENCES_DIR.exists():
+        return
+    for item in OCCURRENCES_DIR.iterdir():
+        if item.name == "occurrence.txt":
+            continue
+        if item.is_dir():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
 
 
 def request_occurrence_download() -> str:
@@ -200,6 +215,7 @@ def sync_occurrences() -> bool:
     gbif_meta = poll_until_ready(download_key)
     download_zip(gbif_meta["downloadLink"], OCCURRENCES_DIR)
     extract(OCCURRENCES_DIR)
+    _cleanup_occurrences_dir()
 
     state["gbif_occurrences"] = {
         "crawl_finished": crawl_finished,

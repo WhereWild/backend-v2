@@ -67,6 +67,12 @@ _STRUCT_FIELDS = [
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _safe_finite(x) -> bool:
+    try:
+        return math.isfinite(float(x))
+    except (TypeError, ValueError):
+        return False
+
 def _atomic_write(path: Path, table: pa.Table) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
@@ -229,8 +235,8 @@ def _collect_entries_from_numerical_stats(
     layer_by_id = {lay["id"]: lay for lay in layers}
     entries: dict[str, dict[str, Any]] = {}
 
-    for _, row in df.iterrows():
-        variable = str(row.get("variable") or "")
+    for record in df.to_dict("records"):
+        variable = str(record.get("variable") or "")
         if not variable or variable not in layer_by_id:
             continue
         layer = layer_by_id[variable]
@@ -239,21 +245,16 @@ def _collect_entries_from_numerical_stats(
         except ValueError:
             continue
         if vtype not in (ValueType.RATIO, ValueType.INTERVAL):
-            continue  # circular → _collect_entries_from_circular_stats; others → not rankable
-        metrics = _metrics_for_vtype(layer, vtype)
-        for metric in metrics:
-            val = row.get(metric)
+            continue
+        for metric in _metrics_for_vtype(layer, vtype):
+            val = record.get(metric)
             if val is None:
                 continue
-            try:
-                fval = float(val)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(fval):
+            if not _safe_finite(val):
                 continue
             entries[f"{variable}::{metric}"] = {
                 "taxon_key": taxon_key,
-                "value": fval,
+                "value": float(val),
                 "sample_count": sample_count,
             }
     return entries
@@ -278,23 +279,19 @@ def _collect_entries_from_nominal_stats(
     nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL])
     entries: dict[str, dict[str, Any]] = {}
 
-    for _, row in df.iterrows():
-        variable = str(row.get("variable") or "")
-        metric = str(row.get("metric") or "")
+    for record in df.to_dict("records"):
+        variable = str(record.get("variable") or "")
+        metric = str(record.get("metric") or "")
         if variable not in nominal_ids:
             continue
         if metric not in nominal_metrics and not metric.startswith("class_"):
             continue
-        val = row.get("value")
-        try:
-            fval = float(val)
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(fval):
+        val = record.get("value")
+        if not _safe_finite(val):
             continue
         entries[f"{variable}::{metric}"] = {
             "taxon_key": taxon_key,
-            "value": fval,
+            "value": float(val),
             "sample_count": sample_count,
         }
     return entries
@@ -318,8 +315,8 @@ def _collect_entries_from_circular_stats(
     layer_by_id = {lay["id"]: lay for lay in layers}
     entries: dict[str, dict[str, Any]] = {}
 
-    for _, row in df.iterrows():
-        variable = str(row.get("variable") or "")
+    for record in df.to_dict("records"):
+        variable = str(record.get("variable") or "")
         if not variable or variable not in layer_by_id:
             continue
         layer = layer_by_id[variable]
@@ -330,18 +327,14 @@ def _collect_entries_from_circular_stats(
         if vtype != ValueType.CIRCULAR:
             continue
         for metric in METRICS_BY_TYPE[ValueType.CIRCULAR]:
-            val = row.get(metric)
+            val = record.get(metric)
             if val is None:
                 continue
-            try:
-                fval = float(val)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(fval):
+            if not _safe_finite(val):
                 continue
             entries[f"{variable}::{metric}"] = {
                 "taxon_key": taxon_key,
-                "value": fval,
+                "value": float(val),
                 "sample_count": sample_count,
             }
     return entries
@@ -377,10 +370,10 @@ def _build_rank_index(
         return
 
     column_entries: dict[str, list[dict[str, Any]]] = {}
-    for _, row in catalog.iterrows():
-        taxon_key = str(row["taxon_key"])
-        taxon_path = str(row.get("path") or "")
-        sample_count = int(row.get("sample_count") or 0)
+    for row in catalog.itertuples(index=False):
+        taxon_key = str(row.taxon_key)
+        taxon_path = str(row.path or "")
+        sample_count = int(row.sample_count or 0)
         if not taxon_path:
             continue
         for col_key, entry in _collect_all_entries(
@@ -496,16 +489,20 @@ def _distribute_positions(ancestor: TaxonRecord, index_path: Path) -> None:
         col_len = min(column_lengths.get(col_name, len(column)), len(column))
         if col_len <= 0:
             continue
+
+        # Extract struct fields into flat arrays — much faster than per-entry as_py()
+        col_slice = column[:col_len]
+        taxon_keys_list = col_slice.field("taxonKey").to_pylist()
+        values_list = col_slice.field("value").to_pylist()
+        sample_counts_list = col_slice.field("sampleCount").to_pylist()
+
         prev_value: float | None = None
         min_rank_pos = 0
         for position in range(col_len):
-            entry = column[position].as_py()
-            if entry is None:
-                continue
-            taxon_key = entry.get("taxonKey")
+            taxon_key = taxon_keys_list[position]
             if taxon_key is None:
                 continue
-            value = entry.get("value")
+            value = values_list[position]
             # Track min-rank position: all tied values share the first position
             # in their group rather than getting arbitrary alphabetical positions.
             if value != prev_value:
@@ -515,8 +512,8 @@ def _distribute_positions(ancestor: TaxonRecord, index_path: Path) -> None:
             # on the species page (the species was never observed in that class).
             if is_class_metric and value == 0.0:
                 continue
-            sample_count = entry.get("sampleCount")
-            rows_by_taxon.setdefault(str(taxon_key), []).append({
+            sample_count = sample_counts_list[position]
+            rows_by_taxon.setdefault(taxon_key, []).append({
                 "variable": variable,
                 "metric": metric,
                 "position": min_rank_pos,

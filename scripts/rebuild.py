@@ -6,12 +6,14 @@ data directory (preserving sync_state.json) and runs the full pipeline:
   1. sync_gbif     — download taxonomy + occurrence data from GBIF
   2. build_tree    — build catalog, ID maps, names, and images
   3. populate_tree — stream occurrence.txt → per-taxon parquet files
-  4. process_gadm  — download GADM GeoPackage + build location tables and catalog
-  5. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
-  6. build_overviews — build COG overviews for all GIS layers
-  7. enrich_tree     — sample GIS layer values into per-taxon occurrence parquets
-  8. enrich_temporal — enrich occurrences with time-windowed ERA5 weather statistics
-  9. process_tree    — compute per-taxon summary statistics and KDE density graphs
+  4. carry_forward — carry enrichment forward from the prior tree
+  5. process_gadm  — download GADM GeoPackage + build location tables and catalog
+  6. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
+  7. build_overviews — build COG overviews for all GIS layers
+  8. enrich_tree     — sample GIS layer values into per-taxon occurrence parquets
+  9. enrich_temporal — enrich occurrences with time-windowed ERA5 weather statistics
+ 10. process_tree    — compute per-taxon summary statistics and KDE density graphs
+ 11. push_b2         — sync data/ to B2 (only with --push)
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -135,6 +137,32 @@ def _release_inhibitor(proc: "subprocess.Popen | None") -> None:
 # data directory
 # ---------------------------------------------------------------------------
 
+_DEFAULT_B2_BUCKET = "wherewild-data"
+_DEFAULT_B2_PREFIX = "data"
+_DEFAULT_B2_ENDPOINT = "https://s3.us-west-004.backblazeb2.com"
+
+
+def _push_b2_stage() -> None:
+    """Sync data/ to B2, overwriting the remote completely (excludes data/cache/)."""
+    remote = os.environ.get("WW_B2_WRITER_REMOTE", "wherewild-localdev-writer")
+    bucket = os.environ.get("WW_B2_BUCKET", _DEFAULT_B2_BUCKET)
+    prefix = os.environ.get("WW_B2_PREFIX", _DEFAULT_B2_PREFIX)
+    transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
+    dest = f"{remote}:{bucket}/{prefix}" if prefix else f"{remote}:{bucket}"
+    cmd = [
+        "rclone", "sync", str(DATA_DIR), dest,
+        "--exclude", "cache/**",
+        "--fast-list",
+        "--transfers", transfers,
+        "--stats-one-line",
+        "--stats", "1m",
+    ]
+    print(f"  rclone sync {DATA_DIR} → {dest}")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(f"rclone sync failed with exit code {result.returncode}")
+
+
 def _run_download_gis(gis_dir: Path | None = None) -> None:
     """Discover and run every scripts/gis/download_*.py."""
     if gis_dir is None:  # pragma: no cover
@@ -229,6 +257,10 @@ STAGES: list[tuple[str, str, object]] = [
     ("process_tree",    "Processing tree (summary stats + KDE)",              lambda: process_tree.main()),
 ]
 
+# push_b2 is not in STAGES — it's always the final action when --push is passed,
+# regardless of which stage the run started at.
+_PUSH_B2_STAGE = ("push_b2", "Pushing data/ to B2", lambda: _push_b2_stage())
+
 
 
 def main() -> None:
@@ -251,6 +283,15 @@ def main() -> None:
         help=(
             "Skip carry-forward and force full re-enrichment of all observations. "
             "The old tree is not preserved before the wipe."
+        ),
+    )
+    parser.add_argument(
+        "--push",
+        action="store_true",
+        help=(
+            "After all pipeline stages complete, sync data/ to B2 (overwriting the remote). "
+            "Uses WW_B2_WRITER_REMOTE / WW_B2_BUCKET / WW_B2_PREFIX env vars or rclone defaults. "
+            "Excludes data/cache/."
         ),
     )
     args = parser.parse_args()
@@ -353,6 +394,13 @@ def main() -> None:
             _set_stage(stage_id, "in_progress")
             fn()
             _set_stage(stage_id, "completed")
+
+        if args.push:
+            push_id, push_label, push_fn = _PUSH_B2_STAGE
+            print(f"\n--- {push_label} ---")
+            _set_stage(push_id, "in_progress")
+            push_fn()
+            _set_stage(push_id, "completed")
 
         finished_at = _now()
         elapsed = int((datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds())

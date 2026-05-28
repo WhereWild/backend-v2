@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import rasterio
+import rasterio.transform
 import rasterio.windows
+
+# Ensure GDAL block cache is generous for the terrain tile reads.
+os.environ.setdefault("GDAL_CACHEMAX", "4096")
 
 from util.temporal import (
     _LAPSE_RATE,
@@ -159,55 +165,93 @@ def _meters_per_degree(lat: float) -> tuple[float, float]:
     return float(m_per_deg_lat), float(m_per_deg_lon)
 
 
-def compute_slope_at_point(lat: float, lon: float) -> float | None:
-    """Compute slope (degrees) at a single lat/lon. For batch use, prefer sample_slope_batch."""
-    result = sample_slope_batch(np.array([lat]), np.array([lon]))
-    return result[0]
-
-
-def _horn_slope(w: np.ndarray, dx_m: float, dy_m: float) -> float:
-    z1, z2, z3 = w[0, 0], w[0, 1], w[0, 2]
-    z4, z6     = w[1, 0],           w[1, 2]
-    z7, z8, z9 = w[2, 0], w[2, 1], w[2, 2]
+def _horn_slope(patch: np.ndarray, dx_m: float, dy_m: float) -> float:
+    z1, z2, z3 = patch[0, 0], patch[0, 1], patch[0, 2]
+    z4, z6 = patch[1, 0], patch[1, 2]
+    z7, z8, z9 = patch[2, 0], patch[2, 1], patch[2, 2]
     dzdx = ((z3 + 2*z6 + z9) - (z1 + 2*z4 + z7)) / (8.0 * dx_m)
     dzdy = ((z7 + 2*z8 + z9) - (z1 + 2*z2 + z3)) / (8.0 * dy_m)
     return float(np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2))))
 
 
-def sample_slope_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]:
-    """Compute slope (degrees) for many points with a single file open.
+def _horn_aspect(patch: np.ndarray, dx_m: float, dy_m: float) -> float:
+    z1, z2, z3 = patch[0, 0], patch[0, 1], patch[0, 2]
+    z4, z6 = patch[1, 0], patch[1, 2]
+    z7, z8, z9 = patch[2, 0], patch[2, 1], patch[2, 2]
+    dzdx = ((z3 + 2*z6 + z9) - (z1 + 2*z4 + z7)) / (8.0 * dx_m)
+    dzdy = ((z7 + 2*z8 + z9) - (z1 + 2*z2 + z3)) / (8.0 * dy_m)
+    return float((90.0 - np.degrees(np.arctan2(dzdy, -dzdx))) % 360.0)
 
-    Points should be pre-sorted by Hilbert index for cache locality.
-    Returns a list of float | None aligned with the input arrays.
+
+def sample_elevation_terrain_batch(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    *,
+    want_elevation: bool = False,
+    want_slope: bool = False,
+    want_aspect: bool = False,
+) -> dict[str, list[float | None]]:
+    """Sample elevation, slope, and/or aspect in a single pass over elevation.tif.
+
+    Opens the file once and reads one 3×3 window per point, computing all
+    requested outputs from the same read.  Points should be hilbert-sorted
+    for GDAL block-cache locality.
+
+    Returns a dict with keys matching the requested outputs.
     """
+    n = len(lats)
     elev_path = LAYERS_DIR / "elevation.tif"
-    results: list[float | None] = [None] * len(lats)
-    if not elev_path.exists() or len(lats) == 0:
+    results: dict[str, list[float | None]] = {}
+    if want_elevation:
+        results["elevation"] = [None] * n
+    if want_slope:
+        results["slope"] = [None] * n
+    if want_aspect:
+        results["aspect"] = [None] * n
+    if not results or not elev_path.exists() or n == 0:
         return results
     try:
         with rasterio.open(elev_path) as ds:
             nodata = ds.nodata
             pixel_deg = abs(ds.transform.a)
             h, w = ds.height, ds.width
+            need_terrain = want_slope or want_aspect
             for i, (lat, lon) in enumerate(zip(lats.tolist(), lons.tolist())):
                 try:
                     row, col = ds.index(lon, lat)
-                    if row < 1 or col < 1 or row >= h - 1 or col >= w - 1:
-                        continue
-                    win = rasterio.windows.Window(col - 1, row - 1, 3, 3)
-                    patch = ds.read(1, window=win).astype(np.float64)
-                    if patch.shape != (3, 3):
-                        continue
-                    if nodata is not None and np.any(patch == nodata):
-                        continue
-                    if np.any(~np.isfinite(patch)):
-                        continue
-                    m_per_deg_lat, m_per_deg_lon = _meters_per_degree(lat)
-                    dx_m = pixel_deg * m_per_deg_lon
-                    dy_m = pixel_deg * m_per_deg_lat
-                    if dx_m == 0 or dy_m == 0:
-                        continue
-                    results[i] = _horn_slope(patch, dx_m, dy_m)
+                    if need_terrain:
+                        if row < 1 or col < 1 or row >= h - 1 or col >= w - 1:
+                            continue
+                        win = rasterio.windows.Window(col - 1, row - 1, 3, 3)
+                        patch = ds.read(1, window=win).astype(np.float64)
+                        if patch.shape != (3, 3):
+                            continue
+                        if nodata is not None and np.any(patch == nodata):
+                            continue
+                        if np.any(~np.isfinite(patch)):
+                            continue
+                        if want_elevation:
+                            results["elevation"][i] = float(patch[1, 1])
+                        m_lat, m_lon = _meters_per_degree(lat)
+                        dx_m = pixel_deg * m_lon
+                        dy_m = pixel_deg * m_lat
+                        if dx_m == 0 or dy_m == 0:
+                            continue
+                        if want_slope:
+                            results["slope"][i] = _horn_slope(patch, dx_m, dy_m)
+                        if want_aspect:
+                            results["aspect"][i] = _horn_aspect(patch, dx_m, dy_m)
+                    else:
+                        # elevation only — single-pixel read is enough
+                        if row < 0 or col < 0 or row >= h or col >= w:
+                            continue
+                        win = rasterio.windows.Window(col, row, 1, 1)
+                        val = ds.read(1, window=win)
+                        v = float(val.flat[0])
+                        if nodata is not None and v == nodata:
+                            continue
+                        if np.isfinite(v):
+                            results["elevation"][i] = v
                 except Exception:
                     continue
     except Exception:
@@ -215,62 +259,24 @@ def sample_slope_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]
     return results
 
 
-def _horn_aspect(w: np.ndarray, dx_m: float, dy_m: float) -> float | None:
-    """Compute aspect (°, N=0 clockwise) via Horn's method."""
-    z1, z2, z3 = w[0, 0], w[0, 1], w[0, 2]
-    z4, z6     = w[1, 0],           w[1, 2]
-    z7, z8, z9 = w[2, 0], w[2, 1], w[2, 2]
-    dzdx = ((z3 + 2*z6 + z9) - (z1 + 2*z4 + z7)) / (8.0 * dx_m)
-    dzdy = ((z7 + 2*z8 + z9) - (z1 + 2*z2 + z3)) / (8.0 * dy_m)
-    raw = np.degrees(np.arctan2(dzdy, -dzdx))
-    return float((90.0 - raw) % 360.0)
+def sample_slope_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]:
+    """Compute slope (degrees) for many points with a single file open."""
+    return sample_elevation_terrain_batch(lats, lons, want_slope=True).get("slope", [None] * len(lats))
 
 
-def compute_aspect_at_point(lat: float, lon: float) -> float | None:
-    """Compute aspect (°, N=0 clockwise) at a single lat/lon. For batch use, prefer sample_aspect_batch."""
-    result = sample_aspect_batch(np.array([lat]), np.array([lon]))
-    return result[0]
+def compute_slope_at_point(lat: float, lon: float) -> float | None:
+    """Compute slope (degrees) at a single lat/lon."""
+    return sample_slope_batch(np.array([lat]), np.array([lon]))[0]
 
 
 def sample_aspect_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]:
-    """Compute aspect (°, N=0 clockwise) for many points with a single file open.
+    """Compute aspect (°, N=0 clockwise) for many points with a single file open."""
+    return sample_elevation_terrain_batch(lats, lons, want_aspect=True).get("aspect", [None] * len(lats))
 
-    Points should be pre-sorted by Hilbert index for cache locality.
-    Returns None for out-of-bounds or nodata pixels.
-    """
-    elev_path = LAYERS_DIR / "elevation.tif"
-    results: list[float | None] = [None] * len(lats)
-    if not elev_path.exists() or len(lats) == 0:
-        return results
-    try:
-        with rasterio.open(elev_path) as ds:
-            nodata = ds.nodata
-            pixel_deg = abs(ds.transform.a)
-            h, w = ds.height, ds.width
-            for i, (lat, lon) in enumerate(zip(lats.tolist(), lons.tolist())):
-                try:
-                    row, col = ds.index(lon, lat)
-                    if row < 1 or col < 1 or row >= h - 1 or col >= w - 1:
-                        continue
-                    win = rasterio.windows.Window(col - 1, row - 1, 3, 3)
-                    patch = ds.read(1, window=win).astype(np.float64)
-                    if patch.shape != (3, 3):
-                        continue
-                    if nodata is not None and np.any(patch == nodata):
-                        continue
-                    if np.any(~np.isfinite(patch)):
-                        continue
-                    m_per_deg_lat, m_per_deg_lon = _meters_per_degree(lat)
-                    dx_m = pixel_deg * m_per_deg_lon
-                    dy_m = pixel_deg * m_per_deg_lat
-                    if dx_m == 0 or dy_m == 0:
-                        continue
-                    results[i] = _horn_aspect(patch, dx_m, dy_m)
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return results
+
+def compute_aspect_at_point(lat: float, lon: float) -> float | None:
+    """Compute aspect (°, N=0 clockwise) at a single lat/lon."""
+    return sample_aspect_batch(np.array([lat]), np.array([lon]))[0]
 
 
 def derive_slope_array(dem: np.ndarray, transform) -> np.ndarray:

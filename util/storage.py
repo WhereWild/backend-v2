@@ -46,7 +46,6 @@ class ParquetStorage:
             return str(path)
         rel = _relative_to_root(path, self.data_root, self.project_root)
         if rel is not None and rel.parts and rel.parts[0] == ".b2-mount":
-            # A path under project root's mount point should map to the mounted key root.
             rel = Path(*rel.parts[1:])
         if rel is None:
             mount_root = Path(os.environ.get("WW_B2_MOUNT", "/workspace/.b2-mount")).expanduser().resolve()
@@ -108,7 +107,6 @@ class ParquetStorage:
     def open_input_file(self, path: Path):
         if self.filesystem is None:
             return path.open("rb")
-        # Prefer local path when available (e.g., rclone mount) for non-parquet blobs.
         if path.exists():
             return path.open("rb")
         if _should_cache_blob(path):
@@ -139,7 +137,6 @@ class ParquetStorage:
             "AWS_S3_ENDPOINT": endpoint_host,
             "AWS_VIRTUAL_HOSTING": "FALSE",
             "AWS_HTTPS": "NO" if endpoint_scheme == "http" else "YES",
-            # COG access pattern should rely on range reads and avoid expensive listings.
             "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
         }
         region = _b2_region_from_host(endpoint_host)

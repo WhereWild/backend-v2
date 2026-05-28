@@ -29,7 +29,7 @@ from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_tax
 
 CONFIG = load_config("global")
 
-TREE_ROOT = Path("data/taxonomy/tree")
+TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
 POSITION_FILE = "relative_ranks_positions.parquet"
 
 # Canonical taxonomy rank order used to determine descendant catalog targets.
@@ -576,7 +576,7 @@ def compute_relative_ranks(ancestor: TaxonRecord, layers: list[dict]) -> None:
 # Query helpers
 # ---------------------------------------------------------------------------
 
-_LOCATIONS_DIR = Path("data/gis/locations")
+_LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 _HIERARCHY_CSV = _LOCATIONS_DIR / "hierarchy.csv"
 

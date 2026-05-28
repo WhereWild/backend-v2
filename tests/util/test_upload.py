@@ -429,6 +429,42 @@ def test_build_archive_generates_categorical_value_lookup():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def test_build_archive_includes_variable_metadata():
+    import io
+    import zipfile
+
+    import pyarrow.parquet as pq
+    df = _make_minimal_df()
+    fake_meta = {
+        "bio1": {
+            "id": "bio1",
+            "display_name": "Annual Mean Temperature",
+            "units": "°C",
+            "value_type": "interval",
+            "category_display_name": "Bioclimatic",
+            "source": "chelsa_v2_1",
+        },
+    }
+    with patch("util.upload._build_layer_meta", return_value=fake_meta), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"):
+        archive_path, _, work_dir = up.build_archive(df)
+    try:
+        with zipfile.ZipFile(archive_path) as zf:
+            names = zf.namelist()
+            assert "variable_metadata.parquet" in names
+            raw = zf.read("variable_metadata.parquet")
+        table = pq.read_table(io.BytesIO(raw))
+        row = table.to_pydict()
+        assert row["id"] == ["bio1"]
+        assert row["name"] == ["Annual Mean Temperature"]
+        assert row["units"] == ["°C"]
+        assert row["value_type"] == ["interval"]
+        assert row["category"] == ["Bioclimatic"]
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def test_build_archive_csv_conversion_exception_silenced():
     import zipfile
     df = _make_minimal_df()

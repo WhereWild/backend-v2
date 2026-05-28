@@ -2083,19 +2083,6 @@ def test_gis_point_nominal_resolves_class_name():
     assert body["class_name"] == "Cold semi-arid"
 
 
-def test_gis_point_temporal_ignores_taxon_params():
-    """Temporal layers always sample the raster even when taxon_id is provided."""
-    import util.gis as gis_module
-    with patch.object(tiles, "get_layer", return_value=_TEMPORAL_LAYER), \
-         patch.object(gis_module, "sample_point", return_value=22.0) as mock_sample, \
-         patch.object(main_module, "_lookup_index_value", return_value=99.0) as mock_lookup:
-        r = client.get("/gis/point?lat=40&lon=-105&variable=temperature_2m_avg_1h"
-                       "&taxon_id=2923970&catalog_number=12345")
-    assert r.status_code == 200
-    assert r.json()["value"] == pytest.approx(22.0)
-    mock_lookup.assert_not_called()
-    mock_sample.assert_called_once()
-
 
 def test_gis_point_nodata_returns_null_value():
     import util.gis as gis_module

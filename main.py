@@ -191,14 +191,11 @@ async def gis_point_value(
 ):
     """Return the raster value for a variable at a lat/lon coordinate.
 
-    For static layers, if taxon_id and catalog_number are both provided the value
-    is read from occurrence_index.parquet instead of the raster — this avoids FP
-    mismatches on sensitive derived variables (e.g. aspect on flat terrain) and
-    ensures the returned value is identical to what the stats were computed from.
-    Falls back to raster sampling when the index row is missing.
-
-    For temporal layers the index is ignored; always returns the current
-    (no-forecast-offset) aggregate for the requested window.
+    If taxon_id and catalog_number are both provided the value is read from
+    occurrence_index.parquet instead of the raster — ensures the returned value
+    is identical to what the stats were computed from, and for temporal variables
+    returns the historical aggregate at observation time rather than the current
+    live window. Falls back to raster sampling when the index row is missing.
     """
     if not math.isfinite(lat) or not math.isfinite(lon):
         raise HTTPException(status_code=400, detail="lat and lon must be finite numbers")
@@ -209,10 +206,9 @@ async def gis_point_value(
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Variable '{variable}' not found")
 
-    is_temporal = layer.get("window_hours") is not None
     value: float | None = None
 
-    if not is_temporal and taxon_id and catalog_number:
+    if taxon_id and catalog_number:
         taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
         if taxon is not None:
             value = _lookup_index_value(taxon, variable, catalog_number)

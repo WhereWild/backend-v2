@@ -430,9 +430,10 @@ def test_build_archive_generates_categorical_value_lookup():
 
 
 def test_build_archive_includes_variable_metadata():
-    import zipfile
-    import pyarrow.parquet as pq
     import io
+    import zipfile
+
+    import pyarrow.parquet as pq
     df = _make_minimal_df()
     fake_meta = {
         "bio1": {

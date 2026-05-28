@@ -25,7 +25,7 @@ import pyarrow.parquet as pq
 import rasterio
 from fastapi import HTTPException
 
-from util.gis import hilbert_index
+from util.gis import DERIVED_FROM_ELEVATION, hilbert_index, sample_aspect_batch, sample_slope_batch
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -184,7 +184,8 @@ def _build_layer_meta() -> dict[str, dict]:
             "category_display_name": cat.get("display_name", cat["id"]),
         }
         for layer, cat in load_layers_with_category()
-        if layer.get("filename") and layer.get("window_hours") is None
+        if (layer.get("filename") or layer["id"] in DERIVED_FROM_ELEVATION)
+        and layer.get("window_hours") is None
     }
 
 
@@ -211,16 +212,28 @@ def enrich_with_gis(df: pd.DataFrame) -> pd.DataFrame:
     s_lats = lats[order]
     s_lons = lons[order]
 
+    elev_path = LAYERS_DIR / "elevation.tif"
+
     result = df.copy()
     for layer in layers:
-        cog_path = LAYERS_DIR / layer["filename"]
-        if not cog_path.exists():
-            continue
-        scale  = layer.get("scale_factor") or 1.0
-        offset = layer.get("add_offset")   or 0.0
+        layer_id = layer["id"]
         try:
-            sorted_vals = _sample_layer(cog_path, s_lats, s_lons, scale, offset, nodata=None)
-            result[layer["id"]] = [sorted_vals[i] for i in restore]
+            if layer_id in DERIVED_FROM_ELEVATION:
+                if not elev_path.exists():
+                    continue
+                if layer_id == "aspect":
+                    sorted_vals = sample_aspect_batch(s_lats, s_lons)
+                else:
+                    sorted_vals = sample_slope_batch(s_lats, s_lons)
+                result[layer_id] = [sorted_vals[i] for i in restore]
+            else:
+                cog_path = LAYERS_DIR / layer["filename"]
+                if not cog_path.exists():
+                    continue
+                scale  = layer.get("scale_factor") or 1.0
+                offset = layer.get("add_offset")   or 0.0
+                sorted_vals = _sample_layer(cog_path, s_lats, s_lons, scale, offset, nodata=None)
+                result[layer_id] = [sorted_vals[i] for i in restore]
         except Exception:
             pass
 
@@ -266,6 +279,23 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
         if lookup_rows:
             pq.write_table(pa.Table.from_pylist(lookup_rows), lookup_path)
 
+        meta_rows = [
+            {
+                "id": layer["id"],
+                "name": layer.get("display_name") or layer["id"],
+                "units": layer.get("units") or None,
+                "value_type": layer.get("value_type") or None,
+                "category": layer.get("category_display_name") or None,
+                "group": layer.get("group") or None,
+                "group_label": layer.get("group_label") or None,
+                "sort_order": idx,
+            }
+            for idx, layer in enumerate(layer_meta.values())
+        ]
+        meta_path = work_dir / "variable_metadata.parquet"
+        if meta_rows:
+            pq.write_table(pa.Table.from_pylist(meta_rows), meta_path)
+
         archive_name = "processed_observations.zip"
         archive_path = work_dir / archive_name
         files_to_zip = [
@@ -276,6 +306,7 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
             (work_dir / DENSITY_FILE,               DENSITY_FILE),
             (work_dir / OCCURRENCE_INDEX_FILE,      OCCURRENCE_INDEX_FILE),
             (lookup_path,                           "categorical_value_lookup.parquet"),
+            (meta_path,                             "variable_metadata.parquet"),
         ]
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for parquet_path, arcname in files_to_zip:

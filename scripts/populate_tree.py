@@ -8,6 +8,7 @@ in memory and flushed in batches to reduce I/O.
 
 import csv
 import json
+import shutil
 import sys
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -187,6 +188,10 @@ def main() -> None:
         _flush(buffers, path)
 
     print(f"Done. {rows_read:,} rows read, {rows_written:,} written to tree.")
+    # Only remove the occurrences dir when it's the real pipeline path (not a test tmp dir).
+    occ_dir = OCCURRENCE_PATH.parent
+    if occ_dir.name == "occurrences":
+        shutil.rmtree(occ_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":  # pragma: no cover

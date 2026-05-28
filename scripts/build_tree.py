@@ -780,6 +780,7 @@ def main() -> None:
     with open(CATALOG_PATH, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"Wrote {len(catalog)} taxa to {CATALOG_PATH}")
+    csv_path.unlink(missing_ok=True)
 
     # Phase 2: ID mapping — download DWC-A once, reuse in Phase 3
     print("\nBuilding iNat ID mapping...")
@@ -787,6 +788,7 @@ def main() -> None:
     build_mapping(catalog, dwca_bytes)
     id_updated = apply_mapping(catalog)
     print(f"Applied inat_id to {id_updated:,} catalog entries.")
+    MAPPING_PATH.unlink(missing_ok=True)
 
     # Phase 3: Common names, preferred images, GBIF backup images
     print("\nFetching GBIF backbone vernacular names...")

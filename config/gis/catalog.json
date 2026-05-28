@@ -1418,7 +1418,7 @@
           "display_name": "WRB Soil Class",
           "units": "",
           "value_type": "nominal",
-          "vrt_url": "https://files.isric.org/soilgrids/latest/data/wrb/MostProbable_152160.vrt",
+          "vrt_url": "https://files.isric.org/soilgrids/latest/data/wrb/MostProbable.vrt",
           "filename": "wrb.tif",
           "scale_factor": null,
           "add_offset": null,

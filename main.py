@@ -15,8 +15,6 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Upload
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from starlette.concurrency import run_in_threadpool
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
 
 import util.rankings as rankings
 from config.config import load_config
@@ -108,28 +106,7 @@ def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
         df = df[df["coordinateUncertaintyInMeters"] <= 500]
     return df
 
-_SPECIES_CACHE_PREFIXES = (
-    "/species/",
-    "/api/taxon/",
-    "/api/species/",
-    "/api/taxa/",
-    "/variables",
-    "/data-sources",
-    "/phenology_values",
-)
-_SPECIES_CACHE_HEADER = "public, max-age=604800"
-
-
-class _SpeciesCacheMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: StarletteRequest, call_next):
-        response = await call_next(request)
-        if response.status_code == 200 and any(request.url.path.startswith(p) for p in _SPECIES_CACHE_PREFIXES):
-            response.headers["Cache-Control"] = _SPECIES_CACHE_HEADER
-        return response
-
-
 app = FastAPI()
-app.add_middleware(_SpeciesCacheMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"], expose_headers=["X-Nominal-Classes"])
 
 

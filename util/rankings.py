@@ -15,16 +15,17 @@ import csv
 import json
 import math
 import os
-import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from config.config import METRICS_BY_TYPE, ValueType, load_config
 from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE
+from util.storage import atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
 
 CONFIG = load_config("global")
@@ -37,14 +38,6 @@ _RANK_ORDER: tuple[str, ...] = (
     "KINGDOM", "PHYLUM", "CLASS", "ORDER", "FAMILY", "GENUS", "SPECIES", "SUBSPECIES",
 )
 
-_CATALOG_SCHEMA = pa.schema([
-    pa.field("taxon_key", pa.string()),
-    pa.field("path", pa.string()),
-    pa.field("scientific_name", pa.string()),
-    pa.field("common_name", pa.string()),
-    pa.field("rank", pa.string()),
-    pa.field("sample_count", pa.int64()),
-])
 
 _POSITION_SCHEMA = pa.schema([
     pa.field("variable", pa.string()),
@@ -74,15 +67,7 @@ def _safe_finite(x) -> bool:
         return False
 
 def _atomic_write(path: Path, table: pa.Table) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        pq.write_table(table, tmp_path)
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+    atomic_write_parquet(path, table, row_group_size=256)
 
 
 def _resolve_context_label(taxon: TaxonRecord) -> str:
@@ -160,57 +145,28 @@ def _infer_sample_count(taxon_dir: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Descendant catalogs
+# Rank index build
 # ---------------------------------------------------------------------------
 
-def _write_descendant_catalog(out_path: Path, taxa: list[TaxonRecord]) -> None:
-    if not taxa:
-        out_path.unlink(missing_ok=True)
-        return
-    rows = []
-    for t in taxa:
-        rows.append({
-            "taxon_key": str(t["taxon_key"]),
-            "path": t["path"],
-            "scientific_name": t.get("scientific_name") or "",
-            "common_name": t.get("common_name") or "",
-            "rank": t.get("rank") or "",
-            "sample_count": _infer_sample_count(TREE_ROOT / t["path"]),
-        })
-    _atomic_write(out_path, pa.Table.from_pylist(rows, schema=_CATALOG_SCHEMA))
-
-
-def build_descendant_catalogs(ancestor: TaxonRecord) -> None:
-    """Write {rank}.parquet catalog files under the ancestor's tree directory."""
+def _descendants_for_rank(ancestor: TaxonRecord, rank: str) -> list[TaxonRecord]:
+    """Return descendant taxa to include in a rank index, respecting species/subspecies combining."""
     ancestor_rank = ancestor.get("rank") or ""
-    targets = _descendant_rank_targets(ancestor_rank)
-    if not targets:
-        return
-
     equiv = frozenset(CONFIG.subspecies_equivalents)
     species_rank = CONFIG.species_rank
 
-    by_rank: dict[str, list[TaxonRecord]] = {}
-    for desc in iter_descendants(ancestor, include_self=False):
-        rank = desc.get("rank") or ""
-        canonical = "SUBSPECIES" if rank in equiv else rank
-        by_rank.setdefault(canonical, []).append(desc)
+    if rank == "SUBSPECIES":
+        if ancestor_rank != species_rank:
+            return []
+        target_ranks = equiv
+    elif rank == "SPECIES" and ancestor_rank not in (species_rank, *equiv):
+        target_ranks = {species_rank} | equiv
+    else:
+        target_ranks = {rank}
 
-    ancestor_dir = TREE_ROOT / ancestor["path"]
-    for rank in targets:
-        out_path = ancestor_dir / f"{rank.lower()}.parquet"
-        if rank == "SUBSPECIES":
-            if ancestor_rank != species_rank:
-                out_path.unlink(missing_ok=True)
-                continue
-            _write_descendant_catalog(out_path, by_rank.get("SUBSPECIES", []))
-        elif rank == "SPECIES" and ancestor_rank not in (species_rank, *CONFIG.subspecies_equivalents):
-            # Non-species ancestors: SPECIES catalog includes leaf-rank taxa of all species-group ranks
-            combined = list(by_rank.get("SPECIES", []))
-            combined += by_rank.get("SUBSPECIES", [])
-            _write_descendant_catalog(out_path, combined)
-        else:
-            _write_descendant_catalog(out_path, by_rank.get(rank, []))
+    return [
+        t for t in iter_descendants(ancestor, include_self=False)
+        if (t.get("rank") or "").upper() in target_ranks
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -353,29 +309,24 @@ def _collect_all_entries(
 
 
 def _build_rank_index(
-    catalog_path: Path,
+    ancestor: TaxonRecord,
+    rank: str,
     index_path: Path,
     layers: list[dict],
 ) -> None:
-    """Read catalog, collect per-taxon metrics, write sorted struct array index."""
-    try:
-        catalog = pq.read_table(
-            catalog_path, columns=["taxon_key", "path", "sample_count"]
-        ).to_pandas()
-    except Exception:
-        index_path.unlink(missing_ok=True)
-        return
-    if catalog.empty:
+    """Collect per-taxon metrics for all descendants of rank and write sorted struct array index."""
+    descendants = _descendants_for_rank(ancestor, rank)
+    if not descendants:
         index_path.unlink(missing_ok=True)
         return
 
     column_entries: dict[str, list[dict[str, Any]]] = {}
-    for row in catalog.itertuples(index=False):
-        taxon_key = str(row.taxon_key)
-        taxon_path = str(row.path or "")
-        sample_count = int(row.sample_count or 0)
+    for t in descendants:
+        taxon_key = str(t["taxon_key"])
+        taxon_path = t.get("path", "")
         if not taxon_path:
             continue
+        sample_count = _infer_sample_count(TREE_ROOT / taxon_path)
         for col_key, entry in _collect_all_entries(
             taxon_key, TREE_ROOT / taxon_path, sample_count, layers
         ).items():
@@ -424,12 +375,8 @@ def build_rank_indexes(ancestor: TaxonRecord, layers: list[dict]) -> None:
 
     ancestor_dir = TREE_ROOT / ancestor["path"]
     for rank in targets:
-        catalog_path = ancestor_dir / f"{rank.lower()}.parquet"
         index_path = ancestor_dir / f"{rank.lower()}_index.parquet"
-        if not catalog_path.exists():
-            index_path.unlink(missing_ok=True)
-            continue
-        _build_rank_index(catalog_path, index_path, layers)
+        _build_rank_index(ancestor, rank, index_path, layers)
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +514,6 @@ def compute_relative_ranks(ancestor: TaxonRecord, layers: list[dict]) -> None:
     Designed to be called per-ancestor in a top-down (shallowest-first) BFS pass
     after the bottom-up stats pass is complete.
     """
-    build_descendant_catalogs(ancestor)
     build_rank_indexes(ancestor, layers)
     distribute_all_positions(ancestor)
 
@@ -969,14 +915,21 @@ def _load_scope_keys(
 ) -> frozenset[str]:
     """Return taxon_key set for all descendants of within_taxon at descendant_rank."""
     rank_lower = "subspecies" if descendant_rank in CONFIG.subspecies_equivalents else descendant_rank.lower()
-    catalog_path = TREE_ROOT / within_taxon["path"] / f"{rank_lower}.parquet"
-    if catalog_path.exists():
+    index_path = TREE_ROOT / within_taxon["path"] / f"{rank_lower}_index.parquet"
+    if index_path.exists():
         try:
-            tbl = pq.read_table(catalog_path, columns=["taxon_key"])
-            return frozenset(str(k) for k in tbl.column("taxon_key").to_pylist())
+            schema = pq.read_schema(index_path)
+            col_lengths: dict[str, int] = json.loads(schema.metadata.get(b"column_lengths", b"{}"))
+            if col_lengths:
+                first_col = next(iter(col_lengths))
+                col_len = col_lengths[first_col]
+                tbl = pq.read_table(index_path, columns=[first_col])
+                col = tbl.column(first_col).combine_chunks().slice(0, col_len)
+                keys = pc.struct_field(col, "taxonKey").to_pylist()
+                return frozenset(str(k) for k in keys if k is not None)
         except Exception:
             pass
-    # Fall back to live DFS if catalog is missing
+    # Fall back to live DFS if index is missing
     accepted_ranks_set: set[str] = {descendant_rank}
     if descendant_rank == CONFIG.species_rank and include_species_like:
         accepted_ranks_set |= set(CONFIG.subspecies_equivalents)
@@ -999,21 +952,30 @@ def _query_catalog(
     loc_counts: dict[str, int],
 ) -> dict:
     rank_lower = "subspecies" if descendant_rank in CONFIG.subspecies_equivalents else descendant_rank.lower()
-    catalog_path = TREE_ROOT / within_taxon["path"] / f"{rank_lower}.parquet"
-    if not catalog_path.exists():
+    index_path = TREE_ROOT / within_taxon["path"] / f"{rank_lower}_index.parquet"
+    if not index_path.exists():
         return _empty_result("no_catalog")
 
     try:
-        rows = pq.read_table(catalog_path).to_pylist()
+        schema = pq.read_schema(index_path)
+        col_lengths: dict[str, int] = json.loads(schema.metadata.get(b"column_lengths", b"{}"))
+        if not col_lengths:
+            return _empty_result("no_catalog")
+        first_col = next(iter(col_lengths))
+        col_len = col_lengths[first_col]
+        tbl = pq.read_table(index_path, columns=[first_col])
+        col = tbl.column(first_col).combine_chunks().slice(0, col_len)
+        taxon_keys = pc.struct_field(col, "taxonKey").to_pylist()
+        sample_counts_list = pc.struct_field(col, "sampleCount").to_pylist()
     except Exception:
         return _empty_result("no_catalog")
 
+    tk_sc = {str(tk): int(sc or 0) for tk, sc in zip(taxon_keys, sample_counts_list) if tk}
+    eligible_total = len(tk_sc)
     accepted_ranks = _accepted_ranks(descendant_rank, include_species_like)
 
     filtered: list[tuple[TaxonRecord, int]] = []
-    for row in rows:
-        tk = str(row.get("taxon_key") or "")
-        sc = int(row.get("sample_count") or 0)
+    for tk, sc in tk_sc.items():
         if loc_keys is not None and tk not in loc_keys:
             continue
         effective_sc = loc_counts.get(tk, 0) if loc_counts else sc
@@ -1045,7 +1007,7 @@ def _query_catalog(
     return {
         "total": total,
         "matched_total": total,
-        "eligible_total": len(rows),
+        "eligible_total": eligible_total,
         "empty_reason": None if results else "no_results",
         "results": results,
     }

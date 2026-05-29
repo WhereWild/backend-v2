@@ -156,11 +156,12 @@ def extract(src_dir: Path | None = None, output_name: str = "species_list.csv") 
 
 
 def _cleanup_occurrences_dir() -> None:
-    """Delete everything in the occurrences dir except occurrence.txt."""
+    """Delete everything in the occurrences dir except occurrence.txt and multimedia.txt."""
     if not OCCURRENCES_DIR.exists():
         return
+    keep = {"occurrence.txt", "multimedia.txt"}
     for item in OCCURRENCES_DIR.iterdir():
-        if item.name == "occurrence.txt":
+        if item.name in keep:
             continue
         if item.is_dir():
             shutil.rmtree(item)

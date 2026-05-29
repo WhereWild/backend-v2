@@ -43,7 +43,7 @@ TREE_ROOT = Path("data/taxonomy/tree")
 LAYERS_DIR = Path("data/gis/layers")
 CATALOG_PATH = Path("config/gis/catalog.json")
 OCCURRENCE_FILE = "occurrence.parquet"
-ROW_LIMIT = 10_000_000
+ROW_LIMIT = 3_500_000
 
 _LAYER_WORKERS = int(os.environ.get("ENRICH_LAYER_WORKERS", "4"))
 # Rasters whose uncompressed footprint fits under this limit are loaded fully
@@ -170,7 +170,7 @@ def _missing_rows_for_taxon(taxon: TaxonRecord, layer_ids: list[str]) -> pa.Tabl
         "hilbertIdx":       pa.array(df_f["hilbertIdx"].to_numpy(),               type=pa.int32()),
         "decimalLatitude":  pa.array(df_f["decimalLatitude"].to_numpy(),          type=pa.float64()),
         "decimalLongitude": pa.array(df_f["decimalLongitude"].to_numpy(),         type=pa.float64()),
-        "missingLayers":    pa.array(missing_layers,                              type=pa.list_(pa.string())),
+        "missingLayers":    pa.array(missing_layers,                              type=pa.list_(pa.large_string())),
         "taxonKey":         pa.array([taxon["taxon_key"]] * len(df_f),            type=pa.string()),
         "dataPath":         pa.array([str(data_path)] * len(df_f),                type=pa.string()),
     })

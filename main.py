@@ -18,7 +18,7 @@ from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
 from config.config import load_config
-from util import citations, gis, taxa, tiles, upload
+from util import citations, gis, taxa, tiles, units, upload
 from util.rankings import POSITION_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
@@ -135,7 +135,7 @@ def data_sources():
 
 
 @app.get("/variables")
-def list_variables():
+def list_variables(unit_system: str | None = Query(None)):
     result = []
     for layer, category in tiles.load_layers_with_category():
         value_type = _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous")
@@ -155,14 +155,14 @@ def list_variables():
         result.append({
             "id": layer["id"],
             "name": layer.get("display_name"),
-            "units": layer.get("units") or None,
+            "units": units.display_units(layer, unit_system),
             "value_type": value_type,
             "domain": layer.get("domain") or None,
             "category": category.get("display_name", "Other"),
             "source_ids": [layer["source"]] if layer.get("source") else None,
             "legend_classes": legend_classes,
-            "render_min": rmin,
-            "render_max": rmax,
+            "render_min": units.convert_value(rmin, layer, unit_system),
+            "render_max": units.convert_value(rmax, layer, unit_system),
             "group": layer.get("group") or None,
             "group_label": layer.get("group_label") or None,
         })
@@ -189,6 +189,7 @@ async def gis_point_value(
     variable: str = Query(...),
     taxon_id: str | None = Query(None),
     catalog_number: str | None = Query(None),
+    unit_system: str | None = Query(None),
 ):
     """Return the raster value for a variable at a lat/lon coordinate.
 
@@ -228,12 +229,13 @@ async def gis_point_value(
                 class_color = (entry.get("traits") or {}).get("color") or None
                 break
 
+    converted_value = units.convert_value(value, layer, unit_system)
     return {
         "variable": variable,
-        "units": layer.get("units") or None,
+        "units": units.display_units(layer, unit_system),
         "lat": lat,
         "lon": lon,
-        "value": value,
+        "value": converted_value,
         "class_name": class_name,
         "class_color": class_color,
     }
@@ -304,7 +306,7 @@ def get_species_obscured(taxon_id: str):
 
 
 @app.get("/api/taxon/{taxon_id}/env-stats")
-def get_taxon_env_stats(taxon_id: str):
+def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -356,13 +358,13 @@ def get_taxon_env_stats(taxon_id: str):
         entry: dict = {
             "id": var_id,
             "display_name": layer.get("display_name"),
-            "units": layer.get("units") or None,
+            "units": units.display_units(layer, unit_system),
             "value_type": layer.get("value_type"),
             "domain": layer.get("domain") or None,
         }
         if var_id in numerical_stats:
-            entry["stats"] = numerical_stats[var_id]
-            entry["density"] = density_by_var.get(var_id)
+            entry["stats"] = units.convert_summary(numerical_stats[var_id], layer, unit_system)
+            entry["density"] = units.convert_density_curve(density_by_var.get(var_id), layer, unit_system)
             entry["classes"] = None
         elif var_id in circular_stats:
             entry["stats"] = circular_stats[var_id]
@@ -549,7 +551,7 @@ def get_species_environment(
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     variable_metadata = {
         "name": layer["display_name"] if layer else variable_id,
-        "units": (layer.get("units") or None) if layer else None,
+        "units": units.display_units(layer, unit_system) if layer else None,
         "value_type": layer.get("value_type") if layer else None,
         "domain": (layer.get("domain") or None) if layer else None,
     }
@@ -565,21 +567,22 @@ def get_species_environment(
             if result is not None:
                 if result["type"] == "continuous":
                     stats = result["stats"]
+                    raw_summary = {
+                        "count": stats["count"],
+                        "min": stats.get("min"),
+                        "mean": stats.get("mean"),
+                        "max": stats.get("max"),
+                        "stddev": stats.get("std"),
+                        "q10": stats.get("10th_percentile"),
+                        "q90": stats.get("90th_percentile"),
+                    }
                     return {
                         "species_id": taxon.get("taxon_key"),
                         "variable": variable_id,
                         "variable_metadata": variable_metadata,
                         "observation_count": result["observation_count"],
-                        "summary": {
-                            "count": stats["count"],
-                            "min": stats.get("min"),
-                            "mean": stats.get("mean"),
-                            "max": stats.get("max"),
-                            "stddev": stats.get("std"),
-                            "q10": stats.get("10th_percentile"),
-                            "q90": stats.get("90th_percentile"),
-                        },
-                        "density_curve": result["density_curve"],
+                        "summary": units.convert_summary(raw_summary, layer, unit_system),
+                        "density_curve": units.convert_density_curve(result["density_curve"], layer, unit_system),
                         "categorical_distribution": None,
                         "relative_ranks": [],
                     }
@@ -711,7 +714,7 @@ def get_species_environment(
         raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
 
     count = int(row.get("count") or 0)
-    summary = {
+    raw_summary = {
         "count": count,
         "min": row.get("min"),
         "mean": row.get("mean"),
@@ -733,8 +736,8 @@ def get_species_environment(
         "variable": variable_id,
         "variable_metadata": variable_metadata,
         "observation_count": count,
-        "summary": summary,
-        "density_curve": density_curve,
+        "summary": units.convert_summary(raw_summary, layer, unit_system),
+        "density_curve": units.convert_density_curve(density_curve, layer, unit_system),
         "categorical_distribution": None,
         "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
     }
@@ -1238,10 +1241,13 @@ def query_taxa(
         min_rbar=min_rbar,
     )
 
+    sort_layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == norm_sort_variable), None) if norm_sort_variable else None
     serialized: list[dict] = []
     for item in result["results"]:
         taxon = item["taxon"]
         preferred = taxon.get("inat_preferred_common_name") or taxon.get("common_name") or ""
+        raw_sort = item.get("sort_value")
+        converted_sort = units.convert_value(raw_sort, sort_layer, unit_system, metric=sort_metric) if sort_layer else raw_sort
         serialized.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
@@ -1253,7 +1259,7 @@ def query_taxa(
             **_image_fields(taxon),
             "match_score": item.get("match_score"),
             "sample_count": item.get("sample_count"),
-            "sort_value": item.get("sort_value"),
+            "sort_value": converted_sort,
             "sort_variable": sort_variable,
             "sort_metric": sort_metric,
             "location_count": item.get("location_count"),
@@ -1274,7 +1280,7 @@ def query_taxa(
             "variable": sort_variable,
             "metric": sort_metric,
             "order": sort_order,
-            "units": unit_system,
+            "units": units.display_units(sort_layer, unit_system) if sort_layer else None,
         },
         "total": result["total"],
         "matched_total": result["matched_total"],

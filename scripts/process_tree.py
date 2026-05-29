@@ -18,7 +18,6 @@ Pass 2 — Rankings (top-down, shallowest first):
 from __future__ import annotations
 
 import argparse
-import os
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,8 +33,11 @@ from util.rankings import POSITION_FILE, compute_relative_ranks
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
+    GLOBAL_STATS_DIR,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
+    PHENOLOGY_COUNTS_FILE,
+    TREE_ROOT,
     compute_taxon_stats,
 )
 from util.storage import atomic_write_parquet
@@ -128,48 +130,91 @@ _STATS_FILES = [
     ("positions",       POSITION_FILE),
 ]
 
-_GLOBAL_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "global"
-_TREE_ROOT   = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
-
-
 _CONSOLIDATION_ROW_GROUP_SIZE = 256
 
 
 def run_consolidation() -> None:
     """Merge per-node stats files into global files under data/taxonomy/global/."""
-    _GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
+    GLOBAL_STATS_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
     print("[consolidate] building global stats files")
 
-    for label, filename in _STATS_FILES:
-        frames: list[pa.Table] = []
-        for path in sorted(_TREE_ROOT.rglob(filename)):
-            taxon_key = path.parent.name.rsplit("_", 1)[-1]
-            tbl = pq.read_table(path)
-            tbl = tbl.append_column(
-                pa.field("taxon_key", pa.string()),
-                pa.array([taxon_key] * len(tbl), type=pa.string()),
+    tmp_dir = GLOBAL_STATS_DIR / ".tmp_consolidate"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for label, filename in _STATS_FILES:
+            frames: list[pa.Table] = []
+            for path in sorted(TREE_ROOT.rglob(filename)):
+                taxon_key = path.parent.name.rsplit("_", 1)[-1]
+                tbl = pq.read_table(path)
+                tbl = tbl.append_column(
+                    pa.field("taxon_key", pa.string()),
+                    pa.array([taxon_key] * len(tbl), type=pa.string()),
+                )
+                frames.append(tbl)
+
+            if not frames:
+                print(f"[consolidate] {label}: no files found, skipping")
+                continue
+
+            combined = pa.concat_tables(frames, promote_options="default")
+            sort_idx = pc.sort_indices(combined, sort_keys=[("taxon_key", "ascending")])
+            combined = combined.take(sort_idx)
+            atomic_write_parquet(
+                tmp_dir / filename, combined,
+                row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE,
             )
-            frames.append(tbl)
+            print(
+                f"[consolidate] {label}: {len(frames)} taxa"
+                f"  {len(combined)} rows"
+                f"  → {filename}"
+                f"  [{time.monotonic() - t0:.1f}s]"
+            )
 
-        if not frames:
-            print(f"[consolidate] {label}: no files found, skipping")
-            continue
+        # All files written successfully — move into place atomically
+        for _, filename in _STATS_FILES:
+            src = tmp_dir / filename
+            if src.exists():
+                src.replace(GLOBAL_STATS_DIR / filename)
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        combined = pa.concat_tables(frames)
-        sort_idx = pc.sort_indices(combined, sort_keys=[("taxon_key", "ascending")])
-        combined = combined.take(sort_idx)
+    # Extract per-taxon phenology counts from numerical_stats metadata → global file
+    pheno_rows: list[dict] = []
+    for path in sorted(TREE_ROOT.rglob(NUMERICAL_STATS_FILE)):
+        taxon_key = path.parent.name.rsplit("_", 1)[-1]
+        try:
+            meta = pq.read_schema(path).metadata or {}
+            raw = meta.get(b"phenology_counts")
+            if raw:
+                import json as _json
+                for pheno_val, count in _json.loads(raw).items():
+                    pheno_rows.append({"taxon_key": taxon_key, "phenology_value": pheno_val, "count": count})
+        except Exception:
+            pass
+    if pheno_rows:
+        pheno_tbl = pa.Table.from_pylist(pheno_rows)
+        sort_idx = pc.sort_indices(pheno_tbl, sort_keys=[("taxon_key", "ascending")])
+        pheno_tbl = pheno_tbl.take(sort_idx)
         atomic_write_parquet(
-            _GLOBAL_DIR / filename, combined,
+            GLOBAL_STATS_DIR / "phenology_counts.parquet", pheno_tbl,
             row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE,
         )
-        print(
-            f"[consolidate] {label}: {len(frames)} taxa"
-            f"  {len(combined)} rows"
-            f"  → {filename}"
-            f"  [{time.monotonic() - t0:.1f}s]"
-        )
+        print(f"[consolidate] phenology: {len(pheno_rows)} rows for {len(set(r['taxon_key'] for r in pheno_rows))} taxa  [{time.monotonic() - t0:.1f}s]")
 
+    # Remove per-node stats files and any leftover {rank}.parquet catalogs
+    removed = 0
+    patterns = [filename for _, filename in _STATS_FILES] + [
+        PHENOLOGY_COUNTS_FILE,
+        "species.parquet", "subspecies.parquet", "genus.parquet",
+        "family.parquet", "order.parquet", "variety.parquet", "form.parquet",
+    ]
+    for filename in patterns:
+        for path in TREE_ROOT.rglob(filename):
+            path.unlink()
+            removed += 1
+    print(f"[consolidate] removed {removed} per-node files")
     print(f"[consolidate] done — {time.monotonic() - t0:.1f}s total")
 
 

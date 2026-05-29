@@ -24,8 +24,13 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from util.storage import atomic_write_parquet
+from util.storage import ParquetStorageProxy, atomic_write_parquet
 from util.taxa import TaxonRecord, get_children
+
+_storage = ParquetStorageProxy(
+    data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
+    project_root=Path(__file__).parent.parent,
+)
 
 TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
 OCCURRENCE_INDEX_FILE = "occurrence_index.parquet"
@@ -299,7 +304,7 @@ def read_slice(
     Numeric: O(log n + m) where m is the number of matching records.
     Categorical: O(1) offset lookup + O(m) extraction.
     """
-    schema = pq.read_schema(index_path)
+    schema = _storage.read_schema(index_path)
     if layer_id not in schema.names:
         return []
     if not pa.types.is_struct(schema.field(layer_id).type):
@@ -313,7 +318,7 @@ def read_slice(
     col_lengths: dict[str, int] = json.loads(meta.get(b"column_lengths", b"{}"))
     true_len = col_lengths.get(layer_id)
 
-    table = pq.read_table(index_path, columns=[layer_id])
+    table = _storage.read_table(index_path, columns=[layer_id])
     col = table.column(layer_id).combine_chunks()
     col = col.slice(0, true_len) if true_len is not None else col.filter(pc.invert(pc.is_null(col)))
 
@@ -369,7 +374,7 @@ def read_slice(
 
 def lookup_value(index_path: Path, layer_id: str, catalog_number: str) -> float | None:
     """Return the stored GIS value for a specific observation. O(n) linear scan."""
-    schema = pq.read_schema(index_path)
+    schema = _storage.read_schema(index_path)
     if layer_id not in schema.names:
         return None
     if not pa.types.is_struct(schema.field(layer_id).type):
@@ -379,7 +384,7 @@ def lookup_value(index_path: Path, layer_id: str, catalog_number: str) -> float 
     col_lengths: dict[str, int] = json.loads(meta.get(b"column_lengths", b"{}"))
     true_len = col_lengths.get(layer_id)
 
-    table = pq.read_table(index_path, columns=[layer_id])
+    table = _storage.read_table(index_path, columns=[layer_id])
     col = table.column(layer_id).combine_chunks()
     if true_len is not None:
         col = col.slice(0, true_len)

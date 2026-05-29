@@ -143,25 +143,42 @@ _DEFAULT_B2_ENDPOINT = "https://s3.us-west-004.backblazeb2.com"
 
 
 def _push_b2_stage() -> None:
-    """Sync data/ to B2, overwriting the remote completely (excludes data/cache/)."""
+    """Push data to B2 in two passes:
+    - taxonomy: rclone sync (overwrites remote to match local)
+    - gis:      rclone copy (upload-only; never deletes existing remote files)
+    """
     remote = os.environ.get("WW_B2_WRITER_REMOTE", "wherewild-localdev-writer")
     bucket = os.environ.get("WW_B2_BUCKET", _DEFAULT_B2_BUCKET)
     prefix = os.environ.get("WW_B2_PREFIX", _DEFAULT_B2_PREFIX)
     transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
-    dest = f"{remote}:{bucket}/{prefix}" if prefix else f"{remote}:{bucket}"
-    cmd = [
-        "rclone", "sync", str(DATA_DIR), dest,
+    base_dest = f"{remote}:{bucket}/{prefix}" if prefix else f"{remote}:{bucket}"
+
+    base_flags = ["--fast-list", "--transfers", transfers, "--stats-one-line", "--stats", "1m"]
+
+    taxonomy_src = DATA_DIR / "taxonomy"
+    taxonomy_dest = f"{base_dest}/taxonomy"
+    print(f"  rclone sync {taxonomy_src} → {taxonomy_dest}")
+    r = subprocess.run([
+        "rclone", "sync", str(taxonomy_src), taxonomy_dest,
         "--exclude", "cache/**",
-        "--exclude", "gis/temporal/chunks/**",
-        "--fast-list",
-        "--transfers", transfers,
-        "--stats-one-line",
-        "--stats", "1m",
-    ]
-    print(f"  rclone sync {DATA_DIR} → {dest}")
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        raise RuntimeError(f"rclone sync failed with exit code {result.returncode}")
+        *base_flags,
+    ])
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone sync taxonomy failed with exit code {r.returncode}")
+
+    locations_src = DATA_DIR / "gis" / "locations"
+    locations_dest = f"{base_dest}/gis/locations"
+    print(f"  rclone sync {locations_src} → {locations_dest}")
+    r = subprocess.run(["rclone", "sync", str(locations_src), locations_dest, *base_flags])
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone sync gis/locations failed with exit code {r.returncode}")
+
+    layers_src = DATA_DIR / "gis" / "layers"
+    layers_dest = f"{base_dest}/gis/layers"
+    print(f"  rclone copy {layers_src} → {layers_dest}")
+    r = subprocess.run(["rclone", "copy", str(layers_src), layers_dest, *base_flags])
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone copy gis/layers failed with exit code {r.returncode}")
 
 
 def _run_download_gis(gis_dir: Path | None = None) -> None:

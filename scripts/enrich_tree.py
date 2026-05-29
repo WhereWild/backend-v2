@@ -16,7 +16,6 @@ from __future__ import annotations
 import functools
 import json
 import os
-import tempfile
 from collections import defaultdict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -94,13 +93,8 @@ def _load_layers() -> list[dict]:
 
 
 def _atomic_write(path: Path, table: pa.Table) -> None:
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        pq.write_table(table, tmp_path)
-        tmp_path.replace(path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    from util.storage import atomic_write_parquet
+    atomic_write_parquet(path, table, row_group_size=256)
 
 
 @functools.lru_cache(maxsize=1)

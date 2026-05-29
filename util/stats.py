@@ -18,7 +18,6 @@ import json
 import math
 import os
 import random
-import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -31,13 +30,15 @@ from scipy.stats import circmean, circstd, circvar, gaussian_kde, vonmises
 from scipy.stats import entropy as _scipy_entropy
 
 from config.config import ValueType, load_config
-from util.taxa import TaxonRecord, get_children, iter_descendants
+from util.indexing import build_leaf_index, build_nonleaf_index
+from util.storage import atomic_write_parquet
+from util.taxa import TaxonRecord, iter_descendants
 
 CONFIG = load_config("global")
 
 TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
+GLOBAL_STATS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "global"
 OCCURRENCE_FILE = "occurrence.parquet"
-OCCURRENCE_INDEX_FILE = "occurrence_index.parquet"
 NUMERICAL_STATS_FILE = "numerical_stats.parquet"
 NOMINAL_STATS_FILE = "nominal_stats.parquet"
 CIRCULAR_STATS_FILE = "circular_stats.parquet"
@@ -74,13 +75,6 @@ def apply_timestamp_filter(
     if end_ts is not None:
         df = df[col <= end_ts]
     return df
-
-# Columns present in occurrence.parquet that are NOT GIS layer values and should
-# be stripped from the slice index (quality-filter cols are applied then dropped).
-_INDEX_STRIP_COLS = frozenset([
-    "hilbertIdx", "eventTimestamp", "coordinateUncertaintyInMeters", "obscured",
-    "gbifRegion", "level0Gid", "level1Gid", "level2Gid", "dp", "vitality", "rcs",
-])
 
 # Ranks for which occurrence_index.parquet is built.
 # Order and above aggregate too many descendants to be useful for slice queries.
@@ -124,13 +118,36 @@ def write_phenology_counts(taxon_dir: Path, counts: Counter) -> None:
 
 
 def read_phenology_counts(taxon_dir: Path) -> dict[str, int]:
+    taxon_key = taxon_dir.name.rsplit("_", 1)[-1]
+    global_path = GLOBAL_STATS_DIR / "phenology_counts.parquet"
+    if global_path.exists():
+        try:
+            rows = pq.read_table(
+                global_path,
+                filters=[("taxon_key", "=", taxon_key)],
+            ).to_pylist()
+            if rows:
+                return {r["phenology_value"]: r["count"] for r in rows}
+        except Exception:
+            pass
+    # fallback: per-node numerical_stats metadata (pre-consolidation)
+    p = taxon_dir / NUMERICAL_STATS_FILE
+    if p.exists():
+        try:
+            meta = pq.read_schema(p).metadata or {}
+            raw = meta.get(b"phenology_counts")
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+    # legacy JSON fallback
     p = taxon_dir / PHENOLOGY_COUNTS_FILE
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text())
-    except Exception:
-        return {}
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {}
 
 
 def _filter_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -154,14 +171,12 @@ def _reservoir_update(reservoir: list, n_seen: int, values: np.ndarray) -> int:
     return n_seen
 
 
-def _atomic_write(path: Path, table: pa.Table) -> None:
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        pq.write_table(table, tmp_path)
-        tmp_path.replace(path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+def _atomic_write(path: Path, table: pa.Table, custom_metadata: dict[str, str] | None = None) -> None:
+    if custom_metadata:
+        existing = table.schema.metadata or {}
+        merged = {**existing, **{k.encode(): v.encode() for k, v in custom_metadata.items()}}
+        table = table.replace_schema_metadata(merged)
+    atomic_write_parquet(path, table)
 
 
 # ---------------------------------------------------------------------------
@@ -401,13 +416,13 @@ def _nominal_cat_entries(layer_id: str, layer: dict, counts: Counter, summary: d
 # Write helpers
 # ---------------------------------------------------------------------------
 
-def _write_stats_frame(path: Path, stats: dict[str, dict]) -> None:
+def _write_stats_frame(path: Path, stats: dict[str, dict], custom_metadata: dict[str, str] | None = None) -> None:
     if not stats:
         return
     frame = pd.DataFrame.from_dict(stats, orient="index")
     frame.index.name = "variable"
     frame = frame.reset_index()
-    _atomic_write(path, pa.Table.from_pandas(frame, preserve_index=False))
+    _atomic_write(path, pa.Table.from_pandas(frame, preserve_index=False), custom_metadata)
 
 
 def _write_nominal_stats(directory: Path, entries: list[dict]) -> None:
@@ -529,13 +544,14 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
             case _:
                 raise NotImplementedError(f"Stats not implemented for value type {vtype!r}")
 
+    pheno_counts = compute_phenology_counts(df)
+    pheno_meta = {"phenology_counts": json.dumps(dict(pheno_counts))} if pheno_counts else None
     taxon_dir.mkdir(parents=True, exist_ok=True)
-    _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats)
+    _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats, pheno_meta)
     _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_density(taxon_dir, density_rows)
-    _write_index_from_df(taxon_dir, df)
-    write_phenology_counts(taxon_dir, compute_phenology_counts(df))
+    build_leaf_index(taxon_dir, df, layer_meta, taxon_dir.name.rsplit("_", 1)[-1])
 
 
 def process_observations_df(directory: Path, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:
@@ -714,14 +730,6 @@ def compute_location_filtered_stats(
     return None
 
 
-def _write_index_from_df(taxon_dir: Path, df: pd.DataFrame) -> None:
-    """Write occurrence_index.parquet from an already-filtered DataFrame."""
-    idx = df.drop(columns=[c for c in _INDEX_STRIP_COLS if c in df.columns])
-    idx = idx.dropna(subset=["catalogNumber", "decimalLatitude", "decimalLongitude"])
-    if idx.empty:
-        return
-    taxon_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write(taxon_dir / OCCURRENCE_INDEX_FILE, pa.Table.from_pandas(idx, preserve_index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -898,31 +906,14 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
 
     if not numerical_stats and not nominal_entries and not circular_stats:
         return
+    pheno_meta = {"phenology_counts": json.dumps(dict(pheno_acc))} if pheno_acc else None
     taxon_dir.mkdir(parents=True, exist_ok=True)
-    _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats)
+    _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats, pheno_meta)
     _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_density(taxon_dir, density_rows)
-    write_phenology_counts(taxon_dir, pheno_acc)
 
 
-def _build_nonleaf_index_from_children(taxon: TaxonRecord, taxon_dir: Path) -> None:
-    """Build occurrence_index.parquet by concatenating direct children's index files.
-
-    Requires children to already be processed (call in bottom-up / leaf-first order).
-    Reads O(children) files instead of O(all leaf descendants).
-    """
-    frames = []
-    for child in get_children(taxon["taxon_key"]):
-        child_idx = TREE_ROOT / child["path"] / OCCURRENCE_INDEX_FILE
-        if child_idx.exists():
-            frames.append(pq.read_table(child_idx).to_pandas())
-    if not frames:
-        return
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined.drop_duplicates(subset=["catalogNumber"])
-    taxon_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write(taxon_dir / OCCURRENCE_INDEX_FILE, pa.Table.from_pandas(combined, preserve_index=False))
 
 
 # ---------------------------------------------------------------------------
@@ -956,49 +947,6 @@ def compute_taxon_stats(
     else:
         _process_nonleaf(taxon, taxon_dir, layer_meta)
         if rank in _INDEX_RANKS:
-            _build_nonleaf_index_from_children(taxon, taxon_dir)
+            build_nonleaf_index(taxon, taxon_dir)
 
 
-def _load_occ_for_index(path: Path) -> pd.DataFrame | None:
-    """Read and quality-filter one occurrence.parquet, stripping non-index cols."""
-    if not path.exists():
-        return None
-    table = pq.read_table(path)
-    if table.num_rows == 0:
-        return None
-    df = _filter_df(table.to_pandas())
-    if df.empty:
-        return None
-    drop = [c for c in _INDEX_STRIP_COLS if c in df.columns]
-    if drop:
-        df = df.drop(columns=drop)
-    return df.dropna(subset=["catalogNumber", "decimalLatitude", "decimalLongitude"])
-
-
-def _build_occurrence_index(taxon: TaxonRecord, taxon_dir: Path, is_leaf: bool) -> None:
-    """Build and write occurrence_index.parquet for a taxon.
-
-    Stores catalogNumber, lat, lon, and all GIS layer columns (quality filters
-    pre-applied) so slice endpoints need no second lookup pass.
-    """
-    if is_leaf:
-        df = _load_occ_for_index(taxon_dir / OCCURRENCE_FILE)
-        frames = [df] if df is not None else []
-    else:
-        frames = []
-        seen: set[str] = set()
-        for desc in iter_descendants(taxon, include_self=True):
-            df = _load_occ_for_index(TREE_ROOT / desc["path"] / OCCURRENCE_FILE)
-            if df is None:
-                continue
-            df = df[~df["catalogNumber"].astype(str).isin(seen)]
-            seen.update(df["catalogNumber"].astype(str).tolist())
-            frames.append(df)
-
-    if not frames:
-        return
-    combined = pd.concat(frames, ignore_index=True)
-    if not is_leaf:
-        combined = combined.drop_duplicates(subset=["catalogNumber"])
-    taxon_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write(taxon_dir / OCCURRENCE_INDEX_FILE, pa.Table.from_pandas(combined, preserve_index=False))

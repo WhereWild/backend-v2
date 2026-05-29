@@ -51,6 +51,23 @@ def display_units(layer: dict, unit_system: str | None) -> str | None:
     return layer.get("units") or None
 
 
+def convert_value_from_display(
+    value: float,
+    layer: dict,
+    unit_system: str | None,
+    *,
+    metric: str | None = None,
+) -> float:
+    """Convert a value FROM display units BACK TO raw (metric) units."""
+    if unit_system != "imperial":
+        return value
+    from_unit = layer.get("imperial_unit") or ""
+    to_unit = layer.get("units") or ""
+    if not from_unit or not to_unit or from_unit == to_unit:
+        return value
+    return _convert(float(value), from_unit, to_unit, offset=_apply_offset(layer, metric))
+
+
 def convert_value(
     value: float | None,
     layer: dict,

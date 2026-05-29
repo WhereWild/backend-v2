@@ -268,7 +268,8 @@ def test_main_writes_pickle(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "load_gbif_vernacular", lambda b: {})
     monkeypatch.setattr(build_tree, "apply_names", lambda catalog, im, gm: 0)
     monkeypatch.setattr(build_tree, "run_inat_preferred", lambda catalog: (0, 0))
-    monkeypatch.setattr(build_tree, "run_gbif_backup", lambda catalog: 0)
+    monkeypatch.setattr(build_tree, "run_gbif_backup", lambda catalog: (0, 0))
+    monkeypatch.setattr(build_tree, "infer_species_inat_ids", lambda catalog, b: 0)
     monkeypatch.setattr(build_tree, "update_name_index", lambda payload: 0)
     _make_csv([SPECIES_ROW], tmp_path)
 
@@ -1252,7 +1253,7 @@ def test_build_gbif_images_keeps_better_score(tmp_path, monkeypatch):
 def test_run_gbif_backup_no_files(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", tmp_path / "occurrence.txt")
     monkeypatch.setattr(build_tree, "MULTIMEDIA_PATH", tmp_path / "multimedia.txt")
-    assert build_tree.run_gbif_backup({"123": {}}) == 0
+    assert build_tree.run_gbif_backup({"123": {}}) == (0, 0)
 
 
 def test_run_gbif_backup_updates_catalog(tmp_path, monkeypatch):
@@ -1268,7 +1269,7 @@ def test_run_gbif_backup_updates_catalog(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
     monkeypatch.setattr(build_tree, "MULTIMEDIA_PATH", mm)
     catalog = {"123": {}}
-    assert build_tree.run_gbif_backup(catalog) == 1
+    assert build_tree.run_gbif_backup(catalog) == (1, 0)
     assert "gbif_backup_image" in catalog["123"]
 
 

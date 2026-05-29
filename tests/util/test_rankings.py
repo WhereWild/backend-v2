@@ -433,7 +433,8 @@ def test_distribute_positions_accumulates_across_contexts(tmp_path, monkeypatch)
 
 def test_build_rank_indexes_skips_missing_catalog(tmp_path, monkeypatch):
     monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    # Genus has no species.parquet → no species_index.parquet
+    monkeypatch.setattr(rk, "iter_descendants", lambda t, **kw: [])
+    # No descendants → no species_index.parquet
     rk.build_rank_indexes(_GENUS, [_RATIO_LAYER])
     genus_dir = tmp_path / _GENUS["path"]
     assert not (genus_dir / "species_index.parquet").exists()

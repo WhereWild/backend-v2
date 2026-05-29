@@ -3,6 +3,7 @@ name: Deploy
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -18,4 +19,5 @@ jobs:
             cd /opt/wherewild/wherewild-v2
             git pull origin main
             docker compose -f docker-compose.prod.yml build api
+            docker compose -f docker-compose.prod.yml rm -sf api
             docker compose -f docker-compose.prod.yml up -d api

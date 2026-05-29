@@ -1,0 +1,14 @@
+[Unit]
+Description=WhereWild
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+WorkingDirectory=/opt/wherewild/wherewild-v2
+ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml up
+ExecStop=/usr/bin/docker compose -f docker-compose.prod.yml down
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

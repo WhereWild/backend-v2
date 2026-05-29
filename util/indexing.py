@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -25,6 +24,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+from util.storage import atomic_write_parquet
 from util.taxa import TaxonRecord, get_children
 
 TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
@@ -157,15 +157,7 @@ def _finalize_and_write(
     }
     table = table.replace_schema_metadata(meta)
 
-    taxon_dir.mkdir(parents=True, exist_ok=True)
-    path = taxon_dir / OCCURRENCE_INDEX_FILE
-    with tempfile.NamedTemporaryFile(dir=taxon_dir, suffix=".parquet", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        pq.write_table(table, tmp_path)
-        tmp_path.replace(path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    atomic_write_parquet(taxon_dir / OCCURRENCE_INDEX_FILE, table, row_group_size=max_len)
 
 
 # ---------------------------------------------------------------------------

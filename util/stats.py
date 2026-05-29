@@ -18,7 +18,6 @@ import json
 import math
 import os
 import random
-import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -31,7 +30,8 @@ from scipy.stats import circmean, circstd, circvar, gaussian_kde, vonmises
 from scipy.stats import entropy as _scipy_entropy
 
 from config.config import ValueType, load_config
-from util.indexing import OCCURRENCE_INDEX_FILE, build_leaf_index, build_nonleaf_index
+from util.indexing import build_leaf_index, build_nonleaf_index
+from util.storage import atomic_write_parquet
 from util.taxa import TaxonRecord, iter_descendants
 
 CONFIG = load_config("global")
@@ -162,13 +162,7 @@ def _atomic_write(path: Path, table: pa.Table, custom_metadata: dict[str, str] |
         existing = table.schema.metadata or {}
         merged = {**existing, **{k.encode(): v.encode() for k, v in custom_metadata.items()}}
         table = table.replace_schema_metadata(merged)
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        pq.write_table(table, tmp_path)
-        tmp_path.replace(path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    atomic_write_parquet(path, table)
 
 
 # ---------------------------------------------------------------------------

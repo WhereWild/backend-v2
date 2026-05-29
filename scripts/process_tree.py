@@ -18,14 +18,27 @@ Pass 2 — Rankings (top-down, shallowest first):
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 from config.config import load_config
-from util.rankings import compute_relative_ranks
-from util.stats import compute_taxon_stats
+from util.rankings import POSITION_FILE, compute_relative_ranks
+from util.stats import (
+    CIRCULAR_STATS_FILE,
+    DENSITY_FILE,
+    NOMINAL_STATS_FILE,
+    NUMERICAL_STATS_FILE,
+    compute_taxon_stats,
+)
+from util.storage import atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants
 from util.tiles import load_layers
 
@@ -107,6 +120,59 @@ def _setup() -> tuple[list[dict], dict[str, dict], dict[int, list[TaxonRecord]],
     return layers, layer_meta, by_depth, stats_levels, rank_levels, total
 
 
+_STATS_FILES = [
+    ("numerical_stats", NUMERICAL_STATS_FILE),
+    ("nominal_stats",   NOMINAL_STATS_FILE),
+    ("circular_stats",  CIRCULAR_STATS_FILE),
+    ("density",         DENSITY_FILE),
+    ("positions",       POSITION_FILE),
+]
+
+_GLOBAL_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "global"
+_TREE_ROOT   = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
+
+
+_CONSOLIDATION_ROW_GROUP_SIZE = 256
+
+
+def run_consolidation() -> None:
+    """Merge per-node stats files into global files under data/taxonomy/global/."""
+    _GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
+    print("[consolidate] building global stats files")
+
+    for label, filename in _STATS_FILES:
+        frames: list[pa.Table] = []
+        for path in sorted(_TREE_ROOT.rglob(filename)):
+            taxon_key = path.parent.name.rsplit("_", 1)[-1]
+            tbl = pq.read_table(path)
+            tbl = tbl.append_column(
+                pa.field("taxon_key", pa.string()),
+                pa.array([taxon_key] * len(tbl), type=pa.string()),
+            )
+            frames.append(tbl)
+
+        if not frames:
+            print(f"[consolidate] {label}: no files found, skipping")
+            continue
+
+        combined = pa.concat_tables(frames)
+        sort_idx = pc.sort_indices(combined, sort_keys=[("taxon_key", "ascending")])
+        combined = combined.take(sort_idx)
+        atomic_write_parquet(
+            _GLOBAL_DIR / filename, combined,
+            row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE,
+        )
+        print(
+            f"[consolidate] {label}: {len(frames)} taxa"
+            f"  {len(combined)} rows"
+            f"  → {filename}"
+            f"  [{time.monotonic() - t0:.1f}s]"
+        )
+
+    print(f"[consolidate] done — {time.monotonic() - t0:.1f}s total")
+
+
 def run_stats() -> None:
     layers, layer_meta, by_depth, stats_levels, _, total = _setup()
     print(f"[process_tree] {total} taxa — stats:{STATS_WORKERS} workers")
@@ -125,9 +191,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--phase",
-        choices=["stats", "rankings", "all"],
+        choices=["stats", "rankings", "consolidate", "all"],
         default="all",
-        help="Run only the stats pass, only the rankings pass, or both (default: all).",
+        help="Run stats, rankings, consolidate, or all (default: all).",
     )
     args, _ = parser.parse_known_args()
 
@@ -158,6 +224,11 @@ def main() -> None:
             by_depth, rank_levels, task,
             max_workers=RANK_WORKERS, label="rankings", total=total,
         )
+        if args.phase == "all":
+            print("[process_tree] rankings complete — starting consolidation pass")
+
+    if args.phase in ("consolidate", "all"):
+        run_consolidation()
 
 
 if __name__ == "__main__":  # pragma: no cover

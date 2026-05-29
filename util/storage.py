@@ -351,3 +351,29 @@ def _b2_region_from_host(host: str) -> str | None:
     if len(parts) >= 2 and parts[0] == "s3":
         return parts[1]
     return None
+
+
+def atomic_write_parquet(
+    path: Path,
+    table: Any,
+    *,
+    row_group_size: int | None = None,
+    compression: str = "zstd",
+) -> None:
+    """Atomically write a PyArrow table to a parquet file.
+
+    Writes to a sibling temp file first then renames for atomicity.
+    Defaults to zstd compression.
+    """
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kwargs: dict[str, Any] = {"compression": compression}
+    if row_group_size is not None:
+        kwargs["row_group_size"] = row_group_size
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        pq.write_table(table, tmp_path, **kwargs)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)

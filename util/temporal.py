@@ -19,7 +19,6 @@ no-op: obs_elev is NaN → offset is 0.
 from __future__ import annotations
 
 import json
-import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1158,16 +1157,8 @@ def process_chunk_mode(
 # ---------------------------------------------------------------------------
 
 def _atomic_write(parquet_path: Path, table: pa.Table) -> None:
-    parquet_path = parquet_path.resolve()
-    with tempfile.NamedTemporaryFile(
-        dir=parquet_path.parent, suffix=".parquet", delete=False
-    ) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        pq.write_table(table, tmp_path)
-        tmp_path.replace(parquet_path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    from util.storage import atomic_write_parquet
+    atomic_write_parquet(parquet_path, table, row_group_size=256)
 
 
 def _apply_updates_arrow(

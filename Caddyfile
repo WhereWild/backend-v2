@@ -1,0 +1,7 @@
+wherewild.net, www.wherewild.net {
+    reverse_proxy frontend:8080
+}
+
+api.wherewild.net {
+    reverse_proxy api:8000
+}

@@ -1,3 +1,4 @@
+import os
 import pickle
 from collections.abc import Iterable
 from functools import lru_cache
@@ -6,7 +7,7 @@ from typing import Any, TypedDict
 
 from rapidfuzz import fuzz, process
 
-CATALOG_DIR = Path("data/taxonomy/catalog")
+CATALOG_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "catalog"
 
 
 class TaxonRecord(TypedDict):

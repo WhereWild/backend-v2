@@ -7,4 +7,5 @@ __pycache__/
 htmlcov/
 data/
 logs/
+docker/rclone.conf
 tests/temporal/fixtures/*.json

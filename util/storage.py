@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import configparser
-from dataclasses import dataclass
-from functools import lru_cache
 import os
-from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Optional
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
-
 
 _DEFAULT_B2_BUCKET = "wherewild-data"
 _DEFAULT_B2_PREFIX = "data"
@@ -29,12 +28,12 @@ class ParquetStorage:
     mode: str
     data_root: Path
     project_root: Path
-    filesystem: Optional[pafs.FileSystem]
-    bucket: Optional[str]
-    prefix: Optional[str]
-    endpoint: Optional[str] = None
-    key_id: Optional[str] = None
-    app_key: Optional[str] = None
+    filesystem: pafs.FileSystem | None
+    bucket: str | None
+    prefix: str | None
+    endpoint: str | None = None
+    key_id: str | None = None
+    app_key: str | None = None
 
     @property
     def is_remote(self) -> bool:
@@ -46,7 +45,6 @@ class ParquetStorage:
             return str(path)
         rel = _relative_to_root(path, self.data_root, self.project_root)
         if rel is not None and rel.parts and rel.parts[0] == ".b2-mount":
-            # A path under project root's mount point should map to the mounted key root.
             rel = Path(*rel.parts[1:])
         if rel is None:
             mount_root = Path(os.environ.get("WW_B2_MOUNT", "/workspace/.b2-mount")).expanduser().resolve()
@@ -74,8 +72,8 @@ class ParquetStorage:
     def read_table(
         self,
         path: Path,
-        columns: Optional[list[str]] = None,
-        filters: Optional[list[tuple[str, str, Any]]] = None,
+        columns: list[str] | None = None,
+        filters: list[tuple[str, str, Any]] | None = None,
     ):
         resolved = self.resolve(path)
         kwargs: dict[str, Any] = {}
@@ -108,7 +106,6 @@ class ParquetStorage:
     def open_input_file(self, path: Path):
         if self.filesystem is None:
             return path.open("rb")
-        # Prefer local path when available (e.g., rclone mount) for non-parquet blobs.
         if path.exists():
             return path.open("rb")
         if _should_cache_blob(path):
@@ -139,7 +136,6 @@ class ParquetStorage:
             "AWS_S3_ENDPOINT": endpoint_host,
             "AWS_VIRTUAL_HOSTING": "FALSE",
             "AWS_HTTPS": "NO" if endpoint_scheme == "http" else "YES",
-            # COG access pattern should rely on range reads and avoid expensive listings.
             "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
         }
         region = _b2_region_from_host(endpoint_host)
@@ -237,7 +233,7 @@ def _get_parquet_storage(data_root: str, project_root: str, mode: str) -> Parque
     )
 
 
-def _relative_to_root(path: Path, data_root: Path, project_root: Path) -> Optional[Path]:
+def _relative_to_root(path: Path, data_root: Path, project_root: Path) -> Path | None:
     resolved = path.expanduser().resolve()
     for root in (data_root, project_root):
         try:
@@ -264,7 +260,7 @@ def _cache_root() -> Path:
     return Path(root)
 
 
-def _ensure_cached(storage: ParquetStorage, path: Path) -> Optional[Path]:
+def _ensure_cached(storage: ParquetStorage, path: Path) -> Path | None:
     try:
         rel = _relative_to_root(path, storage.data_root, storage.project_root)
         if rel is None:
@@ -288,7 +284,7 @@ def _ensure_cached(storage: ParquetStorage, path: Path) -> Optional[Path]:
         return None
 
 
-def _resolve_b2_credentials() -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _resolve_b2_credentials() -> tuple[str | None, str | None, str | None]:
     endpoint = (os.environ.get("WW_B2_S3_ENDPOINT") or "").strip()
     key_id = (os.environ.get("WW_B2_KEY_ID") or "").strip()
     app_key = (os.environ.get("WW_B2_APP_KEY") or "").strip()
@@ -314,7 +310,7 @@ def _resolve_b2_credentials() -> tuple[Optional[str], Optional[str], Optional[st
     return endpoint or None, key_id or None, app_key or None
 
 
-def _load_rclone_remote(remote: Optional[str]) -> Optional[tuple[str, str, str]]:
+def _load_rclone_remote(remote: str | None) -> tuple[str, str, str] | None:
     remote_name = str(remote or "").strip()
     if not remote_name:
         return None
@@ -350,7 +346,7 @@ def _normalize_endpoint(endpoint: str) -> tuple[str, str]:
     return host, scheme
 
 
-def _b2_region_from_host(host: str) -> Optional[str]:
+def _b2_region_from_host(host: str) -> str | None:
     parts = [part for part in host.split(".") if part]
     if len(parts) >= 2 and parts[0] == "s3":
         return parts[1]

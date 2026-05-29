@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import tempfile
 from collections import Counter
@@ -34,7 +35,7 @@ from util.taxa import TaxonRecord, get_children, iter_descendants
 
 CONFIG = load_config("global")
 
-TREE_ROOT = Path("data/taxonomy/tree")
+TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
 OCCURRENCE_FILE = "occurrence.parquet"
 OCCURRENCE_INDEX_FILE = "occurrence_index.parquet"
 NUMERICAL_STATS_FILE = "numerical_stats.parquet"

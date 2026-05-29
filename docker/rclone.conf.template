@@ -1,0 +1,9 @@
+[wherewild-localdev-reader]
+type = b2
+account = REPLACE_WITH_READER_KEY_ID
+key = REPLACE_WITH_READER_APP_KEY
+
+[wherewild-localdev-writer]
+type = b2
+account = REPLACE_WITH_WRITER_KEY_ID
+key = REPLACE_WITH_WRITER_APP_KEY

@@ -19,13 +19,16 @@ from starlette.concurrency import run_in_threadpool
 import util.rankings as rankings
 from config.config import load_config
 from util import citations, gis, taxa, tiles, units, upload
+from util.indexing import OCCURRENCE_INDEX_FILE
+from util.indexing import lookup_value as _index_lookup_value
+from util.indexing import read_slice as _index_read_slice
 from util.rankings import POSITION_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
+    GLOBAL_STATS_DIR,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
-    OCCURRENCE_INDEX_FILE,
     TREE_ROOT,
     apply_phenology_filter,
     apply_timestamp_filter,
@@ -73,30 +76,11 @@ def _load_legend(layer_id: str) -> list:
 
 
 def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
-    """Read a precomputed env value for a known observation from occurrence_index.parquet.
-
-    Preferred over raster sampling for static variables: avoids the FP sensitivity
-    that can cause mismatches on derived variables like aspect near flat terrain.
-    Returns None if the index doesn't exist, the column is absent, or the row is missing.
-    """
+    """Read a precomputed env value for a known observation from occurrence_index.parquet."""
     index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
     if not index_path.exists():
         return None
-    schema = pq.read_schema(index_path)
-    if variable_id not in schema.names:
-        return None
-    try:
-        df = pq.read_table(
-            index_path,
-            columns=["catalogNumber", variable_id],
-            filters=[("catalogNumber", "=", catalog_number)],
-        ).to_pandas()
-    except Exception:
-        return None
-    if df.empty:
-        return None
-    val = df.iloc[0][variable_id]
-    return float(val) if pd.notna(val) else None
+    return _index_lookup_value(index_path, variable_id, catalog_number)
 
 
 def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -333,45 +317,42 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
 
-    taxon_dir = TREE_ROOT / taxon["path"]
     layer_index = {layer["id"]: layer for layer in tiles.load_layers()}
+    taxon_key = str(taxon["taxon_key"])
+    _tk = [("taxon_key", "=", taxon_key)]
 
     numerical_stats: dict[str, dict] = {}
-    num_path = taxon_dir / NUMERICAL_STATS_FILE
-    if num_path.exists():
-        for row in pq.read_table(num_path).to_pylist():
-            var = row.pop("variable")
-            numerical_stats[var] = row
+    for row in pq.read_table(GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE, filters=_tk).to_pylist():
+        row.pop("taxon_key", None)
+        var = row.pop("variable")
+        numerical_stats[var] = row
 
     circular_stats: dict[str, dict] = {}
-    circ_path = taxon_dir / CIRCULAR_STATS_FILE
-    if circ_path.exists():
-        for row in pq.read_table(circ_path).to_pylist():
-            var = row.pop("variable")
-            circular_stats[var] = row
+    for row in pq.read_table(GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE, filters=_tk).to_pylist():
+        row.pop("taxon_key", None)
+        var = row.pop("variable")
+        circular_stats[var] = row
 
     nominal_stats: dict[str, dict] = {}
     nominal_classes: dict[str, list] = {}
-    nom_path = taxon_dir / NOMINAL_STATS_FILE
-    if nom_path.exists():
-        for row in pq.read_table(nom_path).to_pylist():
-            var, metric, value = row["variable"], row["metric"], row["value"]
-            if metric.startswith("class_"):
-                if not value:
-                    continue
-                class_id = int(metric[6:])
-                nominal_classes.setdefault(var, []).append({"class_id": class_id, "fraction": value})
-            else:
-                nominal_stats.setdefault(var, {})[metric] = value
-        for var in nominal_classes:
-            nominal_classes[var].sort(key=lambda e: -e["fraction"])
+    for row in pq.read_table(GLOBAL_STATS_DIR / NOMINAL_STATS_FILE, filters=_tk).to_pylist():
+        row.pop("taxon_key", None)
+        var, metric, value = row["variable"], row["metric"], row["value"]
+        if metric.startswith("class_"):
+            if not value:
+                continue
+            class_id = int(metric[6:])
+            nominal_classes.setdefault(var, []).append({"class_id": class_id, "fraction": value})
+        else:
+            nominal_stats.setdefault(var, {})[metric] = value
+    for var in nominal_classes:
+        nominal_classes[var].sort(key=lambda e: -e["fraction"])
 
     density_by_var: dict[str, dict] = {}
-    den_path = taxon_dir / DENSITY_FILE
-    if den_path.exists():
-        for row in pq.read_table(den_path).to_pylist():
-            var = row.pop("variable")
-            density_by_var[var] = row
+    for row in pq.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk).to_pylist():
+        row.pop("taxon_key", None)
+        var = row.pop("variable")
+        density_by_var[var] = row
 
     all_var_ids = list(dict.fromkeys(list(numerical_stats) + list(circular_stats) + list(nominal_stats)))
     variables = []
@@ -405,25 +386,23 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
 # Legacy compatibility endpoints (frontend still uses these URL patterns)
 # ---------------------------------------------------------------------------
 
-def _load_relative_ranks(taxon_dir: Path, variable_id: str) -> list[dict]:
-    """Read relative_ranks_positions.parquet and return rank rows for one variable."""
-    pos_path = taxon_dir / POSITION_FILE
-    if not pos_path.exists():
-        return []
+def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
+    """Read relative_ranks_positions.parquet from global file for one taxon+variable."""
     try:
-        rows = pq.read_table(pos_path).to_pylist()
+        rows = pq.read_table(
+            GLOBAL_STATS_DIR / POSITION_FILE,
+            filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
+        ).to_pylist()
     except Exception:
         return []
     result = []
     for row in rows:
-        if row.get("variable") != variable_id:
-            continue
         position = row.get("position") or 0
         count = row.get("count") or 0
         percentile = round(position / count, 3) if count > 0 else 0.0
         result.append({
             "metric": row.get("metric"),
-            "position": position + 1,          # 1-based rank
+            "position": position + 1,
             "count": count,
             "percentile": percentile,
             "sampleCount": row.get("sampleCount"),
@@ -569,7 +548,6 @@ def get_species_environment(
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
 
     variable_id = _resolve_variable_id(variable_id)
-    taxon_dir = TREE_ROOT / taxon["path"]
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     variable_metadata = {
         "name": layer["display_name"] if layer else variable_id,
@@ -650,10 +628,10 @@ def get_species_environment(
                 }
 
     if value_type == "nominal":
-        nom_path = taxon_dir / NOMINAL_STATS_FILE
-        if not nom_path.exists():
-            raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
-        rows = [r for r in pq.read_table(nom_path).to_pylist() if r["variable"] == variable_id]
+        rows = pq.read_table(
+            GLOBAL_STATS_DIR / NOMINAL_STATS_FILE,
+            filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)],
+        ).to_pylist()
         if not rows:
             raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
         metrics = {r["metric"]: r["value"] for r in rows}
@@ -694,14 +672,13 @@ def get_species_environment(
             },
             "density_curve": None,
             "categorical_distribution": categorical_distribution,
-            "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
+            "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id),
         }
 
     if value_type == "circular":
-        circ_path = taxon_dir / CIRCULAR_STATS_FILE
-        if not circ_path.exists():
-            raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
-        row = next((r for r in pq.read_table(circ_path).to_pylist() if r["variable"] == variable_id), None)
+        _tk_var = [("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)]
+        rows = pq.read_table(GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE, filters=_tk_var).to_pylist()
+        row = rows[0] if rows else None
         if row is None:
             raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
         count = int(row.get("count") or 0)
@@ -711,12 +688,9 @@ def get_species_environment(
             "rbar": row.get("rbar"),
             "circular_std": row.get("circular_std"),
         }
-        density_curve = None
-        den_path = taxon_dir / DENSITY_FILE
-        if den_path.exists():
-            den_row = next((r for r in pq.read_table(den_path).to_pylist() if r["variable"] == variable_id), None)
-            if den_row:
-                density_curve = {"points": den_row["points"], "density": den_row["density"]}
+        den_rows = pq.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
+        den_row = den_rows[0] if den_rows else None
+        density_curve = {"points": den_row["points"], "density": den_row["density"]} if den_row else None
         return {
             "species_id": taxon.get("taxon_key"),
             "variable": variable_id,
@@ -725,13 +699,12 @@ def get_species_environment(
             "summary": summary,
             "density_curve": density_curve,
             "categorical_distribution": None,
-            "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
+            "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id),
         }
 
-    num_path = taxon_dir / NUMERICAL_STATS_FILE
-    if not num_path.exists():
-        raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
-    row = next((r for r in pq.read_table(num_path).to_pylist() if r["variable"] == variable_id), None)
+    _tk_var = [("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)]
+    rows = pq.read_table(GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE, filters=_tk_var).to_pylist()
+    row = rows[0] if rows else None
     if row is None:
         raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
 
@@ -746,12 +719,9 @@ def get_species_environment(
         "q90": row.get("90th_percentile"),
     }
 
-    density_curve = None
-    den_path = taxon_dir / DENSITY_FILE
-    if den_path.exists():
-        den_row = next((r for r in pq.read_table(den_path).to_pylist() if r["variable"] == variable_id), None)
-        if den_row:
-            density_curve = {"points": den_row["points"], "density": den_row["density"]}
+    den_rows = pq.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
+    den_row = den_rows[0] if den_rows else None
+    density_curve = {"points": den_row["points"], "density": den_row["density"]} if den_row else None
 
     return {
         "species_id": taxon.get("taxon_key"),
@@ -761,7 +731,7 @@ def get_species_environment(
         "summary": units.convert_summary(raw_summary, layer, unit_system),
         "density_curve": units.convert_density_curve(density_curve, layer, unit_system),
         "categorical_distribution": None,
-        "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
+        "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id),
     }
 
 
@@ -985,33 +955,13 @@ def _read_index_for_slice(
     class_value: float | None = None,
     limit: int | None = None,
 ) -> list[dict]:
-    """Filter occurrence_index.parquet by value range or class and return observations."""
-    schema = pq.read_schema(index_path)
-    if variable_id not in schema.names:
-        return []
-    cols = [c for c in ["catalogNumber", "decimalLatitude", "decimalLongitude", variable_id] if c in schema.names]
-    df = pq.read_table(index_path, columns=cols).to_pandas()
-    if class_value is not None:
-        col = pd.to_numeric(df[variable_id], errors="coerce")
-        mask = col == float(class_value)
-    elif circular_wrap:
-        col = pd.to_numeric(df[variable_id], errors="coerce")
-        mask = col.between(value_min, 360.0, inclusive="both") | col.between(0.0, value_max, inclusive="both")
-    else:
-        col = pd.to_numeric(df[variable_id], errors="coerce")
-        mask = col.between(value_min, value_max, inclusive="both")
-    df = df[mask].dropna(subset=["decimalLatitude", "decimalLongitude"])
-    if limit is not None:
-        df = df.head(limit)
-    return [
-        {
-            "catalogNumber": str(r["catalogNumber"]),
-            "latitude": r["decimalLatitude"],
-            "longitude": r["decimalLongitude"],
-            "value": (float(r[variable_id]) if pd.notna(r[variable_id]) else None),
-        }
-        for r in df.to_dict("records")
-    ]
+    """Binary-search occurrence_index.parquet by value range or class."""
+    return _index_read_slice(
+        index_path, variable_id,
+        value_min=value_min, value_max=value_max,
+        circular_wrap=circular_wrap, class_value=class_value,
+        limit=limit,
+    )
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/slice")
@@ -1257,7 +1207,7 @@ def query_taxa(
             raise HTTPException(status_code=404, detail=f"Taxon not found: {within_taxon}")
 
     norm_rank = descendant_rank.upper() if descendant_rank else None
-    norm_sort_variable = sort_variable.replace("_", "") if sort_variable else None
+    norm_sort_variable = _resolve_variable_id(sort_variable) if sort_variable else None
 
     result = rankings.query_taxa(
         q=normalized_q,

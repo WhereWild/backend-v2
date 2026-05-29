@@ -26,12 +26,12 @@ import rasterio
 from fastapi import HTTPException
 
 from util.gis import DERIVED_FROM_ELEVATION, hilbert_index, sample_aspect_batch, sample_slope_batch
+from util.indexing import OCCURRENCE_INDEX_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
-    OCCURRENCE_INDEX_FILE,
     _filter_df,
     process_observations_df,
 )

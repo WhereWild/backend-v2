@@ -110,9 +110,8 @@ def _flush(buffers: dict, taxon_path: str) -> None:
             existing = existing.cast(new_table.schema)
         new_table = pa.concat_tables([existing, new_table])
 
-    tmp = file_path.with_suffix(".parquet.tmp")
-    pq.write_table(new_table, tmp)
-    tmp.replace(file_path)
+    from util.storage import atomic_write_parquet
+    atomic_write_parquet(file_path, new_table, row_group_size=256)
 
     buffers[taxon_path].clear()
 

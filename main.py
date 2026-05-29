@@ -19,6 +19,9 @@ from starlette.concurrency import run_in_threadpool
 import util.rankings as rankings
 from config.config import load_config
 from util import citations, gis, taxa, tiles, units, upload
+from util.indexing import OCCURRENCE_INDEX_FILE
+from util.indexing import lookup_value as _index_lookup_value
+from util.indexing import read_slice as _index_read_slice
 from util.rankings import POSITION_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
@@ -33,7 +36,6 @@ from util.stats import (
     compute_phenology_counts,
     read_phenology_counts,
 )
-from util.indexing import OCCURRENCE_INDEX_FILE, lookup_value as _index_lookup_value, read_slice as _index_read_slice
 from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
 
 _CONFIG = load_config("global")

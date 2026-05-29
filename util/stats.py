@@ -37,6 +37,7 @@ from util.taxa import TaxonRecord, iter_descendants
 CONFIG = load_config("global")
 
 TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
+GLOBAL_STATS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "global"
 OCCURRENCE_FILE = "occurrence.parquet"
 NUMERICAL_STATS_FILE = "numerical_stats.parquet"
 NOMINAL_STATS_FILE = "nominal_stats.parquet"
@@ -117,6 +118,19 @@ def write_phenology_counts(taxon_dir: Path, counts: Counter) -> None:
 
 
 def read_phenology_counts(taxon_dir: Path) -> dict[str, int]:
+    taxon_key = taxon_dir.name.rsplit("_", 1)[-1]
+    global_path = GLOBAL_STATS_DIR / "phenology_counts.parquet"
+    if global_path.exists():
+        try:
+            rows = pq.read_table(
+                global_path,
+                filters=[("taxon_key", "=", taxon_key)],
+            ).to_pylist()
+            if rows:
+                return {r["phenology_value"]: r["count"] for r in rows}
+        except Exception:
+            pass
+    # fallback: per-node numerical_stats metadata (pre-consolidation)
     p = taxon_dir / NUMERICAL_STATS_FILE
     if p.exists():
         try:
@@ -126,7 +140,7 @@ def read_phenology_counts(taxon_dir: Path) -> dict[str, int]:
                 return json.loads(raw)
         except Exception:
             pass
-    # fallback for data written before this change
+    # legacy JSON fallback
     p = taxon_dir / PHENOLOGY_COUNTS_FILE
     if p.exists():
         try:

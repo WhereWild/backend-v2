@@ -751,7 +751,7 @@ def test_get_taxon_env_stats_no_files():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[]), \
-         patch("pathlib.Path.exists", return_value=False):
+         patch.object(pq, "read_table", return_value=pa.table({})):
         r = client.get("/api/taxon/2923970/env-stats")
     assert r.status_code == 200
     assert r.json()["variables"] == []
@@ -772,7 +772,7 @@ def test_get_species_environment_nominal_no_file():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
-         patch("pathlib.Path.exists", return_value=False):
+         patch.object(pq, "read_table", return_value=pa.table({})):
         r = client.get("/species/2923970/environment/kg0")
     assert r.status_code == 404
 
@@ -820,7 +820,7 @@ def test_get_species_environment_numerical_no_file():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
-         patch("pathlib.Path.exists", return_value=False):
+         patch.object(pq, "read_table", return_value=pa.table({})):
         r = client.get("/species/2923970/environment/bio1")
     assert r.status_code == 404
 
@@ -1313,7 +1313,7 @@ def test_get_species_environment_with_location_no_layer_falls_through(monkeypatc
     _patch_hierarchy(monkeypatch, {"USA": _USA})
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(tiles, "load_layers", return_value=[]), \
-         patch("pathlib.Path.exists", return_value=False):
+         patch.object(pq, "read_table", return_value=pa.table({})):
         r = client.get("/species/2923970/environment/bio1?location=USA")
     assert r.status_code == 404
 

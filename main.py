@@ -310,7 +310,13 @@ def get_taxon(taxon_id: str):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    return {**taxon, **_image_fields(taxon)}
+    sci = taxon.get("scientific_name", "")
+    def _title_name(s: str) -> str:
+        def cap_word(w: str) -> str:
+            return re.sub(r"(^|(?<=-))[a-z]", lambda m: m.group().upper(), w.lower())
+        return " ".join(cap_word(w) for w in s.split())
+    vnames = [_title_name(n) for n in taxon.get("vernacular_names") or []]
+    return {**taxon, "scientific_name": sci.replace("_", " "), "vernacular_names": vnames, **_image_fields(taxon)}
 
 
 @app.get("/api/species/{taxon_id}/obscured")
@@ -1019,6 +1025,7 @@ def get_species_environment_slice(
     phenology: str | None = None,
     start_ts: int | None = None,
     end_ts: int | None = None,
+    unit_system: str | None = None,
 ):
     if not math.isfinite(min_value) or not math.isfinite(max_value):
         raise HTTPException(status_code=400, detail="min and max must be finite numbers")
@@ -1037,14 +1044,21 @@ def get_species_environment_slice(
     circular_wrap = variable_id == "aspect" and max_value < min_value
     if max_value < min_value and not circular_wrap:
         min_value, max_value = max_value, min_value
+    # Convert display-unit min/max back to raw (metric) values for querying.
+    raw_min = units.convert_value_from_display(min_value, layer, unit_system)
+    raw_max = units.convert_value_from_display(max_value, layer, unit_system)
     if location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None:
         filter_col = _location_filter_col(location) if location is not None else None
         if location is None or filter_col is not None:
             observations = _slice_from_raw_occ(
                 taxon, variable_id, filter_col, location,
-                min_value, max_value, circular_wrap, limit,
+                raw_min, raw_max, circular_wrap, limit,
                 phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
             )
+            observations = [
+                {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
+                for obs in observations
+            ]
             return {
                 "species_id": taxon.get("taxon_key"),
                 "variable": variable_id,
@@ -1057,9 +1071,13 @@ def get_species_environment_slice(
         raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")
     observations = _read_index_for_slice(
         index_path, variable_id,
-        value_min=min_value, value_max=max_value, circular_wrap=circular_wrap,
+        value_min=raw_min, value_max=raw_max, circular_wrap=circular_wrap,
         limit=limit,
     )
+    observations = [
+        {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
+        for obs in observations
+    ]
     return {
         "species_id": taxon.get("taxon_key"),
         "variable": variable_id,

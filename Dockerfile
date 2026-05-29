@@ -13,6 +13,9 @@ RUN apt-get update \
     htop \
     bash-completion \
     build-essential \
+    fuse \
+    psmisc \
+    rclone \
  && rm -rf /var/lib/apt/lists/*
 
 RUN echo '\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr/share/bash-completion/bash_completion\nfi' >> /etc/bash.bashrc \
@@ -34,4 +37,7 @@ COPY . .
 RUN echo '\n[ -f /etc/wherewild_aliases.sh ] && . /etc/wherewild_aliases.sh' >> /etc/bash.bashrc
 COPY docker/aliases.sh /etc/wherewild_aliases.sh
 
+COPY docker/entrypoint.sh /usr/local/bin/wherewild-entrypoint
+RUN chmod +x /usr/local/bin/wherewild-entrypoint
+ENTRYPOINT ["/usr/local/bin/wherewild-entrypoint"]
 CMD ["bash"]

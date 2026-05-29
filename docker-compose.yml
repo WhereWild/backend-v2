@@ -5,6 +5,14 @@ services:
     volumes:
       - .:/workspace
       - root-home:/root
+    environment:
+      - RCLONE_CONFIG=/workspace/docker/rclone.conf
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
     stdin_open: true
     tty: true
 

@@ -103,8 +103,6 @@ class GlobalConfig:
     temporal_raster_vars: str = ""        # CSV, empty = all
     temporal_raster_windows: str = ""     # CSV window labels (e.g. "24h,7d"), empty = all
     temporal_raster_force_rebuild: bool = False
-    temporal_raster_upload_enabled: bool = False
-    temporal_raster_b2_dest: str = ""     # rclone destination for upload
 
     @property
     def gis_root(self) -> Path:
@@ -116,6 +114,8 @@ class GlobalConfig:
             if hints.get(f.name) not in _SCALAR_TYPES:
                 continue
             val = os.environ.get(f.name.upper())
+            if val is None and f.name == "data_root":
+                val = os.environ.get("WHEREWILD_DATA_ROOT")
             if val is not None:
                 setattr(self, f.name, hints[f.name](val))
 

@@ -152,6 +152,7 @@ def _push_b2_stage() -> None:
     cmd = [
         "rclone", "sync", str(DATA_DIR), dest,
         "--exclude", "cache/**",
+        "--exclude", "gis/temporal/chunks/**",
         "--fast-list",
         "--transfers", transfers,
         "--stats-one-line",

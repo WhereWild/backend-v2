@@ -305,6 +305,7 @@ b2-push-all() {
   : > "$log_file"
   rclone copy "$data_root" "${remote}:${bucket}/${prefix}" \
     --exclude "cache/**" \
+    --exclude "gis/temporal/chunks/**" \
     --fast-list \
     --transfers "$transfers" \
     --stats "$stats_interval" \
@@ -378,6 +379,7 @@ b2-overwrite-remote() {
   : > "$log_file"
   rclone sync "$data_root" "${remote}:${bucket}/${prefix}" \
     --exclude "cache/**" \
+    --exclude "gis/temporal/chunks/**" \
     --fast-list \
     --transfers "$transfers" \
     --stats "$stats_interval" \
@@ -597,7 +599,10 @@ b2-push-dir() {
   local bucket="${WW_B2_BUCKET:-wherewild-data}"
   local prefix="${WW_B2_PREFIX:-data}"
   local local_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
-  local transfers="${WW_RCLONE_TRANSFERS:-4}"
+  local transfers="${WW_RCLONE_TRANSFERS:-16}"
+  local stats_interval="${WW_RCLONE_STATS_INTERVAL:-1m}"
+  local log_dir="/workspace/logs/rclone"
+  local pid_dir="/workspace/logs/pids"
   local force=0
   local dry_run=0
   local args=()
@@ -638,10 +643,78 @@ b2-push-dir() {
     remote_path="${bucket}/${path}"
   fi
 
+  local log_name="push-dir-${path//\//-}"
+  local log_file="${log_dir}/${log_name}.log"
+  local pid_file="${pid_dir}/rclone-${log_name}.pid"
+
+  mkdir -p "$log_dir" "$pid_dir"
+
+  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+    echo "b2-push-dir: already running (pid $(cat "$pid_file"))"
+    return 0
+  fi
+
   echo "b2-push-dir: ${source} → ${remote}:${remote_path}"
+  : > "$log_file"
   rclone copy "$source" "${remote}:${remote_path}" \
+    --fast-list \
     --transfers "$transfers" \
-    ${dry_run:+--dry-run}
+    --stats "$stats_interval" \
+    --stats-log-level INFO \
+    --log-file "$log_file" \
+    --log-level INFO \
+    ${dry_run:+--dry-run} > /dev/null 2>&1 &
+  local pid="$!"
+  echo "$pid" > "$pid_file"
+  echo "b2-push-dir started (pid ${pid}); log: ${log_file}"
+}
+
+b2-wipe() {
+  local remote="${WW_B2_WRITER_REMOTE:-wherewild-localdev-writer}"
+  local bucket="${WW_B2_BUCKET:-wherewild-data}"
+  local prefix="${WW_B2_PREFIX:-data}"
+  local dry_run=0
+
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=1 ;;
+    esac
+  done
+
+  local remote_path="${bucket}"
+  if [[ -n "$prefix" ]]; then
+    remote_path="${bucket}/${prefix}"
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    echo "b2-wipe (dry-run): would purge ${remote}:${remote_path}"
+    return 0
+  fi
+
+  echo "b2-wipe WARNING:"
+  echo "This will DELETE ALL files under ${remote}:${remote_path}"
+  echo "Type 'destroy' to proceed:"
+  local confirm
+  read -r confirm
+  if [[ "$confirm" != "destroy" ]]; then
+    echo "b2-wipe: aborted"
+    return 1
+  fi
+
+  local log_dir="/workspace/logs/rclone"
+  local pid_dir="/workspace/logs/pids"
+  local log_file="${log_dir}/wipe.log"
+  local pid_file="${pid_dir}/rclone-wipe.pid"
+  mkdir -p "$log_dir" "$pid_dir"
+
+  echo "b2-wipe: purging ${remote}:${remote_path} …"
+  : > "$log_file"
+  rclone purge "${remote}:${remote_path}" \
+    --log-file "$log_file" \
+    --log-level INFO > /dev/null 2>&1 &
+  local pid="$!"
+  echo "$pid" > "$pid_file"
+  echo "b2-wipe started (pid ${pid}); log: ${log_file}"
 }
 
 b2-help() {
@@ -683,6 +756,9 @@ B2 helpers:
 
 - b2-push-dir <path> [--dry-run] [--force]
   Upload a local directory from /workspace/data/<path> to B2.
+
+- b2-wipe [--dry-run]
+  Purge ALL files under the remote data prefix (irreversible — requires typing 'destroy').
 
 - b2-env
   Print WHEREWILD_DATA_ROOT for the mount path.

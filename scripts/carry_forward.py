@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -59,13 +59,8 @@ def _is_temporal_col(col: str, temporal_ids: frozenset[str]) -> bool:
 
 
 def _atomic_write(path: Path, table: pa.Table) -> None:
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        pq.write_table(table, tmp_path)
-        tmp_path.replace(path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    from util.storage import atomic_write_parquet
+    atomic_write_parquet(path, table, row_group_size=256)
 
 
 def _carry_one(
@@ -136,17 +131,24 @@ def _carry_one(
     if n_carried == 0:
         return 0, n_changed, n_new_obs, n_total
 
-    result = new_df.copy()
-
+    new_cols: dict[str, np.ndarray] = {}
     for col in tree_cols:
         src = f"_old_{col}"
         if src in merged.columns:
-            result[col] = np.where(coords_same, merged[src].values, np.nan)
+            new_cols[col] = np.where(coords_same, merged[src].values, np.nan)
 
     for col in temp_cols:
         src = f"_old_{col}"
         if src in merged.columns:
-            result[col] = np.where(coords_same & ts_same, merged[src].values, np.nan)
+            new_cols[col] = np.where(coords_same & ts_same, merged[src].values, np.nan)
+
+    if new_cols:
+        result = pd.concat(
+            [new_df, pd.DataFrame(new_cols, index=new_df.index)],
+            axis=1,
+        )
+    else:
+        result = new_df
 
     _atomic_write(new_path, pa.Table.from_pandas(result, preserve_index=False))
     return n_carried, n_changed, n_new_obs, n_total

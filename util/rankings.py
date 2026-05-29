@@ -15,7 +15,6 @@ import csv
 import json
 import math
 import os
-import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -25,6 +24,7 @@ import pyarrow.parquet as pq
 
 from config.config import METRICS_BY_TYPE, ValueType, load_config
 from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE
+from util.storage import atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
 
 CONFIG = load_config("global")
@@ -74,15 +74,7 @@ def _safe_finite(x) -> bool:
         return False
 
 def _atomic_write(path: Path, table: pa.Table) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".parquet", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        pq.write_table(table, tmp_path)
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+    atomic_write_parquet(path, table, row_group_size=256)
 
 
 def _resolve_context_label(taxon: TaxonRecord) -> str:

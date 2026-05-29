@@ -1,0 +1,42 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+    depends_on:
+      - api
+      - frontend
+
+  api:
+    build: .
+    volumes:
+      - .:/workspace
+      - root-home:/root
+    environment:
+      - RCLONE_CONFIG=/workspace/docker/rclone.conf
+      - WHEREWILD_MODE=api
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../front-end
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+volumes:
+  root-home:
+  caddy-data:
+  caddy-config:

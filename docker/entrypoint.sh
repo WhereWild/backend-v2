@@ -10,62 +10,35 @@ if [[ -f "$template" && ! -f "$target" ]]; then
 fi
 
 MODE="${WHEREWILD_MODE:-dev}"
-AUTO_PULL_ENABLED="${WHEREWILD_AUTO_PULL_ENABLED:-true}"
 
-start_auto_pull_scheduler() {
-  case "${AUTO_PULL_ENABLED,,}" in
-    1|true|yes|on)
-      echo "Starting in-container auto-pull scheduler"
-      /usr/local/bin/wherewild-auto-pull-service &
-      ;;
-    *)
-      echo "In-container auto-pull scheduler disabled (WHEREWILD_AUTO_PULL_ENABLED=${AUTO_PULL_ENABLED})"
-      ;;
-  esac
-}
+if [[ "$MODE" == "api" ]]; then
+  # shellcheck source=/dev/null
+  . /workspace/docker/aliases.sh
 
-case "$MODE" in
-  api)
-    echo "Starting WhereWild API"
-    if [[ -f /etc/wherewild_aliases.sh ]]; then
-      # Reuse the helper logic for data-root selection and startup log rotation.
-      . /etc/wherewild_aliases.sh
-      ww_prepare_api_runtime >/dev/null
+  mount_point="${WW_B2_MOUNT:-/workspace/.b2-mount}"
+  export WHEREWILD_DATA_ROOT="$mount_point"
 
-      # If we're serving from local data, kick off a background pull to populate it.
-      # (When serving from the mounted remote, pulling everything locally is redundant.)
-      local_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
-      # Normalize paths (strip any trailing slash) before comparing to avoid brittle string equality.
-      normalized_data_root="${WHEREWILD_DATA_ROOT%/}"
-      normalized_local_root="${local_root%/}"
-      if [[ "$normalized_data_root" == "$normalized_local_root" ]]; then
-        echo "Starting b2-pull-all to populate $local_root"
-        # b2-pull-all manages its own rclone log at /workspace/logs/rclone/clone.log
-        b2-pull-all
-        start_auto_pull_scheduler
-      fi
+  echo "[entrypoint] mounting B2 at $mount_point..."
+  b2-mount || true
 
-      ww_prepare_api_log
-    else
-      # Fallback if aliases weren't baked into the image.
-      # Honor WHEREWILD_LOCAL_DATA_ROOT if set, otherwise default to /workspace/data.
-      local_root="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}"
-      export WHEREWILD_DATA_ROOT="$local_root"
-      mkdir -p /workspace/logs
-      if [[ -f /workspace/logs/api.log ]]; then
-        mv -f /workspace/logs/api.log /workspace/logs/api.previous.log
-      fi
+  echo "[entrypoint] waiting for mount..."
+  _mounted=0
+  for _i in $(seq 30); do
+    if mountpoint -q "$mount_point" 2>/dev/null; then
+      _mounted=1
+      break
     fi
+    sleep 1
+  done
 
-    exec > >(tee /workspace/logs/api.log) 2>&1
-    exec uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
-    ;;
-  dev)
-    echo "Entering dev mode"
-    exec "$@"
-    ;;
-  *)
-    echo "Unknown WHEREWILD_MODE=$MODE"
-    exit 1
-    ;;
-esac
+  if [[ "$_mounted" -eq 1 ]]; then
+    echo "[entrypoint] B2 mounted"
+  else
+    echo "[entrypoint] WARNING: B2 not ready after 30s, starting anyway"
+  fi
+
+  exec uv run --env-file /workspace/.env uvicorn main:app \
+    --host 0.0.0.0 --port 8000 --log-level info
+fi
+
+exec "$@"

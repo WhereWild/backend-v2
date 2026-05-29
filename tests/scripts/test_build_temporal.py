@@ -1142,7 +1142,7 @@ class _FakeCfg:
 
 
 def _patch_main_base(monkeypatch, tmp_path: Path, force: bool = True,
-                     upload: bool = False, vars_str: str = "temperature_2m",
+                     vars_str: str = "temperature_2m",
                      windows_str: str = "1h"):
     """Patch all external I/O needed for main()."""
     cfg = _FakeCfg()
@@ -1150,8 +1150,8 @@ def _patch_main_base(monkeypatch, tmp_path: Path, force: bool = True,
     cfg.temporal_raster_force_rebuild = force
     cfg.temporal_raster_vars = vars_str
     cfg.temporal_raster_windows = windows_str
-    cfg.temporal_raster_upload_enabled = upload
 
+    monkeypatch.setenv("TEMPORAL_RASTER_NO_PUSH", "1")
     monkeypatch.setattr("scripts.build_temporal.load_config", lambda _: cfg)
 
     # fsspec.filesystem mock
@@ -1371,70 +1371,6 @@ def test_main_gfs_snow_depth_unavailable(monkeypatch, tmp_path: Path, capsys):
     assert "not found" in out or "ERA5-land only" in out
 
 
-def test_main_upload_enabled(monkeypatch, tmp_path: Path):
-    """upload_enabled=True → subprocess.run called with rclone."""
-    _patch_main_base(monkeypatch, tmp_path, force=True, upload=True)
-
-    # Need to set b2_dest
-    class _UploadCfg(_FakeCfg):
-        temporal_raster_out_dir = str(tmp_path)
-        temporal_raster_force_rebuild = True
-        temporal_raster_vars = "temperature_2m"
-        temporal_raster_windows = "1h"
-        temporal_raster_upload_enabled = True
-        temporal_raster_b2_dest = "b2:mybucket/rasters"
-
-    monkeypatch.setattr("scripts.build_temporal.load_config", lambda _: _UploadCfg())
-
-    run_calls = []
-
-    def _fake_run(cmd, *a, **kw):
-        run_calls.append(cmd)
-        result = MagicMock()
-        result.returncode = 0
-        return result
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-
-    bt.main()
-    assert any("rclone" in c[0] for c in run_calls)
-
-
-def test_main_upload_rclone_failure(monkeypatch, tmp_path: Path, capsys):
-    """upload_enabled=True, rclone returns non-zero → prints error."""
-    _patch_main_base(monkeypatch, tmp_path, force=True, upload=True)
-
-    class _UploadCfg(_FakeCfg):
-        temporal_raster_out_dir = str(tmp_path)
-        temporal_raster_force_rebuild = True
-        temporal_raster_vars = "temperature_2m"
-        temporal_raster_windows = "1h"
-        temporal_raster_upload_enabled = True
-        temporal_raster_b2_dest = "b2:mybucket/rasters"
-
-    monkeypatch.setattr("scripts.build_temporal.load_config", lambda _: _UploadCfg())
-
-    def _fake_run(cmd, *a, **kw):
-        result = MagicMock()
-        result.returncode = 1
-        return result
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-
-    bt.main()
-    out = capsys.readouterr().out
-    assert "rclone exited" in out
-
-
-def test_main_upload_disabled(monkeypatch, tmp_path: Path):
-    """upload_enabled=False → subprocess.run never called."""
-    _patch_main_base(monkeypatch, tmp_path, force=True, upload=False)
-
-    run_calls = []
-    monkeypatch.setattr("subprocess.run", lambda *a, **kw: run_calls.append(1))
-
-    bt.main()
-    assert run_calls == []
 
 
 def test_main_empty_vars_uses_all(monkeypatch, tmp_path: Path):

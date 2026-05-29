@@ -25,8 +25,13 @@ import pyarrow.parquet as pq
 
 from config.config import METRICS_BY_TYPE, ValueType, load_config
 from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE
-from util.storage import atomic_write_parquet
+from util.storage import ParquetStorageProxy, atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
+
+_storage = ParquetStorageProxy(
+    data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
+    project_root=Path(__file__).parent.parent,
+)
 
 CONFIG = load_config("global")
 
@@ -385,7 +390,7 @@ def build_rank_indexes(ancestor: TaxonRecord, layers: list[dict]) -> None:
 
 def _load_column_lengths(index_path: Path) -> dict[str, int]:
     try:
-        schema = pq.read_schema(index_path)
+        schema = _storage.read_schema(index_path)
         raw = (schema.metadata or {}).get(b"column_lengths")
         if not raw:
             return {}
@@ -557,7 +562,7 @@ def _location_taxon_keys(gid: str) -> tuple[frozenset[str], dict[str, int]]:
     """Return (taxon_key set, per-taxon observation counts) for a GID."""
     scope = _gid_to_scope(gid)
     try:
-        tbl = pq.read_table(
+        tbl = _storage.read_table(
             _LOC_TAXA_PATH,
             filters=[("scope", "=", scope), ("gid", "=", gid)],
         )
@@ -577,7 +582,7 @@ def _location_taxon_keys(gid: str) -> tuple[frozenset[str], dict[str, int]]:
 def _read_index_entries(index_path: Path, col_name: str, col_len: int) -> list[dict]:
     """Read one struct column from a rank_index.parquet, returning up to col_len entries."""
     try:
-        tbl = pq.read_table(index_path, columns=[col_name])
+        tbl = _storage.read_table(index_path, columns=[col_name])
         column = tbl.column(col_name).combine_chunks()
         result = []
         for i in range(min(col_len, len(column))):
@@ -591,43 +596,27 @@ def _read_index_entries(index_path: Path, col_name: str, col_len: int) -> list[d
 
 def _taxon_metric_value(taxon_dir: Path, variable_id: str, metric_id: str) -> float | None:
     """Read one variable::metric value from a taxon's stats files."""
-    num_path = taxon_dir / NUMERICAL_STATS_FILE
-    if num_path.exists():
+    for path, filter_fn in [
+        (taxon_dir / NUMERICAL_STATS_FILE,
+         lambda df: df[df["variable"] == variable_id]),
+        (taxon_dir / NOMINAL_STATS_FILE,
+         lambda df: df[(df["variable"] == variable_id) & (df["metric"] == metric_id)]),
+        (taxon_dir / CIRCULAR_STATS_FILE,
+         lambda df: df[df["variable"] == variable_id]),
+    ]:
         try:
-            df = pq.read_table(num_path).to_pandas()
-            rows = df[df["variable"] == variable_id]
-            if not rows.empty and metric_id in rows.columns:
-                val = rows.iloc[0][metric_id]
-                if val is not None:
-                    fval = float(val)
-                    if math.isfinite(fval):
-                        return fval
-        except Exception:
-            pass
-    nom_path = taxon_dir / NOMINAL_STATS_FILE
-    if nom_path.exists():
-        try:
-            df = pq.read_table(nom_path).to_pandas()
-            rows = df[(df["variable"] == variable_id) & (df["metric"] == metric_id)]
-            if not rows.empty:
-                val = rows.iloc[0]["value"]
-                if val is not None:
-                    fval = float(val)
-                    if math.isfinite(fval):
-                        return fval
-        except Exception:
-            pass
-    circ_path = taxon_dir / CIRCULAR_STATS_FILE
-    if circ_path.exists():
-        try:
-            df = pq.read_table(circ_path).to_pandas()
-            rows = df[df["variable"] == variable_id]
-            if not rows.empty and metric_id in rows.columns:
-                val = rows.iloc[0][metric_id]
-                if val is not None:
-                    fval = float(val)
-                    if math.isfinite(fval):
-                        return fval
+            df = _storage.read_table(path).to_pandas()
+            rows = filter_fn(df)
+            if rows.empty:
+                continue
+            col = "value" if "value" in rows.columns else metric_id
+            if col not in rows.columns:
+                continue
+            val = rows.iloc[0][col]
+            if val is not None:
+                fval = float(val)
+                if math.isfinite(fval):
+                    return fval
         except Exception:
             pass
     return None
@@ -672,9 +661,6 @@ def _query_ranked_scoped(
     rank_lower = "subspecies" if descendant_rank in CONFIG.subspecies_equivalents else descendant_rank.lower()
     ancestor_dir = TREE_ROOT / within_taxon["path"]
     index_path = ancestor_dir / f"{rank_lower}_index.parquet"
-
-    if not index_path.exists():
-        return _empty_result("no_index")
 
     col_name = f"{sort_variable}::{sort_metric}"
     col_len = _load_column_lengths(index_path).get(col_name)
@@ -916,19 +902,18 @@ def _load_scope_keys(
     """Return taxon_key set for all descendants of within_taxon at descendant_rank."""
     rank_lower = "subspecies" if descendant_rank in CONFIG.subspecies_equivalents else descendant_rank.lower()
     index_path = TREE_ROOT / within_taxon["path"] / f"{rank_lower}_index.parquet"
-    if index_path.exists():
-        try:
-            schema = pq.read_schema(index_path)
-            col_lengths: dict[str, int] = json.loads(schema.metadata.get(b"column_lengths", b"{}"))
-            if col_lengths:
-                first_col = next(iter(col_lengths))
-                col_len = col_lengths[first_col]
-                tbl = pq.read_table(index_path, columns=[first_col])
-                col = tbl.column(first_col).combine_chunks().slice(0, col_len)
-                keys = pc.struct_field(col, "taxonKey").to_pylist()
-                return frozenset(str(k) for k in keys if k is not None)
-        except Exception:
-            pass
+    try:
+        schema = _storage.read_schema(index_path)
+        col_lengths: dict[str, int] = json.loads(schema.metadata.get(b"column_lengths", b"{}"))
+        if col_lengths:
+            first_col = next(iter(col_lengths))
+            col_len = col_lengths[first_col]
+            tbl = _storage.read_table(index_path, columns=[first_col])
+            col = tbl.column(first_col).combine_chunks().slice(0, col_len)
+            keys = pc.struct_field(col, "taxonKey").to_pylist()
+            return frozenset(str(k) for k in keys if k is not None)
+    except Exception:
+        pass
     # Fall back to live DFS if index is missing
     accepted_ranks_set: set[str] = {descendant_rank}
     if descendant_rank == CONFIG.species_rank and include_species_like:
@@ -953,17 +938,15 @@ def _query_catalog(
 ) -> dict:
     rank_lower = "subspecies" if descendant_rank in CONFIG.subspecies_equivalents else descendant_rank.lower()
     index_path = TREE_ROOT / within_taxon["path"] / f"{rank_lower}_index.parquet"
-    if not index_path.exists():
-        return _empty_result("no_catalog")
 
     try:
-        schema = pq.read_schema(index_path)
+        schema = _storage.read_schema(index_path)
         col_lengths: dict[str, int] = json.loads(schema.metadata.get(b"column_lengths", b"{}"))
         if not col_lengths:
             return _empty_result("no_catalog")
         first_col = next(iter(col_lengths))
         col_len = col_lengths[first_col]
-        tbl = pq.read_table(index_path, columns=[first_col])
+        tbl = _storage.read_table(index_path, columns=[first_col])
         col = tbl.column(first_col).combine_chunks().slice(0, col_len)
         taxon_keys = pc.struct_field(col, "taxonKey").to_pylist()
         sample_counts_list = pc.struct_field(col, "sampleCount").to_pylist()

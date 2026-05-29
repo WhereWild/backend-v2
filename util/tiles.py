@@ -8,6 +8,7 @@ config/gis/catalog.json — scale_factor, add_offset, render_min, render_max.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import math
@@ -25,8 +26,41 @@ from rasterio.warp import reproject as warp_reproject
 from rasterio.windows import from_bounds as window_from_bounds
 from rasterio.windows import transform as window_transform
 
+from util.storage import ParquetStorageProxy
+
 CATALOG_PATH = Path("config/gis/catalog.json")
 LAYERS_DIR   = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "layers"
+
+_storage = ParquetStorageProxy(
+    data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
+    project_root=Path(__file__).parent.parent,
+)
+
+
+@contextlib.contextmanager
+def _open_raster(path: Path):
+    """Open a raster file, using GDAL /vsis3/ when running against remote B2 storage.
+
+    Sets GDAL credentials directly in os.environ to bypass rasterio.Env's
+    boto3 guard, which rejects AWS_* keys when boto3 is installed.
+    """
+    storage = _storage.current()
+    if storage.is_remote and not path.exists():
+        gdal_env = storage.gdal_env()
+        prev = {k: os.environ.get(k) for k in gdal_env}
+        os.environ.update(gdal_env)
+        try:
+            with rasterio.open(storage.vsis3_path(path)) as ds:
+                yield ds
+        finally:
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    else:
+        with rasterio.open(path) as ds:
+            yield ds
 
 WEB_MERCATOR      = CRS.from_epsg(3857)
 WGS84             = CRS.from_epsg(4326)
@@ -61,13 +95,27 @@ _npy_cache: dict[Path, tuple[float, np.ndarray]] = {}
 
 
 def _load_temporal_npy(path: Path) -> np.ndarray | None:
-    if not path.exists():
-        return None
-    mtime = path.stat().st_mtime
+    storage = _storage.current()
     cached = _npy_cache.get(path)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-    arr = np.load(path).astype(np.float32)
+    if cached is not None:
+        if not storage.is_remote and path.exists() and cached[0] != path.stat().st_mtime:
+            pass  # local file changed — fall through to reload
+        else:
+            return cached[1]
+
+    if path.exists():
+        arr = np.load(path).astype(np.float32)
+        mtime = path.stat().st_mtime
+    elif storage.is_remote:
+        try:
+            with storage.open_input_file(path) as f:
+                arr = np.load(f).astype(np.float32)
+        except Exception:
+            return None
+        mtime = 0.0
+    else:
+        return None
+
     _npy_cache[path] = (mtime, arr)
     return arr
 
@@ -266,12 +314,14 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
 # Tile renderer
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=128)
 def _load_temporal_meta(var_id: str, window_label: str) -> dict:
     path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}.meta.json"
-    if path.exists():
-        import json as _json
-        return _json.loads(path.read_text())
-    return {}
+    try:
+        with _storage.open_input_file(path) as f:
+            return json.loads(f.read())
+    except Exception:
+        return {}
 
 
 def get_layer_render_range(layer: dict) -> tuple[float | None, float | None]:
@@ -427,7 +477,7 @@ def nominal_tile_range_classes(
     path = LAYERS_DIR / layer["filename"]
     counts: dict[int, int] = {}
 
-    with rasterio.open(path) as ds:
+    with _open_raster(path) as ds:
         db = ds.bounds
         overviews = ds.overviews(1) or []
 
@@ -496,8 +546,8 @@ def _render_derived_elevation_tile_bytes(
     dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
     dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
 
-    if elev_path.exists():
-        with rasterio.open(elev_path) as ds:
+    try:
+        with _open_raster(elev_path) as ds:
             db = ds.bounds
             rl0 = max(lon0, db.left)
             rl1 = min(lon1, db.right)
@@ -533,6 +583,8 @@ def _render_derived_elevation_tile_bytes(
                     dst_nodata=np.nan,
                     resampling=Resampling.bilinear,
                 )
+    except Exception:
+        pass
 
     if layer["id"] == "aspect":
         rgba = _colorize_aspect(dest)
@@ -571,7 +623,7 @@ def render_layer_tile_bytes(
     dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
     dest          = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
 
-    with rasterio.open(path) as ds:
+    with _open_raster(path) as ds:
         db = ds.bounds
         rl0 = max(lon0, db.left)
         rl1 = min(lon1, db.right)

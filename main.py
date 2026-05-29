@@ -18,7 +18,7 @@ from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
 from config.config import load_config
-from util import citations, gis, taxa, tiles, upload
+from util import citations, gis, taxa, tiles, units, upload
 from util.rankings import POSITION_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
@@ -37,6 +37,7 @@ from util.stats import (
 from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
 
 _CONFIG = load_config("global")
+_SYNC_STATE_PATH = Path("data/sync_state.json")
 _LEGEND_DIR = Path("config/gis/legends")
 _OCC_FILE = "occurrence.parquet"
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
@@ -129,13 +130,26 @@ def root():
     return {"status": "ok"}
 
 
+@app.get("/version")
+def version():
+    try:
+        state = json.loads(_SYNC_STATE_PATH.read_text()) if _SYNC_STATE_PATH.exists() else {}
+        crawl_ts = (
+            state.get("gbif_occurrences", {}).get("crawl_finished")
+            or state.get("gbif_taxonomy", {}).get("crawl_finished")
+        )
+    except Exception:
+        crawl_ts = None
+    return {"version": crawl_ts}
+
+
 @app.get("/data-sources")
 def data_sources():
     return citations.load_data_sources()
 
 
 @app.get("/variables")
-def list_variables():
+def list_variables(unit_system: str | None = Query(None)):
     result = []
     for layer, category in tiles.load_layers_with_category():
         value_type = _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous")
@@ -155,14 +169,14 @@ def list_variables():
         result.append({
             "id": layer["id"],
             "name": layer.get("display_name"),
-            "units": layer.get("units") or None,
+            "units": units.display_units(layer, unit_system),
             "value_type": value_type,
             "domain": layer.get("domain") or None,
             "category": category.get("display_name", "Other"),
             "source_ids": [layer["source"]] if layer.get("source") else None,
             "legend_classes": legend_classes,
-            "render_min": rmin,
-            "render_max": rmax,
+            "render_min": units.convert_value(rmin, layer, unit_system),
+            "render_max": units.convert_value(rmax, layer, unit_system),
             "group": layer.get("group") or None,
             "group_label": layer.get("group_label") or None,
         })
@@ -189,6 +203,7 @@ async def gis_point_value(
     variable: str = Query(...),
     taxon_id: str | None = Query(None),
     catalog_number: str | None = Query(None),
+    unit_system: str | None = Query(None),
 ):
     """Return the raster value for a variable at a lat/lon coordinate.
 
@@ -228,12 +243,13 @@ async def gis_point_value(
                 class_color = (entry.get("traits") or {}).get("color") or None
                 break
 
+    converted_value = units.convert_value(value, layer, unit_system)
     return {
         "variable": variable,
-        "units": layer.get("units") or None,
+        "units": units.display_units(layer, unit_system),
         "lat": lat,
         "lon": lon,
-        "value": value,
+        "value": converted_value,
         "class_name": class_name,
         "class_color": class_color,
     }
@@ -257,7 +273,9 @@ async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Que
         tiles.render_layer_tile_bytes,
         layer_id, z, x, y, tile_size,
     )
-    headers: dict[str, str] = {"Cache-Control": "public, max-age=3600"}
+    is_temporal = layer.get("window_hours") is not None
+    cache_max_age = 300 if is_temporal else 604800
+    headers: dict[str, str] = {"Cache-Control": f"public, max-age={cache_max_age}"}
     if str(layer.get("value_type") or "").lower() == "nominal":
         class_counts = await run_in_threadpool(tiles.nominal_tile_range_classes, layer_id, z, x, y, x, y)
         if class_counts:
@@ -292,7 +310,13 @@ def get_taxon(taxon_id: str):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    return {**taxon, **_image_fields(taxon)}
+    sci = taxon.get("scientific_name", "")
+    def _title_name(s: str) -> str:
+        def cap_word(w: str) -> str:
+            return re.sub(r"(^|(?<=-))[a-z]", lambda m: m.group().upper(), w.lower())
+        return " ".join(cap_word(w) for w in s.split())
+    vnames = [_title_name(n) for n in taxon.get("vernacular_names") or []]
+    return {**taxon, "scientific_name": sci.replace("_", " "), "vernacular_names": vnames, **_image_fields(taxon)}
 
 
 @app.get("/api/species/{taxon_id}/obscured")
@@ -304,7 +328,7 @@ def get_species_obscured(taxon_id: str):
 
 
 @app.get("/api/taxon/{taxon_id}/env-stats")
-def get_taxon_env_stats(taxon_id: str):
+def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -356,13 +380,13 @@ def get_taxon_env_stats(taxon_id: str):
         entry: dict = {
             "id": var_id,
             "display_name": layer.get("display_name"),
-            "units": layer.get("units") or None,
+            "units": units.display_units(layer, unit_system),
             "value_type": layer.get("value_type"),
             "domain": layer.get("domain") or None,
         }
         if var_id in numerical_stats:
-            entry["stats"] = numerical_stats[var_id]
-            entry["density"] = density_by_var.get(var_id)
+            entry["stats"] = units.convert_summary(numerical_stats[var_id], layer, unit_system)
+            entry["density"] = units.convert_density_curve(density_by_var.get(var_id), layer, unit_system)
             entry["classes"] = None
         elif var_id in circular_stats:
             entry["stats"] = circular_stats[var_id]
@@ -549,7 +573,7 @@ def get_species_environment(
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     variable_metadata = {
         "name": layer["display_name"] if layer else variable_id,
-        "units": (layer.get("units") or None) if layer else None,
+        "units": units.display_units(layer, unit_system) if layer else None,
         "value_type": layer.get("value_type") if layer else None,
         "domain": (layer.get("domain") or None) if layer else None,
     }
@@ -565,21 +589,22 @@ def get_species_environment(
             if result is not None:
                 if result["type"] == "continuous":
                     stats = result["stats"]
+                    raw_summary = {
+                        "count": stats["count"],
+                        "min": stats.get("min"),
+                        "mean": stats.get("mean"),
+                        "max": stats.get("max"),
+                        "stddev": stats.get("std"),
+                        "q10": stats.get("10th_percentile"),
+                        "q90": stats.get("90th_percentile"),
+                    }
                     return {
                         "species_id": taxon.get("taxon_key"),
                         "variable": variable_id,
                         "variable_metadata": variable_metadata,
                         "observation_count": result["observation_count"],
-                        "summary": {
-                            "count": stats["count"],
-                            "min": stats.get("min"),
-                            "mean": stats.get("mean"),
-                            "max": stats.get("max"),
-                            "stddev": stats.get("std"),
-                            "q10": stats.get("10th_percentile"),
-                            "q90": stats.get("90th_percentile"),
-                        },
-                        "density_curve": result["density_curve"],
+                        "summary": units.convert_summary(raw_summary, layer, unit_system),
+                        "density_curve": units.convert_density_curve(result["density_curve"], layer, unit_system),
                         "categorical_distribution": None,
                         "relative_ranks": [],
                     }
@@ -711,7 +736,7 @@ def get_species_environment(
         raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
 
     count = int(row.get("count") or 0)
-    summary = {
+    raw_summary = {
         "count": count,
         "min": row.get("min"),
         "mean": row.get("mean"),
@@ -733,8 +758,8 @@ def get_species_environment(
         "variable": variable_id,
         "variable_metadata": variable_metadata,
         "observation_count": count,
-        "summary": summary,
-        "density_curve": density_curve,
+        "summary": units.convert_summary(raw_summary, layer, unit_system),
+        "density_curve": units.convert_density_curve(density_curve, layer, unit_system),
         "categorical_distribution": None,
         "relative_ranks": _load_relative_ranks(taxon_dir, variable_id),
     }
@@ -1000,6 +1025,7 @@ def get_species_environment_slice(
     phenology: str | None = None,
     start_ts: int | None = None,
     end_ts: int | None = None,
+    unit_system: str | None = None,
 ):
     if not math.isfinite(min_value) or not math.isfinite(max_value):
         raise HTTPException(status_code=400, detail="min and max must be finite numbers")
@@ -1018,14 +1044,21 @@ def get_species_environment_slice(
     circular_wrap = variable_id == "aspect" and max_value < min_value
     if max_value < min_value and not circular_wrap:
         min_value, max_value = max_value, min_value
+    # Convert display-unit min/max back to raw (metric) values for querying.
+    raw_min = units.convert_value_from_display(min_value, layer, unit_system)
+    raw_max = units.convert_value_from_display(max_value, layer, unit_system)
     if location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None:
         filter_col = _location_filter_col(location) if location is not None else None
         if location is None or filter_col is not None:
             observations = _slice_from_raw_occ(
                 taxon, variable_id, filter_col, location,
-                min_value, max_value, circular_wrap, limit,
+                raw_min, raw_max, circular_wrap, limit,
                 phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
             )
+            observations = [
+                {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
+                for obs in observations
+            ]
             return {
                 "species_id": taxon.get("taxon_key"),
                 "variable": variable_id,
@@ -1038,9 +1071,13 @@ def get_species_environment_slice(
         raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")
     observations = _read_index_for_slice(
         index_path, variable_id,
-        value_min=min_value, value_max=max_value, circular_wrap=circular_wrap,
+        value_min=raw_min, value_max=raw_max, circular_wrap=circular_wrap,
         limit=limit,
     )
+    observations = [
+        {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
+        for obs in observations
+    ]
     return {
         "species_id": taxon.get("taxon_key"),
         "variable": variable_id,
@@ -1238,10 +1275,13 @@ def query_taxa(
         min_rbar=min_rbar,
     )
 
+    sort_layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == norm_sort_variable), None) if norm_sort_variable else None
     serialized: list[dict] = []
     for item in result["results"]:
         taxon = item["taxon"]
         preferred = taxon.get("inat_preferred_common_name") or taxon.get("common_name") or ""
+        raw_sort = item.get("sort_value")
+        converted_sort = units.convert_value(raw_sort, sort_layer, unit_system, metric=sort_metric) if sort_layer else raw_sort
         serialized.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
@@ -1253,7 +1293,7 @@ def query_taxa(
             **_image_fields(taxon),
             "match_score": item.get("match_score"),
             "sample_count": item.get("sample_count"),
-            "sort_value": item.get("sort_value"),
+            "sort_value": converted_sort,
             "sort_variable": sort_variable,
             "sort_metric": sort_metric,
             "location_count": item.get("location_count"),
@@ -1274,7 +1314,7 @@ def query_taxa(
             "variable": sort_variable,
             "metric": sort_metric,
             "order": sort_order,
-            "units": unit_system,
+            "units": units.display_units(sort_layer, unit_system) if sort_layer else None,
         },
         "total": result["total"],
         "matched_total": result["matched_total"],

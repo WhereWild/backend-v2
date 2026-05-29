@@ -37,6 +37,7 @@ from util.stats import (
 from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
 
 _CONFIG = load_config("global")
+_SYNC_STATE_PATH = Path("data/sync_state.json")
 _LEGEND_DIR = Path("config/gis/legends")
 _OCC_FILE = "occurrence.parquet"
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
@@ -127,6 +128,19 @@ _VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "
 @app.get("/")
 def root():
     return {"status": "ok"}
+
+
+@app.get("/version")
+def version():
+    try:
+        state = json.loads(_SYNC_STATE_PATH.read_text()) if _SYNC_STATE_PATH.exists() else {}
+        crawl_ts = (
+            state.get("gbif_occurrences", {}).get("crawl_finished")
+            or state.get("gbif_taxonomy", {}).get("crawl_finished")
+        )
+    except Exception:
+        crawl_ts = None
+    return {"version": crawl_ts}
 
 
 @app.get("/data-sources")
@@ -259,7 +273,9 @@ async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Que
         tiles.render_layer_tile_bytes,
         layer_id, z, x, y, tile_size,
     )
-    headers: dict[str, str] = {"Cache-Control": "public, max-age=3600"}
+    is_temporal = layer.get("window_hours") is not None
+    cache_max_age = 300 if is_temporal else 604800
+    headers: dict[str, str] = {"Cache-Control": f"public, max-age={cache_max_age}"}
     if str(layer.get("value_type") or "").lower() == "nominal":
         class_counts = await run_in_threadpool(tiles.nominal_tile_range_classes, layer_id, z, x, y, x, y)
         if class_counts:

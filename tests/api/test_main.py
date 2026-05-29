@@ -56,7 +56,7 @@ def test_get_taxon_by_slug():
          patch.object(taxa, "get_taxon_by_slug", return_value=TAXON):
         response = client.get("/api/taxon/opuntia-humifusa")
     assert response.status_code == 200
-    assert response.json()["scientific_name"] == "Opuntia_humifusa"
+    assert response.json()["scientific_name"] == "Opuntia humifusa"
 
 
 def test_get_taxon_not_found():

@@ -268,7 +268,8 @@ def test_main_writes_pickle(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "load_gbif_vernacular", lambda b: {})
     monkeypatch.setattr(build_tree, "apply_names", lambda catalog, im, gm: 0)
     monkeypatch.setattr(build_tree, "run_inat_preferred", lambda catalog: (0, 0))
-    monkeypatch.setattr(build_tree, "run_gbif_backup", lambda catalog: 0)
+    monkeypatch.setattr(build_tree, "run_gbif_backup", lambda catalog: (0, 0))
+    monkeypatch.setattr(build_tree, "infer_species_inat_ids", lambda catalog, b: 0)
     monkeypatch.setattr(build_tree, "update_name_index", lambda payload: 0)
     _make_csv([SPECIES_ROW], tmp_path)
 
@@ -1252,7 +1253,7 @@ def test_build_gbif_images_keeps_better_score(tmp_path, monkeypatch):
 def test_run_gbif_backup_no_files(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", tmp_path / "occurrence.txt")
     monkeypatch.setattr(build_tree, "MULTIMEDIA_PATH", tmp_path / "multimedia.txt")
-    assert build_tree.run_gbif_backup({"123": {}}) == 0
+    assert build_tree.run_gbif_backup({"123": {}}) == (0, 0)
 
 
 def test_run_gbif_backup_updates_catalog(tmp_path, monkeypatch):
@@ -1268,7 +1269,7 @@ def test_run_gbif_backup_updates_catalog(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
     monkeypatch.setattr(build_tree, "MULTIMEDIA_PATH", mm)
     catalog = {"123": {}}
-    assert build_tree.run_gbif_backup(catalog) == 1
+    assert build_tree.run_gbif_backup(catalog) == (1, 0)
     assert "gbif_backup_image" in catalog["123"]
 
 
@@ -1361,3 +1362,98 @@ def test_build_gbif_images_keeps_first_when_second_worse(tmp_path, monkeypatch):
     }
     result = build_tree._build_gbif_images(gbif_to_taxon)
     assert result["123"]["gbif_backup_image"] == "https://img.example.com/cc0.jpg"
+
+
+# ===========================================================================
+# infer_species_inat_ids
+# ===========================================================================
+
+def _make_dwca_with_parents(taxa_rows: list[dict]) -> bytes:
+    fieldnames = ["id", "taxonID", "taxonRank", "scientificName", "parentNameUsageID"]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        csv_buf = io.StringIO()
+        writer = csv.DictWriter(csv_buf, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in taxa_rows:
+            writer.writerow({f: row.get(f, "") for f in fieldnames})
+        zf.writestr("taxa.csv", csv_buf.getvalue())
+        zf.writestr("VernacularNames-0.csv", "id,vernacularName,language\n")
+    return buf.getvalue()
+
+
+def test_infer_species_inat_ids_basic():
+    # Species 100 has no inat_id; varieties 200/201 both point to iNat parent 99
+    catalog = {
+        "100": {"taxon_key": "100", "path": "Plantae_1/Cactaceae_2/Foo_bar_100",
+                "scientific_name": "Foo_bar", "rank": "SPECIES", "common_name": ""},
+        "200": {"taxon_key": "200", "path": "Plantae_1/Cactaceae_2/Foo_bar_100/Foo_bar_var._a_200",
+                "scientific_name": "Foo_bar_var._a", "rank": "VARIETY", "common_name": "",
+                "inat_id": "1001"},
+        "201": {"taxon_key": "201", "path": "Plantae_1/Cactaceae_2/Foo_bar_100/Foo_bar_var._b_201",
+                "scientific_name": "Foo_bar_var._b", "rank": "VARIETY", "common_name": "",
+                "inat_id": "1002"},
+    }
+    dwca = _make_dwca_with_parents([
+        {"id": "99",   "taxonRank": "species", "scientificName": "OtherGenus bar",
+         "parentNameUsageID": "https://www.inaturalist.org/taxa/50"},
+        {"id": "1001", "taxonRank": "variety", "scientificName": "OtherGenus bar var. a",
+         "parentNameUsageID": "https://www.inaturalist.org/taxa/99"},
+        {"id": "1002", "taxonRank": "variety", "scientificName": "OtherGenus bar var. b",
+         "parentNameUsageID": "https://www.inaturalist.org/taxa/99"},
+    ])
+    updated = build_tree.infer_species_inat_ids(catalog, dwca)
+    assert updated == 1
+    assert catalog["100"]["inat_id"] == "99"
+    assert catalog["100"]["inat_taxon_url"] == "https://www.inaturalist.org/taxa/99"
+
+
+def test_infer_species_inat_ids_skips_when_already_mapped():
+    catalog = {
+        "100": {"taxon_key": "100", "path": "Plantae_1/Cactaceae_2/Foo_bar_100",
+                "scientific_name": "Foo_bar", "rank": "SPECIES", "common_name": "",
+                "inat_id": "existing"},
+        "200": {"taxon_key": "200", "path": "Plantae_1/Cactaceae_2/Foo_bar_100/Foo_bar_var._a_200",
+                "scientific_name": "Foo_bar_var._a", "rank": "VARIETY", "common_name": "",
+                "inat_id": "1001"},
+    }
+    dwca = _make_dwca_with_parents([
+        {"id": "1001", "parentNameUsageID": "https://www.inaturalist.org/taxa/99"},
+    ])
+    updated = build_tree.infer_species_inat_ids(catalog, dwca)
+    assert updated == 0
+    assert catalog["100"]["inat_id"] == "existing"
+
+
+def test_infer_species_inat_ids_no_infer_when_children_disagree():
+    # Two children point to different iNat parents → ambiguous, skip
+    catalog = {
+        "100": {"taxon_key": "100", "path": "Plantae_1/Cactaceae_2/Foo_bar_100",
+                "scientific_name": "Foo_bar", "rank": "SPECIES", "common_name": ""},
+        "200": {"taxon_key": "200", "path": "Plantae_1/Cactaceae_2/Foo_bar_100/Foo_bar_var._a_200",
+                "scientific_name": "Foo_bar_var._a", "rank": "VARIETY", "common_name": "",
+                "inat_id": "1001"},
+        "201": {"taxon_key": "201", "path": "Plantae_1/Cactaceae_2/Foo_bar_100/Foo_bar_var._b_201",
+                "scientific_name": "Foo_bar_var._b", "rank": "VARIETY", "common_name": "",
+                "inat_id": "1002"},
+    }
+    dwca = _make_dwca_with_parents([
+        {"id": "1001", "parentNameUsageID": "https://www.inaturalist.org/taxa/99"},
+        {"id": "1002", "parentNameUsageID": "https://www.inaturalist.org/taxa/98"},  # different!
+    ])
+    updated = build_tree.infer_species_inat_ids(catalog, dwca)
+    assert updated == 0
+    assert "inat_id" not in catalog["100"]
+
+
+def test_infer_species_inat_ids_no_infer_when_no_matched_children():
+    catalog = {
+        "100": {"taxon_key": "100", "path": "Plantae_1/Cactaceae_2/Foo_bar_100",
+                "scientific_name": "Foo_bar", "rank": "SPECIES", "common_name": ""},
+        "200": {"taxon_key": "200", "path": "Plantae_1/Cactaceae_2/Foo_bar_100/Foo_bar_var._a_200",
+                "scientific_name": "Foo_bar_var._a", "rank": "VARIETY", "common_name": ""},
+        # child has no inat_id
+    }
+    dwca = _make_dwca_with_parents([])
+    updated = build_tree.infer_species_inat_ids(catalog, dwca)
+    assert updated == 0

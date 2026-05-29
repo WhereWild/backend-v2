@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -708,6 +709,26 @@ def _build_forecast_aggregates(
 # Main
 # ---------------------------------------------------------------------------
 
+def _push_rasters_to_b2(out_dir: str) -> None:
+    remote = os.environ.get("WW_B2_WRITER_REMOTE", "wherewild-localdev-writer")
+    bucket = os.environ.get("WW_B2_BUCKET", "wherewild-data")
+    prefix = os.environ.get("WW_B2_PREFIX", "data")
+    transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
+    dest = f"{remote}:{bucket}/{prefix}/gis/temporal/rasters" if prefix else f"{remote}:{bucket}/gis/temporal/rasters"
+    print(f"\n=== pushing rasters to B2: {dest} ===")
+    result = subprocess.run([
+        "rclone", "sync", out_dir, dest,
+        "--fast-list",
+        "--transfers", transfers,
+        "--stats-one-line",
+        "--stats", "1m",
+    ])
+    if result.returncode != 0:
+        print(f"  rclone sync exited {result.returncode}")
+    else:
+        print("  upload complete")
+
+
 def main() -> None:
     cfg = load_config("global")
     out_dir = cfg.temporal_raster_out_dir
@@ -909,19 +930,9 @@ def main() -> None:
 
         print(f"\n=== total {time.perf_counter() - t_main:.1f}s ===")
 
-        # ── Optional B2 upload ─────────────────────────────────────────────────
-        if cfg.temporal_raster_upload_enabled and cfg.temporal_raster_b2_dest:
-            import subprocess
-            print("\n=== uploading to B2 ===")
-            result = subprocess.run(
-                ["rclone", "sync", out_dir, cfg.temporal_raster_b2_dest,
-                 "--include", "*.npy", "--include", "*.meta.json",
-                 "--include", "*.sums.npz", "--stats-one-line"],
-            )
-            if result.returncode != 0:
-                print(f"  rclone exited {result.returncode}")
-            else:
-                print("  upload complete")
+        # ── Push rasters to B2 ────────────────────────────────────────────────
+        if os.environ.get("TEMPORAL_RASTER_NO_PUSH", "0") != "1":
+            _push_rasters_to_b2(out_dir)
 
         _write_state("completed")
 

@@ -67,11 +67,7 @@ ww_data_root() {
     return 0
   fi
 
-  if mountpoint -q "$mount_point" 2>/dev/null; then
-    echo "$mount_point"
-  else
-    echo "$local_root"
-  fi
+  echo "$local_root"
 }
 
 b2-mount() {
@@ -801,7 +797,7 @@ api-fg() {
   local data_root
   data_root="$(ww_data_root "$@")"
   export WHEREWILD_DATA_ROOT="$data_root"
-  _uv uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info --reload
+  _uv uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
 }
 
 api-stop() {

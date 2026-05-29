@@ -171,13 +171,25 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
                 (TREE_ROOT / Path(*path_parts)).mkdir(parents=True, exist_ok=True)
 
             common_name = row.get("commonName", "")
-            catalog[str(taxon_key_to_write)] = {
-                "taxon_key": str(taxon_key_to_write),
+            entry_key = str(taxon_key_to_write)
+            catalog[entry_key] = {
+                "taxon_key": entry_key,
                 "path": rel_path,
                 "scientific_name": cleaned_name,
                 "common_name": common_name,
                 "rank": row["taxonRank"],
             }
+
+            # When taxonKey differs from the key we write under (synonym / reclassified
+            # species), preserve the original taxonKey as an alternate lookup key.  GBIF
+            # backbone vernacular names and older occurrence records may still be indexed
+            # under the synonym key (e.g. Escobaria vivipara → 3084514 while the accepted
+            # Pelecyphora vivipara → 11498251).
+            row_taxon_key = str(row["taxonKey"])
+            if row_taxon_key != entry_key:
+                alt_keys: list = catalog[entry_key].setdefault("gbif_synonym_keys", [])
+                if row_taxon_key not in alt_keys:
+                    alt_keys.append(row_taxon_key)
 
             scientific_name_key = _normalize_index_key(cleaned_name)
             if scientific_name_key:
@@ -366,6 +378,127 @@ def apply_mapping(catalog: dict) -> int:
     return updated
 
 
+def infer_species_inat_ids(catalog: dict, dwca_bytes: bytes) -> int:
+    """Infer missing inat_id for species whose children all agree on an iNat parent.
+
+    Handles genus-synonym mismatches (e.g. GBIF Pelecyphora vivipara vs iNat
+    Escobaria vivipara) where exact name matching in build_mapping fails but the
+    child varieties/subspecies were already matched and share a common iNat parent.
+    """
+    # Build iNat child -> parent ID map from DWC-A parentNameUsageID
+    inat_parent: dict[str, str] = {}
+    zf = zipfile.ZipFile(io.BytesIO(dwca_bytes))
+    with io.TextIOWrapper(zf.open(INAT_TAXA_FILENAME), encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            child_id = (row.get("id") or "").strip()
+            parent_url = (row.get("parentNameUsageID") or "").strip()
+            if child_id and parent_url:
+                inat_parent[child_id] = parent_url.rsplit("/", 1)[-1]
+
+    # Build GBIF parent path -> list of child catalog keys
+    path_to_key = {taxon["path"]: key for key, taxon in catalog.items()}
+    parent_to_children: dict[str, list[str]] = defaultdict(list)
+    for key, taxon in catalog.items():
+        path = taxon["path"]
+        if "/" in path:
+            parent_path = path.rsplit("/", 1)[0]
+            parent_key = path_to_key.get(parent_path)
+            if parent_key:
+                parent_to_children[parent_key].append(key)
+
+    updated = 0
+    for parent_key, child_keys in parent_to_children.items():
+        parent_entry = catalog.get(parent_key)
+        if not parent_entry or _clean(parent_entry.get("inat_id")):
+            continue  # Already has inat_id or doesn't exist
+
+        inferred: set[str] = set()
+        for child_key in child_keys:
+            child = catalog.get(child_key)
+            if not child:
+                continue
+            child_inat_id = _clean(child.get("inat_id"))
+            if not child_inat_id:
+                continue
+            parent_inat_id = inat_parent.get(child_inat_id)
+            if parent_inat_id:
+                inferred.add(parent_inat_id)
+
+        if len(inferred) == 1:
+            parent_entry["inat_id"] = inferred.pop()
+            parent_entry["inat_taxon_url"] = f"https://www.inaturalist.org/taxa/{parent_entry['inat_id']}"
+            updated += 1
+
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b: Observation-based iNat ID mapping
+# ---------------------------------------------------------------------------
+
+def _extract_observation_id(values: list) -> str | None:
+    """Return first valid iNat observation ID from a list of catalogNumber values."""
+    import re as _re
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, int) and value >= 0:
+            return str(value)
+        if isinstance(value, float) and value.is_integer() and value >= 0:
+            return str(int(value))
+        text = str(value).strip()
+        if not text:
+            continue
+        if text.isdigit():
+            return text
+        if text.endswith(".0") and text[:-2].isdigit():
+            return text[:-2]
+        matches = _re.findall(r"\d+", text)
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _resolve_obs_inat_ids(catalog: dict, obs_by_taxon: dict[str, str]) -> int:
+    """Given taxon_key → obs_id, batch-query iNat observations API and apply inat_ids."""
+    if not obs_by_taxon:
+        return 0
+    obs_to_taxon = {obs_id: taxon_key for taxon_key, obs_id in obs_by_taxon.items()}
+    obs_ids = list(obs_to_taxon.keys())
+    updated = 0
+    errors = 0
+    for i in range(0, len(obs_ids), INAT_BATCH_SIZE):
+        batch = obs_ids[i: i + INAT_BATCH_SIZE]
+        try:
+            params = {"id": ",".join(batch), "per_page": str(len(batch))}
+            url = f"{INAT_OBS_ENDPOINT}?{urlencode(params)}"
+            req = Request(url, headers={"User-Agent": _UA})
+            with urlopen(req, timeout=30) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+            results = payload.get("results") or []
+        except Exception as exc:
+            print(f"  Batch error: {exc}", flush=True)
+            errors += 1
+            time.sleep(1.0 / INAT_RATE_LIMIT)
+            continue
+        for obs in results:
+            obs_id = str(obs.get("id") or "").strip()
+            inat_taxon = obs.get("taxon") or {}
+            inat_id = str(inat_taxon.get("id") or "").strip()
+            if not obs_id or not inat_id:
+                continue
+            gbif_key = obs_to_taxon.get(obs_id)
+            entry = catalog.get(gbif_key) if gbif_key else None
+            if not entry:
+                continue
+            entry["inat_id"] = inat_id
+            entry["inat_taxon_url"] = f"https://www.inaturalist.org/taxa/{inat_id}"
+            updated += 1
+        time.sleep(1.0 / INAT_RATE_LIMIT)
+    print(f"  Observation mapping: {updated:,} resolved, {errors:,} errors", flush=True)
+    return updated
+
+
 # ---------------------------------------------------------------------------
 # GBIF backbone VernacularName.tsv via remote ZIP range requests
 # ---------------------------------------------------------------------------
@@ -463,7 +596,16 @@ def apply_names(
     for taxon_key, taxon in catalog.items():
         inat_id = str(taxon.get("inat_id") or "").strip()
         inat_names = (inat_map.get(inat_id) if inat_id else None) or []
-        gbif_names = gbif_map.get(taxon_key) or []
+        # Look up GBIF vernacular under the primary key AND any synonym keys (e.g. a
+        # reclassified species still has its old taxon key in the backbone TSV).
+        gbif_keys = [taxon_key] + list(taxon.get("gbif_synonym_keys") or [])
+        seen_gbif: set[str] = set()
+        gbif_names: list[str] = []
+        for gk in gbif_keys:
+            for name in (gbif_map.get(gk) or []):
+                if name not in seen_gbif:
+                    gbif_names.append(name)
+                    seen_gbif.add(name)
         seen = set(inat_names)
         merged = list(inat_names) + [n for n in gbif_names if n not in seen]
         if merged:
@@ -478,9 +620,11 @@ def apply_names(
 # ---------------------------------------------------------------------------
 
 INAT_TAXA_ENDPOINT = "https://api.inaturalist.org/v1/taxa"
+INAT_OBS_ENDPOINT = "https://api.inaturalist.org/v1/observations"
 INAT_PHOTO_BASE_URL = "https://www.inaturalist.org/photos"
 INAT_BATCH_SIZE = 200
 INAT_RATE_LIMIT = 1.0  # requests per second
+OCCURRENCE_PARQUET_FILENAME = "occurrence.parquet"
 
 
 def fetch_taxa_batch(ids: list[str], timeout: int = 30) -> list[dict]:
@@ -677,8 +821,21 @@ def _image_quality(license_str: str, vitality: str, evidence: str, rcs: str) -> 
     return (v, e, r, _license_score(license_str))
 
 
-def _build_gbif_to_taxon(catalog_keys: set[str]) -> dict[str, tuple]:
-    """Stream occurrence.txt → gbifID: (taxon_key, vitality, evidence, rcs)."""
+def _build_gbif_to_taxon(
+    catalog_keys: set[str],
+    synonym_to_catalog: dict[str, str] | None = None,
+    unmatched_inat_keys: set[str] | None = None,
+    obs_id_out: dict[str, str] | None = None,
+) -> dict[str, tuple]:
+    """Stream occurrence.txt → gbifID: (taxon_key, vitality, evidence, rcs).
+
+    synonym_to_catalog maps old synonym taxon keys to their current accepted catalog
+    key so that occurrence records submitted under the old name are still matched.
+
+    If unmatched_inat_keys and obs_id_out are provided, also collects the first
+    iNat catalogNumber per unmatched taxon in the same pass (used by
+    run_observation_mapping so the file is only streamed once).
+    """
     mapping: dict[str, tuple] = {}
     rows = 0
     with open(OCCURRENCE_PATH, encoding="utf-8") as f:
@@ -693,8 +850,18 @@ def _build_gbif_to_taxon(catalog_keys: set[str]) -> dict[str, tuple]:
             taxon_key = (row.get("taxonKey") or "").strip()
             species_key = (row.get("speciesKey") or "").strip()
             key = taxon_key if rank in _SUBSPECIES_RANKS else (species_key or taxon_key)
+            if not key:
+                continue
+            if key not in catalog_keys and synonym_to_catalog:
+                key = synonym_to_catalog.get(key, key)
             if not key or key not in catalog_keys:
                 continue
+            # Opportunistically collect an obs ID for iNat ID resolution.
+            if unmatched_inat_keys and obs_id_out is not None and key in unmatched_inat_keys and key not in obs_id_out:
+                catalog_num = (row.get("catalogNumber") or "").strip()
+                obs_id = _extract_observation_id([catalog_num])
+                if obs_id:
+                    obs_id_out[key] = obs_id
             vitality = (row.get("vitality") or "").strip().lower()
             rcs = (row.get("reproductiveCondition") or "").strip().lower()
             evidence = ""
@@ -749,12 +916,33 @@ def _build_gbif_images(gbif_to_taxon: dict[str, tuple]) -> dict[str, dict]:
     return {k: v[1] for k, v in best.items()}
 
 
-def run_gbif_backup(catalog: dict) -> int:
-    """Apply best GBIF occurrence image to every catalog taxon that has one."""
+def run_gbif_backup(catalog: dict) -> tuple[int, int]:
+    """Stream occurrence.txt once: collect backup image candidates AND obs IDs for
+    any taxa still lacking inat_id, then apply both results.
+
+    Returns (images_updated, obs_ids_resolved).
+    """
     if not OCCURRENCE_PATH.exists() or not MULTIMEDIA_PATH.exists():
         print("  Occurrence data not yet downloaded, skipping.", flush=True)
-        return 0
-    gbif_to_taxon = _build_gbif_to_taxon(set(catalog.keys()))
+        return 0, 0
+    synonym_to_catalog: dict[str, str] = {
+        syn_key: catalog_key
+        for catalog_key, taxon in catalog.items()
+        for syn_key in (taxon.get("gbif_synonym_keys") or [])
+    }
+    # Taxa that still need an inat_id resolved via an observation lookup.
+    unmatched_inat_keys: set[str] = {
+        key for key, taxon in catalog.items()
+        if not _clean(taxon.get("inat_id"))
+        and (taxon.get("rank") or "").upper() in MAPPING_RANKS
+    }
+    obs_id_out: dict[str, str] = {}
+    gbif_to_taxon = _build_gbif_to_taxon(
+        set(catalog.keys()), synonym_to_catalog,
+        unmatched_inat_keys, obs_id_out,
+    )
+    print(f"  Collected obs IDs for {len(obs_id_out):,} unmatched taxa", flush=True)
+    obs_resolved = _resolve_obs_inat_ids(catalog, obs_id_out)
     taxon_images = _build_gbif_images(gbif_to_taxon)
     updated = 0
     for taxon_key, fields in taxon_images.items():
@@ -762,7 +950,7 @@ def run_gbif_backup(catalog: dict) -> int:
         if entry is not None:
             entry.update(fields)
             updated += 1
-    return updated
+    return updated, obs_resolved
 
 
 # ---------------------------------------------------------------------------
@@ -789,8 +977,13 @@ def main() -> None:
     id_updated = apply_mapping(catalog)
     print(f"Applied inat_id to {id_updated:,} catalog entries.")
     MAPPING_PATH.unlink(missing_ok=True)
+    inferred = infer_species_inat_ids(catalog, dwca_bytes)
+    print(f"Inferred inat_id for {inferred:,} additional species from children.")
 
-    # Phase 3: Common names, preferred images, GBIF backup images
+    # Phase 3: Common names, preferred images, GBIF backup images.
+    # run_gbif_backup also streams occurrence.txt to collect obs IDs for any taxa
+    # still lacking inat_id, resolving them via the iNat observations API in the
+    # same pass — no extra file scan needed.
     print("\nFetching GBIF backbone vernacular names...")
     vernacular_bytes = fetch_backbone_vernacular()
     print("Loading vernacular names...")
@@ -801,11 +994,14 @@ def main() -> None:
     print(f"  Catalog: {len(catalog):,} taxa")
     updated = apply_names(catalog, inat_map, gbif_map)
 
+    print("\nFetching GBIF backup images from occurrence data...")
+    backup_n, obs_resolved = run_gbif_backup(catalog)
+    print(f"  Resolved inat_id for {obs_resolved:,} additional taxa via observations.")
+
+    # Now that observation mapping is done, fetch iNat preferred names and images
+    # for any newly resolved taxa (plus anything still pending).
     print("\nFetching iNat preferred names and images...")
     names_n, images_n = run_inat_preferred(catalog)
-
-    print("\nFetching GBIF backup images from occurrence data...")
-    backup_n = run_gbif_backup(catalog)
 
     index_added = update_name_index(payload)
     print(f"Added {index_added:,} new entries to name search index.")

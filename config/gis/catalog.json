@@ -17,7 +17,8 @@
           "add_offset": -273.15,
           "render_min": -53.549988,
           "render_max": 34.75,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         },
         {
           "id": "bio12",
@@ -31,7 +32,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 6553.399902,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "bio5",
@@ -45,7 +47,8 @@
           "add_offset": -273.15,
           "render_min": -33.749985,
           "render_max": 46.950012,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         },
         {
           "id": "bio6",
@@ -59,7 +62,8 @@
           "add_offset": -273.15,
           "render_min": -65.849991,
           "render_max": 26.350006,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         },
         {
           "id": "bio13",
@@ -73,7 +77,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 2821.600098,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "bio14",
@@ -87,7 +92,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 1401.900024,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "bio8",
@@ -101,7 +107,8 @@
           "add_offset": -273.15,
           "render_min": -62.449997,
           "render_max": 37.550018,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         },
         {
           "id": "bio9",
@@ -115,7 +122,8 @@
           "add_offset": -273.15,
           "render_min": -61.049988,
           "render_max": 38.850006,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         },
         {
           "id": "bio10",
@@ -129,7 +137,8 @@
           "add_offset": -273.15,
           "render_min": -38.549988,
           "render_max": 39.350006,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         },
         {
           "id": "bio11",
@@ -143,7 +152,8 @@
           "add_offset": -273.15,
           "render_min": -63.049988,
           "render_max": 31.450012,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         },
         {
           "id": "bio16",
@@ -157,7 +167,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 6552.600098,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "bio17",
@@ -171,7 +182,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 4635.700195,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "bio18",
@@ -185,7 +197,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 6552.600098,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "bio19",
@@ -199,7 +212,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 5989.399902,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "bio3",
@@ -255,7 +269,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 18.9,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         },
         {
           "id": "bio7",
@@ -269,7 +284,8 @@
           "add_offset": 0.0,
           "render_min": 1.7,
           "render_max": 70.700005,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         }
       ]
     },
@@ -603,7 +619,8 @@
           "add_offset": 0.0,
           "render_min": 24.119999,
           "render_max": 544.099976,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "petmean",
@@ -619,7 +636,8 @@
           "add_offset": 0.0,
           "render_min": 9.099999,
           "render_max": 348.589996,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "petmin",
@@ -635,7 +653,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 326.47998,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "petrange",
@@ -651,7 +670,8 @@
           "add_offset": 0.0,
           "render_min": 6.63,
           "render_max": 452.949982,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "in"
         },
         {
           "id": "cmimax",
@@ -745,7 +765,8 @@
           "add_offset": 0.0,
           "render_min": 0.16,
           "render_max": 52.539997,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "mph"
         },
         {
           "id": "sfcWindmean",
@@ -761,7 +782,8 @@
           "add_offset": 0.0,
           "render_min": 0.15,
           "render_max": 48.27,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "mph"
         },
         {
           "id": "sfcWindmin",
@@ -777,7 +799,8 @@
           "add_offset": 0.0,
           "render_min": 0.12,
           "render_max": 44.23,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "mph"
         },
         {
           "id": "sfcWindrange",
@@ -793,7 +816,8 @@
           "add_offset": 0.0,
           "render_min": 0.01,
           "render_max": 19.76,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "mph"
         },
         {
           "id": "gsl",
@@ -821,7 +845,8 @@
           "add_offset": -273.15,
           "render_min": 0.950012,
           "render_max": 37.550018,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F"
         },
         {
           "id": "gdd0",
@@ -837,7 +862,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 12693.100586,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F·days"
         },
         {
           "id": "gdd5",
@@ -853,7 +879,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 10868.100586,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F·days"
         },
         {
           "id": "gdd10",
@@ -869,7 +896,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 9043.100586,
-          "domain": "continuous"
+          "domain": "continuous",
+          "imperial_unit": "°F·days"
         },
         {
           "id": "gddlgd0",
@@ -1013,7 +1041,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": null,
-          "render_max": null
+          "render_max": null,
+          "imperial_unit": "°F"
         },
         {
           "id": "precipitation",
@@ -1031,7 +1060,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": null,
-          "render_max": null
+          "render_max": null,
+          "imperial_unit": "in"
         },
         {
           "id": "cloud_cover",
@@ -1086,7 +1116,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": null,
-          "render_max": null
+          "render_max": null,
+          "imperial_unit": "in"
         },
         {
           "id": "snow_depth",
@@ -1104,7 +1135,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": null,
-          "render_max": null
+          "render_max": null,
+          "imperial_unit": "ft"
         },
         {
           "id": "soil_temperature_0_to_7cm",
@@ -1122,7 +1154,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": null,
-          "render_max": null
+          "render_max": null,
+          "imperial_unit": "°F"
         },
         {
           "id": "soil_moisture_0_to_7cm",
@@ -1158,7 +1191,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": null,
-          "render_max": null
+          "render_max": null,
+          "imperial_unit": "°F"
         },
         {
           "id": "weather_code_simple",
@@ -1217,7 +1251,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": -430.0,
-          "render_max": 8849.0
+          "render_max": 8849.0,
+          "imperial_unit": "ft"
         },
         {
           "id": "slope",

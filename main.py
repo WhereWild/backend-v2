@@ -25,7 +25,6 @@ from util.stats import (
     DENSITY_FILE,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
-    OCCURRENCE_INDEX_FILE,
     TREE_ROOT,
     apply_phenology_filter,
     apply_timestamp_filter,
@@ -34,6 +33,7 @@ from util.stats import (
     compute_phenology_counts,
     read_phenology_counts,
 )
+from util.indexing import OCCURRENCE_INDEX_FILE, lookup_value as _index_lookup_value, read_slice as _index_read_slice
 from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
 
 _CONFIG = load_config("global")
@@ -73,30 +73,11 @@ def _load_legend(layer_id: str) -> list:
 
 
 def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
-    """Read a precomputed env value for a known observation from occurrence_index.parquet.
-
-    Preferred over raster sampling for static variables: avoids the FP sensitivity
-    that can cause mismatches on derived variables like aspect near flat terrain.
-    Returns None if the index doesn't exist, the column is absent, or the row is missing.
-    """
+    """Read a precomputed env value for a known observation from occurrence_index.parquet."""
     index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
     if not index_path.exists():
         return None
-    schema = pq.read_schema(index_path)
-    if variable_id not in schema.names:
-        return None
-    try:
-        df = pq.read_table(
-            index_path,
-            columns=["catalogNumber", variable_id],
-            filters=[("catalogNumber", "=", catalog_number)],
-        ).to_pandas()
-    except Exception:
-        return None
-    if df.empty:
-        return None
-    val = df.iloc[0][variable_id]
-    return float(val) if pd.notna(val) else None
+    return _index_lookup_value(index_path, variable_id, catalog_number)
 
 
 def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -985,33 +966,13 @@ def _read_index_for_slice(
     class_value: float | None = None,
     limit: int | None = None,
 ) -> list[dict]:
-    """Filter occurrence_index.parquet by value range or class and return observations."""
-    schema = pq.read_schema(index_path)
-    if variable_id not in schema.names:
-        return []
-    cols = [c for c in ["catalogNumber", "decimalLatitude", "decimalLongitude", variable_id] if c in schema.names]
-    df = pq.read_table(index_path, columns=cols).to_pandas()
-    if class_value is not None:
-        col = pd.to_numeric(df[variable_id], errors="coerce")
-        mask = col == float(class_value)
-    elif circular_wrap:
-        col = pd.to_numeric(df[variable_id], errors="coerce")
-        mask = col.between(value_min, 360.0, inclusive="both") | col.between(0.0, value_max, inclusive="both")
-    else:
-        col = pd.to_numeric(df[variable_id], errors="coerce")
-        mask = col.between(value_min, value_max, inclusive="both")
-    df = df[mask].dropna(subset=["decimalLatitude", "decimalLongitude"])
-    if limit is not None:
-        df = df.head(limit)
-    return [
-        {
-            "catalogNumber": str(r["catalogNumber"]),
-            "latitude": r["decimalLatitude"],
-            "longitude": r["decimalLongitude"],
-            "value": (float(r[variable_id]) if pd.notna(r[variable_id]) else None),
-        }
-        for r in df.to_dict("records")
-    ]
+    """Binary-search occurrence_index.parquet by value range or class."""
+    return _index_read_slice(
+        index_path, variable_id,
+        value_min=value_min, value_max=value_max,
+        circular_wrap=circular_wrap, class_value=class_value,
+        limit=limit,
+    )
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/slice")

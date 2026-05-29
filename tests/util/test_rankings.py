@@ -219,79 +219,23 @@ def test_infer_sample_count_no_files(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _write_descendant_catalog
+# _descendants_for_rank
 # ---------------------------------------------------------------------------
 
-def test_write_descendant_catalog_writes_rows(tmp_path, monkeypatch):
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    sp_dir = tmp_path / _SPECIES_A["path"]
-    _write_numerical_stats(sp_dir, "bio1", count=10, mean=5.0)
-    out = tmp_path / "catalog.parquet"
-    rk._write_descendant_catalog(out, [_SPECIES_A])
-    df = pd.read_parquet(out)
-    assert len(df) == 1
-    assert df.iloc[0]["taxon_key"] == "200"
-    assert df.iloc[0]["sample_count"] == 10
-
-
-def test_write_descendant_catalog_empty_removes_file(tmp_path):
-    out = tmp_path / "catalog.parquet"
-    out.touch()
-    rk._write_descendant_catalog(out, [])
-    assert not out.exists()
-
-
-# ---------------------------------------------------------------------------
-# build_descendant_catalogs
-# ---------------------------------------------------------------------------
-
-def test_build_descendant_catalogs_genus_writes_species(tmp_path, monkeypatch):
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    sp_dir = tmp_path / _SPECIES_A["path"]
-    _write_numerical_stats(sp_dir, "bio1", count=5, mean=2.0)
-
-    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SUBSPECIES_A]):
-        rk.build_descendant_catalogs(_GENUS)
-
-    genus_dir = tmp_path / _GENUS["path"]
-    species_cat = genus_dir / "species.parquet"
-    assert species_cat.exists()
-    df = pd.read_parquet(species_cat)
-    assert "200" in df["taxon_key"].tolist()
-
-
-def test_build_descendant_catalogs_genus_no_subspecies_catalog(tmp_path, monkeypatch):
-    """GENUS ancestors should NOT produce a subspecies.parquet (only SPECIES ancestors do)."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SUBSPECIES_A]):
-        rk.build_descendant_catalogs(_GENUS)
-
-    genus_dir = tmp_path / _GENUS["path"]
-    assert not (genus_dir / "subspecies.parquet").exists()
-
-
-def test_build_descendant_catalogs_species_writes_subspecies(tmp_path, monkeypatch):
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    subsp_dir = tmp_path / _SUBSPECIES_A["path"]
-    _write_numerical_stats(subsp_dir, "bio1", count=3, mean=1.0)
-
+def test_descendants_for_rank_subspecies_skipped_for_genus(monkeypatch):
+    """_descendants_for_rank returns [] for SUBSPECIES when ancestor is not SPECIES."""
     with patch("util.rankings.iter_descendants", return_value=[_SUBSPECIES_A]):
-        rk.build_descendant_catalogs(_SPECIES_A)
-
-    species_dir = tmp_path / _SPECIES_A["path"]
-    subsp_cat = species_dir / "subspecies.parquet"
-    assert subsp_cat.exists()
-    df = pd.read_parquet(subsp_cat)
-    assert "300" in df["taxon_key"].tolist()
+        result = rk._descendants_for_rank(_GENUS, "SUBSPECIES")
+    assert result == []
 
 
-def test_build_descendant_catalogs_no_targets(tmp_path, monkeypatch):
-    """SUBSPECIES has no ranks below it — no catalogs written."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    with patch("util.rankings.iter_descendants", return_value=[]):
-        rk.build_descendant_catalogs(_SUBSPECIES_A)
-    # Nothing written
-    assert not (tmp_path / _SUBSPECIES_A["path"]).exists()
+def test_descendants_for_rank_species_combines_subspecies_for_genus(monkeypatch):
+    """GENUS→SPECIES includes both SPECIES and SUBSPECIES descendants."""
+    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SUBSPECIES_A]):
+        result = rk._descendants_for_rank(_GENUS, "SPECIES")
+    keys = {t["taxon_key"] for t in result}
+    assert "200" in keys
+    assert "300" in keys
 
 
 # ---------------------------------------------------------------------------
@@ -360,68 +304,50 @@ def test_collect_entries_nominal_stats_no_file(tmp_path):
 
 def test_build_rank_index_sorts_by_value(tmp_path, monkeypatch):
     monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_path = tmp_path / "species.parquet"
     index_path = tmp_path / "species_index.parquet"
 
-    # Two species, B has higher mean bio1
     sp_a_dir = tmp_path / _SPECIES_A["path"]
     sp_b_dir = tmp_path / _SPECIES_B["path"]
     _write_numerical_stats(sp_a_dir, "bio1", count=10, mean=3.0)
     _write_numerical_stats(sp_b_dir, "bio1", count=8, mean=7.0)
 
-    pq.write_table(pa.Table.from_pylist([
-        {"taxon_key": "200", "path": _SPECIES_A["path"], "sample_count": 10,
-         "scientific_name": "A", "common_name": "", "rank": "SPECIES"},
-        {"taxon_key": "201", "path": _SPECIES_B["path"], "sample_count": 8,
-         "scientific_name": "B", "common_name": "", "rank": "SPECIES"},
-    ], schema=rk._CATALOG_SCHEMA), catalog_path)
-
-    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+    with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A, _SPECIES_B]):
+        rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
 
     assert index_path.exists()
-    schema = pq.read_schema(index_path)
-    assert "bio1::mean" in schema.names
-
+    assert "bio1::mean" in pq.read_schema(index_path).names
     tbl = pq.read_table(index_path)
     col = tbl.column("bio1::mean").combine_chunks()
     keys = [col[i].as_py()["taxonKey"] for i in range(2)]
     assert keys == ["200", "201"]  # A (3.0) before B (7.0)
 
 
-def test_build_rank_index_empty_catalog_removes_index(tmp_path):
-    catalog_path = tmp_path / "c.parquet"
+def test_build_rank_index_no_descendants_removes_index(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
     index_path = tmp_path / "i.parquet"
-    pq.write_table(pa.Table.from_pylist([], schema=rk._CATALOG_SCHEMA), catalog_path)
     index_path.touch()
-    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+    with patch("util.rankings._descendants_for_rank", return_value=[]):
+        rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
     assert not index_path.exists()
 
 
 def test_build_rank_index_no_stats_removes_index(tmp_path, monkeypatch):
     monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_path = tmp_path / "c.parquet"
     index_path = tmp_path / "i.parquet"
-    pq.write_table(pa.Table.from_pylist([
-        {"taxon_key": "200", "path": _SPECIES_A["path"], "sample_count": 0,
-         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
-    ], schema=rk._CATALOG_SCHEMA), catalog_path)
     index_path.touch()
-    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
+    # SPECIES_A has no stats file → no entries → index removed
+    with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A]):
+        rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
     assert not index_path.exists()
 
 
 def test_build_rank_index_stores_column_lengths_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_path = tmp_path / "s.parquet"
     index_path = tmp_path / "si.parquet"
     sp_dir = tmp_path / _SPECIES_A["path"]
     _write_numerical_stats(sp_dir, "bio1", count=5, mean=1.0)
-    pq.write_table(pa.Table.from_pylist([
-        {"taxon_key": "200", "path": _SPECIES_A["path"], "sample_count": 5,
-         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
-    ], schema=rk._CATALOG_SCHEMA), catalog_path)
-    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
-
+    with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A]):
+        rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
     lengths = rk._load_column_lengths(index_path)
     assert "bio1::mean" in lengths
     assert lengths["bio1::mean"] == 1
@@ -514,41 +440,6 @@ def test_build_rank_indexes_skips_missing_catalog(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# compute_relative_ranks (integration)
-# ---------------------------------------------------------------------------
-
-def test_compute_relative_ranks_end_to_end(tmp_path, monkeypatch):
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-
-    # Write stats for both species
-    for sp in [_SPECIES_A, _SPECIES_B]:
-        _write_numerical_stats(tmp_path / sp["path"], "bio1", count=10, mean=float(sp["taxon_key"]))
-
-    sp_a = {**_SPECIES_A}
-    sp_b = {**_SPECIES_B}
-
-    with patch("util.rankings.iter_descendants", return_value=[sp_a, sp_b]), \
-         patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {
-             "200": sp_a, "201": sp_b,
-         }.get(str(k))):
-        rk.compute_relative_ranks(_GENUS, [_RATIO_LAYER])
-
-    genus_dir = tmp_path / _GENUS["path"]
-    assert (genus_dir / "species.parquet").exists()
-    assert (genus_dir / "species_index.parquet").exists()
-
-    # Positions written to both species
-    pos_a = pq.read_table(tmp_path / sp_a["path"] / rk.POSITION_FILE).to_pandas()
-    pos_b = pq.read_table(tmp_path / sp_b["path"] / rk.POSITION_FILE).to_pandas()
-    assert len(pos_a) > 0
-    assert len(pos_b) > 0
-    # Species A (mean=200) should have lower position than B (mean=201)
-    a_mean_row = pos_a[pos_a["metric"] == "mean"].iloc[0]
-    b_mean_row = pos_b[pos_b["metric"] == "mean"].iloc[0]
-    assert a_mean_row["position"] < b_mean_row["position"]
-
-
-# ---------------------------------------------------------------------------
 # Coverage-gap tests
 # ---------------------------------------------------------------------------
 
@@ -598,19 +489,6 @@ def test_infer_sample_count_corrupt_nominal_stats(tmp_path):
 def test_infer_sample_count_corrupt_occurrence_index(tmp_path):
     (tmp_path / "occurrence_index.parquet").write_bytes(b"not a parquet")
     assert rk._infer_sample_count(tmp_path) == 0
-
-
-# build_descendant_catalogs — else branch for non-SPECIES non-SUBSPECIES rank (line 204)
-def test_build_descendant_catalogs_family_writes_genus_catalog(tmp_path, monkeypatch):
-    """FAMILY ancestor: GENUS targets hit the else branch."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    genus_desc = {**_GENUS}
-    with patch("util.rankings.iter_descendants", return_value=[genus_desc]):
-        rk.build_descendant_catalogs(_FAMILY)
-    family_dir = tmp_path / _FAMILY["path"]
-    assert (family_dir / "genus.parquet").exists()
-    df = pd.read_parquet(family_dir / "genus.parquet")
-    assert "100" in df["taxon_key"].tolist()
 
 
 # _collect_entries_from_numerical_stats — corrupt stats file (lines 223-224)
@@ -672,61 +550,6 @@ def test_collect_entries_nominal_stats_nonfinite_value(tmp_path):
     entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
     assert "kg0::entropy" not in entries
 
-
-# _build_rank_index — corrupt catalog (lines 320-322)
-def test_build_rank_index_corrupt_catalog(tmp_path):
-    catalog_path = tmp_path / "c.parquet"
-    index_path = tmp_path / "i.parquet"
-    catalog_path.write_bytes(b"garbage")
-    index_path.touch()
-    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
-    assert not index_path.exists()
-
-
-# _build_rank_index — catalog row with empty path (line 333)
-def test_build_rank_index_empty_path_row_skipped(tmp_path, monkeypatch):
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_path = tmp_path / "c.parquet"
-    index_path = tmp_path / "i.parquet"
-    pq.write_table(pa.Table.from_pylist([
-        {"taxon_key": "200", "path": "", "sample_count": 0,
-         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
-    ], schema=rk._CATALOG_SCHEMA), catalog_path)
-    index_path.touch()
-    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
-    # no entries → index removed
-    assert not index_path.exists()
-
-
-# _build_rank_index — padding when columns have unequal lengths (line 364)
-def test_build_rank_index_pads_unequal_columns(tmp_path, monkeypatch):
-    """Taxon A has bio1::mean + bio1::count; taxon B has bio1::mean only.
-
-    bio1::count column has 1 entry, bio1::mean has 2 → padding kicks in.
-    """
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_path = tmp_path / "c.parquet"
-    index_path = tmp_path / "i.parquet"
-
-    sp_a_dir = tmp_path / _SPECIES_A["path"]
-    sp_b_dir = tmp_path / _SPECIES_B["path"]
-    # A: has count + mean; B: count is None (won't produce count entry)
-    _write_numerical_stats(sp_a_dir, "bio1", count=10, mean=1.0)
-    _write_numerical_stats(sp_b_dir, "bio1", count=None, mean=2.0)
-
-    pq.write_table(pa.Table.from_pylist([
-        {"taxon_key": "200", "path": _SPECIES_A["path"], "sample_count": 10,
-         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
-        {"taxon_key": "201", "path": _SPECIES_B["path"], "sample_count": 0,
-         "scientific_name": "", "common_name": "", "rank": "SPECIES"},
-    ], schema=rk._CATALOG_SCHEMA), catalog_path)
-
-    rk._build_rank_index(catalog_path, index_path, [_RATIO_LAYER])
-    assert index_path.exists()
-    tbl = pq.read_table(index_path)
-    # Both mean and count columns present; count column is padded to length 2
-    assert "bio1::mean" in tbl.schema.names
-    assert tbl.num_rows == 2
 
 
 # build_rank_indexes — no-targets branch (line 378)
@@ -1121,30 +944,6 @@ def test_query_ranked_text_min_samples_filter(tmp_path, monkeypatch):
     assert result["empty_reason"] == "no_results"
 
 
-def test_query_text_scope_keys_filter(tmp_path, monkeypatch):
-    """Scope keys filter excludes candidates not in scope."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_path = tmp_path / _GENUS["path"] / "species.parquet"
-    catalog_path.parent.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist([
-            {"taxon_key": "200", "path": _SPECIES_A["path"], "scientific_name": "",
-             "common_name": "", "rank": "SPECIES", "sample_count": 50}
-        ]),
-        catalog_path,
-    )
-    with patch("util.rankings._infer_sample_count", return_value=50), \
-         patch("util.rankings.search_taxa_by_name",
-               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]):
-        result = rk._query_text(
-            q="testus", within_taxon=_GENUS, descendant_rank="SPECIES",
-            limit=10, offset=0, min_samples=0, include_species_like=False,
-            loc_keys=None, loc_counts={},
-        )
-    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
-    assert "200" in ids
-    assert "201" not in ids
-
 
 def test_query_text_loc_keys_filter(tmp_path, monkeypatch):
     """Location filter excludes candidates not in loc_keys."""
@@ -1227,56 +1026,6 @@ def test_query_catalog_corrupt_parquet(tmp_path, monkeypatch):
     )
     assert result["empty_reason"] == "no_catalog"
 
-
-def test_query_catalog_min_samples_filter(tmp_path, monkeypatch):
-    """min_samples filters out low-sample entries."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_dir = tmp_path / _GENUS["path"]
-    catalog_dir.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist([
-            {"taxon_key": "200", "path": _SPECIES_A["path"], "scientific_name": "",
-             "common_name": "", "rank": "SPECIES", "sample_count": 3},
-            {"taxon_key": "201", "path": _SPECIES_B["path"], "scientific_name": "",
-             "common_name": "", "rank": "SPECIES", "sample_count": 100},
-        ]),
-        catalog_dir / "species.parquet",
-    )
-    with patch("util.rankings.get_taxon_by_id",
-               side_effect=lambda k: {"200": _SPECIES_A, "201": _SPECIES_B}.get(k)):
-        result = rk._query_catalog(
-            within_taxon=_GENUS, descendant_rank="SPECIES",
-            limit=10, offset=0, min_samples=10, include_species_like=False,
-            loc_keys=None, loc_counts={},
-        )
-    assert len(result["results"]) == 1
-    assert result["results"][0]["taxon"]["taxon_key"] == "201"
-
-
-def test_query_catalog_loc_keys_filter(tmp_path, monkeypatch):
-    """Location filter excludes taxa not in loc_keys."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_dir = tmp_path / _GENUS["path"]
-    catalog_dir.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist([
-            {"taxon_key": "200", "path": _SPECIES_A["path"], "scientific_name": "",
-             "common_name": "", "rank": "SPECIES", "sample_count": 50},
-            {"taxon_key": "201", "path": _SPECIES_B["path"], "scientific_name": "",
-             "common_name": "", "rank": "SPECIES", "sample_count": 50},
-        ]),
-        catalog_dir / "species.parquet",
-    )
-    with patch("util.rankings.get_taxon_by_id",
-               side_effect=lambda k: {"200": _SPECIES_A, "201": _SPECIES_B}.get(k)):
-        result = rk._query_catalog(
-            within_taxon=_GENUS, descendant_rank="SPECIES",
-            limit=10, offset=0, min_samples=0, include_species_like=False,
-            loc_keys=frozenset({"201"}), loc_counts={"201": 5},
-        )
-    assert len(result["results"]) == 1
-    assert result["results"][0]["taxon"]["taxon_key"] == "201"
-    assert result["results"][0]["location_count"] == 5
 
 
 def test_load_gid_levels_bad_level_value(tmp_path, monkeypatch):

@@ -22,7 +22,6 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
-from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -201,7 +200,8 @@ def run_consolidation() -> None:
             GLOBAL_STATS_DIR / "phenology_counts.parquet", pheno_tbl,
             row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE,
         )
-        print(f"[consolidate] phenology: {len(pheno_rows)} rows for {len(set(r['taxon_key'] for r in pheno_rows))} taxa  [{time.monotonic() - t0:.1f}s]")
+        n_taxa = len(set(r["taxon_key"] for r in pheno_rows))
+        print(f"[consolidate] phenology: {len(pheno_rows)} rows for {n_taxa} taxa  [{time.monotonic() - t0:.1f}s]")
 
     # Remove per-node stats files and any leftover {rank}.parquet catalogs
     removed = 0

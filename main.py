@@ -388,10 +388,13 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
 
 def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
     """Read relative_ranks_positions.parquet from global file for one taxon+variable."""
-    rows = pq.read_table(
-        GLOBAL_STATS_DIR / POSITION_FILE,
-        filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
-    ).to_pylist()
+    try:
+        rows = pq.read_table(
+            GLOBAL_STATS_DIR / POSITION_FILE,
+            filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
+        ).to_pylist()
+    except Exception:
+        return []
     result = []
     for row in rows:
         position = row.get("position") or 0
@@ -545,7 +548,6 @@ def get_species_environment(
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
 
     variable_id = _resolve_variable_id(variable_id)
-    taxon_dir = TREE_ROOT / taxon["path"]
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     variable_metadata = {
         "name": layer["display_name"] if layer else variable_id,
@@ -1205,7 +1207,7 @@ def query_taxa(
             raise HTTPException(status_code=404, detail=f"Taxon not found: {within_taxon}")
 
     norm_rank = descendant_rank.upper() if descendant_rank else None
-    norm_sort_variable = sort_variable.replace("_", "") if sort_variable else None
+    norm_sort_variable = _resolve_variable_id(sort_variable) if sort_variable else None
 
     result = rankings.query_taxa(
         q=normalized_q,

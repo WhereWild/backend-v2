@@ -19,6 +19,7 @@ services:
     volumes:
       - .:/workspace
       - root-home:/root
+      - /sys/class/hwmon:/sys/class/hwmon:ro
     environment:
       - RCLONE_CONFIG=/workspace/docker/rclone.conf
       - WHEREWILD_MODE=api

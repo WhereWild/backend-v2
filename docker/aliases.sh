@@ -1003,6 +1003,28 @@ pdbc() {
   echo "pdbc started: $log_dir"
 }
 
+sync-gis-layers() {
+  local dest="${WW_GIS_LAYERS_DEST:-}"
+  if [[ -z "$dest" ]]; then
+    echo "sync-gis-layers: WW_GIS_LAYERS_DEST is not set"
+    return 1
+  fi
+  local src="${WHEREWILD_LOCAL_DATA_ROOT:-/workspace/data}/gis/layers"
+  local transfers="${WW_RCLONE_TRANSFERS:-8}"
+  local log_dir="/workspace/logs/rclone"
+  local log_file="${log_dir}/gis_layers_sync.log"
+  mkdir -p "$log_dir"
+  echo "syncing $src → $dest (log: $log_file)"
+  rclone copy "$src" "$dest" \
+    --config /workspace/docker/rclone.conf \
+    --transfers "$transfers" \
+    --stats-one-line \
+    --stats 60m \
+    --log-file "$log_file" &
+  echo "running in background (pid $!)"
+  echo "  tail -f $log_file"
+}
+
 ww-help() {
   cat <<'EOF'
 api [--remote|--local]   start api in background (default: auto-detect mount)
@@ -1010,6 +1032,8 @@ api-fg [--remote|--local] start api in foreground (with reload)
 api-stop                 stop api
 
 b2-help   show B2 storage commands
+
+sync-gis-layers          copy gis/layers/ to prod server in background
 
 pt                   run tests with coverage
 pt --temporal        run live S3 end-to-end tests

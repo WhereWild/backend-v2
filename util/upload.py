@@ -11,6 +11,7 @@ available at request time.
 """
 from __future__ import annotations
 
+import io
 import json
 import re
 import shutil
@@ -260,6 +261,17 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
         occ_path = work_dir / "occurrence.parquet"
         df.to_parquet(occ_path, index=False)
 
+        # occurrence_index: wide table (catalogNumber + GIS columns) for frontend
+        # variable filtering. The frontend parser explodes this into per-variable
+        # index rows — one entry per observation per variable.
+        gis_cols = [col for col in df.columns if col in layer_meta]
+        if gis_cols:
+            occ_index_df = df[["catalogNumber"] + gis_cols]
+            pq.write_table(
+                pa.Table.from_pandas(occ_index_df, preserve_index=False),
+                work_dir / OCCURRENCE_INDEX_FILE,
+            )
+
         lookup_rows: list[dict] = []
         for col in df.columns:
             layer = layer_meta.get(col)
@@ -312,12 +324,18 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
             for parquet_path, arcname in files_to_zip:
                 if not parquet_path.exists():
                     continue
-                zf.write(parquet_path, arcname=arcname)
                 try:
-                    csv_bytes = pq.read_table(parquet_path).to_pandas().to_csv(index=False).encode()
-                    zf.writestr(arcname.replace(".parquet", ".csv"), csv_bytes)
+                    table = pq.read_table(parquet_path)
+                    buf = io.BytesIO()
+                    pq.write_table(table, buf, compression="snappy")
+                    zf.writestr(arcname, buf.getvalue())
+                    try:
+                        csv_bytes = table.to_pandas().to_csv(index=False).encode()
+                        zf.writestr(arcname.replace(".parquet", ".csv"), csv_bytes)
+                    except Exception:
+                        pass
                 except Exception:
-                    pass
+                    zf.write(parquet_path, arcname=arcname)
 
     except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)

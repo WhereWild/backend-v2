@@ -2106,84 +2106,36 @@ def test_upload_missing_coordinates_raises_422():
 
 
 def test_upload_csv_success():
-    import shutil
-    import tempfile
-    import zipfile
-    from pathlib import Path
-
     csv = b"latitude,longitude\n45.0,-120.0\n46.0,-121.0\n"
-    fake_archive = Path(tempfile.mkdtemp()) / "out.zip"
-    fake_work_dir = fake_archive.parent
-    with zipfile.ZipFile(fake_archive, "w") as zf:
-        zf.writestr("occurrence.parquet", b"")
-
-    with patch("util.upload.enrich_with_gis", return_value=pd.DataFrame({
-            "catalogNumber": ["Observation #1", "Observation #2"],
-            "decimalLatitude": [45.0, 46.0],
-            "decimalLongitude": [-120.0, -121.0],
-        })), \
-         patch("util.upload.build_archive", return_value=(fake_archive, "processed_observations.zip", fake_work_dir)), \
-         patch("util.tiles.load_layers", return_value=[]):
+    with patch("util.tiles.load_layers", return_value=[]):
         r = client.post("/upload/raw-observations",
                         files=[("file", ("obs.csv", csv, "text/csv"))])
-    shutil.rmtree(fake_work_dir, ignore_errors=True)
-    assert r.status_code == 200
-    assert r.headers["content-type"] == "application/zip"
+    assert r.status_code == 202
+    body = r.json()
+    assert "job_id" in body
+    assert body["status"] == "queued"
 
 
 def test_upload_tsv_parsed_correctly():
-    import shutil
-    import tempfile
-    import zipfile
-    from pathlib import Path
-
     tsv = b"latitude\tlongitude\n45.0\t-120.0\n"
-    fake_archive = Path(tempfile.mkdtemp()) / "out.zip"
-    fake_work_dir = fake_archive.parent
-    with zipfile.ZipFile(fake_archive, "w") as zf:
-        zf.writestr("occurrence.parquet", b"")
-
-    with patch("util.upload.enrich_with_gis", return_value=pd.DataFrame({
-            "catalogNumber": ["Observation #1"],
-            "decimalLatitude": [45.0],
-            "decimalLongitude": [-120.0],
-        })), \
-         patch("util.upload.build_archive", return_value=(fake_archive, "processed_observations.zip", fake_work_dir)), \
-         patch("util.tiles.load_layers", return_value=[]):
+    with patch("util.tiles.load_layers", return_value=[]):
         r = client.post("/upload/raw-observations",
                         files=[("file", ("obs.tsv", tsv, "text/tab-separated-values"))])
-    shutil.rmtree(fake_work_dir, ignore_errors=True)
-    assert r.status_code == 200
+    assert r.status_code == 202
+    assert r.json()["status"] == "queued"
 
 
 def test_upload_parquet_parsed_correctly():
-    import io
-    import shutil
-    import tempfile
-    import zipfile
-    from pathlib import Path
+    import io as _io
 
     import pyarrow as pa
     import pyarrow.parquet as pq_local
-
     df_in = pd.DataFrame({"latitude": [45.0], "longitude": [-120.0]})
-    buf = io.BytesIO()
+    buf = _io.BytesIO()
     pq_local.write_table(pa.Table.from_pandas(df_in), buf)
     parquet_bytes = buf.getvalue()
-
-    fake_archive = Path(tempfile.mkdtemp()) / "out.zip"
-    fake_work_dir = fake_archive.parent
-    with zipfile.ZipFile(fake_archive, "w") as zf:
-        zf.writestr("occurrence.parquet", b"")
-
-    with patch("util.upload.enrich_with_gis", return_value=pd.DataFrame({
-            "catalogNumber": ["Observation #1"],
-            "decimalLatitude": [45.0],
-            "decimalLongitude": [-120.0],
-        })), \
-         patch("util.upload.build_archive", return_value=(fake_archive, "processed_observations.zip", fake_work_dir)), \
-         patch("util.tiles.load_layers", return_value=[]):
+    with patch("util.tiles.load_layers", return_value=[]):
         r = client.post("/upload/raw-observations",
                         files=[("file", ("obs.parquet", parquet_bytes, "application/octet-stream"))])
-    shutil.rmtree(fake_work_dir, ignore_errors=True)
-    assert r.status_code == 200
+    assert r.status_code == 202
+    assert r.json()["status"] == "queued"

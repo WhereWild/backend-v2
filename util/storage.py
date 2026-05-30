@@ -245,7 +245,7 @@ def _relative_to_root(path: Path, data_root: Path, project_root: Path) -> Path |
 
 def _should_cache_blob(path: Path) -> bool:
     suffix = path.suffix.lower()
-    if suffix in {".pkl", ".pickle"}:
+    if suffix in {".pkl", ".pickle", ".json", ".csv"}:
         return True
     extra = os.environ.get("WHEREWILD_CACHE_EXTS", "")
     if extra:

@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import io
 import json
@@ -5,14 +6,18 @@ import math
 import os
 import re
 import shutil
+import time
+import uuid
 from collections import Counter
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
@@ -95,7 +100,76 @@ def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
         df = df[df["coordinateUncertaintyInMeters"] <= 500]
     return df
 
-app = FastAPI()
+# ---------------------------------------------------------------------------
+# Upload job queue
+# ---------------------------------------------------------------------------
+
+_MAX_UPLOAD_ROWS = 50_000
+_DONE_TTL_SECONDS = 3600  # archive stays available for 1 hour after completion
+
+
+@dataclass
+class _UploadJob:
+    job_id: str
+    df: pd.DataFrame
+    status: str = "queued"       # queued | processing | done | error
+    archive_path: Path | None = None
+    archive_name: str | None = None
+    work_dir: Path | None = None
+    error: str | None = None
+    done_at: float | None = None
+
+
+_upload_queue: list[str] = []        # ordered job IDs waiting to run
+_upload_jobs: dict[str, _UploadJob] = {}
+
+
+async def _upload_consumer() -> None:
+    while True:
+        if not _upload_queue:
+            await asyncio.sleep(0.2)
+            continue
+        job_id = _upload_queue.pop(0)
+        job = _upload_jobs.get(job_id)
+        if job is None:
+            continue
+        job.status = "processing"
+        try:
+            df = await run_in_threadpool(upload.enrich_with_gis, job.df)
+            archive_path, archive_name, work_dir = await run_in_threadpool(upload.build_archive, df)
+            job.archive_path = archive_path
+            job.archive_name = archive_name
+            job.work_dir = work_dir
+            job.status = "done"
+        except Exception as exc:
+            job.status = "error"
+            job.error = str(exc)
+        finally:
+            job.done_at = time.monotonic()
+
+
+async def _cleanup_old_jobs() -> None:
+    while True:
+        await asyncio.sleep(300)
+        now = time.monotonic()
+        expired = [
+            jid for jid, job in list(_upload_jobs.items())
+            if job.done_at is not None and (now - job.done_at) > _DONE_TTL_SECONDS
+        ]
+        for jid in expired:
+            job = _upload_jobs.pop(jid, None)
+            if job and job.work_dir:
+                shutil.rmtree(job.work_dir, ignore_errors=True)
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    asyncio.create_task(_upload_consumer())
+    asyncio.create_task(_cleanup_old_jobs())
+    yield
+
+
+app = FastAPI(lifespan=_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"], expose_headers=["X-Nominal-Classes"])
 
 
@@ -1285,17 +1359,12 @@ def query_taxa(
 
 @app.post("/upload/raw-observations")
 async def upload_raw_observations(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-) -> FileResponse:
-    """Accept a CSV, TSV, or Parquet file of observations and return a ZIP archive.
+) -> JSONResponse:
+    """Accept a CSV, TSV, or Parquet file and queue it for processing.
 
-    The archive contains the original observations enriched with all static GIS
-    layer values, pre-computed summary statistics, density curves, and a flat
-    occurrence index — all in both Parquet and CSV formats.
-
-    Temporal enrichment is not included: historical weather aggregates require
-    per-observation timestamps and the full ERA5 archive.
+    Returns a job ID immediately. Poll /upload/status/{job_id} for progress,
+    then fetch the result from /upload/download/{job_id} when status is 'done'.
     """
     filename = file.filename or ""
     suffix = Path(filename).suffix.lower()
@@ -1317,6 +1386,12 @@ async def upload_raw_observations(
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not parse file: {exc}") from exc
 
+    if len(df) > _MAX_UPLOAD_ROWS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Upload exceeds the {_MAX_UPLOAD_ROWS:,}-row limit ({len(df):,} rows).",
+        )
+
     static_layer_ids = {
         layer["id"] for layer in tiles.load_layers()
         if layer.get("filename") and layer.get("window_hours") is None
@@ -1328,8 +1403,46 @@ async def upload_raw_observations(
     df = upload.validate_coordinates(df)
     upload.check_reserved_columns(df, static_layer_ids)
 
-    df = await run_in_threadpool(upload.enrich_with_gis, df)
-    archive_path, archive_name, work_dir = await run_in_threadpool(upload.build_archive, df)
+    job_id = str(uuid.uuid4())
+    _upload_jobs[job_id] = _UploadJob(job_id=job_id, df=df)
+    _upload_queue.append(job_id)
 
-    background_tasks.add_task(shutil.rmtree, work_dir, True)
-    return FileResponse(path=archive_path, media_type="application/zip", filename=archive_name)
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job_id, "position": len(_upload_queue), "status": "queued"},
+    )
+
+
+@app.get("/upload/status/{job_id}")
+async def upload_job_status(job_id: str):
+    """Return the current status and queue position of an upload job."""
+    job = _upload_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
+    position = _upload_queue.index(job_id) + 1 if job_id in _upload_queue else 0
+    return {"job_id": job_id, "status": job.status, "position": position, "error": job.error}
+
+
+@app.get("/upload/download/{job_id}")
+async def upload_job_download(background_tasks: BackgroundTasks, job_id: str) -> FileResponse:
+    """Download the processed archive for a completed upload job.
+
+    The archive is removed from the server after this call.
+    """
+    job = _upload_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
+    if job.status == "error":
+        raise HTTPException(status_code=500, detail=job.error or "Processing failed.")
+    if job.status != "done":
+        raise HTTPException(status_code=409, detail=f"Job not ready (status: {job.status}).")
+    if not job.archive_path or not job.archive_path.exists():
+        raise HTTPException(status_code=410, detail="Archive has expired or was removed.")
+    if job.work_dir:
+        background_tasks.add_task(shutil.rmtree, job.work_dir, True)
+    _upload_jobs.pop(job_id, None)
+    return FileResponse(
+        path=job.archive_path,
+        media_type="application/zip",
+        filename=job.archive_name or "processed_observations.zip",
+    )

@@ -7,19 +7,14 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     environment: production
     steps:
-      - name: Deploy to server
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: root
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            cd /opt/wherewild/wherewild-v2
-            git pull origin main
-            docker compose -f docker-compose.prod.yml build api
-            docker compose -f docker-compose.prod.yml rm -sf api
-            docker compose -f docker-compose.prod.yml up -d api
-            docker builder prune -f --keep-storage 2gb
+      - name: Deploy API
+        run: |
+          cd ~/wherewild/backend-v2
+          git pull origin main
+          docker compose -f docker-compose.optiplex.yml build api
+          docker compose -f docker-compose.optiplex.yml rm -sf api
+          docker compose -f docker-compose.optiplex.yml up -d api
+          docker builder prune -f --keep-storage 2gb

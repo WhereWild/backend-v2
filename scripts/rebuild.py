@@ -143,9 +143,11 @@ _DEFAULT_B2_ENDPOINT = "https://s3.us-west-004.backblazeb2.com"
 
 
 def _push_b2_stage() -> None:
-    """Push data to B2 in two passes:
-    - taxonomy: rclone sync (overwrites remote to match local)
-    - gis:      rclone copy (upload-only; never deletes existing remote files)
+    """Push taxonomy and location data to B2.
+
+    GIS raster layers (gis/layers/) are not pushed — they live on GamBase and
+    the production server's local disk and are large enough that B2 storage
+    costs are not justified when nothing reads them from there.
     """
     remote = os.environ.get("WW_B2_WRITER_REMOTE", "wherewild-localdev-writer")
     bucket = os.environ.get("WW_B2_BUCKET", _DEFAULT_B2_BUCKET)
@@ -172,13 +174,6 @@ def _push_b2_stage() -> None:
     r = subprocess.run(["rclone", "sync", str(locations_src), locations_dest, *base_flags])
     if r.returncode != 0:
         raise RuntimeError(f"rclone sync gis/locations failed with exit code {r.returncode}")
-
-    layers_src = DATA_DIR / "gis" / "layers"
-    layers_dest = f"{base_dest}/gis/layers"
-    print(f"  rclone copy {layers_src} → {layers_dest}")
-    r = subprocess.run(["rclone", "copy", str(layers_src), layers_dest, *base_flags])
-    if r.returncode != 0:
-        raise RuntimeError(f"rclone copy gis/layers failed with exit code {r.returncode}")
 
 
 def _run_download_gis(gis_dir: Path | None = None) -> None:

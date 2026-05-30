@@ -46,6 +46,8 @@ from util.taxa import format_common_name, iter_descendants, normalize_name, taxo
 
 _CONFIG = load_config("global")
 _SYNC_STATE_PATH = Path("data/sync_state.json")
+_PIPELINE_STATE_PATH = Path("data/pipeline_state.json")
+_TEMPORAL_STATE_PATH = Path("data/temporal_state.json")
 _storage = ParquetStorageProxy(
     data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
     project_root=Path(__file__).parent,
@@ -204,6 +206,177 @@ def version():
     except Exception:
         crawl_ts = None
     return {"version": crawl_ts}
+
+
+@app.get("/status")
+async def status():
+    pipeline = await run_in_threadpool(_status_pipeline)
+    temporal = await run_in_threadpool(_status_temporal)
+    server = await run_in_threadpool(_status_server)
+    active_job = next(
+        (j for j in _upload_jobs.values() if j.status == "processing"), None
+    )
+    return {
+        "pipeline": pipeline,
+        "temporal": temporal,
+        "upload_queue": {
+            "depth": len(_upload_queue),
+            "active": active_job is not None,
+        },
+        "server": server,
+    }
+
+
+@app.post("/internal/pipeline-state", status_code=200)
+async def push_pipeline_state(body: dict):
+    from datetime import UTC
+    from datetime import datetime as _dt
+    body["received_at"] = _dt.now(UTC).isoformat()
+    await run_in_threadpool(
+        lambda: _PIPELINE_STATE_PATH.write_text(json.dumps(body))
+    )
+    return {"ok": True}
+
+
+@app.post("/internal/temporal-state", status_code=200)
+async def push_temporal_state(body: dict):
+    from datetime import UTC
+    from datetime import datetime as _dt
+    body["received_at"] = _dt.now(UTC).isoformat()
+    await run_in_threadpool(
+        lambda: _TEMPORAL_STATE_PATH.write_text(json.dumps(body))
+    )
+    return {"ok": True}
+
+
+def _status_pipeline() -> dict | None:
+    # Prefer push-populated file (gambaby); fall back to local sync_state.json (GamBase)
+    path = _PIPELINE_STATE_PATH if _PIPELINE_STATE_PATH.exists() else _SYNC_STATE_PATH
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+        state = raw.get("pipeline", raw) if path == _SYNC_STATE_PATH else raw
+    except Exception:
+        return None
+    from datetime import UTC
+    from datetime import datetime as _dt
+    now = _dt.now(UTC)
+    stage = state.get("stage")
+    stage_elapsed_s = None
+    if state.get("status") == "in_progress" and stage:
+        stage_entry = state.get("stages", {}).get(stage, {})
+        started = stage_entry.get("started_at")
+        if started:
+            try:
+                stage_elapsed_s = int((now - _dt.fromisoformat(started)).total_seconds())
+            except Exception:
+                pass
+    return {
+        "status": state.get("status"),
+        "stage": stage,
+        "stage_elapsed_s": stage_elapsed_s,
+        "last_finished_at": state.get("finished_at"),
+        "last_duration_s": state.get("duration_s"),
+        "received_at": state.get("received_at"),
+    }
+
+
+def _status_temporal() -> dict | None:
+    if not _TEMPORAL_STATE_PATH.exists():
+        return None
+    try:
+        state = json.loads(_TEMPORAL_STATE_PATH.read_text())
+    except Exception:
+        return None
+    from datetime import UTC
+    from datetime import datetime as _dt
+    elapsed_s = None
+    if state.get("status") == "running":
+        started = state.get("started_at")
+        if started:
+            try:
+                elapsed_s = int((_dt.now(UTC) - _dt.fromisoformat(started)).total_seconds())
+            except Exception:
+                pass
+    return {
+        "status": state.get("status"),
+        "elapsed_s": elapsed_s,
+        "last_finished_at": state.get("completed_at"),
+        "last_duration_s": state.get("duration_s"),
+        "received_at": state.get("received_at"),
+    }
+
+
+def _status_server() -> dict:
+    import time as _time
+    result: dict = {}
+
+    # CPU usage — two samples 300ms apart
+    try:
+        def _read_cpu():
+            with open("/proc/stat") as f:
+                parts = f.readline().split()
+            vals = list(map(int, parts[1:8]))
+            return vals[3] + vals[4], sum(vals)  # idle, total
+
+        i1, t1 = _read_cpu()
+        _time.sleep(0.3)
+        i2, t2 = _read_cpu()
+        result["cpu_percent"] = round((1 - (i2 - i1) / (t2 - t1)) * 100, 1)
+    except Exception:
+        result["cpu_percent"] = None
+
+    # CPU temp
+    try:
+        import psutil
+        temps = psutil.sensors_temperatures()
+        cpu_temp = None
+        for name, entries in temps.items():
+            for entry in entries:
+                label = entry.label.lower()
+                if label.startswith("package id 0") or label.startswith("cpu"):
+                    cpu_temp = round(entry.current, 1)
+                    break
+            if cpu_temp is not None:
+                break
+        result["cpu_temp_c"] = cpu_temp
+    except Exception:
+        result["cpu_temp_c"] = None
+
+    # RAM
+    try:
+        mem: dict[str, int] = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    mem[k.strip()] = int(v.strip().split()[0])
+        ram_total_mb = mem["MemTotal"] // 1024
+        ram_used_mb = ram_total_mb - mem.get("MemAvailable", mem.get("MemFree", 0)) // 1024
+        result["ram_used_mb"] = ram_used_mb
+        result["ram_total_mb"] = ram_total_mb
+    except Exception:
+        result["ram_used_mb"] = None
+        result["ram_total_mb"] = None
+
+    # Disk
+    try:
+        st = os.statvfs("/")
+        result["disk_used_gb"] = (st.f_blocks - st.f_bfree) * st.f_frsize // (1024 ** 3)
+        result["disk_total_gb"] = st.f_blocks * st.f_frsize // (1024 ** 3)
+    except Exception:
+        result["disk_used_gb"] = None
+        result["disk_total_gb"] = None
+
+    # Uptime
+    try:
+        with open("/proc/uptime") as f:
+            result["uptime_s"] = int(float(f.read().split()[0]))
+    except Exception:
+        result["uptime_s"] = None
+
+    return result
 
 
 @app.get("/data-sources")

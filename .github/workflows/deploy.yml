@@ -22,3 +22,4 @@ jobs:
             docker compose -f docker-compose.prod.yml build api
             docker compose -f docker-compose.prod.yml rm -sf api
             docker compose -f docker-compose.prod.yml up -d api
+            docker builder prune -f --keep-storage 2gb

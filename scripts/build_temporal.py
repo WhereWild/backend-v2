@@ -709,13 +709,21 @@ def _build_forecast_aggregates(
 # Main
 # ---------------------------------------------------------------------------
 
-def _push_rasters_to_b2(out_dir: str) -> None:
-    remote = os.environ.get("WW_B2_WRITER_REMOTE", "wherewild-localdev-writer")
-    bucket = os.environ.get("WW_B2_BUCKET", "wherewild-data")
-    prefix = os.environ.get("WW_B2_PREFIX", "data")
+def _push_rasters(out_dir: str) -> None:
+    """Sync temporal rasters to the configured destination.
+
+    Set WW_TEMPORAL_RASTER_DEST to an rclone remote path to push directly to
+    the production server (e.g. "gambaby:/home/gambel/wherewild/backend-v2/data/gis/temporal/rasters").
+    Falls back to B2 if unset.
+    """
     transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
-    dest = f"{remote}:{bucket}/{prefix}/gis/temporal/rasters" if prefix else f"{remote}:{bucket}/gis/temporal/rasters"
-    print(f"\n=== pushing rasters to B2: {dest} ===")
+    dest = os.environ.get("WW_TEMPORAL_RASTER_DEST")
+    if not dest:
+        remote = os.environ.get("WW_B2_WRITER_REMOTE", "wherewild-localdev-writer")
+        bucket = os.environ.get("WW_B2_BUCKET", "wherewild-data")
+        prefix = os.environ.get("WW_B2_PREFIX", "data")
+        dest = f"{remote}:{bucket}/{prefix}/gis/temporal/rasters" if prefix else f"{remote}:{bucket}/gis/temporal/rasters"
+    print(f"\n=== pushing rasters to: {dest} ===")
     result = subprocess.run([
         "rclone", "sync", out_dir, dest,
         "--fast-list",
@@ -932,7 +940,7 @@ def main() -> None:
 
         # ── Push rasters to B2 ────────────────────────────────────────────────
         if os.environ.get("TEMPORAL_RASTER_NO_PUSH", "0") != "1":
-            _push_rasters_to_b2(out_dir)
+            _push_rasters(out_dir)
 
         _write_state("completed")
 

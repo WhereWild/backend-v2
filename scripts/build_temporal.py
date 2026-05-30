@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import fsspec
+import httpx
 import numpy as np
 
 from config.config import load_config
@@ -45,6 +46,19 @@ from util.temporal import (
     save_raster_state,
     set_raster_chunk_cache,
 )
+
+_TEMPORAL_STATUS_PUSH_URL = os.environ.get("WHEREWILD_STATUS_PUSH_URL", "")
+
+
+def _push_temporal_state(state: dict) -> None:
+    if not _TEMPORAL_STATUS_PUSH_URL:
+        return
+    try:
+        url = _TEMPORAL_STATUS_PUSH_URL.rstrip("/") + "/internal/temporal-state"
+        httpx.post(url, json=state, timeout=5)
+    except Exception as exc:
+        print(f"temporal status push: failed: {exc}")
+
 
 # ---------------------------------------------------------------------------
 # Variable config
@@ -850,6 +864,7 @@ def main() -> None:
         tmp = state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, indent=2))
         tmp.replace(state_path)
+        _push_temporal_state(state)
 
     _write_state("running")
 

@@ -197,7 +197,7 @@ def test_query_taxa_ranked_scoped_no_index(tmp_path):
         r = client.get("/api/taxa/query?within_taxon=10&descendant_rank=SPECIES"
                        "&sort_variable=bio1&sort_metric=mean")
     assert r.status_code == 200
-    assert r.json()["empty_reason"] == "no_index"
+    assert r.json()["empty_reason"] == "no_column"
 
 
 def _write_occ_index(taxon_dir: Path, rows=None) -> None:

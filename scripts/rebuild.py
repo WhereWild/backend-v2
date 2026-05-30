@@ -47,6 +47,7 @@ DATA_DIR = Path("data")
 SYNC_STATE_PATH = Path("data/sync_state.json")
 OLD_TREE_STAGE = Path("data/tmp/old_tree")
 NOTIFY_URL = os.environ.get("WHEREWILD_NOTIFY_URL", "")
+STATUS_PUSH_URL = os.environ.get("WHEREWILD_STATUS_PUSH_URL", "")
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,7 @@ def _update_pipeline(updates: dict) -> None:
     pipeline.update(updates)
     state["pipeline"] = pipeline
     _write_sync_state(state)
+    _push_pipeline_state(pipeline)
 
 
 def _set_stage(name: str, status: str) -> None:
@@ -89,6 +91,7 @@ def _set_stage(name: str, status: str) -> None:
     pipeline["stages"] = stages
     state["pipeline"] = pipeline
     _write_sync_state(state)
+    _push_pipeline_state(pipeline)
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +106,17 @@ def notify(event: str, payload: dict) -> None:
         httpx.post(NOTIFY_URL, json={"event": event, **payload}, timeout=5)
     except Exception as exc:
         print(f"notify: failed to POST {event!r}: {exc}")
+
+
+def _push_pipeline_state(pipeline: dict) -> None:
+    """Push current pipeline state to the API status endpoint. Silently drops if URL unset."""
+    if not STATUS_PUSH_URL:
+        return
+    try:
+        url = STATUS_PUSH_URL.rstrip("/") + "/internal/pipeline-state"
+        httpx.post(url, json=pipeline, timeout=5)
+    except Exception as exc:
+        print(f"status push: failed: {exc}")
 
 
 # ---------------------------------------------------------------------------

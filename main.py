@@ -10,7 +10,6 @@ from functools import lru_cache
 from pathlib import Path
 
 import pandas as pd
-import pyarrow.parquet as pq
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -37,10 +36,15 @@ from util.stats import (
     compute_phenology_counts,
     read_phenology_counts,
 )
+from util.storage import ParquetStorageProxy
 from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
 
 _CONFIG = load_config("global")
 _SYNC_STATE_PATH = Path("data/sync_state.json")
+_storage = ParquetStorageProxy(
+    data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
+    project_root=Path(__file__).parent,
+)
 _LEGEND_DIR = Path("config/gis/legends")
 _OCC_FILE = "occurrence.parquet"
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
@@ -78,9 +82,10 @@ def _load_legend(layer_id: str) -> list:
 def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
     """Read a precomputed env value for a known observation from occurrence_index.parquet."""
     index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
-    if not index_path.exists():
+    try:
+        return _index_lookup_value(index_path, variable_id, catalog_number)
+    except Exception:
         return None
-    return _index_lookup_value(index_path, variable_id, catalog_number)
 
 
 def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -322,20 +327,20 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
     _tk = [("taxon_key", "=", taxon_key)]
 
     numerical_stats: dict[str, dict] = {}
-    for row in pq.read_table(GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE, filters=_tk).to_pylist():
+    for row in _storage.read_table(GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE, filters=_tk).to_pylist():
         row.pop("taxon_key", None)
         var = row.pop("variable")
         numerical_stats[var] = row
 
     circular_stats: dict[str, dict] = {}
-    for row in pq.read_table(GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE, filters=_tk).to_pylist():
+    for row in _storage.read_table(GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE, filters=_tk).to_pylist():
         row.pop("taxon_key", None)
         var = row.pop("variable")
         circular_stats[var] = row
 
     nominal_stats: dict[str, dict] = {}
     nominal_classes: dict[str, list] = {}
-    for row in pq.read_table(GLOBAL_STATS_DIR / NOMINAL_STATS_FILE, filters=_tk).to_pylist():
+    for row in _storage.read_table(GLOBAL_STATS_DIR / NOMINAL_STATS_FILE, filters=_tk).to_pylist():
         row.pop("taxon_key", None)
         var, metric, value = row["variable"], row["metric"], row["value"]
         if metric.startswith("class_"):
@@ -349,7 +354,7 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
         nominal_classes[var].sort(key=lambda e: -e["fraction"])
 
     density_by_var: dict[str, dict] = {}
-    for row in pq.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk).to_pylist():
+    for row in _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk).to_pylist():
         row.pop("taxon_key", None)
         var = row.pop("variable")
         density_by_var[var] = row
@@ -389,7 +394,7 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
 def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
     """Read relative_ranks_positions.parquet from global file for one taxon+variable."""
     try:
-        rows = pq.read_table(
+        rows = _storage.read_table(
             GLOBAL_STATS_DIR / POSITION_FILE,
             filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
         ).to_pylist()
@@ -418,7 +423,7 @@ _GADM_LEVEL_COLS: dict[int, str] = {0: "level0Gid", 1: "level1Gid", 2: "level2Gi
 def _timestamp_range_from_metadata(path: Path) -> tuple[int, int] | None:
     """Read min/max eventTimestamp from parquet footer stats — no row scan required."""
     try:
-        meta = pq.read_metadata(str(path))
+        meta = _storage.read_metadata(path)
         if meta.num_row_groups == 0:
             return None
         col_idx = None
@@ -628,7 +633,7 @@ def get_species_environment(
                 }
 
     if value_type == "nominal":
-        rows = pq.read_table(
+        rows = _storage.read_table(
             GLOBAL_STATS_DIR / NOMINAL_STATS_FILE,
             filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)],
         ).to_pylist()
@@ -677,7 +682,7 @@ def get_species_environment(
 
     if value_type == "circular":
         _tk_var = [("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)]
-        rows = pq.read_table(GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE, filters=_tk_var).to_pylist()
+        rows = _storage.read_table(GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE, filters=_tk_var).to_pylist()
         row = rows[0] if rows else None
         if row is None:
             raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
@@ -688,7 +693,7 @@ def get_species_environment(
             "rbar": row.get("rbar"),
             "circular_std": row.get("circular_std"),
         }
-        den_rows = pq.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
+        den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
         den_row = den_rows[0] if den_rows else None
         density_curve = {"points": den_row["points"], "density": den_row["density"]} if den_row else None
         return {
@@ -703,7 +708,7 @@ def get_species_environment(
         }
 
     _tk_var = [("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)]
-    rows = pq.read_table(GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE, filters=_tk_var).to_pylist()
+    rows = _storage.read_table(GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE, filters=_tk_var).to_pylist()
     row = rows[0] if rows else None
     if row is None:
         raise HTTPException(status_code=404, detail=f"No stats for {variable_id}")
@@ -719,7 +724,7 @@ def get_species_environment(
         "q90": row.get("90th_percentile"),
     }
 
-    den_rows = pq.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
+    den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
     den_row = den_rows[0] if den_rows else None
     density_curve = {"points": den_row["points"], "density": den_row["density"]} if den_row else None
 
@@ -778,8 +783,6 @@ def get_species_occurrences(
 
     def _read_occ(path: Path) -> None:
         nonlocal ts_min, ts_max
-        if not path.exists():
-            return
         # Fast path: parquet footer stats when no row-level filters change the range
         if not has_loc_or_pheno:
             result = _timestamp_range_from_metadata(path)
@@ -788,11 +791,11 @@ def get_species_occurrences(
                 ts_min = lo if ts_min is None else min(ts_min, lo)
                 ts_max = hi if ts_max is None else max(ts_max, hi)
         try:
-            schema_names = set(pq.read_schema(path).names)
+            schema_names = set(_storage.read_schema(path).names)
             cols_to_read = [c for c in occ_columns if c in schema_names]
+            table = _storage.read_table(path, columns=cols_to_read)
         except Exception:
-            cols_to_read = list(_OCC_COLUMNS)
-        table = pq.read_table(path, columns=cols_to_read)
+            return
         if table.num_rows == 0:
             return
         df = _filter_occ_df(table.to_pandas())
@@ -845,18 +848,25 @@ def get_species_occurrences(
 def _load_hierarchy() -> dict[str, dict]:
     """Return gid → {name, level, parent_gid} from hierarchy.csv."""
     path = _LOCATIONS_DIR / "hierarchy.csv"
-    if not path.exists():
+    try:
+        f_ctx = _storage.open_input_file(path)
+    except Exception:
         return {}
     result: dict[str, dict] = {}
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            gid = row.get("gid", "")
-            if gid:
-                result[gid] = {
-                    "name": row.get("name", gid),
-                    "level": int(row["level"]),
-                    "parent_gid": row.get("parent_gid") or None,
-                }
+    try:
+        with f_ctx as raw:
+            data = raw.read()
+            text = data.decode("utf-8") if isinstance(data, bytes) else data
+            for row in csv.DictReader(io.StringIO(text)):
+                gid = row.get("gid", "")
+                if gid:
+                    result[gid] = {
+                        "name": row.get("name", gid),
+                        "level": int(row["level"]),
+                        "parent_gid": row.get("parent_gid") or None,
+                    }
+    except Exception:
+        return {}
     return result
 
 
@@ -900,12 +910,9 @@ def get_species_locations(taxon_id: str, level: int | None = None, parent: str |
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
 
-    if not _LOC_TAXA_PATH.exists():
-        return []
-
     taxon_key = str(taxon["taxon_key"])
     try:
-        table = pq.read_table(_LOC_TAXA_PATH, filters=[("taxon_key", "=", taxon_key)])
+        table = _storage.read_table(_LOC_TAXA_PATH, filters=[("taxon_key", "=", taxon_key)])
     except Exception:
         return []
 
@@ -1017,13 +1024,14 @@ def get_species_environment_slice(
                 "observations": observations,
             }
     index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
-    if not index_path.exists():
+    try:
+        observations = _read_index_for_slice(
+            index_path, variable_id,
+            value_min=raw_min, value_max=raw_max, circular_wrap=circular_wrap,
+            limit=limit,
+        )
+    except Exception:
         raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")
-    observations = _read_index_for_slice(
-        index_path, variable_id,
-        value_min=raw_min, value_max=raw_max, circular_wrap=circular_wrap,
-        limit=limit,
-    )
     observations = [
         {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
         for obs in observations
@@ -1080,11 +1088,12 @@ def get_species_environment_class_samples(
                 "observations": observations,
             }
     index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
-    if not index_path.exists():
+    try:
+        observations = _read_index_for_slice(
+            index_path, variable_id, class_value=float(parsed), limit=limit,
+        )
+    except Exception:
         raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")
-    observations = _read_index_for_slice(
-        index_path, variable_id, class_value=float(parsed), limit=limit,
-    )
     return {
         "species_id": taxon.get("taxon_key"),
         "variable": variable_id,
@@ -1123,12 +1132,10 @@ def list_taxa_ranking_options(
     rank_lower = "subspecies" if norm_rank in _CONFIG.subspecies_equivalents else norm_rank.lower()
     index_path = rankings.TREE_ROOT / resolved["path"] / f"{rank_lower}_index.parquet"
 
-    if not index_path.exists():
-        return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": []}
-
-    column_lengths = rankings._load_column_lengths(index_path)
     try:
-        schema = pq.read_schema(index_path)
+        schema = _storage.read_schema(index_path)
+        raw_lengths = (schema.metadata or {}).get(b"column_lengths")
+        column_lengths = {k: int(v) for k, v in json.loads(raw_lengths).items() if int(v) > 0} if raw_lengths else {}
     except Exception:
         return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": []}
 

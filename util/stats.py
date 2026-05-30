@@ -551,7 +551,6 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
     _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_density(taxon_dir, density_rows)
-    build_leaf_index(taxon_dir, df, layer_meta, taxon_dir.name.rsplit("_", 1)[-1])
 
 
 def process_observations_df(directory: Path, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:
@@ -575,6 +574,7 @@ def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
     if df.empty:
         return
     _process_leaf_df(taxon_dir, df, layer_meta)
+    build_leaf_index(taxon_dir, df, layer_meta, taxon_dir.name.rsplit("_", 1)[-1])
 
 
 def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path) -> pd.DataFrame | None:
@@ -609,6 +609,7 @@ def _process_species(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
     if df is None or df.empty:
         return
     _process_leaf_df(taxon_dir, df, layer_meta)
+    build_leaf_index(taxon_dir, df, layer_meta, taxon_dir.name.rsplit("_", 1)[-1])
 
 
 def collect_taxon_df(taxon: TaxonRecord) -> pd.DataFrame | None:

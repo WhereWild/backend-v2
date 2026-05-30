@@ -1,3 +1,9 @@
+if [[ -f /workspace/.env ]]; then
+  set -a
+  source /workspace/.env
+  set +a
+fi
+
 _uv() {
     uv run --env-file /workspace/.env "$@"
 }

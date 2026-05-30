@@ -7,7 +7,14 @@ from typing import Any, TypedDict
 
 from rapidfuzz import fuzz, process
 
+from util.storage import ParquetStorageProxy
+
 CATALOG_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "catalog"
+
+_storage = ParquetStorageProxy(
+    data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
+    project_root=Path(__file__).parent.parent,
+)
 
 
 class TaxonRecord(TypedDict):
@@ -51,7 +58,7 @@ def taxon_slug(value: str | None) -> str:
 
 @lru_cache(maxsize=1)
 def _load_payload() -> dict:
-    with open(CATALOG_DIR / "taxon_catalog.pkl", "rb") as f:
+    with _storage.open_input_file(CATALOG_DIR / "taxon_catalog.pkl") as f:
         return pickle.load(f)
 
 

@@ -42,7 +42,7 @@ TREE_ROOT = Path("data/taxonomy/tree")
 LAYERS_DIR = Path("data/gis/layers")
 CATALOG_PATH = Path("config/gis/catalog.json")
 OCCURRENCE_FILE = "occurrence.parquet"
-ROW_LIMIT = 3_500_000
+ROW_LIMIT = 2_500_000
 
 _LAYER_WORKERS = int(os.environ.get("ENRICH_LAYER_WORKERS", "4"))
 # Rasters whose uncompressed footprint fits under this limit are loaded fully

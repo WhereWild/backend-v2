@@ -144,6 +144,31 @@ def _run_layer(
             chunk_worklists[entry.chunk_num] = slice_
 
     chunks_with_obs = [e for e in chunk_index.ranges if e.chunk_num in chunk_worklists]
+
+    # For multi-source layers, restrict to chunks where every source has a matching
+    # file (same source type + chunk_num). Chunks missing from any source would fail
+    # at download time — this can happen when the index variable (sources[0]) has
+    # chunk_*.om files for a time period that other sources still store as year_*.om.
+    if len(layer.sources) > 1:
+        for src_var in layer.sources[1:]:
+            try:
+                src_idx = build_chunk_index(
+                    layer.model, src_var, min_year=cfg.temporal_min_year
+                )
+                src_keys = {(e.source, e.chunk_num) for e in src_idx.ranges}
+                before = len(chunks_with_obs)
+                chunks_with_obs = [
+                    e for e in chunks_with_obs if (e.source, e.chunk_num) in src_keys
+                ]
+                dropped = before - len(chunks_with_obs)
+                if dropped:
+                    print(
+                        f"[intersect] {layer.id}: dropped {dropped} chunks "
+                        f"not available for {src_var}"
+                    )
+            except Exception as exc:
+                print(f"[warn] {layer.id}: could not intersect with {src_var} index — {exc}")
+
     total_chunks = len(chunks_with_obs)
 
     prefetch_vars = layer.sources if layer.sources else [layer.id]

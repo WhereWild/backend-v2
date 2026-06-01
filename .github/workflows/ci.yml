@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, feature/publish-container]
+    branches: [main]
   pull_request:
 
 jobs:
@@ -24,7 +24,7 @@ jobs:
 
   package:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/feature/publish-container'
+    if: github.ref == 'refs/heads/main'
     needs: [lint, test]
     permissions:
       packages: write

@@ -714,7 +714,7 @@ def _slice_from_raw_occ(
     start_ts: int | None = None,
     end_ts: int | None = None,
 ) -> list[dict]:
-    df = collect_taxon_df(taxon)
+    df = collect_taxon_df(taxon, storage=_storage)
     if df is None or variable_id not in df.columns:
         return []
     if filter_col is not None:
@@ -757,7 +757,7 @@ def _class_samples_from_raw_occ(
     start_ts: int | None = None,
     end_ts: int | None = None,
 ) -> list[dict]:
-    df = collect_taxon_df(taxon)
+    df = collect_taxon_df(taxon, storage=_storage)
     if df is None or variable_id not in df.columns:
         return []
     if filter_col is not None:
@@ -815,6 +815,7 @@ def get_species_environment(
             result = compute_location_filtered_stats(
                 taxon, variable_id, filter_col, location, layer,
                 phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+                storage=_storage,
             )
             if result is not None:
                 if result["type"] == "continuous":
@@ -1007,15 +1008,13 @@ def get_species_occurrences(
     filter_col = _location_filter_col(location) if location is not None else None
     has_loc_or_pheno = filter_col is not None or phenology_norm is not None
     has_ts = start_ts is not None or end_ts is not None
-    # When no filters at all, use precomputed phenology counts from process_tree
     use_precomputed_pheno = not has_loc_or_pheno and not has_ts
 
     extra_cols: list[str] = []
     if filter_col:
         extra_cols.append(filter_col)
-    # rcs needed for phenology filter OR for live phenology counting
-    if phenology_norm or not use_precomputed_pheno:
-        extra_cols.append("rcs")
+    # Always read rcs so we can fall back to live phenology counts if precomputed is missing
+    extra_cols.append("rcs")
     # Need eventTimestamp in data when filtering by it, or when computing range
     # from row-filtered data (loc/pheno active).
     if has_ts or has_loc_or_pheno:
@@ -1079,7 +1078,9 @@ def get_species_occurrences(
             _read_occ(TREE_ROOT / desc["path"] / _OCC_FILE)
 
     if use_precomputed_pheno:
-        pheno_counts = read_phenology_counts(TREE_ROOT / taxon["path"])
+        pheno_counts = read_phenology_counts(TREE_ROOT / taxon["path"]) or dict(
+            sorted(pheno_acc.items(), key=lambda kv: kv[1], reverse=True)
+        )
     else:
         pheno_counts = dict(sorted(pheno_acc.items(), key=lambda kv: kv[1], reverse=True))
 

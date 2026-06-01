@@ -708,12 +708,14 @@ def build_occ_index(
         else None
     )
 
-    all_paths: list[np.ndarray] = []
+    all_taxon_idx: list[np.ndarray] = []
     all_rows: list[np.ndarray] = []
     all_lats: list[np.ndarray] = []
     all_lons: list[np.ndarray] = []
     all_times: list[np.ndarray] = []
     all_elevs: list[np.ndarray] = []
+    _path_lookup: list[str] = []
+    _path_to_idx: dict[str, int] = {}
 
     tree_root = Path(data_root) / "taxonomy" / "tree"
     for node in iter_descendants(root, include_self=True):
@@ -757,16 +759,22 @@ def build_occ_index(
             else np.full(len(row_idx), np.nan)
         )
 
-        all_paths.append(np.full(len(row_idx), str(occ_path), dtype=object))
+        path_str = str(occ_path)
+        if path_str not in _path_to_idx:
+            _path_to_idx[path_str] = len(_path_lookup)
+            _path_lookup.append(path_str)
+        tidx = _path_to_idx[path_str]
+        all_taxon_idx.append(np.full(len(row_idx), tidx, dtype=np.int32))
         all_rows.append(row_idx)
         all_lats.append(lats)
         all_lons.append(lons)
         all_times.append(times)
         all_elevs.append(elevs)
 
-    if not all_paths:
+    _path_type = pa.dictionary(pa.int32(), pa.string())
+    if not all_taxon_idx:
         return pa.table({
-            "taxon_path": pa.array([], type=pa.string()),
+            "taxon_path": pa.array([], type=_path_type),
             "row_idx": pa.array([], type=pa.int64()),
             "latitude": pa.array([], type=pa.float64()),
             "longitude": pa.array([], type=pa.float64()),
@@ -775,7 +783,10 @@ def build_occ_index(
         })
 
     return pa.table({
-        "taxon_path": np.concatenate(all_paths),
+        "taxon_path": pa.DictionaryArray.from_arrays(
+            pa.array(np.concatenate(all_taxon_idx), type=pa.int32()),
+            pa.array(_path_lookup, type=pa.string()),
+        ),
         "row_idx": np.concatenate(all_rows),
         "latitude": np.concatenate(all_lats),
         "longitude": np.concatenate(all_lons),
@@ -799,19 +810,20 @@ def map_to_worklist(
     Returns a table with columns:
         taxon_path, row_idx, chunk_num, lat_idx, lon_idx, time_idx
     """
-    data = occ_table.to_pydict()
-    times = np.asarray(data["timestamp"], dtype=np.float64)
-    lats = np.asarray(data["latitude"], dtype=np.float64)
-    lons = np.asarray(data["longitude"], dtype=np.float64)
-    row_idx = np.asarray(data["row_idx"], dtype=np.int64)
-    taxon_path = np.asarray(data["taxon_path"])
-    elevation = np.asarray(
-        data.get("elevation", np.full(len(times), np.nan)), dtype=np.float64
+    times = occ_table.column("timestamp").to_numpy()
+    lats = occ_table.column("latitude").to_numpy()
+    lons = occ_table.column("longitude").to_numpy()
+    row_idx = occ_table.column("row_idx").to_numpy()
+    taxon_path_col = occ_table.column("taxon_path")
+    elevation = (
+        occ_table.column("elevation").to_numpy()
+        if "elevation" in occ_table.schema.names
+        else np.full(len(times), np.nan, dtype=np.float64)
     )
 
     if times.size == 0:
         return pa.table({
-            "taxon_path": pa.array([], type=pa.string()),
+            "taxon_path": pa.array([], type=taxon_path_col.type),
             "row_idx": pa.array([], type=pa.int64()),
             "chunk_num": pa.array([], type=pa.int32()),
             "lat_idx": pa.array([], type=pa.int32()),
@@ -847,7 +859,7 @@ def map_to_worklist(
     time_indices = np.clip(time_indices, 0, chunk_time_lens - 1)
 
     return pa.table({
-        "taxon_path": taxon_path,
+        "taxon_path": taxon_path_col,
         "row_idx": row_idx,
         "chunk_num": chunk_nums,
         "lat_idx": lat_idx,

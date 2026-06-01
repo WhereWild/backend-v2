@@ -31,7 +31,7 @@ from scipy.stats import entropy as _scipy_entropy
 
 from config.config import ValueType, load_config
 from util.indexing import build_leaf_index, build_nonleaf_index
-from util.storage import atomic_write_parquet
+from util.storage import ParquetStorage, atomic_write_parquet
 from util.taxa import TaxonRecord, iter_descendants
 
 CONFIG = load_config("global")
@@ -612,21 +612,28 @@ def _process_species(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
     build_leaf_index(taxon_dir, df, layer_meta, taxon_dir.name.rsplit("_", 1)[-1])
 
 
-def collect_taxon_df(taxon: TaxonRecord) -> pd.DataFrame | None:
+def collect_taxon_df(taxon: TaxonRecord, storage: ParquetStorage | None = None) -> pd.DataFrame | None:
     """Quality-filtered occurrence DataFrame for a taxon, deduped by catalogNumber.
 
     Leaf (subspecies/variety): reads own occurrence file only.
     Species: reads self + descendants (include_self=True), deduplicates.
     Non-leaf: reads all descendants (include_self=False), deduplicates.
     """
+    def _read(path: Path):
+        if storage is not None:
+            if not storage.exists(path):
+                return None
+            return storage.read_table(path)
+        if not path.exists():
+            return None
+        return pq.read_table(path)
+
     rank = taxon["rank"]
     taxon_dir = TREE_ROOT / taxon["path"]
     if rank in CONFIG.subspecies_equivalents:
         occ_path = taxon_dir / OCCURRENCE_FILE
-        if not occ_path.exists():
-            return None
-        table = pq.read_table(occ_path)
-        if table.num_rows == 0:
+        table = _read(occ_path)
+        if table is None or table.num_rows == 0:
             return None
         df = _filter_df(table.to_pandas())
         return df if not df.empty else None
@@ -635,10 +642,8 @@ def collect_taxon_df(taxon: TaxonRecord) -> pd.DataFrame | None:
     seen: set[str] = set()
     for desc in iter_descendants(taxon, include_self=include_self):
         occ_path = TREE_ROOT / desc["path"] / OCCURRENCE_FILE
-        if not occ_path.exists():
-            continue
-        table = pq.read_table(occ_path)
-        if table.num_rows == 0:
+        table = _read(occ_path)
+        if table is None or table.num_rows == 0:
             continue
         df = _filter_df(table.to_pandas())
         if df.empty:
@@ -660,9 +665,10 @@ def compute_location_filtered_stats(
     phenology: str | None = None,
     start_ts: int | None = None,
     end_ts: int | None = None,
+    storage: ParquetStorage | None = None,
 ) -> dict | None:
     """Compute stats on the fly for variable_id, restricted by location, phenology, and/or timestamp."""
-    df = collect_taxon_df(taxon)
+    df = collect_taxon_df(taxon, storage=storage)
     if df is None:
         return None
     if filter_col is not None:

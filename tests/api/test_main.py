@@ -1297,7 +1297,7 @@ def test_get_species_environment_with_location_nominal(tmp_path, monkeypatch):
 
 def test_get_species_environment_with_location_no_data_falls_through(monkeypatch):
     """compute_location_filtered_stats returns None → falls back to precomputed stats."""
-    monkeypatch.setattr(st_module, "collect_taxon_df", lambda t: None)
+    monkeypatch.setattr(st_module, "collect_taxon_df", lambda t, **kwargs: None)
     _patch_hierarchy(monkeypatch, {"USA": _USA})
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \

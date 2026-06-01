@@ -16,6 +16,7 @@ Usage:
 """
 from __future__ import annotations
 
+import gc
 import os
 import signal
 import threading
@@ -53,6 +54,10 @@ VARS_TO_ENRICH: list[str] | None = [v.strip() for v in _raw_vars.split(",") if v
 # quick re-runs and debugging; files are reused automatically on next run).
 # Defaults to 1 (clear) so production runs don't accumulate hundreds of GB.
 CLEAR_CACHE: bool = os.environ.get("CLEAR_CACHE", "1") != "0"
+
+# Flush accumulated updates to disk when RSS exceeds this threshold (MB).
+# Prevents OOM on large first-time runs where all_updates can grow to 10+ GB.
+_FLUSH_RSS_MB = int(os.environ.get("TEMPORAL_FLUSH_RSS_MB", "40000"))
 
 
 
@@ -243,6 +248,11 @@ def _run_layer(
                 f"rows={rows_done}/{total_rows} "
                 f"rate={rate:.0f}/s eta={eta_s:.0f}s{rss_str}"
             )
+            if rss is not None and rss > _FLUSH_RSS_MB:
+                print(f"[flush] {layer.id}: RSS={rss:.0f}MB, flushing {len(all_updates)} taxa mid-layer")
+                write_back(all_updates)
+                all_updates.clear()
+                gc.collect()
 
     print(f"[done] {layer.id} rows={rows_done} elapsed={time.monotonic() - t_start:.1f}s")
     return all_updates
@@ -297,19 +307,16 @@ def main() -> None:
             print("[done] no observations to enrich")
             return
 
-        # Non-derived layers first
-        merged_updates: dict[str, dict[str, list]] = {}
+        # Non-derived layers first — write back immediately after each layer
+        # so accumulated updates don't stack across all layers in memory.
         for layer in active_layers:
             if layer.derived or stop.is_set():
                 continue
             layer_updates = _run_layer(layer, occ_table, cfg, stop)
-            for tpath, colmap in layer_updates.items():
-                merged_updates.setdefault(tpath, {})
-                for col, chunks_list in colmap.items():
-                    merged_updates[tpath].setdefault(col, []).extend(chunks_list)
-
-        if not stop.is_set():
-            write_back(merged_updates)
+            if layer_updates and not stop.is_set():
+                write_back(layer_updates)
+                layer_updates.clear()
+                gc.collect()
 
         # Derived passes (only if their deps were processed or already present)
         if "vapor_pressure_deficit" in active_ids and not stop.is_set():

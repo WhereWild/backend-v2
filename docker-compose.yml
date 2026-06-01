@@ -5,6 +5,7 @@ services:
     volumes:
       - .:/workspace
       - root-home:/root
+      - /home/gambel/.ssh:/root/.ssh:ro
     environment:
       - RCLONE_CONFIG=/workspace/docker/rclone.conf
     devices:

@@ -395,3 +395,31 @@ def lookup_value(index_path: Path, layer_id: str, catalog_number: str) -> float 
         if cat == catalog_number and val is not None:
             return float(val)
     return None
+
+
+def read_all_values(index_path: Path, layer_id: str) -> list[tuple[str, float]]:
+    """Return all (catalogNumber, raw_value) pairs for a layer. No range filtering."""
+    try:
+        schema = _storage.read_schema(index_path)
+    except Exception:
+        return []
+    if layer_id not in schema.names:
+        return []
+    if not pa.types.is_struct(schema.field(layer_id).type):
+        return []
+
+    meta = schema.metadata or {}
+    col_lengths: dict[str, int] = json.loads(meta.get(b"column_lengths", b"{}"))
+    true_len = col_lengths.get(layer_id)
+
+    table = _storage.read_table(index_path, columns=[layer_id])
+    col = table.column(layer_id).combine_chunks()
+    col = col.slice(0, true_len) if true_len is not None else col
+
+    catalogs = pc.struct_field(col, "catalogNumber").to_pylist()
+    vals = pc.struct_field(col, "value").to_pylist()
+    return [
+        (str(cat), float(val))
+        for cat, val in zip(catalogs, vals)
+        if cat is not None and val is not None
+    ]

@@ -19,6 +19,7 @@ no-op: obs_elev is NaN → offset is 0.
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1205,13 +1206,21 @@ def _apply_updates_arrow(
     return pa.table(cols, names=names)
 
 
-def write_back(updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]]) -> None:
+def write_back(
+    updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]],
+    max_workers: int = 8,
+) -> None:
     """Write accumulated column updates back to occurrence parquets atomically."""
-    for tpath, colmap in updates.items():
+    def _write_one(tpath: str, colmap: dict) -> None:
         parquet_path = Path(tpath)
         table = pq.read_table(parquet_path).combine_chunks()
         updated = _apply_updates_arrow(table, colmap)
         _atomic_write(parquet_path, updated)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_write_one, tpath, colmap): tpath for tpath, colmap in updates.items()}
+        for fut in futures:
+            fut.result()
 
 
 # ---------------------------------------------------------------------------

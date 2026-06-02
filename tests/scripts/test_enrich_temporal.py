@@ -292,7 +292,8 @@ def _all_layers() -> list[TemporalLayer]:
         TemporalLayer(id="precipitation", model="copernicus_era5",
                       grid_mode="lat_asc_lon_pm180", agg="sum", windows=[24]),
         TemporalLayer(id="vapor_pressure_deficit", model="copernicus_era5",
-                      grid_mode="lat_asc_lon_pm180", agg="avg", windows=[24], derived=True),
+                      grid_mode="lat_asc_lon_pm180", agg="avg", windows=[24],
+                      sources=["temperature_2m", "dew_point_2m"]),
         TemporalLayer(id="weather_code_simple", model="copernicus_era5",
                       grid_mode="lat_asc_lon_pm180", agg="mode", windows=[1, 24],
                       sources=["cloud_cover", "precipitation", "snowfall_water_equivalent"]),
@@ -323,29 +324,15 @@ class TestMain:
         assert run_layer_calls == []
         assert "[done] no observations" in capsys.readouterr().out
 
-    def test_full_run_calls_run_layer_and_derived(self, monkeypatch, tmp_path: Path) -> None:
+    def test_full_run_calls_run_layer_for_all(self, monkeypatch, tmp_path: Path) -> None:
         self._patch_base(monkeypatch, tmp_path, _make_occ_table())
         run_layer_calls: list[str] = []
         monkeypatch.setattr("scripts.enrich_temporal._run_layer",
                             lambda *a, **kw: run_layer_calls.append(a[0].id) or {})
-        vpd_called = []
-        monkeypatch.setattr("scripts.enrich_temporal.derive_vpd",
-                            lambda *a, **kw: vpd_called.append(1))
         et.main()
         assert "precipitation" in run_layer_calls
         assert "weather_code_simple" in run_layer_calls
-        assert "vapor_pressure_deficit" not in run_layer_calls
-        assert vpd_called
-
-    def test_derive_vpd_exception_handled(self, monkeypatch, tmp_path: Path) -> None:
-        self._patch_base(monkeypatch, tmp_path, _make_occ_table())
-        monkeypatch.setattr("scripts.enrich_temporal._run_layer", lambda *a, **kw: {})
-
-        def _raise(*a, **kw):
-            raise RuntimeError("vpd exploded")
-
-        monkeypatch.setattr("scripts.enrich_temporal.derive_vpd", _raise)
-        et.main()  # must not propagate
+        assert "vapor_pressure_deficit" in run_layer_calls
 
     def test_handle_signal_sets_stop(self, monkeypatch, tmp_path: Path, capsys) -> None:
         captured: dict[int, object] = {}

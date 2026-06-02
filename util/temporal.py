@@ -1031,7 +1031,7 @@ def process_chunk_mode(
     steps: dict[int, int],
     resolution: float,
     cache_dir: str,
-    secondary_indices: dict[str, "ChunkIndex"] | None = None,
+    secondary_indices: dict[str, ChunkIndex] | None = None,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Download multiple .om files, derive a per-timestep series, apply sliding-window mode.
 
@@ -1193,7 +1193,7 @@ def process_chunk_vpd(
     steps: dict[int, int],
     resolution: float,
     cache_dir: str,
-    secondary_indices: dict[str, "ChunkIndex"] | None = None,
+    secondary_indices: dict[str, ChunkIndex] | None = None,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Derive VPD per-timestep from temperature_2m and dew_point_2m, then avg over windows.
 

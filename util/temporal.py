@@ -19,11 +19,11 @@ no-op: obs_elev is NaN → offset is 0.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from collections.abc import Iterable
 from typing import Any
 
 import fsspec

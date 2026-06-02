@@ -74,20 +74,18 @@ def _resolve_variable_id(variable_id: str) -> str:
     return stripped
 
 
-_LEGEND_ROOT = _LEGEND_DIR.resolve()
-
-
 @lru_cache(maxsize=32)
 def _load_legend(layer_id: str) -> list:
+    legend_root = _LEGEND_DIR.resolve()
     path = (_LEGEND_DIR / f"{layer_id}_legend.json").resolve()
-    if not path.is_relative_to(_LEGEND_ROOT):
+    if not path.is_relative_to(legend_root):
         return []
     if not path.exists():
         # Temporal ids like weather_code_simple_mode_24h → weather_code_simple
         base_id = re.sub(r'_(avg|sum|mode|snapshot)_\d+h$', '', layer_id, flags=re.IGNORECASE)
         if base_id != layer_id:
             path = (_LEGEND_DIR / f"{base_id}_legend.json").resolve()
-            if not path.is_relative_to(_LEGEND_ROOT):
+            if not path.is_relative_to(legend_root):
                 return []
     if not path.exists():
         return []

@@ -40,6 +40,8 @@ from util.temporal import (
     ChunkIndex,
     accumulate_raster,
     accumulate_raster_mode,
+    accumulate_vpd_raster,
+    accumulate_vpd_raster_gfs,
     build_chunk_index,
     load_raster_state,
     reproject_to_grid,
@@ -249,6 +251,32 @@ def _full_build(
                 sums[c] = sums[c] + np.round(gfs_reproj).astype(np.int32)
             n_gfs = max(0, int(round((gfs_end_ts - gfs_mode_start) / gfs_cc.resolution)))
 
+    elif var_id == "vapor_pressure_deficit":
+        # ERA5-land: accumulate per-timestep VPD directly
+        t_cidx = era5_cidx.get("temperature_2m")
+        td_cidx = era5_cidx.get("dew_point_2m")
+        if not t_cidx or not td_cidx:
+            print(f"  [{window_label}] {var_id}: missing ERA5-land temperature/dew_point index, skipping")
+            return
+        vpd_sum, n = accumulate_vpd_raster(era5_model, w_start, era5_end_ts, t_cidx, td_cidx)
+        sums["era5_vpd"] = vpd_sum
+        n_era5 = n
+
+        # GFS gap fill: per-timestep VPD from T + RH
+        dst_g = RASTER_GRIDS[era5_model]
+        gfs_g = RASTER_GRIDS["ncep_gfs013"]
+        t_cidx_gfs = gfs_cidx.get("temperature_2m")
+        rh_cidx_gfs = gfs_cidx.get("relative_humidity_2m")
+        if t_cidx_gfs and rh_cidx_gfs and gfs_start < gfs_end_ts:
+            vpd_gfs_sum, n_gfs = accumulate_vpd_raster_gfs(
+                gfs_start, gfs_end_ts, t_cidx_gfs, rh_cidx_gfs, era5_model
+            )
+            sums["gfs_vpd"] = vpd_gfs_sum
+
+        if not sums:
+            print(f"  [{window_label}] {var_id}: no ERA5 data, skipping")
+            return
+
     else:
         # Scalar accumulation: ERA5 portion
         for rv in _era5_raw_vars(cfg):
@@ -285,37 +313,6 @@ def _full_build(
                         dst_g["ny"], dst_g["nx"],
                         dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
                     )
-                    sums["gfs_dew_point_2m"] = td_repr.astype(np.float64) * n
-                    n_gfs = n
-
-        elif var_id == "vapor_pressure_deficit":
-            t_cidx = gfs_cidx.get("temperature_2m")
-            rh_cidx = gfs_cidx.get("relative_humidity_2m")
-            if t_cidx and rh_cidx and gfs_start < gfs_end_ts:
-                t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", gfs_start, gfs_end_ts, t_cidx)
-                rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", gfs_start, gfs_end_ts, rh_cidx)
-                n = min(t_n, rh_n)
-                if n > 0:
-                    t_avg = (t_sum / n).astype(np.float32)
-                    rh_avg = (rh_sum / n).astype(np.float32)
-                    td_gfs = _derive_dew_point(t_avg, rh_avg)
-                    t_repr = reproject_to_grid(
-                        t_avg,
-                        gfs_g["lat_min"], gfs_g["lat_max"],
-                        gfs_g["lon_min"], gfs_g["lon_max"],
-                        dst_g["ny"], dst_g["nx"],
-                        dst_g["lat_min"], dst_g["lat_max"],
-                        dst_g["lon_min"], dst_g["lon_max"],
-                    )
-                    td_repr = reproject_to_grid(
-                        td_gfs,
-                        gfs_g["lat_min"], gfs_g["lat_max"],
-                        gfs_g["lon_min"], gfs_g["lon_max"],
-                        dst_g["ny"], dst_g["nx"],
-                        dst_g["lat_min"], dst_g["lat_max"],
-                        dst_g["lon_min"], dst_g["lon_max"],
-                    )
-                    sums["gfs_temperature_2m"] = t_repr.astype(np.float64) * n
                     sums["gfs_dew_point_2m"] = td_repr.astype(np.float64) * n
                     n_gfs = n
 
@@ -450,6 +447,66 @@ def _incremental_update(
                     sums[c] = sums[c] + add[c]
             n_gfs += int(round((gfs_end_ts - old_gfs_end) / cc_cidx.resolution))
 
+    elif var_id == "vapor_pressure_deficit":
+        # VPD incremental: accumulate per-timestep VPD directly (not T/Td separately)
+        t_cidx = era5_cidx.get("temperature_2m")
+        td_cidx = era5_cidx.get("dew_point_2m")
+        t_cidx_gfs = gfs_cidx.get("temperature_2m")
+        rh_cidx_gfs = gfs_cidx.get("relative_humidity_2m")
+        resolution = t_cidx.resolution if t_cidx else 3600.0
+
+        def _vpd_era5(start: float, end: float) -> np.ndarray | None:
+            if not t_cidx or not td_cidx or end < start:
+                return None
+            acc, _ = accumulate_vpd_raster(era5_model, start, end, t_cidx, td_cidx)
+            return acc.astype(np.float32)
+
+        def _vpd_gfs(start: float, end: float) -> np.ndarray | None:
+            if not t_cidx_gfs or not rh_cidx_gfs or end < start:
+                return None
+            acc, _ = accumulate_vpd_raster_gfs(start, end, t_cidx_gfs, rh_cidx_gfs, era5_model)
+            return acc.astype(np.float32)
+
+        if era5_end_ts > old_era5_end:
+            swap_start = max(old_era5_end + resolution, old_w_start)
+            swap_end = min(era5_end_ts, old_gfs_end)
+            if swap_end >= swap_start:
+                swap_n = int(round((swap_end - swap_start) / resolution)) + 1
+                added = _vpd_era5(swap_start, swap_end)
+                if added is not None:
+                    sums["era5_vpd"] = sums.get("era5_vpd", np.zeros_like(added)) + added
+                dropped = _vpd_gfs(swap_start, swap_end)
+                if dropped is not None and "gfs_vpd" in sums:
+                    sums["gfs_vpd"] = sums["gfs_vpd"] - dropped
+                n_era5 += swap_n
+                n_gfs -= swap_n
+                old_gfs_start = era5_end_ts + resolution
+
+        if new_w_start > old_w_start:
+            era5_drop_end = min(new_w_start - resolution, era5_end_ts)
+            if era5_drop_end >= old_w_start:
+                drop_n = int(round((era5_drop_end - old_w_start) / resolution)) + 1
+                dropped = _vpd_era5(old_w_start, era5_drop_end)
+                if dropped is not None and "era5_vpd" in sums:
+                    sums["era5_vpd"] = sums["era5_vpd"] - dropped
+                n_era5 -= drop_n
+
+            gfs_drop_start = max(old_w_start, old_gfs_start)
+            gfs_drop_end = min(new_w_start - resolution, old_gfs_end)
+            if gfs_drop_end >= gfs_drop_start:
+                drop_n = int(round((gfs_drop_end - gfs_drop_start) / resolution)) + 1
+                dropped = _vpd_gfs(gfs_drop_start, gfs_drop_end)
+                if dropped is not None and "gfs_vpd" in sums:
+                    sums["gfs_vpd"] = sums["gfs_vpd"] - dropped
+                n_gfs -= drop_n
+
+        if gfs_end_ts > old_gfs_end:
+            add_n = int(round((gfs_end_ts - old_gfs_end) / resolution))
+            added = _vpd_gfs(old_gfs_end + resolution, gfs_end_ts)
+            if added is not None:
+                sums["gfs_vpd"] = sums.get("gfs_vpd", np.zeros_like(added)) + added
+            n_gfs += add_n
+
     else:
         # Scalar incremental
         resolution = next(iter(era5_cidx.values())).resolution if era5_cidx else 3600.0
@@ -473,7 +530,6 @@ def _incremental_update(
                 dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
             )
 
-        # ERA5 quality swap: replace GFS with ERA5 for [old_era5_end+1h, new_era5_end]
         if era5_end_ts > old_era5_end:
             swap_start = max(old_era5_end + resolution, old_w_start)
             swap_end = min(era5_end_ts, old_gfs_end)
@@ -494,7 +550,6 @@ def _incremental_update(
                 n_gfs -= swap_n
                 old_gfs_start = era5_end_ts + resolution
 
-        # Drop oldest hours — new_w_start is the first point of the new window, so drop up to new_w_start - 1h
         if new_w_start > old_w_start:
             era5_drop_end = min(new_w_start - resolution, era5_end_ts)
             if era5_drop_end >= old_w_start:
@@ -519,7 +574,6 @@ def _incremental_update(
                             sums[key] = sums[key] - dropped
                 n_gfs -= drop_n
 
-        # Add newest GFS hours — start at old_gfs_end + 1h to avoid double-counting
         if gfs_end_ts > old_gfs_end:
             add_n = int(round((gfs_end_ts - old_gfs_end) / resolution))
             for gv in _gfs_raw_vars(cfg):
@@ -952,6 +1006,21 @@ def main() -> None:
             _write_state("running")
 
         print(f"\n=== total {time.perf_counter() - t_main:.1f}s ===")
+
+        # ── Clean up raster chunk cache ────────────────────────────────────────
+        # Delete chunk_*.om files (may update each run); keep year_*.om (immutable).
+        chunk_cache_dir = Path(out_dir).parent / "chunks"
+        if chunk_cache_dir.exists():
+            removed = 0
+            for p in chunk_cache_dir.rglob("*.om"):
+                if p.name.startswith("chunk_"):
+                    try:
+                        p.unlink()
+                        removed += 1
+                    except Exception as exc:
+                        print(f"  [cleanup] could not remove {p}: {exc}")
+            if removed:
+                print(f"  [cleanup] removed {removed} chunk_*.om file(s) from {chunk_cache_dir}")
 
         # ── Push rasters to B2 ────────────────────────────────────────────────
         if os.environ.get("TEMPORAL_RASTER_NO_PUSH", "0") != "1":

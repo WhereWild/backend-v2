@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """
 Download FABDEM V1-2 tiles from the University of Bristol data repository,
 extract 1°×1° GeoTIFFs, and stitch them into a single global COG.

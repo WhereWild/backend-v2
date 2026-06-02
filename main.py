@@ -1259,8 +1259,13 @@ def get_observation_variable_values(
         for desc in iter_descendants(taxon, include_self=False):
             _read_index(TREE_ROOT / desc["path"] / OCCURRENCE_INDEX_FILE)
 
+    vals = collected.values()
+    obs_min = min(vals) if collected else None
+    obs_max = max(vals) if collected else None
     return {
         "variable": variable_id,
+        "min": obs_min,
+        "max": obs_max,
         "observations": [{"catalogNumber": k, "value": v} for k, v in collected.items()],
     }
 

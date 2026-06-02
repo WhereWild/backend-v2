@@ -67,7 +67,7 @@ WGS84             = CRS.from_epsg(4326)
 _MERCATOR_HALF    = 2 * math.pi * 6378137 / 2.0
 
 HEATMAP_COLOR_STOPS = np.asarray(
-    [[28, 38, 102], [34, 94, 168], [59, 170, 165], [246, 190, 0], [230, 57, 70]],
+    [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]],
     dtype=np.float32,
 )
 
@@ -205,7 +205,7 @@ def tile_bounds_wgs84(z: int, x: int, y: int) -> tuple[float, float, float, floa
 # 4-stop cyclic ramp peaking exactly at cardinal directions:
 # N=0°→red, E=90°→yellow, S=180°→green, W=270°→blue
 _ASPECT_STOPS = np.array(
-    [[220, 50, 50], [240, 195, 15], [45, 175, 65], [40, 95, 220]],
+    [[40, 95, 220], [45, 175, 65], [240, 195, 15], [220, 50, 50]],
     dtype=np.float32,
 )
 
@@ -213,7 +213,7 @@ _ASPECT_STOPS = np.array(
 def _colorize_aspect(values: np.ndarray) -> np.ndarray:
     """Colorize aspect (0–360°) with a 4-stop cyclic ramp.
 
-    Cardinal peaks: N=red, E=yellow, S=green, W=blue.
+    Cardinal peaks: N=blue, E=green, S=yellow, W=red.
     Blends linearly between stops so transitions are unambiguous.
     NaN pixels (nodata) are fully transparent.
     """

@@ -86,6 +86,8 @@ def _load_legend(layer_id: str) -> list:
         # Temporal ids like weather_code_simple_mode_24h → weather_code_simple
         base_id = re.sub(r'_(avg|sum|mode|snapshot)_\d+h$', '', layer_id, flags=re.IGNORECASE)
         if base_id != layer_id:
+            if not re.fullmatch(r"[A-Za-z0-9_]+", base_id):
+                return []
             path = (_LEGEND_DIR / f"{base_id}_legend.json").resolve()
             if not path.is_relative_to(legend_root):
                 return []

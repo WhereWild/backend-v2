@@ -25,6 +25,7 @@ from config.config import load_config
 from util import citations, gis, taxa, tiles, units, upload
 from util.indexing import OCCURRENCE_INDEX_FILE
 from util.indexing import lookup_value as _index_lookup_value
+from util.indexing import read_all_values as _index_read_all_values
 from util.indexing import read_slice as _index_read_slice
 from util.rankings import POSITION_FILE
 from util.stats import (
@@ -1217,6 +1218,56 @@ def _read_index_for_slice(
         circular_wrap=circular_wrap, class_value=class_value,
         limit=limit,
     )
+
+
+@app.get("/species/{taxon_id}/environment/{variable_id}/observation-values")
+def get_observation_variable_values(
+    taxon_id: str,
+    variable_id: str,
+    unit_system: str | None = None,
+):
+    """Return raw GIS values for all observations of a taxon for one variable.
+
+    Reads occurrence_index.parquet directly (no range filtering) and converts
+    to the requested unit system. Nodes without a built index are silently skipped.
+    """
+    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+    if taxon is None:
+        raise HTTPException(status_code=404, detail="Taxon not found")
+
+    variable_id = _resolve_variable_id(variable_id)
+    layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
+    if layer is None:
+        raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
+
+    collected: dict[str, float] = {}
+
+    def _read_index(path: Path) -> None:
+        for cat, raw_val in _index_read_all_values(path, variable_id):
+            if cat not in collected:
+                converted = units.convert_value(raw_val, layer, unit_system)
+                if converted is not None:
+                    collected[cat] = converted
+
+    is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
+    if taxon["rank"] == _CONFIG.species_rank:
+        for desc in iter_descendants(taxon, include_self=True):
+            _read_index(TREE_ROOT / desc["path"] / OCCURRENCE_INDEX_FILE)
+    elif is_leaf:
+        _read_index(TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE)
+    else:
+        for desc in iter_descendants(taxon, include_self=False):
+            _read_index(TREE_ROOT / desc["path"] / OCCURRENCE_INDEX_FILE)
+
+    vals = collected.values()
+    obs_min = min(vals) if collected else None
+    obs_max = max(vals) if collected else None
+    return {
+        "variable": variable_id,
+        "min": obs_min,
+        "max": obs_max,
+        "observations": [{"catalogNumber": k, "value": v} for k, v in collected.items()],
+    }
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/slice")

@@ -19,6 +19,8 @@ no-op: obs_elev is NaN → offset is 0.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -678,25 +680,38 @@ def build_chunk_index(
 # Occurrence index
 # ---------------------------------------------------------------------------
 
+_OCC_INDEX_SCHEMA = pa.schema([
+    pa.field("taxon_path", pa.string()),
+    pa.field("row_idx", pa.int64()),
+    pa.field("latitude", pa.float64()),
+    pa.field("longitude", pa.float64()),
+    pa.field("timestamp", pa.float64()),
+    pa.field("elevation", pa.float64()),
+])
+
+
+def iter_occ_index_batches(index_path: Path, batch_rows: int) -> Iterable[pa.Table]:
+    """Yield occurrence index batches from a parquet file written by build_occ_index."""
+    pf = pq.ParquetFile(index_path)
+    for batch in pf.iter_batches(batch_size=batch_rows):
+        yield pa.Table.from_batches([batch]).combine_chunks()
+
+
 def build_occ_index(
     root_taxon_id: str,
     data_root: str,
     occ_filename: str,
+    index_path: Path,
     min_year: int | None = None,
     skip_if_cols: list[str] | None = None,
-) -> pa.Table:
-    """Scan all descendant occurrence parquets and return a flat index table.
+) -> int:
+    """Scan all descendant occurrence parquets and write a flat index to disk.
 
-    Columns: taxon_path (str), row_idx (int64), latitude (float64),
-             longitude (float64), timestamp (float64), elevation (float64).
+    Streams one taxon at a time so memory usage is bounded regardless of total
+    observation count. Returns the total number of rows written.
 
-    The `elevation` column is NaN when the DEM pipeline has not yet written an
-    elevation column to the parquets; all downstream elevation corrections
-    degrade gracefully to no-ops in that case.
-
-    skip_if_cols: if provided, rows where ALL of these columns are present and
-    non-null are excluded from the index (they were already enriched by
-    carry_forward and need no re-processing).
+    skip_if_cols: rows where ALL of these columns are present and non-null are
+    excluded (already enriched by carry_forward).
     """
     root = get_taxon_by_id(root_taxon_id)
     if root is None:
@@ -708,91 +723,59 @@ def build_occ_index(
         else None
     )
 
-    all_taxon_idx: list[np.ndarray] = []
-    all_rows: list[np.ndarray] = []
-    all_lats: list[np.ndarray] = []
-    all_lons: list[np.ndarray] = []
-    all_times: list[np.ndarray] = []
-    all_elevs: list[np.ndarray] = []
-    _path_lookup: list[str] = []
-    _path_to_idx: dict[str, int] = {}
-
     tree_root = Path(data_root) / "taxonomy" / "tree"
-    for node in iter_descendants(root, include_self=True):
-        occ_path = tree_root / node["path"] / occ_filename
-        if not occ_path.exists():
-            continue
-        schema = pq.read_schema(occ_path)
-        read_cols = [_LAT_COL, _LON_COL, _TIME_COL]
-        has_elev = "elevation" in schema.names
-        if has_elev:
-            read_cols.append("elevation")
-        table = pq.read_table(occ_path, columns=read_cols)
-        df = table.to_pandas()
+    total_rows = 0
 
-        valid = df[_TIME_COL].notna() & df[_LAT_COL].notna() & df[_LON_COL].notna()
-        if cutoff is not None:
-            valid &= df[_TIME_COL] >= cutoff
+    with pq.ParquetWriter(index_path, _OCC_INDEX_SCHEMA) as writer:
+        for node in iter_descendants(root, include_self=True):
+            occ_path = tree_root / node["path"] / occ_filename
+            if not occ_path.exists():
+                continue
+            schema = pq.read_schema(occ_path)
+            read_cols = [_LAT_COL, _LON_COL, _TIME_COL]
+            has_elev = "elevation" in schema.names
+            if has_elev:
+                read_cols.append("elevation")
+            table = pq.read_table(occ_path, columns=read_cols)
+            df = table.to_pandas()
 
-        # Skip rows already enriched by carry_forward (all requested cols present + non-null).
-        # Check against schema.names — skip cols are not in `df` (only base cols were read).
-        if skip_if_cols:
-            present = [c for c in skip_if_cols if c in schema.names]
-            if len(present) == len(skip_if_cols):
-                skip_df = pq.read_table(occ_path, columns=present).to_pandas()
-                # .any(): a row is done if ANY temporal col is non-null. Larger
-                # windows (e.g. 2160h) are NaN when data before TEMPORAL_MIN_YEAR
-                # wasn't downloaded — that's valid, re-enriching yields the same NaN.
-                already_done = skip_df.notna().any(axis=1)
-                valid &= ~already_done.values
+            valid = df[_TIME_COL].notna() & df[_LAT_COL].notna() & df[_LON_COL].notna()
+            if cutoff is not None:
+                valid &= df[_TIME_COL] >= cutoff
 
-        if not valid.any():
-            continue
+            if skip_if_cols:
+                present = [c for c in skip_if_cols if c in schema.names]
+                if len(present) == len(skip_if_cols):
+                    skip_df = pq.read_table(occ_path, columns=present).to_pandas()
+                    already_done = skip_df.notna().any(axis=1)
+                    valid &= ~already_done.values
 
-        row_idx = df.index[valid].to_numpy(dtype=np.int64)
-        times = df.loc[valid, _TIME_COL].to_numpy(dtype=np.float64)
-        lats = df.loc[valid, _LAT_COL].to_numpy(dtype=np.float64)
-        lons = df.loc[valid, _LON_COL].to_numpy(dtype=np.float64)
-        elevs = (
-            df.loc[valid, "elevation"].to_numpy(dtype=np.float64)
-            if has_elev
-            else np.full(len(row_idx), np.nan)
-        )
+            if not valid.any():
+                continue
 
-        path_str = str(occ_path)
-        if path_str not in _path_to_idx:
-            _path_to_idx[path_str] = len(_path_lookup)
-            _path_lookup.append(path_str)
-        tidx = _path_to_idx[path_str]
-        all_taxon_idx.append(np.full(len(row_idx), tidx, dtype=np.int32))
-        all_rows.append(row_idx)
-        all_lats.append(lats)
-        all_lons.append(lons)
-        all_times.append(times)
-        all_elevs.append(elevs)
+            row_idx = df.index[valid].to_numpy(dtype=np.int64)
+            times = df.loc[valid, _TIME_COL].to_numpy(dtype=np.float64)
+            lats = df.loc[valid, _LAT_COL].to_numpy(dtype=np.float64)
+            lons = df.loc[valid, _LON_COL].to_numpy(dtype=np.float64)
+            elevs = (
+                df.loc[valid, "elevation"].to_numpy(dtype=np.float64)
+                if has_elev
+                else np.full(len(row_idx), np.nan)
+            )
+            path_str = str(occ_path)
 
-    _path_type = pa.dictionary(pa.int32(), pa.string())
-    if not all_taxon_idx:
-        return pa.table({
-            "taxon_path": pa.array([], type=_path_type),
-            "row_idx": pa.array([], type=pa.int64()),
-            "latitude": pa.array([], type=pa.float64()),
-            "longitude": pa.array([], type=pa.float64()),
-            "timestamp": pa.array([], type=pa.float64()),
-            "elevation": pa.array([], type=pa.float64()),
-        })
+            chunk_table = pa.table({
+                "taxon_path": pa.array([path_str] * len(row_idx), type=pa.string()),
+                "row_idx":    pa.array(row_idx,  type=pa.int64()),
+                "latitude":   pa.array(lats,     type=pa.float64()),
+                "longitude":  pa.array(lons,     type=pa.float64()),
+                "timestamp":  pa.array(times,    type=pa.float64()),
+                "elevation":  pa.array(elevs,    type=pa.float64()),
+            })
+            writer.write_table(chunk_table)
+            total_rows += len(row_idx)
 
-    return pa.table({
-        "taxon_path": pa.DictionaryArray.from_arrays(
-            pa.array(np.concatenate(all_taxon_idx), type=pa.int32()),
-            pa.array(_path_lookup, type=pa.string()),
-        ),
-        "row_idx": np.concatenate(all_rows),
-        "latitude": np.concatenate(all_lats),
-        "longitude": np.concatenate(all_lons),
-        "timestamp": np.concatenate(all_times),
-        "elevation": np.concatenate(all_elevs),
-    })
+    return total_rows
 
 
 # ---------------------------------------------------------------------------
@@ -823,7 +806,7 @@ def map_to_worklist(
 
     if times.size == 0:
         return pa.table({
-            "taxon_path": pa.array([], type=taxon_path_col.type),
+            "taxon_path": pa.array([], type=pa.string()),
             "row_idx": pa.array([], type=pa.int64()),
             "chunk_num": pa.array([], type=pa.int32()),
             "lat_idx": pa.array([], type=pa.int32()),
@@ -1205,13 +1188,32 @@ def _apply_updates_arrow(
     return pa.table(cols, names=names)
 
 
-def write_back(updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]]) -> None:
-    """Write accumulated column updates back to occurrence parquets atomically."""
-    for tpath, colmap in updates.items():
+def write_back(
+    updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]],
+    max_workers: int = 8,
+) -> None:
+    """Write accumulated column updates back to occurrence parquets atomically.
+
+    Pops entries from updates as they are submitted so colmap memory is freed
+    progressively during the flush rather than held until all writes complete.
+    """
+    def _write_one(tpath: str, colmap: dict) -> None:
         parquet_path = Path(tpath)
         table = pq.read_table(parquet_path).combine_chunks()
         updated = _apply_updates_arrow(table, colmap)
         _atomic_write(parquet_path, updated)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pending: list = []
+        while updates:
+            tpath, colmap = updates.popitem()
+            pending.append(pool.submit(_write_one, tpath, colmap))
+            if len(pending) >= max_workers * 4:
+                for fut in pending:
+                    fut.result()
+                pending.clear()
+        for fut in pending:
+            fut.result()
 
 
 # ---------------------------------------------------------------------------

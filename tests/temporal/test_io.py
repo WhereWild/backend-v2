@@ -362,16 +362,21 @@ class TestBuildOccIndex:
         return {"taxon_key": "1", "path": str(path), "scientific_name": "X",
                 "common_name": "", "rank": "SPECIES"}
 
-    def test_unknown_root_raises(self, monkeypatch):
+    def _build(self, tmp_path, root_id, data_root, occ_filename, min_year=None, **kw):
+        idx = tmp_path / "occ_index.parquet"
+        util.temporal.build_occ_index(root_id, data_root, occ_filename, idx, min_year=min_year, **kw)
+        return pq.read_table(idx)
+
+    def test_unknown_root_raises(self, tmp_path, monkeypatch):
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: None)
         with pytest.raises(RuntimeError, match="Unknown root taxon"):
-            util.temporal.build_occ_index("bad", "/data", "occurrence.parquet", None)
+            util.temporal.build_occ_index("bad", "/data", "occurrence.parquet", tmp_path / "idx.parquet")
 
     def test_empty_when_no_files(self, tmp_path, monkeypatch):
         node = self._node(tmp_path)
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
         monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = util.temporal.build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet")
         assert result.num_rows == 0
 
     def test_scans_parquet(self, tmp_path, monkeypatch):
@@ -379,7 +384,7 @@ class TestBuildOccIndex:
         node = self._node(tmp_path)
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
         monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = util.temporal.build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet")
         assert result.num_rows == 1
         assert result["latitude"][0].as_py() == pytest.approx(52.52)
 
@@ -390,7 +395,7 @@ class TestBuildOccIndex:
         node = self._node(tmp_path)
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
         monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = util.temporal.build_occ_index("1", str(tmp_path), "occurrence.parquet", 2000)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet", min_year=2000)
         assert result.num_rows == 1
         assert result["timestamp"][0].as_py() == pytest.approx(t_new)
 
@@ -403,7 +408,7 @@ class TestBuildOccIndex:
         node = self._node(tmp_path)
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
         monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = util.temporal.build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet")
         assert result.num_rows == 0
 
     def test_skips_missing_parquet(self, tmp_path, monkeypatch):
@@ -416,7 +421,7 @@ class TestBuildOccIndex:
         node_b = self._node(sub_b)
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node_a)
         monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [node_a, node_b])
-        result = util.temporal.build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet")
         assert result.num_rows == 1
 
 
@@ -450,6 +455,11 @@ class TestBuildOccIndexElevation:
         return {"taxon_key": "1", "path": str(path), "scientific_name": "X",
                 "common_name": "", "rank": "SPECIES"}
 
+    def _build(self, tmp_path, data_root, **kw):
+        idx = tmp_path / "occ_index.parquet"
+        util.temporal.build_occ_index("1", data_root, "occurrence.parquet", idx, **kw)
+        return pq.read_table(idx)
+
     def test_elevation_nan_when_column_absent(self, tmp_path, monkeypatch):
         pq.write_table(pa.table({
             "decimalLatitude": pa.array([52.52], type=pa.float64()),
@@ -459,7 +469,7 @@ class TestBuildOccIndexElevation:
         node = self._node(tmp_path)
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
         monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = util.temporal.build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        result = self._build(tmp_path, str(tmp_path))
         assert "elevation" in result.column_names
         assert np.isnan(result["elevation"][0].as_py())
 
@@ -473,14 +483,14 @@ class TestBuildOccIndexElevation:
         node = self._node(tmp_path)
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
         monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = util.temporal.build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        result = self._build(tmp_path, str(tmp_path))
         assert result["elevation"][0].as_py() == pytest.approx(420.0)
 
     def test_empty_result_has_elevation_column(self, tmp_path, monkeypatch):
         node = self._node(tmp_path)
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
         monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = util.temporal.build_occ_index("1", str(tmp_path), "occurrence.parquet", None)
+        result = self._build(tmp_path, str(tmp_path))
         assert "elevation" in result.column_names
 
 

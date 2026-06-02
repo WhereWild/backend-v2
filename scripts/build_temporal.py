@@ -369,9 +369,6 @@ def _incremental_update(
     n_era5 = int(old_meta["n_era5"])
     n_gfs = int(old_meta["n_gfs"])
 
-    dst_g = RASTER_GRIDS[era5_model]
-    gfs_g = RASTER_GRIDS["ncep_gfs013"]
-
     if agg == "mode":
         # Mode incremental: sums contains {wc_code: count_grid}
         cc_cidx = era5_cidx.get("cloud_cover")
@@ -381,6 +378,7 @@ def _incremental_update(
             return
 
         resolution = cc_cidx.resolution
+        gfs_g = RASTER_GRIDS["ncep_gfs013"]
 
         def _mode_accumulate(start: float, end: float, use_gfs: bool) -> dict[int, np.ndarray] | None:
             if end < start:
@@ -508,6 +506,8 @@ def _incremental_update(
     else:
         # Scalar incremental
         resolution = next(iter(era5_cidx.values())).resolution if era5_cidx else 3600.0
+        dst_g = RASTER_GRIDS[era5_model]
+        gfs_g = RASTER_GRIDS["ncep_gfs013"]
 
         def _accum_era5(rv: str, start: float, end: float) -> np.ndarray | None:
             cidx = era5_cidx.get(rv)

@@ -171,11 +171,21 @@ class _MockCfg:
     temporal_cache_dir = "/tmp/test_cache"
 
 
+_DUMMY_OCC_PATH = Path("/dev/null")  # placeholder — always mocked in TestRunLayer
+
+
+def _mock_batches(batch: pa.Table):
+    """Return iter_occ_index_batches mock that yields one batch."""
+    return lambda *a, **kw: [batch]
+
+
 class TestRunLayer:
     def test_skips_when_chunk_index_fails(self, monkeypatch, capsys) -> None:
         monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
                             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no S3")))
-        et._run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
+        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
+                            _mock_batches(pa.table({})))
+        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
         assert "[skip]" in capsys.readouterr().out
 
     def test_skips_when_no_worklist_rows(self, monkeypatch, capsys) -> None:
@@ -189,14 +199,18 @@ class TestRunLayer:
             "lon_idx": pa.array([], type=pa.int32()),
             "time_idx": pa.array([], type=pa.int32()),
         })
+        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
+                            _mock_batches(pa.table({})))
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: empty)
-        et._run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
+        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
         assert "[skip]" in capsys.readouterr().out
 
     def test_normal_run(self, monkeypatch, capsys) -> None:
         monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
                             lambda *a, **kw: _make_chunk_index())
+        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
+                            _mock_batches(pa.table({})))
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: _occ_table_with_chunk())
         monkeypatch.setattr("scripts.enrich_temporal._download_layer_chunk", lambda *a, **kw: None)
@@ -204,20 +218,22 @@ class TestRunLayer:
                             lambda *a, **kw: ({}, {}))
         monkeypatch.setattr("scripts.enrich_temporal.write_back", lambda *a, **kw: None)
 
-        et._run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
+        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
         out = capsys.readouterr().out
         assert "[done]" in out
 
     def test_stop_event_aborts_before_chunk(self, monkeypatch, capsys) -> None:
         monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
                             lambda *a, **kw: _make_chunk_index())
+        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
+                            _mock_batches(pa.table({})))
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: _occ_table_with_chunk())
         monkeypatch.setattr("scripts.enrich_temporal._download_layer_chunk", lambda *a, **kw: None)
 
         stop = threading.Event()
         stop.set()
-        et._run_layer(_make_layer(), pa.table({}), _MockCfg(), stop)
+        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), stop)
         assert "[stop]" in capsys.readouterr().out
 
     def test_run_layer_mode_calls_process_chunk_mode(self, monkeypatch, capsys) -> None:
@@ -228,6 +244,8 @@ class TestRunLayer:
         )
         monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
                             lambda *a, **kw: _make_chunk_index())
+        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
+                            _mock_batches(pa.table({})))
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: _occ_table_with_chunk())
         mode_called = []
@@ -235,12 +253,14 @@ class TestRunLayer:
         monkeypatch.setattr("scripts.enrich_temporal.process_chunk_mode",
                             lambda *a, **kw: (mode_called.append(1), ({}, {}))[-1])
         monkeypatch.setattr("scripts.enrich_temporal.write_back", lambda *a, **kw: None)
-        et._run_layer(mode_layer, pa.table({}), _MockCfg(), threading.Event())
+        et._run_layer(mode_layer, _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
         assert mode_called
 
     def test_process_chunk_exception_propagates(self, monkeypatch) -> None:
         monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
                             lambda *a, **kw: _make_chunk_index())
+        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
+                            _mock_batches(pa.table({})))
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: _occ_table_with_chunk())
         monkeypatch.setattr("scripts.enrich_temporal._download_layer_chunk", lambda *a, **kw: None)
@@ -250,7 +270,7 @@ class TestRunLayer:
 
         monkeypatch.setattr("scripts.enrich_temporal.process_chunk", _raise)
         with pytest.raises(RuntimeError, match="chunk failed"):
-            et._run_layer(_make_layer(), pa.table({}), _MockCfg(), threading.Event())
+            et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +310,7 @@ class TestMain:
 
         monkeypatch.setattr("scripts.enrich_temporal.load_config", lambda _: _Cfg())
         monkeypatch.setattr("scripts.enrich_temporal.load_temporal_layers", lambda _: _all_layers())
-        monkeypatch.setattr("scripts.enrich_temporal.build_occ_index", lambda *a, **kw: occ_table)
+        monkeypatch.setattr("scripts.enrich_temporal.build_occ_index", lambda *a, **kw: occ_table.num_rows)
         monkeypatch.setattr("scripts.enrich_temporal.VARS_TO_ENRICH", None)
 
     def test_no_observations_exits_early(self, monkeypatch, tmp_path: Path, capsys) -> None:

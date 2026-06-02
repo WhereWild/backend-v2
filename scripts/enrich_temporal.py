@@ -16,7 +16,7 @@ Usage:
 """
 from __future__ import annotations
 
-import gc
+import ctypes
 import os
 import signal
 import threading
@@ -252,7 +252,10 @@ def _run_layer(
                 print(f"[flush] {layer.id}: RSS={rss:.0f}MB, flushing {len(all_updates)} taxa mid-layer")
                 write_back(all_updates)
                 all_updates.clear()
-                gc.collect()
+                try:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
 
     print(f"[done] {layer.id} rows={rows_done} elapsed={time.monotonic() - t_start:.1f}s")
     return all_updates
@@ -316,7 +319,10 @@ def main() -> None:
             if layer_updates and not stop.is_set():
                 write_back(layer_updates)
                 layer_updates.clear()
-                gc.collect()
+                try:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+                except Exception:
+                    pass
 
         # Derived passes (only if their deps were processed or already present)
         if "vapor_pressure_deficit" in active_ids and not stop.is_set():

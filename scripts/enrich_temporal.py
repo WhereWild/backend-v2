@@ -34,12 +34,12 @@ from util.temporal import (
     _download_layer_chunk,
     build_chunk_index,
     build_occ_index,
-    derive_vpd,
     iter_occ_index_batches,
     load_temporal_layers,
     map_to_worklist,
     process_chunk,
     process_chunk_mode,
+    process_chunk_vpd,
     window_steps,
     write_back,
 )
@@ -123,25 +123,20 @@ def _run_layer(
         f"resolution={chunk_index.resolution:.0f}s"
     )
 
-    prefetch_vars = layer.sources if layer.sources else [layer.id]
+    primary_var = layer.sources[0] if layer.sources else layer.id
     steps = window_steps(chunk_index.resolution, tuple(layer.windows))
 
-    # Multi-source intersection filter.
     chunks_eligible = list(chunk_index.ranges)
-    if len(layer.sources) > 1:
-        for src_var in layer.sources[1:]:
-            try:
-                src_idx = build_chunk_index(
-                    layer.model, src_var, min_year=cfg.temporal_min_year
-                )
-                src_keys = {(e.source, e.chunk_num) for e in src_idx.ranges}
-                before = len(chunks_eligible)
-                chunks_eligible = [e for e in chunks_eligible if (e.source, e.chunk_num) in src_keys]
-                dropped = before - len(chunks_eligible)
-                if dropped:
-                    print(f"[intersect] {layer.id}: dropped {dropped} chunks not available for {src_var}")
-            except Exception as exc:
-                print(f"[warn] {layer.id}: could not intersect with {src_var} index — {exc}")
+
+    # Build secondary source chunk indices for time-range lookup inside process_chunk_*.
+    secondary_indices: dict[str, object] = {}
+    for src_var in layer.sources[1:]:
+        try:
+            secondary_indices[src_var] = build_chunk_index(
+                layer.model, src_var, min_year=cfg.temporal_min_year
+            )
+        except Exception as exc:
+            print(f"[warn] {layer.id}: could not build chunk index for {src_var} — {exc}")
 
     t_start = time.monotonic()
     total_rows_done = 0
@@ -170,9 +165,10 @@ def _run_layer(
 
         chunks_this_batch = [e for e in chunks_eligible if e.chunk_num in batch_chunk_worklists]
 
-        # Download chunks needed by this batch (cached on disk, so only fetched once).
+        # Prefetch primary source only; secondary sources are looked up by time range
+        # inside process_chunk_* and cached on first download.
         with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as dl_pool:
-            for fut in [dl_pool.submit(_download_layer_chunk, e, layer.model, prefetch_vars, cfg.temporal_cache_dir) for e in chunks_this_batch]:
+            for fut in [dl_pool.submit(_download_layer_chunk, e, layer.model, [primary_var], cfg.temporal_cache_dir) for e in chunks_this_batch]:
                 fut.result()
 
         batch_rows_done = 0
@@ -186,11 +182,19 @@ def _run_layer(
                 break
             chunk_worklist = batch_chunk_worklists[chunk_entry.chunk_num]
             try:
-                if layer.sources:
+                if layer.id == "vapor_pressure_deficit":
+                    updates, tail_buffer = process_chunk_vpd(
+                        chunk_entry, chunk_worklist, tail_buffer,
+                        layer.model, layer.sources, layer.id,
+                        steps, chunk_index.resolution, cfg.temporal_cache_dir,
+                        secondary_indices=secondary_indices,
+                    )
+                elif layer.sources:
                     updates, tail_buffer = process_chunk_mode(
                         chunk_entry, chunk_worklist, tail_buffer,
                         layer.model, layer.sources, layer.id,
                         steps, chunk_index.resolution, cfg.temporal_cache_dir,
+                        secondary_indices=secondary_indices,
                     )
                 else:
                     updates, tail_buffer = process_chunk(
@@ -253,7 +257,6 @@ def main() -> None:
     try:
         all_layers = load_temporal_layers(CATALOG_PATH)
         active_layers = _filter_layers(all_layers, VARS_TO_ENRICH)
-        active_ids = {layer.id for layer in active_layers}
         print(f"[init] active layers: {[layer.id for layer in active_layers]}")
 
         skip_cols: list[str] = [
@@ -282,20 +285,6 @@ def main() -> None:
             if layer.derived or stop.is_set():
                 continue
             _run_layer(layer, occ_index_path, cfg, stop)
-
-        if "vapor_pressure_deficit" in active_ids and not stop.is_set():
-            vpd_layer = next(layer for layer in active_layers if layer.id == "vapor_pressure_deficit")
-            print(f"[derive] vapor_pressure_deficit windows={vpd_layer.windows}")
-            try:
-                derive_vpd(
-                    str(cfg.plantae_key),
-                    cfg.data_root,
-                    cfg.occurrence_parquet_filename,
-                    vpd_layer.windows,
-                )
-            except Exception:
-                print("[error] derive_vpd failed")
-                traceback.print_exc()
 
     finally:
         if occ_index_path.exists():

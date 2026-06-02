@@ -676,6 +676,14 @@ def build_chunk_index(
     return result
 
 
+def _chunk_entry_for_time(idx: ChunkIndex, ts: float) -> tuple[ChunkRange | None, int]:
+    """Return the ChunkRange containing ts and the 0-based time index within it."""
+    for entry in idx.ranges:
+        if entry.start <= ts <= entry.end:
+            return entry, int(round((ts - entry.start) / idx.resolution))
+    return None, -1
+
+
 # ---------------------------------------------------------------------------
 # Occurrence index
 # ---------------------------------------------------------------------------
@@ -1023,6 +1031,7 @@ def process_chunk_mode(
     steps: dict[int, int],
     resolution: float,
     cache_dir: str,
+    secondary_indices: dict[str, "ChunkIndex"] | None = None,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Download multiple .om files, derive a per-timestep series, apply sliding-window mode.
 
@@ -1037,10 +1046,23 @@ def process_chunk_mode(
     _precip_idx = _sv.index("precipitation")
     _snow_idx   = _sv.index("snowfall_water_equivalent")
 
-    local_paths: list[Path] = [
-        _download_chunk(chunk_entry, model, var, cache_dir) for var in source_variables
+    primary_var = source_variables[0]
+    readers: list[OmFileReader | None] = [
+        OmFileReader(str(_download_chunk(chunk_entry, model, primary_var, cache_dir)))
     ]
-    readers = [OmFileReader(str(p)) for p in local_paths]
+    sec_offsets: list[int] = [0]
+    for var in source_variables[1:]:
+        if secondary_indices is not None and var in secondary_indices:
+            sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
+            if sec_entry is not None:
+                readers.append(OmFileReader(str(_download_chunk(sec_entry, model, var, cache_dir))))
+                sec_offsets.append(sec_t0)
+            else:
+                readers.append(None)
+                sec_offsets.append(0)
+        else:
+            readers.append(OmFileReader(str(_download_chunk(chunk_entry, model, var, cache_dir))))
+            sec_offsets.append(0)
     ny, nx, _ = readers[0].shape
 
     data = worklist_slice.to_pydict()
@@ -1086,7 +1108,21 @@ def process_chunk_mode(
         li, lo = int(lat[s]), int(lon[s])
 
         try:
-            raw = [np.asarray(r[li, lo, :], dtype=np.float64) for r in readers]
+            primary_arr = np.asarray(readers[0][li, lo, :], dtype=np.float64)
+            primary_len = len(primary_arr)
+            raw: list[np.ndarray] = [primary_arr]
+            for r, off in zip(readers[1:], sec_offsets[1:]):
+                if r is None:
+                    raw.append(np.full(primary_len, np.nan, dtype=np.float64))
+                else:
+                    arr = np.asarray(r[li, lo, :], dtype=np.float64)
+                    sliced = arr[off:off + primary_len]
+                    if len(sliced) < primary_len:
+                        padded = np.full(primary_len, np.nan, dtype=np.float64)
+                        padded[:len(sliced)] = sliced
+                        raw.append(padded)
+                    else:
+                        raw.append(sliced)
         except Exception:
             continue
         if any(a.size == 0 for a in raw):
@@ -1142,6 +1178,160 @@ def process_chunk_mode(
                 col = f"{col_prefix}_mode_{hours}h"
                 updates.setdefault(str(tpath), {}).setdefault(col, []).append(
                     (rids, modes[mask])
+                )
+
+    return updates, new_tail
+
+
+def process_chunk_vpd(
+    chunk_entry: ChunkRange,
+    worklist_slice: pa.Table,
+    tail_buffer: TailBuffer,
+    model: str,
+    source_variables: list[str],
+    col_prefix: str,
+    steps: dict[int, int],
+    resolution: float,
+    cache_dir: str,
+    secondary_indices: dict[str, "ChunkIndex"] | None = None,
+) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
+    """Derive VPD per-timestep from temperature_2m and dew_point_2m, then avg over windows.
+
+    source_variables must be ['temperature_2m', 'dew_point_2m'] (in that order).
+    Secondary sources use time-range lookup via secondary_indices, same as process_chunk_mode.
+    """
+    max_window_steps = max(steps.values()) if steps else 0
+
+    primary_var = source_variables[0]
+    readers: list[OmFileReader | None] = [
+        OmFileReader(str(_download_chunk(chunk_entry, model, primary_var, cache_dir)))
+    ]
+    sec_offsets: list[int] = [0]
+    for var in source_variables[1:]:
+        if secondary_indices is not None and var in secondary_indices:
+            sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
+            if sec_entry is not None:
+                readers.append(OmFileReader(str(_download_chunk(sec_entry, model, var, cache_dir))))
+                sec_offsets.append(sec_t0)
+            else:
+                readers.append(None)
+                sec_offsets.append(0)
+        else:
+            readers.append(OmFileReader(str(_download_chunk(chunk_entry, model, var, cache_dir))))
+            sec_offsets.append(0)
+
+    ny, nx, _ = readers[0].shape
+
+    data = worklist_slice.to_pydict()
+    lat = np.asarray(data["lat_idx"], dtype=np.int32)
+    lon = np.asarray(data["lon_idx"], dtype=np.int32)
+    time_idx = np.asarray(data["time_idx"], dtype=np.int32)
+    taxon_path = np.asarray(data["taxon_path"])
+    row_idx = np.asarray(data["row_idx"], dtype=np.int64)
+    obs_elev = np.asarray(
+        data.get("elevation", np.full(len(lat), np.nan)), dtype=np.float64
+    )
+
+    lat = np.clip(lat, 0, ny - 1)
+    lon = np.clip(lon, 0, nx - 1)
+
+    elev_correction: np.ndarray | None = None
+    if np.isfinite(obs_elev).any():
+        model_elev = _read_model_elevation(model, lat, lon)
+        raw_corr = (model_elev - obs_elev) * _LAPSE_RATE
+        elev_correction = np.where(np.isfinite(raw_corr), raw_corr, 0.0)
+
+    order = np.lexsort((lon, lat))
+    lat, lon = lat[order], lon[order]
+    time_idx = time_idx[order]
+    taxon_path, row_idx = taxon_path[order], row_idx[order]
+    if elev_correction is not None:
+        elev_correction = elev_correction[order]
+
+    change = np.empty(len(lat), dtype=bool)
+    change[0] = True
+    change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
+    group_starts = np.flatnonzero(change)
+    group_ends = np.append(group_starts[1:], len(lat))
+
+    updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+    new_tail: TailBuffer = {}
+
+    for s, e in zip(group_starts, group_ends):
+        li, lo = int(lat[s]), int(lon[s])
+
+        try:
+            primary_arr = np.asarray(readers[0][li, lo, :], dtype=np.float64)
+            primary_len = len(primary_arr)
+            raw: list[np.ndarray] = [primary_arr]
+            for r, off in zip(readers[1:], sec_offsets[1:]):
+                if r is None:
+                    raw.append(np.full(primary_len, np.nan, dtype=np.float64))
+                else:
+                    arr = np.asarray(r[li, lo, :], dtype=np.float64)
+                    sliced = arr[off:off + primary_len]
+                    if len(sliced) < primary_len:
+                        padded = np.full(primary_len, np.nan, dtype=np.float64)
+                        padded[:len(sliced)] = sliced
+                        raw.append(padded)
+                    else:
+                        raw.append(sliced)
+        except Exception:
+            continue
+        if any(a.size == 0 for a in raw):
+            continue
+
+        temp_arr = raw[0].copy()
+        dew_arr = raw[1].copy() if len(raw) > 1 else np.full(len(temp_arr), np.nan)
+        if elev_correction is not None:
+            cell_offset = float(np.median(elev_correction[s:e]))
+            temp_arr += cell_offset
+            dew_arr += cell_offset
+
+        derived = vpd_kpa(temp_arr, dew_arr)
+
+        if max_window_steps > 0:
+            new_tail[(li, lo)] = derived[-max_window_steps:].copy()
+
+        time_slice = time_idx[s:e]
+        prev_tail = tail_buffer.get((li, lo))
+        prev_len = 0
+        if prev_tail is not None and max_window_steps > 1:
+            min_t = int(time_slice.min())
+            need = (max_window_steps - 1) - min_t
+            if need > 0:
+                prev_len = min(int(need), len(prev_tail))
+                derived = np.concatenate([prev_tail[-prev_len:], derived])
+
+        min_t = int(time_slice.min())
+        max_t = int(time_slice.max())
+        slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
+        slice_end = min(derived.size - 1, max_t + prev_len)
+        series_slice = derived[slice_start : slice_end + 1]
+        local_time = np.clip(
+            (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
+        )
+
+        if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
+            finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
+            if finite_in_slice.size == 0:
+                continue
+            last_valid = int(finite_in_slice[-1])
+            local_time = np.minimum(local_time, last_valid)
+
+        window_sums, window_counts = window_stats_batch(series_slice, local_time, steps)
+
+        paths_slice = taxon_path[s:e]
+        rows_slice = row_idx[s:e]
+        for tpath in np.unique(paths_slice):
+            mask = paths_slice == tpath
+            rids = rows_slice[mask]
+            for hours, sums in window_sums.items():
+                cnts = window_counts[hours]
+                values = np.where(cnts > 0, sums / np.where(cnts > 0, cnts, 1), np.nan)
+                col = f"{col_prefix}_avg_{hours}h"
+                updates.setdefault(str(tpath), {}).setdefault(col, []).append(
+                    (rids, values[mask])
                 )
 
     return updates, new_tail
@@ -1355,6 +1545,173 @@ def accumulate_raster(
     return total_sum, n_steps
 
 
+def accumulate_vpd_raster(
+    model: str,
+    start_ts: float,
+    end_ts: float,
+    t_cidx: ChunkIndex,
+    td_cidx: ChunkIndex,
+) -> tuple[np.ndarray, int]:
+    """Accumulate sum of vpd_kpa(T[t], Td[t]) per timestep across the full native grid.
+
+    Both temperature_2m and dew_point_2m are on the same model (e.g. copernicus_era5_land).
+    Uses time-range lookup for Td chunks so chunk file naming differences are handled.
+
+    Returns (vpd_sum: float64 (ny, nx), n_steps: int).
+    """
+    grid = RASTER_GRIDS[model]
+    flipud = grid["flipud"]
+    resolution = t_cidx.resolution
+
+    total_sum: np.ndarray | None = None
+    n_steps = 0
+
+    for t_entry in t_cidx.ranges:
+        if t_entry.end < start_ts:
+            continue
+        if t_entry.start > end_ts:
+            break
+
+        t0 = max(0, int(round((max(t_entry.start, start_ts) - t_entry.start) / resolution)))
+        t1 = min(t_entry.time_len, int(round((min(t_entry.end, end_ts) - t_entry.start) / resolution)) + 1)
+        if t1 <= t0:
+            continue
+
+        t_reader = _open_chunk(t_entry, model, "temperature_2m")
+        ny, nx, _ = t_reader.shape
+
+        if total_sum is None:
+            total_sum = np.zeros((ny, nx), dtype=np.float64)
+
+        sub = 24
+        for ts in range(t0, t1, sub):
+            te = min(ts + sub, t1)
+            step_ts = t_entry.start + ts * resolution
+
+            t_data = np.asarray(
+                t_reader.read_array((slice(0, ny), slice(0, nx), slice(ts, te))),
+                dtype=np.float64,
+            )
+
+            td_entry, td_t0 = _chunk_entry_for_time(td_cidx, step_ts)
+            if td_entry is None:
+                continue
+            td_reader = _open_chunk(td_entry, model, "dew_point_2m")
+            batch_len = te - ts
+            td_data = np.asarray(
+                td_reader.read_array((slice(0, ny), slice(0, nx), slice(td_t0, td_t0 + batch_len))),
+                dtype=np.float64,
+            )
+            if td_data.shape[2] < batch_len:
+                t_data = t_data[:, :, :td_data.shape[2]]
+
+            vpd_batch = vpd_kpa(t_data, td_data)
+            total_sum += np.nansum(vpd_batch, axis=2)
+
+        n_steps += t1 - t0
+
+    if total_sum is None:
+        g = RASTER_GRIDS[model]
+        ny, nx = g.get("ny", 1), g.get("nx", 1)
+        return np.zeros((ny, nx), dtype=np.float64), 0
+
+    if flipud:
+        total_sum = np.flipud(total_sum)
+    return total_sum, n_steps
+
+
+def _rh_to_dew_point(t: np.ndarray, rh: np.ndarray) -> np.ndarray:
+    """Magnus formula: dew_point (°C) from temperature (°C) and relative humidity (%)."""
+    rh_c = np.clip(rh, 1.0, 100.0)
+    gamma = np.log(rh_c / 100.0) + 17.625 * t / (243.04 + t)
+    return (243.04 * gamma / (17.625 - gamma)).astype(np.float64)
+
+
+def accumulate_vpd_raster_gfs(
+    start_ts: float,
+    end_ts: float,
+    t_cidx: ChunkIndex,
+    rh_cidx: ChunkIndex,
+    dst_model: str,
+) -> tuple[np.ndarray, int]:
+    """Accumulate sum of vpd_kpa(T[t], derive_td(T[t], RH[t])) per GFS timestep.
+
+    Derives dew_point from GFS temperature + relative_humidity per timestep, then
+    computes VPD. Result is reprojected to dst_model native grid.
+
+    Returns (vpd_sum reprojected to dst_model: float64 (ny, nx), n_steps: int).
+    """
+    gfs_model = "ncep_gfs013"
+    gfs_grid = RASTER_GRIDS[gfs_model]
+    dst_grid = RASTER_GRIDS[dst_model]
+    flipud = gfs_grid["flipud"]
+    resolution = t_cidx.resolution
+
+    total_sum_gfs: np.ndarray | None = None
+    n_steps = 0
+
+    for t_entry in t_cidx.ranges:
+        if t_entry.end < start_ts:
+            continue
+        if t_entry.start > end_ts:
+            break
+
+        t0 = max(0, int(round((max(t_entry.start, start_ts) - t_entry.start) / resolution)))
+        t1 = min(t_entry.time_len, int(round((min(t_entry.end, end_ts) - t_entry.start) / resolution)) + 1)
+        if t1 <= t0:
+            continue
+
+        t_reader = _open_chunk(t_entry, gfs_model, "temperature_2m")
+        ny, nx, _ = t_reader.shape
+
+        if total_sum_gfs is None:
+            total_sum_gfs = np.zeros((ny, nx), dtype=np.float64)
+
+        sub = 24
+        for ts in range(t0, t1, sub):
+            te = min(ts + sub, t1)
+            step_ts = t_entry.start + ts * resolution
+
+            t_data = np.asarray(
+                t_reader.read_array((slice(0, ny), slice(0, nx), slice(ts, te))),
+                dtype=np.float64,
+            )
+
+            rh_entry, rh_t0 = _chunk_entry_for_time(rh_cidx, step_ts)
+            if rh_entry is None:
+                continue
+            rh_reader = _open_chunk(rh_entry, gfs_model, "relative_humidity_2m")
+            batch_len = te - ts
+            rh_data = np.asarray(
+                rh_reader.read_array((slice(0, ny), slice(0, nx), slice(rh_t0, rh_t0 + batch_len))),
+                dtype=np.float64,
+            )
+            if rh_data.shape[2] < batch_len:
+                t_data = t_data[:, :, :rh_data.shape[2]]
+
+            for i in range(t_data.shape[2]):
+                td_slice = _rh_to_dew_point(t_data[:, :, i], rh_data[:, :, i])
+                vpd_slice = vpd_kpa(t_data[:, :, i], td_slice)
+                total_sum_gfs += np.where(np.isfinite(vpd_slice), vpd_slice, 0.0)
+
+        n_steps += t1 - t0
+
+    if total_sum_gfs is None:
+        ny, nx = gfs_grid.get("ny", 1), gfs_grid.get("nx", 1)
+        total_sum_gfs = np.zeros((ny, nx), dtype=np.float64)
+
+    if flipud:
+        total_sum_gfs = np.flipud(total_sum_gfs)
+
+    reprojected = reproject_to_grid(
+        total_sum_gfs.astype(np.float32),
+        gfs_grid["lat_min"], gfs_grid["lat_max"], gfs_grid["lon_min"], gfs_grid["lon_max"],
+        dst_grid["ny"], dst_grid["nx"],
+        dst_grid["lat_min"], dst_grid["lat_max"], dst_grid["lon_min"], dst_grid["lon_max"],
+    )
+    return reprojected.astype(np.float64), n_steps
+
+
 def accumulate_raster_mode(
     model: str,
     start_ts: float,
@@ -1524,14 +1881,8 @@ def compute_raster_final(
     zero = np.zeros_like(next(iter(sums.values())), dtype=np.float64)
 
     if var_id == "vapor_pressure_deficit":
-        t_e = sums.get("era5_temperature_2m", zero) / max(n_era5, 1)
-        td_e = sums.get("era5_dew_point_2m", zero) / max(n_era5, 1)
-        val = vpd_kpa(t_e, td_e) * n_era5
-        if n_gfs > 0 and "gfs_temperature_2m" in sums:
-            t_g = sums["gfs_temperature_2m"] / n_gfs
-            td_g = sums["gfs_dew_point_2m"] / n_gfs  # derived from RH before accumulating
-            val = val + vpd_kpa(t_g, td_g) * n_gfs
-        result = val / n_total
+        vpd_sum = sums.get("era5_vpd", zero) + sums.get("gfs_vpd", zero)
+        result = vpd_sum / n_total
         return np.maximum(result, 0.0).astype(np.float32)
 
     if var_id == "dew_point_2m":

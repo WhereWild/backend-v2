@@ -78,22 +78,22 @@ def _resolve_variable_id(variable_id: str) -> str:
 def _load_legend(layer_id: str) -> list:
     if not re.fullmatch(r"[A-Za-z0-9_]+", layer_id):
         return []
-    legend_root = _LEGEND_DIR.resolve()
-    path = (_LEGEND_DIR / f"{layer_id}_legend.json").resolve()
-    if not path.is_relative_to(legend_root):
+    legend_root = os.path.realpath(_LEGEND_DIR)
+    path = os.path.realpath(_LEGEND_DIR / f"{layer_id}_legend.json")
+    if not path.startswith(legend_root + os.sep):
         return []
-    if not path.exists():
+    if not os.path.exists(path):
         # Temporal ids like weather_code_simple_mode_24h → weather_code_simple
         base_id = re.sub(r'_(avg|sum|mode|snapshot)_\d+h$', '', layer_id, flags=re.IGNORECASE)
         if base_id != layer_id:
             if not re.fullmatch(r"[A-Za-z0-9_]+", base_id):
                 return []
-            path = (_LEGEND_DIR / f"{base_id}_legend.json").resolve()
-            if not path.is_relative_to(legend_root):
+            path = os.path.realpath(_LEGEND_DIR / f"{base_id}_legend.json")
+            if not path.startswith(legend_root + os.sep):
                 return []
-    if not path.exists():
+    if not os.path.exists(path):
         return []
-    return json.loads(path.read_text()).get("classes", [])
+    return json.loads(Path(path).read_text()).get("classes", [])
 
 
 def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:

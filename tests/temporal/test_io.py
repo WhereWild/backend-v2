@@ -54,10 +54,12 @@ class TestLoadTemporalLayers:
         ids = {la.id for la in layers}
         assert "temperature_2m" in ids
 
-    def test_derived_layers(self):
+    def test_vpd_has_sources(self):
         layers = util.temporal.load_temporal_layers(_CATALOG)
-        derived = {la.id for la in layers if la.derived}
-        assert "vapor_pressure_deficit" in derived
+        vpd = next(la for la in layers if la.id == "vapor_pressure_deficit")
+        assert vpd.derived is False
+        assert "temperature_2m" in vpd.sources
+        assert "dew_point_2m" in vpd.sources
 
     def test_layer_window_override(self):
         layers = util.temporal.load_temporal_layers(_CATALOG)

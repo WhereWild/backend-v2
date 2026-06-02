@@ -434,24 +434,21 @@ class TestComputeRasterFinal:
         assert int(result[0, 0]) == 63
 
     def test_vpd_clamped_to_zero(self) -> None:
-        t = np.full((2, 2), 10.0)
-        td = np.full((2, 2), 15.0)  # td > t → would be negative VPD
         n = 10
+        vpd_val = float(vpd_kpa(10.0, 15.0))  # td > t → negative
         result = compute_raster_final("vapor_pressure_deficit", "avg",
-                                      {"era5_temperature_2m": t * n, "era5_dew_point_2m": td * n},
+                                      {"era5_vpd": np.full((2, 2), vpd_val * n)},
                                       n, 0)
         assert (result >= 0).all()
 
     def test_vpd_formula(self) -> None:
         t_val, td_val = 20.0, 10.0
         n = 24
-        t = np.full((2, 2), t_val * n)
-        td = np.full((2, 2), td_val * n)
+        vpd_val = float(vpd_kpa(t_val, td_val))
         result = compute_raster_final("vapor_pressure_deficit", "avg",
-                                      {"era5_temperature_2m": t, "era5_dew_point_2m": td},
+                                      {"era5_vpd": np.full((2, 2), vpd_val * n)},
                                       n, 0)
-        expected = float(vpd_kpa(t_val, td_val))
-        assert result[0, 0] == pytest.approx(expected, abs=1e-4)
+        assert result[0, 0] == pytest.approx(vpd_val, abs=1e-4)
 
     def test_era5_only_avg(self) -> None:
         era5 = np.full((2, 2), 48.0)
@@ -461,20 +458,14 @@ class TestComputeRasterFinal:
 
     def test_vpd_with_gfs(self) -> None:
         n_era5, n_gfs = 24, 12
-        t_e, td_e = 20.0, 15.0
-        t_g, td_g = 25.0, 10.0
+        vpd_e = float(vpd_kpa(20.0, 15.0))
+        vpd_g = float(vpd_kpa(25.0, 10.0))
         sums = {
-            "era5_temperature_2m": np.full((2, 2), t_e * n_era5),
-            "era5_dew_point_2m":   np.full((2, 2), td_e * n_era5),
-            "gfs_temperature_2m":  np.full((2, 2), t_g * n_gfs),
-            "gfs_dew_point_2m":    np.full((2, 2), td_g * n_gfs),
+            "era5_vpd": np.full((2, 2), vpd_e * n_era5),
+            "gfs_vpd":  np.full((2, 2), vpd_g * n_gfs),
         }
         result = compute_raster_final("vapor_pressure_deficit", "avg", sums, n_era5, n_gfs)
-        expected = max(
-            (float(vpd_kpa(t_e, td_e)) * n_era5 + float(vpd_kpa(t_g, td_g)) * n_gfs)
-            / (n_era5 + n_gfs),
-            0.0,
-        )
+        expected = max((vpd_e * n_era5 + vpd_g * n_gfs) / (n_era5 + n_gfs), 0.0)
         assert result[0, 0] == pytest.approx(expected, abs=1e-4)
 
     def test_dew_point_era5_only(self) -> None:

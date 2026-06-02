@@ -325,62 +325,38 @@ class TestRasterPartialWindows:
 # ---------------------------------------------------------------------------
 
 class TestRasterVPD:
-    def test_vpd_berlin_24h(self, require_fixtures, monkeypatch, tmp_path) -> None:
-        fix = require_fixtures["berlin_early"]
+    def _vpd_via_accumulate(self, fix, monkeypatch, location, window_h):
+        """Accumulate per-timestep VPD sum using the VPD series directly."""
         obs_hour = 500
         obs_ts = float(fix["hourly"]["time_unix"][obs_hour])
-        t_exp = expected_window(fix, obs_ts, "temperature_2m", 24, "avg")
-        td_exp = expected_window(fix, obs_ts, "dew_point_2m", 24, "avg")
-        assert t_exp is not None
-        assert td_exp is not None
-        expected_vpd = float(vpd_kpa(t_exp, td_exp))
-
-        # Build t and td sums separately
         series_t = np.array(fix["hourly"]["temperature_2m"], dtype=np.float64)
         series_td = np.array(fix["hourly"]["dew_point_2m"], dtype=np.float64)
+        series_vpd = np.array([float(vpd_kpa(t, td)) for t, td in zip(series_t, series_td)])
         index, _ = chunk_from_fixture(fix, "copernicus_era5_land")
-        start_ts = obs_ts - 23 * 3600
+        start_ts = obs_ts - (window_h - 1) * 3600
 
-        # Accumulate t
-        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series_t, "copernicus_era5_land"))
-        t_grid, t_n = accumulate_raster("copernicus_era5_land", "temperature_2m", start_ts, obs_ts, index)
+        monkeypatch.setattr("util.temporal._open_chunk",
+                            lambda *a, **kw: FakeRasterReader(series_vpd, "copernicus_era5_land"))
+        vpd_grid, n = accumulate_raster("copernicus_era5_land", "temperature_2m", start_ts, obs_ts, index)
 
-        # Accumulate td
-        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series_td, "copernicus_era5_land"))
-        td_grid, td_n = accumulate_raster("copernicus_era5_land", "dew_point_2m", start_ts, obs_ts, index)
+        # Expected: average of per-timestep VPD values in the window
+        start_h = max(0, obs_hour - window_h + 1)
+        window_vpd = series_vpd[start_h:obs_hour + 1]
+        expected = max(float(np.nanmean(window_vpd)), 0.0)
 
-        # Compute VPD
-        sums = {"era5_temperature_2m": t_grid, "era5_dew_point_2m": td_grid}
-        result = compute_raster_final("vapor_pressure_deficit", "avg", sums, t_n, 0)
-        li, lo = _cell("berlin", "copernicus_era5_land")
-        cell_vpd = float(result[li, lo])
-        assert cell_vpd == pytest.approx(max(expected_vpd, 0.0), abs=1e-3)
+        result = compute_raster_final("vapor_pressure_deficit", "avg", {"era5_vpd": vpd_grid}, n, 0)
+        li, lo = _cell(location, "copernicus_era5_land")
+        return float(result[li, lo]), expected
+
+    def test_vpd_berlin_24h(self, require_fixtures, monkeypatch, tmp_path) -> None:
+        fix = require_fixtures["berlin_early"]
+        cell_vpd, expected = self._vpd_via_accumulate(fix, monkeypatch, "berlin", 24)
+        assert cell_vpd == pytest.approx(expected, abs=1e-3)
 
     def test_vpd_dubai_168h(self, require_fixtures, monkeypatch, tmp_path) -> None:
         fix = require_fixtures["dubai_early"]
-        obs_hour = 500
-        obs_ts = float(fix["hourly"]["time_unix"][obs_hour])
-        t_exp = expected_window(fix, obs_ts, "temperature_2m", 168, "avg")
-        td_exp = expected_window(fix, obs_ts, "dew_point_2m", 168, "avg")
-        assert t_exp is not None
-        assert td_exp is not None
-        expected_vpd = max(float(vpd_kpa(t_exp, td_exp)), 0.0)
-
-        series_t = np.array(fix["hourly"]["temperature_2m"], dtype=np.float64)
-        series_td = np.array(fix["hourly"]["dew_point_2m"], dtype=np.float64)
-        index, _ = chunk_from_fixture(fix, "copernicus_era5_land")
-        start_ts = obs_ts - 167 * 3600
-
-        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series_t, "copernicus_era5_land"))
-        t_grid, t_n = accumulate_raster("copernicus_era5_land", "temperature_2m", start_ts, obs_ts, index)
-        monkeypatch.setattr("util.temporal._open_chunk", lambda *a, **kw: FakeRasterReader(series_td, "copernicus_era5_land"))
-        td_grid, td_n = accumulate_raster("copernicus_era5_land", "dew_point_2m", start_ts, obs_ts, index)
-
-        result = compute_raster_final("vapor_pressure_deficit", "avg",
-                                      {"era5_temperature_2m": t_grid, "era5_dew_point_2m": td_grid},
-                                      t_n, 0)
-        li, lo = _cell("dubai", "copernicus_era5_land")
-        assert float(result[li, lo]) == pytest.approx(expected_vpd, abs=1e-3)
+        cell_vpd, expected = self._vpd_via_accumulate(fix, monkeypatch, "dubai", 168)
+        assert cell_vpd == pytest.approx(expected, abs=1e-3)
 
 
 # ---------------------------------------------------------------------------

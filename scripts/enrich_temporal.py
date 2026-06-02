@@ -16,7 +16,6 @@ Usage:
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import signal
 import threading
@@ -25,7 +24,6 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pyarrow as pa
 import pyarrow.compute as pc
 
 from config.config import load_config
@@ -37,6 +35,7 @@ from util.temporal import (
     build_chunk_index,
     build_occ_index,
     derive_vpd,
+    iter_occ_index_batches,
     load_temporal_layers,
     map_to_worklist,
     process_chunk,
@@ -50,15 +49,11 @@ CATALOG_PATH = Path("config/gis/catalog.json")
 _raw_vars = os.environ.get("VARS_TO_ENRICH", "")
 VARS_TO_ENRICH: list[str] | None = [v.strip() for v in _raw_vars.split(",") if v.strip()] or None
 
-# Set CLEAR_CACHE=0 to preserve the download cache after a run (useful for
-# quick re-runs and debugging; files are reused automatically on next run).
-# Defaults to 1 (clear) so production runs don't accumulate hundreds of GB.
 CLEAR_CACHE: bool = os.environ.get("CLEAR_CACHE", "1") != "0"
 
-# Flush accumulated updates to disk when RSS exceeds this threshold (MB).
-# Prevents OOM on large first-time runs where all_updates can grow to 10+ GB.
-_FLUSH_RSS_MB = int(os.environ.get("TEMPORAL_FLUSH_RSS_MB", "40000"))
-
+# Number of occurrence rows processed per batch. Keeps peak RSS bounded
+# regardless of total observation count.
+_BATCH_ROWS = int(os.environ.get("TEMPORAL_BATCH_ROWS", "5000000"))
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +84,6 @@ def _cleanup_cache(cache_dir: str) -> None:
 
 
 def _filter_layers(all_layers: list[TemporalLayer], vars_to_enrich: list[str] | None) -> list[TemporalLayer]:
-    """Return layers to process, applying VARS_TO_ENRICH filter.
-
-    If vars_to_enrich contains at least one temporal id, restrict to those.
-    If it contains no temporal ids (all spatial), do all temporal layers.
-    """
     if vars_to_enrich is None:
         return all_layers
     temporal_ids = {layer.id for layer in all_layers}
@@ -110,10 +100,10 @@ def _filter_layers(all_layers: list[TemporalLayer], vars_to_enrich: list[str] | 
 
 def _run_layer(
     layer: TemporalLayer,
-    occ_table,
+    occ_index_path: Path,
     cfg,
     stop: threading.Event,
-) -> dict:
+) -> None:
     print(
         f"[layer] id={layer.id} model={layer.model} agg={layer.agg} "
         f"windows={layer.windows} grid_mode={layer.grid_mode}"
@@ -126,34 +116,18 @@ def _run_layer(
         )
     except Exception as exc:
         print(f"[skip] {layer.id}: could not build chunk index — {exc}")
-        return {}
+        return
 
     print(
         f"[chunks] {layer.id}: {len(chunk_index.ranges)} chunks, "
         f"resolution={chunk_index.resolution:.0f}s"
     )
 
-    worklist = map_to_worklist(occ_table, chunk_index, layer.grid_mode, layer.grid_step)
-    if worklist.num_rows == 0:
-        print(f"[skip] {layer.id}: no observations mapped to any chunk")
-        return {}
-
+    prefetch_vars = layer.sources if layer.sources else [layer.id]
     steps = window_steps(chunk_index.resolution, tuple(layer.windows))
-    tail_buffer: TailBuffer = {}
 
-    # Pre-build per-chunk worklists in one pass (avoids a second filter scan per chunk).
-    chunk_worklists: dict[int, pa.Table] = {}
-    for entry in chunk_index.ranges:
-        slice_ = worklist.filter(pc.equal(worklist["chunk_num"], entry.chunk_num))
-        if slice_.num_rows > 0:
-            chunk_worklists[entry.chunk_num] = slice_
-
-    chunks_with_obs = [e for e in chunk_index.ranges if e.chunk_num in chunk_worklists]
-
-    # For multi-source layers, restrict to chunks where every source has a matching
-    # file (same source type + chunk_num). Chunks missing from any source would fail
-    # at download time — this can happen when the index variable (sources[0]) has
-    # chunk_*.om files for a time period that other sources still store as year_*.om.
+    # Multi-source intersection filter.
+    chunks_eligible = list(chunk_index.ranges)
     if len(layer.sources) > 1:
         for src_var in layer.sources[1:]:
             try:
@@ -161,104 +135,98 @@ def _run_layer(
                     layer.model, src_var, min_year=cfg.temporal_min_year
                 )
                 src_keys = {(e.source, e.chunk_num) for e in src_idx.ranges}
-                before = len(chunks_with_obs)
-                chunks_with_obs = [
-                    e for e in chunks_with_obs if (e.source, e.chunk_num) in src_keys
-                ]
-                dropped = before - len(chunks_with_obs)
+                before = len(chunks_eligible)
+                chunks_eligible = [e for e in chunks_eligible if (e.source, e.chunk_num) in src_keys]
+                dropped = before - len(chunks_eligible)
                 if dropped:
-                    print(
-                        f"[intersect] {layer.id}: dropped {dropped} chunks "
-                        f"not available for {src_var}"
-                    )
+                    print(f"[intersect] {layer.id}: dropped {dropped} chunks not available for {src_var}")
             except Exception as exc:
                 print(f"[warn] {layer.id}: could not intersect with {src_var} index — {exc}")
 
-    total_chunks = len(chunks_with_obs)
-
-    prefetch_vars = layer.sources if layer.sources else [layer.id]
-    total_rows = worklist.num_rows
-    rows_done = 0
     t_start = time.monotonic()
+    total_rows_done = 0
+    batch_num = 0
+    stopped = False
 
-    # Accumulate updates across all chunks; write back once at the end to avoid
-    # reading and rewriting each parquet file once per chunk (42x reduction in disk I/O).
-    all_updates: dict[str, dict[str, list]] = {}
+    for occ_batch in iter_occ_index_batches(occ_index_path, _BATCH_ROWS):
+        if stop.is_set():
+            print(f"[stop] {layer.id}: interrupted")
+            stopped = True
+            break
+        batch_num += 1
 
-    # Submit all downloads upfront; process each chunk as its download finishes.
-    # Pool limits to _PREFETCH_WORKERS concurrent downloads so chunks N+1..N+7
-    # are fetched while chunk N is being processed.
-    with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
-        dl_futures = [
-            pool.submit(_download_layer_chunk, entry, layer.model, prefetch_vars, cfg.temporal_cache_dir)
-            for entry in chunks_with_obs
-        ]
+        worklist = map_to_worklist(occ_batch, chunk_index, layer.grid_mode, layer.grid_step)
+        if worklist.num_rows == 0:
+            continue
 
-        for chunk_idx, (chunk_entry, dl_fut) in enumerate(zip(chunks_with_obs, dl_futures), 1):
+        batch_chunk_worklists: dict[int, object] = {}
+        for entry in chunks_eligible:
+            sl = worklist.filter(pc.equal(worklist["chunk_num"], entry.chunk_num))
+            if sl.num_rows > 0:
+                batch_chunk_worklists[entry.chunk_num] = sl
+
+        if not batch_chunk_worklists:
+            continue
+
+        chunks_this_batch = [e for e in chunks_eligible if e.chunk_num in batch_chunk_worklists]
+
+        # Download chunks needed by this batch (cached on disk, so only fetched once).
+        with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as dl_pool:
+            for fut in [dl_pool.submit(_download_layer_chunk, e, layer.model, prefetch_vars, cfg.temporal_cache_dir) for e in chunks_this_batch]:
+                fut.result()
+
+        batch_rows_done = 0
+        tail_buffer: TailBuffer = {}
+        batch_updates: dict[str, dict[str, list]] = {}
+
+        for chunk_entry in chunks_this_batch:
             if stop.is_set():
                 print(f"[stop] {layer.id}: interrupted before chunk {chunk_entry.chunk_num}")
-                return all_updates
-
-            dl_fut.result()  # wait for this chunk's files to be ready
-
-            chunk_worklist = chunk_worklists[chunk_entry.chunk_num]
-
+                stopped = True
+                break
+            chunk_worklist = batch_chunk_worklists[chunk_entry.chunk_num]
             try:
                 if layer.sources:
                     updates, tail_buffer = process_chunk_mode(
-                        chunk_entry,
-                        chunk_worklist,
-                        tail_buffer,
-                        layer.model,
-                        layer.sources,
-                        layer.id,
-                        steps,
-                        chunk_index.resolution,
-                        cfg.temporal_cache_dir,
+                        chunk_entry, chunk_worklist, tail_buffer,
+                        layer.model, layer.sources, layer.id,
+                        steps, chunk_index.resolution, cfg.temporal_cache_dir,
                     )
                 else:
                     updates, tail_buffer = process_chunk(
-                        chunk_entry,
-                        chunk_worklist,
-                        tail_buffer,
-                        layer.model,
-                        layer.id,
-                        steps,
-                        layer.agg,
-                        cfg.temporal_cache_dir,
+                        chunk_entry, chunk_worklist, tail_buffer,
+                        layer.model, layer.id, steps, layer.agg, cfg.temporal_cache_dir,
                     )
                 for tpath, colmap in updates.items():
-                    all_updates.setdefault(tpath, {})
-                    for col, chunks_list in colmap.items():
-                        all_updates[tpath].setdefault(col, []).extend(chunks_list)
+                    batch_updates.setdefault(tpath, {})
+                    for col, pairs in colmap.items():
+                        batch_updates[tpath].setdefault(col, []).extend(pairs)
             except Exception:
-                print(f"[error] {layer.id} chunk={chunk_entry.chunk_num}")
+                print(f"[error] {layer.id} batch={batch_num} chunk={chunk_entry.chunk_num}")
                 traceback.print_exc()
                 raise
 
-            rows_done += chunk_worklist.num_rows
-            elapsed = time.monotonic() - t_start
-            rate = rows_done / elapsed if elapsed > 0 else 0.0
-            remaining = total_rows - rows_done
-            eta_s = remaining / rate if rate > 0 else float("inf")
-            rss = _rss_mb()
-            rss_str = f" rss={rss:.0f}MB" if rss is not None else ""
-            print(
-                f"[progress] {layer.id} chunk {chunk_idx}/{total_chunks} "
-                f"rows={rows_done}/{total_rows} "
-                f"rate={rate:.0f}/s eta={eta_s:.0f}s{rss_str}"
-            )
-            if rss is not None and rss > _FLUSH_RSS_MB:
-                print(f"[flush] {layer.id}: RSS={rss:.0f}MB, flushing {len(all_updates)} taxa mid-layer")
-                write_back(all_updates)
-                all_updates.clear()
-                try:
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
+            batch_rows_done += chunk_worklist.num_rows
 
-    print(f"[done] {layer.id} rows={rows_done} elapsed={time.monotonic() - t_start:.1f}s")
-    return all_updates
+        total_rows_done += batch_rows_done
+        rss = _rss_mb()
+        rss_str = f" rss={rss:.0f}MB" if rss is not None else ""
+        print(
+            f"[batch] {layer.id} batch={batch_num} "
+            f"rows={total_rows_done}{rss_str} elapsed={time.monotonic() - t_start:.0f}s"
+        )
+
+        if batch_updates and not stop.is_set():
+            write_back(batch_updates)
+
+        if stopped:
+            break
+
+    if not stopped:
+        if total_rows_done == 0:
+            print(f"[skip] {layer.id}: no observations mapped to any chunk")
+        else:
+            print(f"[done] {layer.id} rows={total_rows_done} elapsed={time.monotonic() - t_start:.1f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +248,7 @@ def main() -> None:
             print(f"[warn] could not register handler for signal {sig}: {exc}")
 
     Path(cfg.temporal_cache_dir).mkdir(parents=True, exist_ok=True)
+    occ_index_path = Path(cfg.temporal_cache_dir) / "occ_index.parquet"
 
     try:
         all_layers = load_temporal_layers(CATALOG_PATH)
@@ -287,8 +256,6 @@ def main() -> None:
         active_ids = {layer.id for layer in active_layers}
         print(f"[init] active layers: {[layer.id for layer in active_layers]}")
 
-        # Compute output column names for all active non-derived layers so
-        # build_occ_index can skip rows already enriched by carry_forward.
         skip_cols: list[str] = [
             f"{layer.id}_{layer.agg}_{w}h"
             for layer in active_layers
@@ -297,34 +264,25 @@ def main() -> None:
         ]
 
         print(f"[occ_index] scanning root={str(cfg.plantae_key)} min_year={cfg.temporal_min_year}")
-        occ_table = build_occ_index(
+        n_obs = build_occ_index(
             str(cfg.plantae_key),
             cfg.data_root,
             cfg.occurrence_parquet_filename,
-            cfg.temporal_min_year,
+            occ_index_path,
+            min_year=cfg.temporal_min_year,
             skip_if_cols=skip_cols if skip_cols else None,
         )
-        print(f"[occ_index] {occ_table.num_rows} observations")
+        print(f"[occ_index] {n_obs} observations")
 
-        if occ_table.num_rows == 0:
+        if n_obs == 0:
             print("[done] no observations to enrich")
             return
 
-        # Non-derived layers first — write back immediately after each layer
-        # so accumulated updates don't stack across all layers in memory.
         for layer in active_layers:
             if layer.derived or stop.is_set():
                 continue
-            layer_updates = _run_layer(layer, occ_table, cfg, stop)
-            if layer_updates and not stop.is_set():
-                write_back(layer_updates)
-                layer_updates.clear()
-                try:
-                    ctypes.CDLL("libc.so.6").malloc_trim(0)
-                except Exception:
-                    pass
+            _run_layer(layer, occ_index_path, cfg, stop)
 
-        # Derived passes (only if their deps were processed or already present)
         if "vapor_pressure_deficit" in active_ids and not stop.is_set():
             vpd_layer = next(layer for layer in active_layers if layer.id == "vapor_pressure_deficit")
             print(f"[derive] vapor_pressure_deficit windows={vpd_layer.windows}")
@@ -340,6 +298,8 @@ def main() -> None:
                 traceback.print_exc()
 
     finally:
+        if occ_index_path.exists():
+            occ_index_path.unlink()
         if CLEAR_CACHE:
             print(f"[cleanup] clearing cache {cfg.temporal_cache_dir}")
             _cleanup_cache(cfg.temporal_cache_dir)

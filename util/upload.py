@@ -297,6 +297,7 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
                 "name": layer.get("display_name") or layer["id"],
                 "units": layer.get("units") or None,
                 "value_type": layer.get("value_type") or None,
+                "domain": layer.get("domain") or None,
                 "category": layer.get("category_display_name") or None,
                 "group": layer.get("group") or None,
                 "group_label": layer.get("group_label") or None,

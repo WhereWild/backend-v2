@@ -263,8 +263,6 @@ def _full_build(
         n_era5 = n
 
         # GFS gap fill: per-timestep VPD from T + RH
-        dst_g = RASTER_GRIDS[era5_model]
-        gfs_g = RASTER_GRIDS["ncep_gfs013"]
         t_cidx_gfs = gfs_cidx.get("temperature_2m")
         rh_cidx_gfs = gfs_cidx.get("relative_humidity_2m")
         if t_cidx_gfs and rh_cidx_gfs and gfs_start < gfs_end_ts:

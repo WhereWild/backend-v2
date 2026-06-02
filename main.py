@@ -76,6 +76,8 @@ def _resolve_variable_id(variable_id: str) -> str:
 
 @lru_cache(maxsize=32)
 def _load_legend(layer_id: str) -> list:
+    if not re.fullmatch(r"[A-Za-z0-9_]+", layer_id):
+        return []
     legend_root = _LEGEND_DIR.resolve()
     path = (_LEGEND_DIR / f"{layer_id}_legend.json").resolve()
     if not path.is_relative_to(legend_root):

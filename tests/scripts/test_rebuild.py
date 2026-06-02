@@ -14,6 +14,7 @@ def patch_paths(monkeypatch, tmp_path):
     monkeypatch.setattr(rebuild, "SYNC_STATE_PATH", data_dir / "sync_state.json")
     monkeypatch.setattr(rebuild, "TAXONOMY_CACHE_DIR", data_dir / "taxonomy" / "cache")
     monkeypatch.setattr(rebuild, "NOTIFY_URL", "")
+    monkeypatch.setattr(rebuild, "STATUS_PUSH_URL", "")
     monkeypatch.setattr("sys.argv", ["rebuild"])
 
 

@@ -1175,6 +1175,8 @@ def _patch_main_base(monkeypatch, tmp_path: Path, force: bool = True,
     monkeypatch.setattr("scripts.build_temporal._full_build", lambda *a, **kw: None)
     monkeypatch.setattr("scripts.build_temporal._incremental_update", lambda *a, **kw: None)
     monkeypatch.setattr("scripts.build_temporal._build_forecast_aggregates", lambda *a, **kw: None)
+    monkeypatch.setattr("scripts.build_temporal._push_temporal_state", lambda *a, **kw: None)
+    monkeypatch.setattr("scripts.build_temporal._push_rasters", lambda *a, **kw: None)
 
     return cfg
 

@@ -291,19 +291,33 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
         if lookup_rows:
             pq.write_table(pa.Table.from_pylist(lookup_rows), lookup_path)
 
-        meta_rows = [
-            {
+        meta_rows = []
+        for idx, layer in enumerate(layer_meta.values()):
+            raw_classes = _load_legend(layer["id"])
+            legend_json = None
+            if raw_classes:
+                legend_json = json.dumps([
+                    {
+                        "id": cls["id"],
+                        "name": cls.get("name", str(cls["id"])),
+                        "color": cls.get("traits", {}).get("color") or None,
+                    }
+                    for cls in raw_classes
+                ])
+            meta_rows.append({
                 "id": layer["id"],
                 "name": layer.get("display_name") or layer["id"],
                 "units": layer.get("units") or None,
                 "value_type": layer.get("value_type") or None,
+                "domain": layer.get("domain") or None,
                 "category": layer.get("category_display_name") or None,
                 "group": layer.get("group") or None,
                 "group_label": layer.get("group_label") or None,
                 "sort_order": idx,
-            }
-            for idx, layer in enumerate(layer_meta.values())
-        ]
+                "render_min": layer.get("render_min"),
+                "render_max": layer.get("render_max"),
+                "legend_classes": legend_json,
+            })
         meta_path = work_dir / "variable_metadata.parquet"
         if meta_rows:
             pq.write_table(pa.Table.from_pylist(meta_rows), meta_path)

@@ -2,12 +2,9 @@ version = 1
 
 [[annotations]]
 path = [
-  ".dockerignore",
   ".env.example",
-  ".gitignore",
   ".python-version",
   "Caddyfile",
-  "Dockerfile",
   "deploy/wherewild.service",
   "docker/rclone.conf.template",
   "pyproject.toml",

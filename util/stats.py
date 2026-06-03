@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import pickle
 import random
 from collections import Counter
 from pathlib import Path
@@ -26,13 +27,12 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fastdigest import TDigest
-from scipy.stats import circmean, circstd, circvar, gaussian_kde, vonmises
+from scipy.stats import circmean, circstd, circvar, vonmises
 from scipy.stats import entropy as _scipy_entropy
 
 from config.config import ValueType, load_config
-from util.indexing import build_leaf_index, build_nonleaf_index
 from util.storage import ParquetStorage, atomic_write_parquet
-from util.taxa import TaxonRecord, iter_descendants
+from util.taxa import TaxonRecord, get_children, iter_descendants
 
 CONFIG = load_config("global")
 
@@ -45,8 +45,27 @@ CIRCULAR_STATS_FILE = "circular_stats.parquet"
 DENSITY_FILE = "density.parquet"
 PHENOLOGY_COUNTS_FILE = "phenology_counts.json"
 
-_KDE_MAX_SAMPLES = 20_000
+_KDE_MAX_SAMPLES = 100_000
 _KDE_N_POINTS = 128
+
+# Non-layer columns required for filtering, deduplication, phenology, and indexing.
+_OCC_BASE_COLS: frozenset[str] = frozenset({
+    "catalogNumber",
+    "obscured",
+    "coordinateUncertaintyInMeters",
+    "rcs",
+    "eventTimestamp",
+    "decimalLatitude",
+    "decimalLongitude",
+})
+
+
+def _read_occ_table(occ_path: Path, layer_meta: dict[str, dict]) -> pa.Table:
+    """Read only the columns needed for stats computation from an occurrence parquet."""
+    needed = _OCC_BASE_COLS | layer_meta.keys()
+    pf = pq.ParquetFile(occ_path)
+    cols = [c for c in pf.schema_arrow.names if c in needed]
+    return pf.read(columns=cols)
 
 
 def apply_phenology_filter(df: pd.DataFrame, phenology: str) -> pd.DataFrame:
@@ -75,10 +94,6 @@ def apply_timestamp_filter(
     if end_ts is not None:
         df = df[col <= end_ts]
     return df
-
-# Ranks for which occurrence_index.parquet is built.
-# Order and above aggregate too many descendants to be useful for slice queries.
-_INDEX_RANKS = CONFIG.leaf_rank_set | frozenset(["GENUS", "FAMILY"])
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +186,342 @@ def _reservoir_update(reservoir: list, n_seen: int, values: np.ndarray) -> int:
     return n_seen
 
 
+_ACC_FILE = ".acc"
+
+
+def _df_to_acc(df: pd.DataFrame, layer_meta: dict[str, dict]) -> dict:
+    """Build an in-memory accumulator dict from a filtered DataFrame."""
+    acc: dict = {"continuous": {}, "circular": {}, "nominal": {}, "pheno": {}}
+    _total_unique: int | None = None
+
+    def _col_unique(col: str) -> int:
+        nonlocal _total_unique
+        null_mask = df[col].isna()
+        if not null_mask.any():
+            if _total_unique is None:
+                _total_unique = int(df["catalogNumber"].nunique())
+            return _total_unique
+        return int(df.loc[~null_mask, "catalogNumber"].nunique())
+
+    for col in df.columns:
+        if col not in layer_meta:
+            continue
+        vtype = _layer_value_type(layer_meta[col])
+        if vtype is None:
+            continue
+        match vtype:
+            case ValueType.RATIO | ValueType.INTERVAL:
+                raw = df[col]
+                series = (raw.dropna() if raw.dtype == np.float64
+                          else pd.to_numeric(raw, errors="coerce").dropna())
+                if series.empty:
+                    continue
+                values = series.to_numpy(dtype=float)
+                values = values[np.isfinite(values)]
+                if values.size == 0:
+                    continue
+                digest = TDigest()
+                digest.batch_update(values.tolist())
+                reservoir: list = []
+                n_seen = _reservoir_update(reservoir, 0, values)
+                acc["continuous"][col] = {
+                    "digest": digest, "reservoir": reservoir,
+                    "n_seen": n_seen, "unique": _col_unique(col),
+                }
+            case ValueType.NOMINAL:
+                series = df[col].dropna()
+                if series.empty:
+                    continue
+                acc["nominal"][col] = {
+                    "counts": Counter(int(float(v)) for v in series),
+                    "unique": _col_unique(col),
+                }
+            case ValueType.CIRCULAR:
+                raw = df[col]
+                series = (raw.dropna() if raw.dtype == np.float64
+                          else pd.to_numeric(raw, errors="coerce").dropna())
+                if series.empty:
+                    continue
+                values = series.to_numpy(dtype=float)
+                values = values[np.isfinite(values)]
+                if values.size == 0:
+                    continue
+                rad = np.deg2rad(values)
+                reservoir = []
+                n_seen = _reservoir_update(reservoir, 0, values)
+                acc["circular"][col] = {
+                    "cos_sum": float(np.sum(np.cos(rad))),
+                    "sin_sum": float(np.sum(np.sin(rad))),
+                    "n": len(values), "reservoir": reservoir,
+                    "n_seen": n_seen, "unique": _col_unique(col),
+                }
+    acc["pheno"] = dict(compute_phenology_counts(df))
+    return acc
+
+
+def _reservoir_batch_merge(parts: list[tuple[list, int]]) -> tuple[list, int]:
+    """Merge N reservoir samples in one proportional draw — O(sum of sizes), not O(N × max)."""
+    total_n = sum(n for _, n in parts)
+    if total_n == 0:
+        return [], 0
+    combined_size = sum(len(r) for r, _ in parts)
+    if combined_size <= _KDE_MAX_SAMPLES:
+        merged = []
+        for r, _ in parts:
+            merged.extend(r)
+        return merged, total_n
+    result = []
+    for r, n in parts:
+        take = max(0, min(round(_KDE_MAX_SAMPLES * n / total_n), len(r)))
+        if take == 0:
+            continue
+        if take >= len(r):
+            result.extend(r)
+        else:
+            arr = np.asarray(r, dtype=np.float64)
+            result.extend(arr[np.random.permutation(len(arr))[:take]].tolist())
+    return result, total_n
+
+
+def _merge_accs_batch(accs: list[dict]) -> dict:
+    """Merge a list of accumulators efficiently — single proportional reservoir draw per column."""
+    merged: dict = {"continuous": {}, "circular": {}, "nominal": {}, "pheno": {}}
+
+    # Gather all per-column contributions, then merge in one shot.
+    cont_parts: dict[str, list] = {}
+    circ_parts: dict[str, list] = {}
+
+    for acc in accs:
+        for col, s in acc.get("continuous", {}).items():
+            if col not in cont_parts:
+                cont_parts[col] = []
+            cont_parts[col].append(s)
+
+        for col, s in acc.get("circular", {}).items():
+            if col not in circ_parts:
+                circ_parts[col] = []
+            circ_parts[col].append(s)
+
+        for col, s in acc.get("nominal", {}).items():
+            if col not in merged["nominal"]:
+                merged["nominal"][col] = {"counts": Counter(s["counts"]), "unique": s["unique"]}
+            else:
+                t = merged["nominal"][col]
+                t["counts"].update(s["counts"])
+                t["unique"] += s["unique"]
+
+        for k, v in acc.get("pheno", {}).items():
+            merged["pheno"][k] = merged["pheno"].get(k, 0) + v
+
+    for col, parts in cont_parts.items():
+        digest = parts[0]["digest"]
+        for p in parts[1:]:
+            digest.merge_inplace(p["digest"])
+        reservoir, n_seen = _reservoir_batch_merge([(p["reservoir"], p["n_seen"]) for p in parts])
+        merged["continuous"][col] = {
+            "digest": digest,
+            "reservoir": reservoir,
+            "n_seen": n_seen,
+            "unique": sum(p["unique"] for p in parts),
+        }
+
+    for col, parts in circ_parts.items():
+        reservoir, n_seen = _reservoir_batch_merge([(p["reservoir"], p["n_seen"]) for p in parts])
+        merged["circular"][col] = {
+            "cos_sum": sum(p["cos_sum"] for p in parts),
+            "sin_sum": sum(p["sin_sum"] for p in parts),
+            "n": sum(p["n"] for p in parts),
+            "reservoir": reservoir,
+            "n_seen": n_seen,
+            "unique": sum(p["unique"] for p in parts),
+        }
+
+    return merged
+
+
+def _merge_acc_inplace(target: dict, source: dict) -> None:
+    """Merge source accumulator into target in-place (used for own-parquet + children merge)."""
+    for col, s in source.get("continuous", {}).items():
+        if col not in target["continuous"]:
+            target["continuous"][col] = {
+                "digest": s["digest"], "reservoir": list(s["reservoir"]),
+                "n_seen": s["n_seen"], "unique": s["unique"],
+            }
+        else:
+            t = target["continuous"][col]
+            t["digest"].merge_inplace(s["digest"])
+            reservoir, n_seen = _reservoir_batch_merge(
+                [(t["reservoir"], t["n_seen"]), (s["reservoir"], s["n_seen"])]
+            )
+            t["reservoir"], t["n_seen"] = reservoir, n_seen
+            t["unique"] += s["unique"]
+
+    for col, s in source.get("circular", {}).items():
+        if col not in target["circular"]:
+            target["circular"][col] = {
+                "cos_sum": s["cos_sum"], "sin_sum": s["sin_sum"], "n": s["n"],
+                "reservoir": list(s["reservoir"]), "n_seen": s["n_seen"], "unique": s["unique"],
+            }
+        else:
+            t = target["circular"][col]
+            t["cos_sum"] += s["cos_sum"]
+            t["sin_sum"] += s["sin_sum"]
+            t["n"] += s["n"]
+            reservoir, n_seen = _reservoir_batch_merge(
+                [(t["reservoir"], t["n_seen"]), (s["reservoir"], s["n_seen"])]
+            )
+            t["reservoir"], t["n_seen"] = reservoir, n_seen
+            t["unique"] += s["unique"]
+
+    for col, s in source.get("nominal", {}).items():
+        if col not in target["nominal"]:
+            target["nominal"][col] = {"counts": Counter(s["counts"]), "unique": s["unique"]}
+        else:
+            t = target["nominal"][col]
+            t["counts"].update(s["counts"])
+            t["unique"] += s["unique"]
+
+    for k, v in source.get("pheno", {}).items():
+        target["pheno"][k] = target["pheno"].get(k, 0) + v
+
+
+def _save_acc(taxon_dir: Path, acc: dict) -> None:
+    data = {
+        "continuous": {
+            col: {
+                "digest_bytes": a["digest"].to_bytes(),
+                "reservoir": a["reservoir"], "n_seen": a["n_seen"], "unique": a["unique"],
+            }
+            for col, a in acc["continuous"].items()
+        },
+        "circular": {col: dict(a) for col, a in acc["circular"].items()},
+        "nominal": {col: {"counts": dict(a["counts"]), "unique": a["unique"]}
+                    for col, a in acc["nominal"].items()},
+        "pheno": acc["pheno"],
+    }
+    with open(taxon_dir / _ACC_FILE, "wb") as f:
+        pickle.dump(data, f, protocol=4)
+
+
+def _load_acc(taxon_dir: Path) -> dict | None:
+    acc_path = taxon_dir / _ACC_FILE
+    if not acc_path.exists():
+        return None
+    try:
+        with open(acc_path, "rb") as f:
+            data = pickle.load(f)
+    except Exception:
+        return None
+    return {
+        "continuous": {
+            col: {
+                "digest": TDigest.from_bytes(a["digest_bytes"]),
+                "reservoir": a["reservoir"], "n_seen": a["n_seen"], "unique": a["unique"],
+            }
+            for col, a in data["continuous"].items()
+        },
+        "circular": {col: dict(a) for col, a in data["circular"].items()},
+        "nominal": {
+            col: {"counts": Counter(a["counts"]), "unique": a["unique"]}
+            for col, a in data["nominal"].items()
+        },
+        "pheno": dict(data["pheno"]),
+    }
+
+
+def _write_stats_from_acc(taxon_dir: Path, acc: dict, layer_meta: dict[str, dict]) -> None:
+    """Compute and write stats files from a merged accumulator."""
+    numerical_stats: dict[str, dict] = {}
+    circular_stats: dict[str, dict] = {}
+    nominal_entries: list[dict] = []
+    density_rows: list[dict] = []
+
+    for col, a in acc["continuous"].items():
+        if col not in layer_meta:
+            continue
+        layer = layer_meta[col]
+        vtype = _layer_value_type(layer)
+        digest = a["digest"]
+        reservoir = np.array(a["reservoir"], dtype=float)
+        reservoir = reservoir[np.isfinite(reservoir)]
+        if _is_discrete(layer):
+            counts = Counter(int(v) for v in reservoir)
+            mode_val = counts.most_common(1)[0][0] if counts else None
+            stats = _continuous_stats_streaming(digest, a["unique"], None)
+            stats["mode"] = mode_val
+            if counts:
+                total = sum(counts.values())
+                min_val, max_val = min(counts), max(counts)
+                all_bins = [(k, counts.get(k, 0)) for k in range(min_val, max_val + 1)]
+                density_rows.append({
+                    "variable": col,
+                    "count": int(digest.n_values),
+                    "sampleCount": len(reservoir),
+                    "pointCount": len(all_bins),
+                    "points": [float(k) for k, _ in all_bins],
+                    "density": [float(v / total) for _, v in all_bins],
+                    "min": float(min_val),
+                    "max": float(max_val),
+                    "bandwidth": 0.0,
+                })
+        else:
+            kde = build_density_curve(reservoir, vtype) if vtype is not None and reservoir.size >= 2 else None
+            stats = _continuous_stats_streaming(digest, a["unique"], kde)
+            if kde:
+                density_rows.append({
+                    "variable": col,
+                    "count": stats["count"],
+                    "sampleCount": len(reservoir),
+                    "pointCount": len(kde["points"]),
+                    "points": kde["points"],
+                    "density": kde["density"],
+                    "min": kde["min"],
+                    "max": kde["max"],
+                    "bandwidth": kde["bandwidth"],
+                })
+        numerical_stats[col] = stats
+
+    for col, a in acc["circular"].items():
+        if col not in layer_meta or a["n"] == 0:
+            continue
+        reservoir = np.array(a["reservoir"], dtype=float)
+        reservoir = reservoir[np.isfinite(reservoir)]
+        kde = build_density_curve(reservoir, ValueType.CIRCULAR) if reservoir.size >= 2 else None
+        stats = _circ_stats_streaming(a["cos_sum"], a["sin_sum"], a["n"], a["unique"], kde)
+        if kde:
+            density_rows.append({
+                "variable": col,
+                "count": stats["count"],
+                "sampleCount": len(reservoir),
+                "pointCount": len(kde["points"]),
+                "points": kde["points"],
+                "density": kde["density"],
+                "min": kde["min"],
+                "max": kde["max"],
+                "bandwidth": kde["bandwidth"],
+            })
+        circular_stats[col] = stats
+
+    for col, a in acc["nominal"].items():
+        if col not in layer_meta:
+            continue
+        layer = layer_meta[col]
+        counts = a["counts"]
+        summary, _ = _nominal_stats(counts, a["unique"])
+        if summary:
+            nominal_entries.extend(_nominal_cat_entries(col, layer, counts, summary))
+
+    if not numerical_stats and not nominal_entries and not circular_stats:
+        return
+    pheno_acc = Counter(acc.get("pheno", {}))
+    pheno_meta = {"phenology_counts": json.dumps(dict(pheno_acc))} if pheno_acc else None
+    taxon_dir.mkdir(parents=True, exist_ok=True)
+    _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats, pheno_meta)
+    _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
+    _write_nominal_stats(taxon_dir, nominal_entries)
+    _write_density(taxon_dir, density_rows)
+
+
 def _atomic_write(path: Path, table: pa.Table, custom_metadata: dict[str, str] | None = None) -> None:
     if custom_metadata:
         existing = table.schema.metadata or {}
@@ -183,6 +534,9 @@ def _atomic_write(path: Path, table: pa.Table, custom_metadata: dict[str, str] |
 # KDE / density curve
 # ---------------------------------------------------------------------------
 
+_FFT_GRID = 512  # fine grid for FFT convolution — power of 2 for efficiency
+
+
 def _gaussian_kde_curve(values: np.ndarray) -> dict | None:
     if values.size < 2:
         return None
@@ -192,15 +546,31 @@ def _gaussian_kde_curve(values: np.ndarray) -> dict | None:
         min_val -= span
         max_val += span
     try:
-        kde = gaussian_kde(values, bw_method="silverman")
+        n = len(values)
+        std = float(np.std(values, ddof=1))
+        if std == 0.0:
+            return None
+        h = 1.06 * std * n ** (-0.2)
+        # FFT-based KDE: bin → convolve in frequency domain → sample output points.
+        # O(n + M log M) vs O(n × 128) for direct kernel eval. Exact same result.
+        counts, bin_edges = np.histogram(values, bins=_FFT_GRID, range=(min_val, max_val))
+        bin_width = (max_val - min_val) / _FFT_GRID
+        freqs = np.fft.rfftfreq(_FFT_GRID, d=bin_width)
+        kernel_fft = np.exp(-2.0 * math.pi ** 2 * freqs ** 2 * h ** 2)
+        density_fine = np.fft.irfft(np.fft.rfft(counts.astype(np.float64)) * kernel_fft)[:_FFT_GRID]
+        density_fine = np.maximum(density_fine, 0.0)
+        area = density_fine.sum() * bin_width
+        if area > 0:
+            density_fine /= area
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
         xs = np.linspace(min_val, max_val, _KDE_N_POINTS)
-        density = kde(xs)
+        density = np.interp(xs, bin_centers, density_fine)
         return {
             "points": xs.tolist(),
             "density": density.tolist(),
             "min": min_val,
             "max": max_val,
-            "bandwidth": float(kde.factor * float(values.std())),
+            "bandwidth": h,
             "mode": float(xs[int(np.argmax(density))]),
         }
     except Exception:
@@ -219,11 +589,20 @@ def _von_mises_kde_curve(values_deg: np.ndarray) -> dict | None:
         h = max((4.0 / (3.0 * n)) ** 0.2 * cstd_rad, 0.05)
         kappa = 1.0 / h ** 2
         grid_deg = np.linspace(0.0, 360.0, _KDE_N_POINTS, endpoint=False)
-        grid_rad = np.deg2rad(grid_deg)
-        # Vectorised: evaluate all sample kernels at once (n × _KDE_N_POINTS broadcast)
-        density = vonmises.pdf(
-            grid_rad[np.newaxis, :], kappa, loc=values_rad[:, np.newaxis]
-        ).sum(axis=0) / n
+        # FFT-based circular KDE: bin on [0,360) grid, convolve with wrapped Gaussian.
+        counts, _ = np.histogram(np.degrees(values_rad) % 360.0,
+                                 bins=_FFT_GRID, range=(0.0, 360.0))
+        bin_width_deg = 360.0 / _FFT_GRID
+        freqs = np.fft.rfftfreq(_FFT_GRID, d=bin_width_deg)
+        h_deg = np.degrees(h)
+        kernel_fft = np.exp(-2.0 * math.pi ** 2 * freqs ** 2 * h_deg ** 2)
+        density_fine = np.fft.irfft(np.fft.rfft(counts.astype(np.float64)) * kernel_fft)[:_FFT_GRID]
+        density_fine = np.maximum(density_fine, 0.0)
+        area = density_fine.sum() * bin_width_deg
+        if area > 0:
+            density_fine /= area
+        fine_centers = np.linspace(0.0, 360.0, _FFT_GRID, endpoint=False)
+        density = np.interp(grid_deg, fine_centers, density_fine)
         mode_deg = float(grid_deg[int(np.argmax(density))])
         return {
             "points": grid_deg.tolist(),
@@ -301,29 +680,29 @@ def _circ_stats_streaming(
 # Stats computation — exact (leaf taxa)
 # ---------------------------------------------------------------------------
 
-def _continuous_stats_exact(series: pd.Series, unique_samples: int, kde: dict | None) -> dict:
-    """Exact continuous stats via pd.describe() + KDE mode."""
-    desc = series.describe(percentiles=[0.10, 0.25, 0.50, 0.75, 0.90])
-    q10 = float(desc["10%"])
-    q25 = float(desc["25%"])
-    q75 = float(desc["75%"])
-    q90 = float(desc["90%"])
+def _continuous_stats_exact(values: np.ndarray, unique_samples: int, kde: dict | None) -> dict:
+    """Exact continuous stats via numpy (faster than pd.describe for small arrays)."""
+    q10, q25, q50, q75, q90 = np.percentile(values, [10, 25, 50, 75, 90])
+    mean = float(np.mean(values))
+    std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+    if not math.isfinite(std):
+        std = 0.0
     return {
-        "count": int(desc["count"]),
+        "count": len(values),
         "unique_samples": unique_samples,
-        "min": float(desc["min"]),
-        "10th_percentile": q10,
-        "25th_percentile": q25,
-        "median": float(desc["50%"]),
-        "75th_percentile": q75,
-        "90th_percentile": q90,
-        "max": float(desc["max"]),
-        "mean": float(desc["mean"]),
-        "std": float(desc["std"]) if math.isfinite(desc["std"]) else 0.0,
-        "variance": float(desc["std"]) ** 2 if math.isfinite(desc["std"]) else 0.0,
-        "iqr": q75 - q25,
-        "10_90_range": q90 - q10,
-        "range": float(desc["max"] - desc["min"]),
+        "min": float(values.min()),
+        "10th_percentile": float(q10),
+        "25th_percentile": float(q25),
+        "median": float(q50),
+        "75th_percentile": float(q75),
+        "90th_percentile": float(q90),
+        "max": float(values.max()),
+        "mean": mean,
+        "std": std,
+        "variance": std ** 2,
+        "iqr": float(q75 - q25),
+        "10_90_range": float(q90 - q10),
+        "range": float(values.max() - values.min()),
         "mode": kde["mode"] if kde else None,
     }
 
@@ -454,6 +833,17 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
     nominal_entries: list[dict] = []
     density_rows: list[dict] = []
 
+    # Cache total unique count — reused across columns with no nulls (the common case).
+    _total_unique: int | None = None
+
+    def _col_unique(col: str) -> int:
+        nonlocal _total_unique
+        if not df[col].isna().any():
+            if _total_unique is None:
+                _total_unique = int(df["catalogNumber"].nunique())
+            return _total_unique
+        return int(df.loc[df[col].notna(), "catalogNumber"].nunique())
+
     for col in gis_cols:
         layer = layer_meta[col]
         vtype = _layer_value_type(layer)
@@ -462,35 +852,35 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
 
         match vtype:
             case ValueType.RATIO | ValueType.INTERVAL:
-                series = pd.to_numeric(df[col], errors="coerce").dropna()
-                if series.empty:
-                    continue
-                values = series.to_numpy(dtype=float)
+                raw = df[col]
+                values = (raw.to_numpy(dtype=np.float64, na_value=np.nan)
+                          if raw.dtype == np.float64
+                          else pd.to_numeric(raw, errors="coerce").to_numpy(dtype=np.float64))
                 values = values[np.isfinite(values)]
                 if values.size == 0:
                     continue
-                unique = int(df[df[col].notna()]["catalogNumber"].nunique())
+                unique = _col_unique(col)
                 if _is_discrete(layer):
-                    stats = _continuous_stats_exact(series[np.isfinite(series)], unique, None)
-                    stats["mode"] = int(series.value_counts().idxmax())
-                    bin_counts = series.value_counts().sort_index()
+                    stats = _continuous_stats_exact(values, unique, None)
+                    counts_c = Counter(int(v) for v in values)
+                    stats["mode"] = counts_c.most_common(1)[0][0]
                     min_val, max_val = int(values.min()), int(values.max())
-                    bin_counts = bin_counts.reindex(range(min_val, max_val + 1), fill_value=0)
-                    total = int(bin_counts.sum())
+                    total = len(values)
+                    all_bins = [(k, counts_c.get(k, 0)) for k in range(min_val, max_val + 1)]
                     density_rows.append({
                         "variable": col,
                         "count": stats["count"],
-                        "sampleCount": len(values),
-                        "pointCount": len(bin_counts),
-                        "points": [float(v) for v in bin_counts.index.tolist()],
-                        "density": [float(c / total) for c in bin_counts.tolist()],
+                        "sampleCount": total,
+                        "pointCount": len(all_bins),
+                        "points": [float(k) for k, _ in all_bins],
+                        "density": [float(v / total) for _, v in all_bins],
                         "min": float(min_val),
                         "max": float(max_val),
                         "bandwidth": 0.0,
                     })
                 else:
                     kde = build_density_curve(values, vtype)
-                    stats = _continuous_stats_exact(series[np.isfinite(series)], unique, kde)
+                    stats = _continuous_stats_exact(values, unique, kde)
                     if kde:
                         density_rows.append({
                             "variable": col,
@@ -506,27 +896,28 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                 numerical_stats[col] = stats
 
             case ValueType.NOMINAL:
-                series = df[col].dropna()
-                if series.empty:
+                raw = df[col].dropna()
+                if raw.empty:
                     continue
-                unique = int(df[df[col].notna()]["catalogNumber"].nunique())
-                raw_counts: Counter = Counter()
-                for v in series:
-                    raw_counts[int(float(v))] += 1
+                unique = _col_unique(col)
+                raw_counts: Counter = Counter(int(float(v)) for v in raw)
                 summary, _ = _nominal_stats(raw_counts, unique)
                 nominal_entries.extend(_nominal_cat_entries(col, layer, raw_counts, summary))
 
             case ValueType.CIRCULAR:
-                series = pd.to_numeric(df[col], errors="coerce").dropna()
-                if series.empty:
-                    continue
-                values = series.to_numpy(dtype=float)
+                raw = df[col]
+                values = (raw.to_numpy(dtype=np.float64, na_value=np.nan)
+                          if raw.dtype == np.float64
+                          else pd.to_numeric(raw, errors="coerce").to_numpy(dtype=np.float64))
                 values = values[np.isfinite(values)]
                 if values.size == 0:
                     continue
-                unique = int(df[df[col].notna()]["catalogNumber"].nunique())
+                unique = _col_unique(col)
                 kde = build_density_curve(values, vtype)
-                stats = _circ_stats_exact(series[np.isfinite(series)], unique, kde)
+                rad = np.deg2rad(values)
+                cos_s = float(np.sum(np.cos(rad)))
+                sin_s = float(np.sum(np.sin(rad)))
+                stats = _circ_stats_streaming(cos_s, sin_s, len(values), unique, kde)
                 if kde:
                     density_rows.append({
                         "variable": col,
@@ -567,17 +958,16 @@ def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
     occ_path = taxon_dir / OCCURRENCE_FILE
     if not occ_path.exists():
         return
-    table = pq.read_table(occ_path)
+    table = _read_occ_table(occ_path, layer_meta)
     if table.num_rows == 0:
         return
     df = _filter_df(table.to_pandas())
     if df.empty:
         return
     _process_leaf_df(taxon_dir, df, layer_meta)
-    build_leaf_index(taxon_dir, df, layer_meta, taxon_dir.name.rsplit("_", 1)[-1])
 
 
-def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path) -> pd.DataFrame | None:
+def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> pd.DataFrame | None:
     """Combine occurrence data for a SPECIES and all its subspecies-equivalent descendants.
 
     Deduplicates by catalogNumber so shared observations are not double-counted.
@@ -589,7 +979,7 @@ def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path) -> pd.DataFrame | N
         occ_path = TREE_ROOT / desc["path"] / OCCURRENCE_FILE
         if not occ_path.exists():
             continue
-        table = pq.read_table(occ_path)
+        table = _read_occ_table(occ_path, layer_meta)
         if table.num_rows == 0:
             continue
         df = _filter_df(table.to_pandas())
@@ -605,11 +995,14 @@ def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path) -> pd.DataFrame | N
 
 def _process_species(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
     """Compute exact stats for a SPECIES, rolling in all subspecies observations."""
-    df = _collect_species_df(taxon, taxon_dir)
+    df = _collect_species_df(taxon, taxon_dir, layer_meta)
     if df is None or df.empty:
         return
     _process_leaf_df(taxon_dir, df, layer_meta)
-    build_leaf_index(taxon_dir, df, layer_meta, taxon_dir.name.rsplit("_", 1)[-1])
+    # Save accumulator so genus (parent) can merge without re-reading parquets.
+    # The acc includes all subspecies data (already combined by _collect_species_df).
+    taxon_dir.mkdir(parents=True, exist_ok=True)
+    _save_acc(taxon_dir, _df_to_acc(df, layer_meta))
 
 
 def collect_taxon_df(taxon: TaxonRecord, storage: ParquetStorage | None = None) -> pd.DataFrame | None:
@@ -731,7 +1124,8 @@ def compute_location_filtered_stats(
         if values.size == 0:
             return None
         kde = build_density_curve(values, ValueType.CIRCULAR)
-        stats = _circ_stats_exact(series[np.isfinite(series)], unique, kde)
+        rad = np.deg2rad(values)
+        stats = _circ_stats_streaming(float(np.sum(np.cos(rad))), float(np.sum(np.sin(rad))), len(values), unique, kde)
         density_curve = {"points": kde["points"], "density": kde["density"]} if kde else None
         return {"type": "circular", "observation_count": stats["count"], "stats": stats, "density_curve": density_curve}
     return None
@@ -744,181 +1138,33 @@ def compute_location_filtered_stats(
 # ---------------------------------------------------------------------------
 
 def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
-    # continuous_acc: layer_id → {digest, reservoir, n_seen, unique}
-    continuous_acc: dict[str, dict] = {}
-    # nominal_acc: layer_id → {counts, unique}
-    nominal_acc: dict[str, dict] = {}
-    # circular_acc: layer_id → {cos_sum, sin_sum, n, reservoir, n_seen, unique}
-    circular_acc: dict[str, dict] = {}
-    pheno_acc: Counter = Counter()
-    # index accumulation: deduplicated rows for occurrence_index.parquet
-    for desc in iter_descendants(taxon, include_self=True):
-        occ_path = TREE_ROOT / desc["path"] / OCCURRENCE_FILE
-        if not occ_path.exists():
-            continue
-        table = pq.read_table(occ_path)
-        if table.num_rows == 0:
-            continue
-        df = _filter_df(table.to_pandas())
-        if df.empty:
-            continue
+    child_accs: list[dict] = []
 
-        # Cache per-parquet unique catalog number count — reused across columns
-        # when the column has no nulls (the common case for fully-enriched data).
-        _total_unique: int | None = None
+    # Include any direct observations on this taxon (e.g. genus-level GBIF records
+    # not identified to species). Rare but valid.
+    occ_path = taxon_dir / OCCURRENCE_FILE
+    if occ_path.exists():
+        table = _read_occ_table(occ_path, layer_meta)
+        if table.num_rows > 0:
+            df = _filter_df(table.to_pandas())
+            if not df.empty:
+                child_accs.append(_df_to_acc(df, layer_meta))
 
-        def _col_unique(col: str) -> int:
-            nonlocal _total_unique
-            null_mask = df[col].isna()
-            if not null_mask.any():
-                if _total_unique is None:
-                    _total_unique = int(df["catalogNumber"].nunique())
-                return _total_unique
-            return int(df.loc[~null_mask, "catalogNumber"].nunique())
+    # Collect all direct children's accumulators, then batch-merge in one shot.
+    # Each child already accumulated its entire subtree (species acc = species + subspecies).
+    for child in get_children(taxon["taxon_key"]):
+        child_acc = _load_acc(TREE_ROOT / child["path"])
+        if child_acc is not None:
+            child_accs.append(child_acc)
 
-        for col in df.columns:
-            if col not in layer_meta:
-                continue
-            vtype = _layer_value_type(layer_meta[col])
-            if vtype is None:
-                continue
-
-            match vtype:
-                case ValueType.RATIO | ValueType.INTERVAL:
-                    raw = df[col]
-                    series = (raw.dropna() if raw.dtype == np.float64
-                              else pd.to_numeric(raw, errors="coerce").dropna())
-                    if series.empty:
-                        continue
-                    values = series.to_numpy(dtype=float)
-                    values = values[np.isfinite(values)]
-                    if values.size == 0:
-                        continue
-                    acc = continuous_acc.setdefault(col, {
-                        "digest": TDigest(), "reservoir": [], "n_seen": 0, "unique": 0,
-                    })
-                    acc["digest"].batch_update(values.tolist())
-                    acc["n_seen"] = _reservoir_update(acc["reservoir"], acc["n_seen"], values)
-                    acc["unique"] += _col_unique(col)
-
-                case ValueType.NOMINAL:
-                    series = df[col].dropna()
-                    if series.empty:
-                        continue
-                    acc = nominal_acc.setdefault(col, {"counts": Counter(), "unique": 0})
-                    for v in series:
-                        acc["counts"][int(float(v))] += 1
-                    acc["unique"] += _col_unique(col)
-
-                case ValueType.CIRCULAR:
-                    raw = df[col]
-                    series = (raw.dropna() if raw.dtype == np.float64
-                              else pd.to_numeric(raw, errors="coerce").dropna())
-                    if series.empty:
-                        continue
-                    values = series.to_numpy(dtype=float)
-                    values = values[np.isfinite(values)]
-                    if values.size == 0:
-                        continue
-                    acc = circular_acc.setdefault(col, {
-                        "cos_sum": 0.0, "sin_sum": 0.0, "n": 0,
-                        "reservoir": [], "n_seen": 0, "unique": 0,
-                    })
-                    rad = np.deg2rad(values)
-                    acc["cos_sum"] += float(np.sum(np.cos(rad)))
-                    acc["sin_sum"] += float(np.sum(np.sin(rad)))
-                    acc["n"] += len(values)
-                    acc["n_seen"] = _reservoir_update(acc["reservoir"], acc["n_seen"], values)
-                    acc["unique"] += _col_unique(col)
-
-                case _:
-                    continue  # skip unimplemented types in streaming
-
-        pheno_acc.update(compute_phenology_counts(df))
-
-    numerical_stats: dict[str, dict] = {}
-    nominal_entries: list[dict] = []
-    density_rows: list[dict] = []
-
-    for col, acc in continuous_acc.items():
-        digest = acc["digest"]
-        reservoir = np.array(acc["reservoir"], dtype=float)
-        reservoir = reservoir[np.isfinite(reservoir)]
-        layer = layer_meta[col]
-        vtype = _layer_value_type(layer)
-        if _is_discrete(layer):
-            counts = Counter(int(v) for v in reservoir)
-            mode_val = counts.most_common(1)[0][0] if counts else None
-            stats = _continuous_stats_streaming(digest, acc["unique"], None)
-            stats["mode"] = mode_val
-            if counts:
-                total = sum(counts.values())
-                min_val, max_val = min(counts), max(counts)
-                all_bins = [(k, counts.get(k, 0)) for k in range(min_val, max_val + 1)]
-                density_rows.append({
-                    "variable": col,
-                    "count": int(digest.n_values),
-                    "sampleCount": len(reservoir),
-                    "pointCount": len(all_bins),
-                    "points": [float(k) for k, _ in all_bins],
-                    "density": [float(v / total) for _, v in all_bins],
-                    "min": float(min_val),
-                    "max": float(max_val),
-                    "bandwidth": 0.0,
-                })
-        else:
-            kde = build_density_curve(reservoir, vtype) if vtype is not None else None
-            stats = _continuous_stats_streaming(digest, acc["unique"], kde)
-            if kde:
-                density_rows.append({
-                    "variable": col,
-                    "count": stats["count"],
-                    "sampleCount": len(reservoir),
-                    "pointCount": len(kde["points"]),
-                    "points": kde["points"],
-                    "density": kde["density"],
-                    "min": kde["min"],
-                    "max": kde["max"],
-                    "bandwidth": kde["bandwidth"],
-                })
-        numerical_stats[col] = stats
-
-    for col, acc in nominal_acc.items():
-        layer = layer_meta[col]
-        summary, _ = _nominal_stats(acc["counts"], acc["unique"])
-        nominal_entries.extend(_nominal_cat_entries(col, layer, acc["counts"], summary))
-
-    circular_stats: dict[str, dict] = {}
-    for col, acc in circular_acc.items():
-        if acc["n"] == 0:
-            continue
-        layer = layer_meta[col]
-        reservoir = np.array(acc["reservoir"], dtype=float)
-        reservoir = reservoir[np.isfinite(reservoir)]
-        kde = build_density_curve(reservoir, ValueType.CIRCULAR) if reservoir.size >= 2 else None
-        stats = _circ_stats_streaming(acc["cos_sum"], acc["sin_sum"], acc["n"], acc["unique"], kde)
-        if kde:
-            density_rows.append({
-                "variable": col,
-                "count": stats["count"],
-                "sampleCount": len(reservoir),
-                "pointCount": len(kde["points"]),
-                "points": kde["points"],
-                "density": kde["density"],
-                "min": kde["min"],
-                "max": kde["max"],
-                "bandwidth": kde["bandwidth"],
-            })
-        circular_stats[col] = stats
-
-    if not numerical_stats and not nominal_entries and not circular_stats:
+    if not child_accs:
         return
-    pheno_meta = {"phenology_counts": json.dumps(dict(pheno_acc))} if pheno_acc else None
+
+    acc = _merge_accs_batch(child_accs)
+
     taxon_dir.mkdir(parents=True, exist_ok=True)
-    _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats, pheno_meta)
-    _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
-    _write_nominal_stats(taxon_dir, nominal_entries)
-    _write_density(taxon_dir, density_rows)
+    _save_acc(taxon_dir, acc)
+    _write_stats_from_acc(taxon_dir, acc, layer_meta)
 
 
 
@@ -927,10 +1173,22 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def stats_complete(taxon: TaxonRecord) -> bool:
+    """True if stats for this taxon have already been written and can be skipped."""
+    taxon_dir = TREE_ROOT / taxon["path"]
+    if not (taxon_dir / NUMERICAL_STATS_FILE).exists():
+        return False
+    # Non-leaf taxa must also have their .acc file so the parent can merge it.
+    if taxon["rank"] not in CONFIG.subspecies_equivalents:
+        return (taxon_dir / _ACC_FILE).exists()
+    return True
+
+
 def compute_taxon_stats(
     taxon: TaxonRecord,
     layers: list[dict],
     layer_meta: dict[str, dict] | None = None,
+    resume: bool = False,
 ) -> None:
     """Compute and write summary stats for one taxon node.
 
@@ -944,6 +1202,8 @@ def compute_taxon_stats(
     ``layer_meta`` may be pre-built and passed in to avoid rebuilding it for every taxon.
     """
     taxon_dir = TREE_ROOT / taxon["path"]
+    if resume and stats_complete(taxon):
+        return
     if layer_meta is None:
         layer_meta = {layer["id"]: layer for layer in layers}
     rank = taxon["rank"]
@@ -953,7 +1213,5 @@ def compute_taxon_stats(
         _process_species(taxon, taxon_dir, layer_meta)
     else:
         _process_nonleaf(taxon, taxon_dir, layer_meta)
-        if rank in _INDEX_RANKS:
-            build_nonleaf_index(taxon, taxon_dir)
 
 

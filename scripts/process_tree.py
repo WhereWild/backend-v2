@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 
@@ -28,7 +28,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from config.config import load_config
-from util.rankings import POSITION_FILE, compute_relative_ranks
+from util.rankings import POSITION_FILE, POSITION_CTX_GLOB, compute_relative_ranks, preload_stats_cache
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -38,6 +38,7 @@ from util.stats import (
     PHENOLOGY_COUNTS_FILE,
     TREE_ROOT,
     compute_taxon_stats,
+    stats_complete,
 )
 from util.storage import atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants
@@ -45,10 +46,9 @@ from util.tiles import load_layers
 
 CONFIG = load_config("global")
 
-STATS_WORKERS = 4
-RANK_WORKERS = 4
+STATS_WORKERS = 1
+RANK_WORKERS = 1
 LOG_INTERVAL = 50
-
 
 def _load_layers() -> list[dict]:
     return load_layers()
@@ -72,6 +72,8 @@ def _level_pass(
     completed = 0
     failed = 0
     t0 = time.monotonic()
+    _WINDOW = 500
+    recent: deque[float] = deque(maxlen=_WINDOW)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for depth in levels:
@@ -82,14 +84,20 @@ def _level_pass(
                 try:
                     future.result()
                     completed += 1
+                    now = time.monotonic()
+                    recent.append(now)
                     if completed % LOG_INTERVAL == 0 or completed == total:
-                        elapsed = time.monotonic() - t0
-                        rate = completed / elapsed
+                        elapsed = now - t0
+                        if len(recent) >= 2:
+                            rate = (len(recent) - 1) / (recent[-1] - recent[0])
+                        else:
+                            rate = completed / elapsed if elapsed > 0 else 0
                         eta = (total - completed) / rate if rate > 0 else 0
                         print(
                             f"[{label}] {completed}/{total}"
                             f"  elapsed={_fmt_duration(elapsed)}"
                             f"  eta={_fmt_duration(eta)}"
+                            f"  rate={rate:.1f}/s"
                             f"  ({node['rank']} {node['scientific_name']})"
                         )
                 except Exception as exc:
@@ -136,6 +144,24 @@ def run_consolidation() -> None:
     """Merge per-node stats files into global files under data/taxonomy/global/."""
     GLOBAL_STATS_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
+
+    # Merge per-context position files → one relative_ranks_positions.parquet per taxon
+    print("[consolidate] merging per-context position files...")
+    ctx_dirs: dict[Path, list[Path]] = {}
+    for ctx_file in TREE_ROOT.rglob(POSITION_CTX_GLOB):
+        ctx_dirs.setdefault(ctx_file.parent, []).append(ctx_file)
+    n_merged = 0
+    for taxon_dir, ctx_files in ctx_dirs.items():
+        try:
+            combined = pa.concat_tables([pq.read_table(f) for f in ctx_files])
+            atomic_write_parquet(taxon_dir / POSITION_FILE, combined, row_group_size=256)
+            for f in ctx_files:
+                f.unlink(missing_ok=True)
+            n_merged += 1
+        except Exception as e:
+            print(f"[consolidate] positions merge failed {taxon_dir.name}: {e}")
+    print(f"[consolidate] merged positions for {n_merged:,} taxa  [{time.monotonic()-t0:.1f}s]")
+
     print("[consolidate] building global stats files")
 
     tmp_dir = GLOBAL_STATS_DIR / ".tmp_consolidate"
@@ -203,31 +229,46 @@ def run_consolidation() -> None:
         n_taxa = len(set(r["taxon_key"] for r in pheno_rows))
         print(f"[consolidate] phenology: {len(pheno_rows)} rows for {n_taxa} taxa  [{time.monotonic() - t0:.1f}s]")
 
-    # Remove per-node stats files and any leftover {rank}.parquet catalogs
+    # Remove per-node stats files, accumulator state, rank catalogs, and any tmp parquets
     removed = 0
     patterns = [filename for _, filename in _STATS_FILES] + [
         PHENOLOGY_COUNTS_FILE,
         "species.parquet", "subspecies.parquet", "genus.parquet",
         "family.parquet", "order.parquet", "variety.parquet", "form.parquet",
+        ".acc",
     ]
     for filename in patterns:
         for path in TREE_ROOT.rglob(filename):
             path.unlink()
             removed += 1
+    for path in TREE_ROOT.rglob("tmp*.parquet"):
+        path.unlink()
+        removed += 1
+    for path in TREE_ROOT.rglob(POSITION_CTX_GLOB):
+        path.unlink()
+        removed += 1
     print(f"[consolidate] removed {removed} per-node files")
     print(f"[consolidate] done — {time.monotonic() - t0:.1f}s total")
 
 
-def run_stats() -> None:
+def run_stats(resume: bool = False) -> None:
     layers, layer_meta, by_depth, stats_levels, _, total = _setup()
-    print(f"[process_tree] {total} taxa — stats:{STATS_WORKERS} workers")
-    task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta)
+    print(f"[process_tree] {total} taxa — stats:{STATS_WORKERS} workers" + (" — RESUME" if resume else ""))
+    task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta, resume=resume)
     _level_pass(by_depth, stats_levels, task, max_workers=STATS_WORKERS, label="stats", total=total)
 
 
 def run_rankings() -> None:
     layers, _, by_depth, _, rank_levels, total = _setup()
     print(f"[process_tree] {total} taxa — rankings:{RANK_WORKERS} workers")
+    removed = 0
+    for pattern in ["tmp*.parquet", POSITION_CTX_GLOB, POSITION_FILE]:
+        for p in TREE_ROOT.rglob(pattern):
+            p.unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        print(f"[process_tree] cleaned up {removed} stale position/tmp files")
+    preload_stats_cache(layers)
     task = partial(compute_relative_ranks, layers=layers)
     _level_pass(by_depth, rank_levels, task, max_workers=RANK_WORKERS, label="rankings", total=total)
 
@@ -239,6 +280,11 @@ def main() -> None:
         choices=["stats", "rankings", "consolidate", "all"],
         default="all",
         help="Run stats, rankings, consolidate, or all (default: all).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip taxa whose stats files are already written (for restarts).",
     )
     args, _ = parser.parse_known_args()
 
@@ -252,10 +298,11 @@ def main() -> None:
         f"[process_tree] {total} taxa across {len(stats_levels)} levels"
         f" — stats:{STATS_WORKERS} workers  rankings:{RANK_WORKERS} workers"
         f" — phase:{args.phase}"
+        + (" — RESUME" if args.resume else "")
     )
 
     if args.phase in ("stats", "all"):
-        task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta)
+        task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta, resume=args.resume)
         _level_pass(
             by_depth, stats_levels, task,
             max_workers=STATS_WORKERS, label="stats", total=total,
@@ -264,6 +311,14 @@ def main() -> None:
             print("[process_tree] stats complete — starting rankings pass")
 
     if args.phase in ("rankings", "all"):
+        removed = 0
+        for pattern in ["tmp*.parquet", POSITION_CTX_GLOB, POSITION_FILE]:
+            for p in TREE_ROOT.rglob(pattern):
+                p.unlink(missing_ok=True)
+                removed += 1
+        if removed:
+            print(f"[process_tree] cleaned up {removed} stale position/tmp files")
+        preload_stats_cache(layers)
         task = partial(compute_relative_ranks, layers=layers)
         _level_pass(
             by_depth, rank_levels, task,

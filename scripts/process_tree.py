@@ -353,6 +353,12 @@ def run_consolidation() -> None:
         path.unlink()
         removed += 1
     print(f"[consolidate] removed {removed} per-node files")
+
+    cache_file = GLOBAL_STATS_DIR.parent / "stats_cache.pkl.gz"
+    if cache_file.exists():
+        cache_file.unlink()
+        print(f"[consolidate] removed {cache_file.name}")
+
     print(f"[consolidate] done — {time.monotonic() - t0:.1f}s total")
 
 

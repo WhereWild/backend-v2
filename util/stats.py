@@ -537,7 +537,7 @@ def _atomic_write(path: Path, table: pa.Table, custom_metadata: dict[str, str] |
 _FFT_GRID = 512  # fine grid for FFT convolution — power of 2 for efficiency
 
 
-def _gaussian_kde_curve(values: np.ndarray) -> dict | None:
+def _gaussian_kde_curve(values: np.ndarray, bounded_at_zero: bool = False) -> dict | None:
     if values.size < 2:
         return None
     min_val, max_val = float(values.min()), float(values.max())
@@ -551,10 +551,22 @@ def _gaussian_kde_curve(values: np.ndarray) -> dict | None:
         if std == 0.0:
             return None
         h = 1.06 * std * n ** (-0.2)
+
+        # For ratio-scale variables (min ≥ 0), the FFT treats the signal as
+        # periodic, so mass near 0 wraps around and appears as a fake spike at
+        # the upper end. Fix: reflect data at 0 → compute KDE on [-max, max] →
+        # extract [0, max] and double (fold correction). Bandwidth h is still
+        # derived from the original data so Scott's rule is unaffected.
+        if bounded_at_zero and min_val >= 0.0:
+            work_vals = np.concatenate([-values, values])
+            work_min, work_max = -max_val, max_val
+        else:
+            work_vals, work_min, work_max = values, min_val, max_val
+
         # FFT-based KDE: bin → convolve in frequency domain → sample output points.
         # O(n + M log M) vs O(n × 128) for direct kernel eval. Exact same result.
-        counts, bin_edges = np.histogram(values, bins=_FFT_GRID, range=(min_val, max_val))
-        bin_width = (max_val - min_val) / _FFT_GRID
+        counts, bin_edges = np.histogram(work_vals, bins=_FFT_GRID, range=(work_min, work_max))
+        bin_width = (work_max - work_min) / _FFT_GRID
         freqs = np.fft.rfftfreq(_FFT_GRID, d=bin_width)
         kernel_fft = np.exp(-2.0 * math.pi ** 2 * freqs ** 2 * h ** 2)
         density_fine = np.fft.irfft(np.fft.rfft(counts.astype(np.float64)) * kernel_fft)[:_FFT_GRID]
@@ -563,8 +575,15 @@ def _gaussian_kde_curve(values: np.ndarray) -> dict | None:
         if area > 0:
             density_fine /= area
         bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-        xs = np.linspace(min_val, max_val, _KDE_N_POINTS)
-        density = np.interp(xs, bin_centers, density_fine)
+
+        if bounded_at_zero and min_val >= 0.0:
+            xs = np.linspace(0.0, max_val, _KDE_N_POINTS)
+            density = np.interp(xs, bin_centers, density_fine) * 2.0
+            min_val = 0.0
+        else:
+            xs = np.linspace(min_val, max_val, _KDE_N_POINTS)
+            density = np.interp(xs, bin_centers, density_fine)
+
         return {
             "points": xs.tolist(),
             "density": density.tolist(),
@@ -622,7 +641,11 @@ def build_density_curve(values: np.ndarray, value_type: ValueType) -> dict | Non
     Returns a dict with points/density/min/max/bandwidth/mode, or None.
     """
     match value_type:
-        case ValueType.RATIO | ValueType.INTERVAL:
+        case ValueType.RATIO:
+            arr = np.asarray(values, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            return _gaussian_kde_curve(arr, bounded_at_zero=True)
+        case ValueType.INTERVAL:
             arr = np.asarray(values, dtype=float)
             arr = arr[np.isfinite(arr)]
             return _gaussian_kde_curve(arr)

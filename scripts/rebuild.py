@@ -236,16 +236,6 @@ def wipe_data_dir() -> None:
 # pipeline
 # ---------------------------------------------------------------------------
 
-def _pid_alive(pid: int | None) -> bool:
-    """Return True if a process with the given PID is currently running."""
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
-
 
 def _sync_gbif_stage() -> None:
     sync_gbif.main()
@@ -304,17 +294,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Detect a previous crash: if a prior run left status=in_progress but its
-    # PID is gone, it never finished cleanly (OOM, power loss, etc.).
-    # If the PID is still alive, another instance is already running — exit.
     existing = _read_sync_state().get("pipeline", {})
     resuming = False
 
     if existing.get("status") == "in_progress":
-        running_pid = existing.get("pid")
-        if _pid_alive(running_pid):
-            print(f"Pipeline already running (pid {running_pid}), exiting.")
-            return
         crashed_at = _now()
         _update_pipeline({"status": "crashed", "finished_at": crashed_at})
         print("WARNING: previous pipeline run did not finish — marked as crashed")

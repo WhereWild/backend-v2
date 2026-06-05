@@ -47,7 +47,7 @@ from util.temporal import (
 # Chunks with this many observations or fewer are read via HTTP range requests
 # instead of a full download. Pre-2010 chunks and carry-forward tails are
 # typically sparse, so this avoids downloading GB-sized files for a handful of points.
-_RANGE_REQUEST_THRESHOLD = int(os.environ.get("TEMPORAL_RANGE_REQUEST_THRESHOLD", "500"))
+_RANGE_REQUEST_THRESHOLD = int(os.environ.get("TEMPORAL_RANGE_REQUEST_THRESHOLD", "1000"))
 
 CATALOG_PATH = Path("config/gis/catalog.json")
 
@@ -179,11 +179,20 @@ def _run_layer(
         }
         dense_chunks = [e for e in chunks_this_batch if e.chunk_num not in sparse_set]
 
+        print(
+            f"[prefetch] {layer.id} batch={batch_num}: "
+            f"{len(dense_chunks)} download + {len(sparse_set)} range-req "
+            f"({sum(batch_chunk_worklists[e.chunk_num].num_rows for e in dense_chunks)} dense obs, "
+            f"{sum(batch_chunk_worklists[e.chunk_num].num_rows for e in chunks_this_batch if e.chunk_num in sparse_set)} sparse obs)"
+        )
+
         # Prefetch primary source for dense chunks only.
         if dense_chunks:
+            t_dl = time.monotonic()
             with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as dl_pool:
                 for fut in [dl_pool.submit(_download_layer_chunk, e, layer.model, [primary_var], cfg.temporal_cache_dir) for e in dense_chunks]:
                     fut.result()
+            print(f"[prefetch] {layer.id} batch={batch_num}: downloads done ({time.monotonic() - t_dl:.1f}s)")
 
         batch_rows_done = 0
         tail_buffer: TailBuffer = {}
@@ -196,6 +205,10 @@ def _run_layer(
                 break
             chunk_worklist = batch_chunk_worklists[chunk_entry.chunk_num]
             use_range = chunk_entry.chunk_num in sparse_set
+            print(
+                f"[chunk] {layer.id} chunk={chunk_entry.chunk_num} "
+                f"obs={chunk_worklist.num_rows} mode={'range-req' if use_range else 'download'}"
+            )
             try:
                 if layer.id == "vapor_pressure_deficit":
                     updates, tail_buffer = process_chunk_vpd(

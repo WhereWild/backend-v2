@@ -530,6 +530,14 @@ def _open_chunk(entry: ChunkRange, model: str, variable: str) -> OmFileReader:
     return OmFileReader.from_fsspec(fs, path)
 
 
+def _open_chunk_s3(entry: ChunkRange, model: str, variable: str) -> OmFileReader:
+    """Open a chunk directly from S3 via HTTP range requests — no local download."""
+    filename = _chunk_filename(entry)
+    path = f"openmeteo/data/{model}/{variable}/{filename}"
+    fs = fsspec.filesystem("s3", anon=True)
+    return OmFileReader.from_fsspec(fs, path)
+
+
 def _download_chunk(
     chunk_entry: ChunkRange,
     model: str,
@@ -877,6 +885,7 @@ def process_chunk(
     steps: dict[int, int],
     agg_mode: str,
     cache_dir: str,
+    range_request: bool = False,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Download, process, and delete one .om chunk.
 
@@ -904,8 +913,8 @@ def process_chunk(
     """
     max_window_steps = max(steps.values()) if steps else 0
 
-    local_path = _download_chunk(chunk_entry, model, variable, cache_dir)
-    reader = OmFileReader(str(local_path))
+    reader = (_open_chunk_s3(chunk_entry, model, variable) if range_request
+              else OmFileReader(str(_download_chunk(chunk_entry, model, variable, cache_dir))))
     ny, nx, _ = reader.shape
 
     data = worklist_slice.to_pydict()
@@ -1032,6 +1041,7 @@ def process_chunk_mode(
     resolution: float,
     cache_dir: str,
     secondary_indices: dict[str, ChunkIndex] | None = None,
+    range_request: bool = False,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Download multiple .om files, derive a per-timestep series, apply sliding-window mode.
 
@@ -1046,22 +1056,24 @@ def process_chunk_mode(
     _precip_idx = _sv.index("precipitation")
     _snow_idx   = _sv.index("snowfall_water_equivalent")
 
+    def _open(entry: ChunkRange, var: str) -> OmFileReader:
+        return (_open_chunk_s3(entry, model, var) if range_request
+                else OmFileReader(str(_download_chunk(entry, model, var, cache_dir))))
+
     primary_var = source_variables[0]
-    readers: list[OmFileReader | None] = [
-        OmFileReader(str(_download_chunk(chunk_entry, model, primary_var, cache_dir)))
-    ]
+    readers: list[OmFileReader | None] = [_open(chunk_entry, primary_var)]
     sec_offsets: list[int] = [0]
     for var in source_variables[1:]:
         if secondary_indices is not None and var in secondary_indices:
             sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
             if sec_entry is not None:
-                readers.append(OmFileReader(str(_download_chunk(sec_entry, model, var, cache_dir))))
+                readers.append(_open(sec_entry, var))
                 sec_offsets.append(sec_t0)
             else:
                 readers.append(None)
                 sec_offsets.append(0)
         else:
-            readers.append(OmFileReader(str(_download_chunk(chunk_entry, model, var, cache_dir))))
+            readers.append(_open(chunk_entry, var))
             sec_offsets.append(0)
     ny, nx, _ = readers[0].shape
 
@@ -1194,6 +1206,7 @@ def process_chunk_vpd(
     resolution: float,
     cache_dir: str,
     secondary_indices: dict[str, ChunkIndex] | None = None,
+    range_request: bool = False,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Derive VPD per-timestep from temperature_2m and dew_point_2m, then avg over windows.
 
@@ -1202,22 +1215,24 @@ def process_chunk_vpd(
     """
     max_window_steps = max(steps.values()) if steps else 0
 
+    def _open(entry: ChunkRange, var: str) -> OmFileReader:
+        return (_open_chunk_s3(entry, model, var) if range_request
+                else OmFileReader(str(_download_chunk(entry, model, var, cache_dir))))
+
     primary_var = source_variables[0]
-    readers: list[OmFileReader | None] = [
-        OmFileReader(str(_download_chunk(chunk_entry, model, primary_var, cache_dir)))
-    ]
+    readers: list[OmFileReader | None] = [_open(chunk_entry, primary_var)]
     sec_offsets: list[int] = [0]
     for var in source_variables[1:]:
         if secondary_indices is not None and var in secondary_indices:
             sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
             if sec_entry is not None:
-                readers.append(OmFileReader(str(_download_chunk(sec_entry, model, var, cache_dir))))
+                readers.append(_open(sec_entry, var))
                 sec_offsets.append(sec_t0)
             else:
                 readers.append(None)
                 sec_offsets.append(0)
         else:
-            readers.append(OmFileReader(str(_download_chunk(chunk_entry, model, var, cache_dir))))
+            readers.append(_open(chunk_entry, var))
             sec_offsets.append(0)
 
     ny, nx, _ = readers[0].shape
@@ -1343,7 +1358,7 @@ def process_chunk_vpd(
 
 def _atomic_write(parquet_path: Path, table: pa.Table) -> None:
     from util.storage import atomic_write_parquet
-    atomic_write_parquet(parquet_path, table, row_group_size=256)
+    atomic_write_parquet(parquet_path, table, row_group_size=50_000)
 
 
 def _apply_updates_arrow(

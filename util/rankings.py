@@ -15,9 +15,12 @@ import csv
 import json
 import math
 import os
+import re as _re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+_TEMPORAL_RE = _re.compile(r'_\d+h$')
 
 import numpy as np
 import pyarrow as pa
@@ -41,13 +44,23 @@ _storage = ParquetStorageProxy(
 _stats_cache: dict[str, tuple[int, np.ndarray]] | None = None
 _metric_vocab: list[str] = []       # sorted list of all metric keys
 _metric_to_idx: dict[str, int] = {} # reverse lookup
+# Boolean mask over _metric_vocab: True = include in rank indexes, False = skip.
+# Temporal variables (layer IDs ending in _\d+h) are excluded — too many columns.
+_rankings_mask: np.ndarray | None = None  # shape (len(_metric_vocab),), dtype bool
+
+def _build_rankings_mask() -> None:
+    global _rankings_mask
+    _rankings_mask = np.array(
+        [not _TEMPORAL_RE.search(k.split("::")[0]) for k in _metric_vocab],
+        dtype=bool,
+    )
 
 CONFIG = load_config("global")
 
 TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
 _CACHE_FILE = TREE_ROOT.parent / "stats_cache.pkl.gz"
 POSITION_FILE = "relative_ranks_positions.parquet"
-POSITION_CTX_GLOB = "positions_ctx_*.parquet"  # per-context files written during rankings pass
+POSITION_CTX_GLOB = "*_positions.parquet"  # per-context files written during rankings pass
 
 # Canonical taxonomy rank order used to determine descendant catalog targets.
 _RANK_ORDER: tuple[str, ...] = (
@@ -56,11 +69,12 @@ _RANK_ORDER: tuple[str, ...] = (
 
 
 _POSITION_SCHEMA = pa.schema([
+    pa.field("taxon_key", pa.string()),
     pa.field("variable", pa.string()),
     pa.field("metric", pa.string()),
-    pa.field("position", pa.int64()),
-    pa.field("count", pa.int64()),
-    pa.field("sampleCount", pa.int64()),
+    pa.field("position", pa.int32()),
+    pa.field("count", pa.int32()),
+    pa.field("sampleCount", pa.int32()),
     pa.field("contextTaxonId", pa.string()),
     pa.field("contextLabel", pa.string()),
 ])
@@ -83,7 +97,7 @@ def _safe_finite(x) -> bool:
         return False
 
 def _atomic_write(path: Path, table: pa.Table) -> None:
-    atomic_write_parquet(path, table, row_group_size=256)
+    atomic_write_parquet(path, table, row_group_size=50_000)
 
 
 def _resolve_context_label(taxon: TaxonRecord) -> str:
@@ -273,6 +287,7 @@ def preload_stats_cache(layers: list[dict]) -> None:
             _metric_vocab[:] = saved["vocab"]
             _metric_to_idx.update({k: i for i, k in enumerate(_metric_vocab)})
             _stats_cache.update(saved["cache"])
+            _build_rankings_mask()
             print(f"[rankings] cache loaded from disk: {len(_stats_cache):,} taxa  [{_time.monotonic()-t0:.1f}s]")
             return
         except Exception as e:
@@ -284,9 +299,6 @@ def preload_stats_cache(layers: list[dict]) -> None:
     all_paths = list(TREE_ROOT.rglob(NUMERICAL_STATS_FILE))
     total_paths = len(all_paths)
     t0 = _time.monotonic()
-    done = 0
-    LOG_EVERY = 10_000
-
     # Phase 1: read all stats files in parallel, collect raw dicts
     raw: dict[str, dict] = {}
     print(f"[rankings] preloading stats cache for {total_paths:,} taxa...")
@@ -298,15 +310,6 @@ def preload_stats_cache(layers: list[dict]) -> None:
                 raw[taxon_key] = entry
             except Exception:
                 pass
-            done += 1
-            if done % LOG_EVERY == 0 or done == total_paths:
-                elapsed = _time.monotonic() - t0
-                rate = done / elapsed if elapsed > 0 else 0
-                eta = (total_paths - done) / rate if rate > 0 else 0
-                m, s = divmod(int(eta), 60)
-                eta_str = f"{m}m{s:02d}s" if m else f"{s}s"
-                print(f"[rankings/preload] {done:,}/{total_paths:,}  {rate:.0f}/s  eta={eta_str}")
-    print(f"[rankings] read complete: {len(raw):,} taxa  [{_time.monotonic()-t0:.1f}s]  converting to compact format...")
 
     # Phase 2: build global metric vocab and convert to numpy float32 arrays (~6x RAM reduction)
     all_keys: set[str] = set()
@@ -314,6 +317,7 @@ def preload_stats_cache(layers: list[dict]) -> None:
         all_keys.update(k for k in entry if k != "__sample_count__")
     _metric_vocab[:] = sorted(all_keys)
     _metric_to_idx.update({k: i for i, k in enumerate(_metric_vocab)})
+    _build_rankings_mask()
     n_metrics = len(_metric_vocab)
 
     for taxon_key, entry in raw.items():
@@ -556,17 +560,10 @@ def _build_rank_index(
     layers: list[dict],
 ) -> None:
     """Collect per-taxon metrics for all descendants of rank and write sorted struct array index."""
-    import time as _time
-    ancestor_name = ancestor.get("scientific_name") or ancestor.get("taxon_key", "?")
-    ancestor_rank = ancestor.get("rank", "?")
-    t0 = _time.monotonic()
-
     descendants = _descendants_for_rank(ancestor, rank)
     if not descendants:
         index_path.unlink(missing_ok=True)
         return
-
-    print(f"  [rank_index] {ancestor_rank} {ancestor_name} → {rank}: {len(descendants):,} descendants", flush=True)
 
     # Collect lightweight (taxon_key, cached_dict) pairs — just references into _stats_cache,
     # no data copying. Then process one column at a time so only one Python list of entries
@@ -594,10 +591,13 @@ def _build_rank_index(
         col_idx: dict[str, list[int]] = {}
         col_val: dict[str, list[float]] = {}
         vocab = _metric_vocab
-        print(f"    collecting {len(desc_data):,} taxa...", flush=True)
+        include = _rankings_mask  # excludes temporal vars; None before preload (shouldn't happen)
         for i, (_, entry) in enumerate(desc_data):
             values_arr = entry[1]
-            for metric_idx in np.where(~np.isnan(values_arr))[0]:
+            active = ~np.isnan(values_arr)
+            if include is not None:
+                active &= include
+            for metric_idx in np.where(active)[0]:
                 k = vocab[metric_idx]
                 v = float(values_arr[metric_idx])
                 if k in col_idx:
@@ -625,13 +625,24 @@ def _build_rank_index(
             index_path.unlink(missing_ok=True)
             return
 
+    context_taxon_id = str(ancestor["taxon_key"])
+    context_label = _resolve_context_label(ancestor)
+
     struct_type = pa.struct(_STRUCT_FIELDS)
     arrays: dict[str, pa.Array] = {}
     column_lengths: dict[str, int] = {}
     max_len = 0
 
-    n_cols = len(col_idx) if _stats_cache is not None else len(col_idx_fb)  # type: ignore[possibly-undefined]
-    print(f"    sorting+building {n_cols:,} columns...", flush=True)
+    # Positions accumulators — numpy chunks for ints (no Python int objects),
+    # plain lists for strings (references to existing objects, no copies).
+    pos_tks:  list[str] = []
+    pos_vars: list[str] = []
+    pos_mets: list[str] = []
+    pos_pos_chunks: list[np.ndarray] = []
+    pos_cnt_chunks: list[np.ndarray] = []
+    pos_sc_chunks:  list[np.ndarray] = []
+
+
 
     if _stats_cache is not None:
         for col_key in sorted(col_idx):
@@ -656,6 +667,32 @@ def _build_rank_index(
                 ],
                 fields=_STRUCT_FIELDS,
             )
+
+            # Collect positions inline — data is already sorted, no re-read needed.
+            variable, metric = col_key.split("::", 1)
+            if metric not in _ANGULAR_METRICS and n > 0:
+                sorted_vals = val_np[order]
+                # Vectorised min_rank_pos: tied values share the first position in their group.
+                is_new = np.empty(n, dtype=bool)
+                is_new[0] = True
+                if n > 1:
+                    is_new[1:] = sorted_vals[1:] != sorted_vals[:-1]
+                group_starts = np.where(is_new)[0]
+                group_ids = np.cumsum(is_new) - 1
+                min_rank_arr = group_starts[group_ids].astype(np.int32)
+
+                if metric.startswith("class_"):
+                    indices = np.where(sorted_vals != 0.0)[0]
+                else:
+                    indices = np.arange(n, dtype=np.int32)
+
+                if len(indices):
+                    pos_tks.extend([sorted_tks[i] for i in indices])
+                    pos_vars.extend([variable] * len(indices))
+                    pos_mets.extend([metric] * len(indices))
+                    pos_pos_chunks.append(min_rank_arr[indices])
+                    pos_cnt_chunks.append(np.full(len(indices), n, dtype=np.int32))
+                    pos_sc_chunks.append(sorted_scs[indices].astype(np.int32))
     else:
         for col_key, entries in col_idx_fb.items():  # type: ignore[possibly-undefined]
             entries.sort(key=lambda e: (e[1], e[0]))
@@ -684,7 +721,30 @@ def _build_rank_index(
     table = pa.table(arrays)
     metadata = {b"column_lengths": json.dumps(column_lengths).encode("utf-8")}
     _atomic_write(index_path, table.replace_schema_metadata(metadata))
-    print(f"    wrote {n_cols:,} cols  max_len={max_len:,}  [{_time.monotonic()-t0:.1f}s]", flush=True)
+    del arrays, table
+
+    # Write per-(ancestor,rank) positions file — no distribute pass needed.
+    if pos_tks and pos_pos_chunks:
+        all_pos = np.concatenate(pos_pos_chunks)
+        all_cnt = np.concatenate(pos_cnt_chunks)
+        all_sc  = np.concatenate(pos_sc_chunks)
+        del pos_pos_chunks, pos_cnt_chunks, pos_sc_chunks
+        n_pos = len(pos_tks)
+        pos_table = pa.table({
+            "taxon_key":     pa.array(pos_tks,  type=pa.string()),
+            "variable":      pa.array(pos_vars, type=pa.string()),
+            "metric":        pa.array(pos_mets, type=pa.string()),
+            "position":      pa.array(all_pos),
+            "count":         pa.array(all_cnt),
+            "sampleCount":   pa.array(all_sc),
+            "contextTaxonId": pa.array([context_taxon_id] * n_pos, type=pa.string()),
+            "contextLabel":   pa.array([context_label]    * n_pos, type=pa.string()),
+        }, schema=_POSITION_SCHEMA)
+        del pos_tks, pos_vars, pos_mets, all_pos, all_cnt, all_sc
+        # Sort by taxon_key so consolidation can merge-sort efficiently.
+        pos_table = pos_table.sort_by([("taxon_key", "ascending")])
+        ctx_pos_path = index_path.parent / f"{rank.lower()}_positions.parquet"
+        _atomic_write(ctx_pos_path, pos_table)
 
 
 def build_rank_indexes(ancestor: TaxonRecord, layers: list[dict]) -> None:
@@ -715,132 +775,6 @@ def _load_column_lengths(index_path: Path) -> dict[str, int]:
         return {}
 
 
-def _load_existing_positions(positions_path: Path) -> list[dict[str, Any]]:
-    if not positions_path.exists():
-        return []
-    try:
-        rows = pq.read_table(positions_path).to_pylist()
-        return [r for r in rows if r.get("variable") and r.get("metric")]
-    except Exception:
-        return []
-
-
-def _distribute_positions(ancestor: TaxonRecord, index_path: Path) -> None:
-    """Read one rank index and upsert position rows into each descendant's file."""
-    if not index_path.exists():
-        return
-    try:
-        schema = pq.read_schema(index_path)
-    except Exception:
-        return
-
-    metric_columns = [n for n in schema.names if "::" in n]
-    if not metric_columns:
-        return
-
-    column_lengths = _load_column_lengths(index_path)
-    context_taxon_id = str(ancestor["taxon_key"])
-    context_label = _resolve_context_label(ancestor)
-
-    import gc as _gc
-    import time as _dtime
-    _dt0 = _dtime.monotonic()
-    anc_name = ancestor.get("scientific_name") or ancestor.get("taxon_key", "?")
-    rank_label = index_path.stem
-    print(f"  [distribute] {anc_name} {rank_label}: reading {len(metric_columns)} cols...", flush=True)
-
-    try:
-        table = pq.read_table(index_path, columns=metric_columns)
-    except Exception:
-        return
-    tbl_mb = sum(col.nbytes for col in table.columns) / 1e6
-    print(f"  [distribute] index loaded: {len(table):,} rows  {tbl_mb:.0f}MB  accumulating...", flush=True)
-
-    # Store (variable, metric, position, count, sampleCount) tuples.
-    rows_by_taxon: dict[str, list[tuple]] = {}
-    for col_name in metric_columns:
-        variable, metric = col_name.split("::", 1)
-        if metric in _ANGULAR_METRICS:
-            continue
-        is_class_metric = metric.startswith("class_")
-        column = table.column(col_name).combine_chunks()
-        col_len = min(column_lengths.get(col_name, len(column)), len(column))
-        if col_len <= 0:
-            continue
-
-        col_slice = column[:col_len]
-        taxon_keys_list = col_slice.field("taxonKey").to_pylist()
-        values_list = col_slice.field("value").to_pylist()
-        sample_counts_list = col_slice.field("sampleCount").to_pylist()
-
-        prev_value: float | None = None
-        min_rank_pos = 0
-        for position in range(col_len):
-            taxon_key = taxon_keys_list[position]
-            if taxon_key is None:
-                continue
-            value = values_list[position]
-            if value != prev_value:
-                min_rank_pos = position
-                prev_value = value
-            if is_class_metric and value == 0.0:
-                continue
-            sample_count = sample_counts_list[position]
-            rows_by_taxon.setdefault(taxon_key, []).append((
-                variable, metric, min_rank_pos, col_len,
-                int(sample_count) if sample_count is not None else None,
-            ))
-
-    total_rows = sum(len(v) for v in rows_by_taxon.values())
-    print(f"  [distribute] accumulated {total_rows:,} rows for {len(rows_by_taxon):,} taxa  [{_dtime.monotonic()-_dt0:.1f}s]  freeing Arrow table...", flush=True)
-
-    del table
-    _gc.collect()
-
-    # Write one per-context file per taxon — no reads needed, just overwrite.
-    # Consolidation merges all positions_ctx_*.parquet → relative_ranks_positions.parquet.
-    ctx_filename = f"positions_ctx_{context_taxon_id}.parquet"
-    all_taxon_keys = list(rows_by_taxon.keys())
-    n_total = len(all_taxon_keys)
-    n_written = 0
-    print(f"  [distribute] writing {ctx_filename} for {n_total:,} taxa...", flush=True)
-    for taxon_key in all_taxon_keys:
-        new_tuples = rows_by_taxon.pop(taxon_key)
-        n_written += 1
-        if n_written % 25_000 == 0:
-            print(f"  [distribute] wrote {n_written:,}/{n_total:,}  [{_dtime.monotonic()-_dt0:.1f}s]", flush=True)
-        if not new_tuples:
-            continue
-        taxon = get_taxon_by_id(taxon_key)
-        if taxon is None:
-            continue
-        nt_vars, nt_mets, nt_pos, nt_cnt, nt_sc = map(list, zip(*new_tuples))
-        n_new = len(nt_vars)
-        tbl = pa.Table.from_arrays(
-            [
-                pa.array(nt_vars,                      type=pa.string()),
-                pa.array(nt_mets,                      type=pa.string()),
-                pa.array(nt_pos,                       type=pa.int64()),
-                pa.array(nt_cnt,                       type=pa.int64()),
-                pa.array(nt_sc,                        type=pa.int64()),
-                pa.array([context_taxon_id] * n_new,   type=pa.string()),
-                pa.array([context_label]    * n_new,   type=pa.string()),
-            ],
-            schema=_POSITION_SCHEMA,
-        )
-        _atomic_write(TREE_ROOT / taxon["path"] / ctx_filename, tbl)
-
-    print(f"  [distribute] done  [{_dtime.monotonic()-_dt0:.1f}s]", flush=True)
-
-
-def distribute_all_positions(ancestor: TaxonRecord) -> None:
-    """Distribute position rows from all rank indexes under ancestor's directory."""
-    ancestor_rank = ancestor.get("rank") or ""
-    targets = _descendant_rank_targets(ancestor_rank)
-    ancestor_dir = TREE_ROOT / ancestor["path"]
-    for rank in targets:
-        index_path = ancestor_dir / f"{rank.lower()}_index.parquet"
-        _distribute_positions(ancestor, index_path)
 
 
 # ---------------------------------------------------------------------------
@@ -848,13 +782,12 @@ def distribute_all_positions(ancestor: TaxonRecord) -> None:
 # ---------------------------------------------------------------------------
 
 def compute_relative_ranks(ancestor: TaxonRecord, layers: list[dict]) -> None:
-    """Build descendant catalogs, rank indexes, and distribute positions for one ancestor.
+    """Build descendant rank indexes (and inline positions files) for one ancestor.
 
-    Designed to be called per-ancestor in a top-down (shallowest-first) BFS pass
-    after the bottom-up stats pass is complete.
+    Positions are written as positions_ctx_{id}_{rank}.parquet alongside each index.
+    Consolidation merges them into the global positions file. No separate distribute pass.
     """
     build_rank_indexes(ancestor, layers)
-    distribute_all_positions(ancestor)
 
 
 # ---------------------------------------------------------------------------

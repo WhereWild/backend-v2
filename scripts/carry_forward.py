@@ -60,7 +60,7 @@ def _is_temporal_col(col: str, temporal_ids: frozenset[str]) -> bool:
 
 def _atomic_write(path: Path, table: pa.Table) -> None:
     from util.storage import atomic_write_parquet
-    atomic_write_parquet(path, table, row_group_size=256)
+    atomic_write_parquet(path, table, row_group_size=50_000)
 
 
 def _carry_one(

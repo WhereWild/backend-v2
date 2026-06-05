@@ -111,7 +111,7 @@ def _flush(buffers: dict, taxon_path: str) -> None:
         new_table = pa.concat_tables([existing, new_table])
 
     from util.storage import atomic_write_parquet
-    atomic_write_parquet(file_path, new_table, row_group_size=256)
+    atomic_write_parquet(file_path, new_table, row_group_size=50_000)
 
     buffers[taxon_path].clear()
 

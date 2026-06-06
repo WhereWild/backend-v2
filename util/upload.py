@@ -27,7 +27,6 @@ import rasterio
 from fastapi import HTTPException
 
 from util.gis import DERIVED_FROM_ELEVATION, hilbert_index, sample_aspect_batch, sample_slope_batch
-from util.indexing import OCCURRENCE_INDEX_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -261,17 +260,6 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
         occ_path = work_dir / "occurrence.parquet"
         df.to_parquet(occ_path, index=False)
 
-        # occurrence_index: wide table (catalogNumber + GIS columns) for frontend
-        # variable filtering. The frontend parser explodes this into per-variable
-        # index rows — one entry per observation per variable.
-        gis_cols = [col for col in df.columns if col in layer_meta]
-        if gis_cols:
-            occ_index_df = df[["catalogNumber"] + gis_cols]
-            pq.write_table(
-                pa.Table.from_pandas(occ_index_df, preserve_index=False),
-                work_dir / OCCURRENCE_INDEX_FILE,
-            )
-
         lookup_rows: list[dict] = []
         for col in df.columns:
             layer = layer_meta.get(col)
@@ -330,7 +318,6 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
             (work_dir / NOMINAL_STATS_FILE,         NOMINAL_STATS_FILE),
             (work_dir / CIRCULAR_STATS_FILE,        CIRCULAR_STATS_FILE),
             (work_dir / DENSITY_FILE,               DENSITY_FILE),
-            (work_dir / OCCURRENCE_INDEX_FILE,      OCCURRENCE_INDEX_FILE),
             (lookup_path,                           "categorical_value_lookup.parquet"),
             (meta_path,                             "variable_metadata.parquet"),
         ]

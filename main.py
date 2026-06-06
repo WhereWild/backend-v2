@@ -1252,9 +1252,15 @@ def get_observation_variable_values(
             return
         try:
             import pyarrow.parquet as _pq
-            tbl = _pq.read_table(path, columns=["catalogNumber", variable_id])
-            for cat, val in zip(tbl["catalogNumber"].to_pylist(), tbl[variable_id].to_pylist()):
-                if cat not in collected and val is not None:
+            schema_names = set(_pq.read_schema(path).names)
+            extra = [c for c in ("obscured", "coordinateUncertaintyInMeters") if c in schema_names]
+            tbl = _pq.read_table(path, columns=["catalogNumber", variable_id] + extra).to_pandas()
+            if "obscured" in tbl.columns:
+                tbl = tbl[tbl["obscured"] == "No"]
+            if "coordinateUncertaintyInMeters" in tbl.columns:
+                tbl = tbl[tbl["coordinateUncertaintyInMeters"] <= 500]
+            for cat, val in zip(tbl["catalogNumber"].tolist(), tbl[variable_id].tolist()):
+                if cat not in collected and val is not None and not (isinstance(val, float) and math.isnan(val)):
                     converted = units.convert_value(float(val), layer, unit_system)
                     if converted is not None:
                         collected[cat] = converted

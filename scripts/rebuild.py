@@ -159,6 +159,7 @@ def _push_stage() -> None:
     transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
     flags = [
         "--exclude", "taxonomy/cache/**",
+        "--exclude", "gis/temporal/rasters/**",
         "--transfers", transfers,
         "--stats-one-line", "--stats", "1m",
     ]

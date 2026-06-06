@@ -73,52 +73,39 @@ def _build_category_offsets(sorted_vals: pa.Array) -> dict[str, dict]:
     return offsets
 
 
-def _build_struct_col(
-    val_series: pd.Series,
+def _build_struct_col_np(
+    val_np: np.ndarray,
     cat_arr: pa.Array,
     orig_arr: pa.Array,
     lat_arr: pa.Array,
     lon_arr: pa.Array,
     categorical: bool,
 ) -> tuple[pa.StructArray, pa.Array] | None:
-    """Build a single sorted struct column for one GIS layer."""
-    numeric = pd.to_numeric(val_series, errors="coerce")
-    if categorical:
-        valid_mask = numeric.notna()
-    else:
-        valid_mask = numeric.notna() & np.isfinite(numeric.values)
-
-    if not valid_mask.any():
+    """Build a sorted struct column: numpy argsort on values, pc.take on pre-built PyArrow arrays."""
+    valid = np.isfinite(val_np) if not categorical else ~np.isnan(val_np)
+    if not valid.any():
         return None
 
-    valid_np = valid_mask.to_numpy()
-    val_type = pa.int64() if categorical else pa.float64()
+    v = val_np[valid]
+    local_sort = np.argsort(v, kind="stable")
 
-    if categorical:
-        raw = [int(v) for v in numeric[valid_mask].tolist()]
-    else:
-        raw = [float(v) for v in numeric[valid_mask].tolist()]
+    # Map local (within-valid) sort indices to global row positions, then take via PyArrow.
+    global_idx = pa.array(np.where(valid)[0][local_sort], type=pa.int64())
 
-    vals = pa.array(raw, type=val_type)
-    mask_arr = pa.array(valid_np)
-    cats = pc.filter(cat_arr, mask_arr)
-    origs = pc.filter(orig_arr, mask_arr)
-    lats = pc.filter(lat_arr, mask_arr)
-    lons = pc.filter(lon_arr, mask_arr)
-
-    sort_idx = pc.sort_indices(vals)
     fields = _STRUCT_FIELDS_INT if categorical else _STRUCT_FIELDS_FLOAT
+    val_type = pa.int64() if categorical else pa.float64()
+    sorted_vals = pa.array(v[local_sort].astype(np.int64 if categorical else np.float64), type=val_type)
+
     struct_arr = pa.StructArray.from_arrays(
         [
-            pc.take(cats, sort_idx),
-            pc.take(origs, sort_idx),
-            pc.take(lats, sort_idx),
-            pc.take(lons, sort_idx),
-            pc.take(vals, sort_idx),
+            pc.take(cat_arr, global_idx),
+            pc.take(orig_arr, global_idx),
+            pc.take(lat_arr, global_idx),
+            pc.take(lon_arr, global_idx),
+            sorted_vals,
         ],
         fields=fields,
     )
-    sorted_vals = pc.take(vals, sort_idx)
     return struct_arr, sorted_vals
 
 
@@ -186,10 +173,12 @@ def build_leaf_index(
         return
 
     n = len(df)
-    cat_arr = pa.array(df["catalogNumber"].tolist(), type=pa.large_string())
-    lat_arr = pa.array(df["decimalLatitude"].tolist(), type=pa.float64())
-    lon_arr = pa.array(df["decimalLongitude"].tolist(), type=pa.float64())
-    orig_arr = pa.array([0] * n, type=pa.int32())
+    # Pre-build shared PyArrow arrays once — string/float arrays are faster via pc.take than
+    # repeated numpy object → PyArrow conversions per layer.
+    cat_arr = pa.array(df["catalogNumber"].to_numpy(dtype=object), type=pa.large_string())
+    lat_arr = pa.array(df["decimalLatitude"].to_numpy(dtype=np.float64), type=pa.float64())
+    lon_arr = pa.array(df["decimalLongitude"].to_numpy(dtype=np.float64), type=pa.float64())
+    orig_arr = pa.array(np.zeros(n, dtype=np.int32), type=pa.int32())
 
     origin_map = [{"id": 0, "taxon_key": taxon_key}]
     index_columns: dict[str, pa.Array] = {}
@@ -200,7 +189,11 @@ def build_leaf_index(
         if layer_id not in df.columns:
             continue
         categorical = _is_categorical(layer)
-        result = _build_struct_col(df[layer_id], cat_arr, orig_arr, lat_arr, lon_arr, categorical)
+        col = df[layer_id]
+        val_np = (col.to_numpy(dtype=np.float64, na_value=np.nan)
+                  if col.dtype == np.float64
+                  else pd.to_numeric(col, errors="coerce").to_numpy(dtype=np.float64))
+        result = _build_struct_col_np(val_np, cat_arr, orig_arr, lat_arr, lon_arr, categorical)
         if result is None:
             continue
         struct_arr, sorted_vals = result

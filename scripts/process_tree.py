@@ -19,16 +19,17 @@ from __future__ import annotations
 
 import argparse
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from config.config import load_config
-from util.rankings import POSITION_FILE, compute_relative_ranks
+from util.rankings import POSITION_CTX_GLOB, POSITION_FILE, compute_relative_ranks, preload_stats_cache
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -45,10 +46,9 @@ from util.tiles import load_layers
 
 CONFIG = load_config("global")
 
-STATS_WORKERS = 4
-RANK_WORKERS = 4
+STATS_WORKERS = 1
+RANK_WORKERS = 1
 LOG_INTERVAL = 50
-
 
 def _load_layers() -> list[dict]:
     return load_layers()
@@ -72,6 +72,8 @@ def _level_pass(
     completed = 0
     failed = 0
     t0 = time.monotonic()
+    window = 500
+    recent: deque[float] = deque(maxlen=window)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for depth in levels:
@@ -82,14 +84,20 @@ def _level_pass(
                 try:
                     future.result()
                     completed += 1
+                    now = time.monotonic()
+                    recent.append(now)
                     if completed % LOG_INTERVAL == 0 or completed == total:
-                        elapsed = time.monotonic() - t0
-                        rate = completed / elapsed
+                        elapsed = now - t0
+                        if len(recent) >= 2:
+                            rate = (len(recent) - 1) / (recent[-1] - recent[0])
+                        else:
+                            rate = completed / elapsed if elapsed > 0 else 0
                         eta = (total - completed) / rate if rate > 0 else 0
                         print(
                             f"[{label}] {completed}/{total}"
                             f"  elapsed={_fmt_duration(elapsed)}"
                             f"  eta={_fmt_duration(eta)}"
+                            f"  rate={rate:.1f}/s"
                             f"  ({node['rank']} {node['scientific_name']})"
                         )
                 except Exception as exc:
@@ -126,58 +134,183 @@ _STATS_FILES = [
     ("nominal_stats",   NOMINAL_STATS_FILE),
     ("circular_stats",  CIRCULAR_STATS_FILE),
     ("density",         DENSITY_FILE),
-    ("positions",       POSITION_FILE),
+    # positions handled separately — built inline during rank index pass, merged at consolidation
 ]
 
-_CONSOLIDATION_ROW_GROUP_SIZE = 256
+_CONSOLIDATION_ROW_GROUP_SIZE = 50_000
+_POS_MEM_BUDGET = 1_000_000_000  # 1 GB Arrow in-memory per sort run
+
+
+def _consolidate_positions(t0: float) -> None:
+    """External sort-merge of positions ctx files into one global sorted parquet."""
+    import shutil as _shutil
+
+    pos_files = sorted(TREE_ROOT.rglob(POSITION_CTX_GLOB))
+    if not pos_files:
+        print("[consolidate] positions: no ctx files found, skipping")
+        return
+
+    print(f"[consolidate] positions: {len(pos_files):,} ctx files, sort-merging...")
+    runs_dir = GLOBAL_STATS_DIR / ".pos_runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Phase 1 — build sorted runs bounded by _POS_MEM_BUDGET
+        run_paths: list[Path] = []
+        frames: list[pa.Table] = []
+        current_bytes = 0
+
+        total_rows = 0
+
+        def _flush_run() -> None:
+            nonlocal total_rows
+            if not frames:
+                return
+            tbl = pa.concat_tables(frames).sort_by(
+                [("taxon_key", "ascending"), ("variable", "ascending")]
+            )
+            total_rows += len(tbl)
+            p = runs_dir / f"run_{len(run_paths):05d}.parquet"
+            pq.write_table(tbl, p, compression="snappy",
+                           row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
+            run_paths.append(p)
+            frames.clear()
+            print(f"[consolidate/positions] run {len(run_paths):03d} written  "
+                  f"{len(tbl):,} rows  {p.stat().st_size/1e6:.0f}MB  "
+                  f"[{time.monotonic()-t0:.1f}s]", flush=True)
+
+        file_idx = 0
+        for f in pos_files:
+            file_idx += 1
+            try:
+                pf = pq.ParquetFile(f)
+                for batch in pf.iter_batches(batch_size=500_000):
+                    tbl = pa.Table.from_batches([batch])
+                    frames.append(tbl)
+                    current_bytes += tbl.nbytes
+                    if current_bytes >= _POS_MEM_BUDGET:
+                        _flush_run()
+                        current_bytes = 0
+            except Exception as e:
+                print(f"[consolidate/positions] skip {f.name}: {e}", flush=True)
+                continue
+            if file_idx % 500 == 0:
+                print(f"[consolidate/positions] scanned {file_idx:,}/{len(pos_files):,} files  "
+                      f"{len(run_paths)} runs so far  [{time.monotonic()-t0:.1f}s]", flush=True)
+        _flush_run()
+
+        if not run_paths:
+            print("[consolidate] positions: no data written")
+            return
+
+        print(f"[consolidate/positions] phase 1 done: {len(run_paths)} runs  "
+              f"{total_rows:,} rows  [{time.monotonic()-t0:.1f}s]", flush=True)
+
+        # Phase 2 — iterative merge until one run remains
+        group = 10
+        pass_num = 0
+        while len(run_paths) > 1:
+            pass_num += 1
+            next_runs: list[Path] = []
+            for i in range(0, len(run_paths), group):
+                chunk = run_paths[i : i + group]
+                tbls = [pq.read_table(p) for p in chunk]
+                merged = pa.concat_tables(tbls).sort_by(
+                    [("taxon_key", "ascending"), ("variable", "ascending")]
+                )
+                del tbls
+                out = runs_dir / f"merge_p{pass_num}_{len(next_runs):04d}.parquet"
+                pq.write_table(merged, out, compression="snappy",
+                               row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
+                del merged
+                for p in chunk:
+                    p.unlink(missing_ok=True)
+                next_runs.append(out)
+                print(f"[consolidate/positions] pass {pass_num} merge {len(next_runs)}/{-(-len(run_paths)//group)}  "
+                      f"[{time.monotonic()-t0:.1f}s]", flush=True)
+            run_paths = next_runs
+
+        run_paths[0].replace(GLOBAL_STATS_DIR / POSITION_FILE)
+        for f in pos_files:
+            f.unlink(missing_ok=True)
+
+        size_mb = (GLOBAL_STATS_DIR / POSITION_FILE).stat().st_size / 1e6
+        print(f"[consolidate] positions: done  {total_rows:,} rows  {size_mb:.0f}MB  "
+              f"[{time.monotonic()-t0:.1f}s]")
+
+    finally:
+        _shutil.rmtree(runs_dir, ignore_errors=True)
 
 
 def run_consolidation() -> None:
     """Merge per-node stats files into global files under data/taxonomy/global/."""
     GLOBAL_STATS_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
-    print("[consolidate] building global stats files")
+
+    print(f"[consolidate] building global stats files  [{time.monotonic()-t0:.1f}s]")
 
     tmp_dir = GLOBAL_STATS_DIR / ".tmp_consolidate"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        for label, filename in _STATS_FILES:
-            frames: list[pa.Table] = []
-            for path in sorted(TREE_ROOT.rglob(filename)):
+
+    for label, filename in _STATS_FILES:
+        dest = GLOBAL_STATS_DIR / filename
+        if dest.exists():
+            print(f"[consolidate] {label}: already exists, skipping  [{time.monotonic()-t0:.1f}s]")
+            continue
+        tmp_path = tmp_dir / filename
+        if tmp_path.exists():
+            print(f"[consolidate] {label}: resuming from tmp  [{time.monotonic()-t0:.1f}s]")
+            tmp_path.replace(dest)
+            print(f"[consolidate] {label}: moved to global  [{time.monotonic()-t0:.1f}s]")
+            continue
+        print(f"[consolidate] {label}: scanning tree...  [{time.monotonic()-t0:.1f}s]")
+        paths = sorted(TREE_ROOT.rglob(filename), key=lambda p: p.parent.name.rsplit("_", 1)[-1])
+        print(f"[consolidate] {label}: {len(paths)} files found, reading...  [{time.monotonic()-t0:.1f}s]")
+        if not paths:
+            print(f"[consolidate] {label}: no files found, skipping")
+            continue
+
+        # Stream-write in batches to avoid holding all frames in memory at once.
+        writer: pq.ParquetWriter | None = None
+        batch: list[pa.Table] = []
+        total_rows = 0
+        batch_size = 100_000
+        try:
+            for n, path in enumerate(paths, 1):
                 taxon_key = path.parent.name.rsplit("_", 1)[-1]
                 tbl = pq.read_table(path)
                 tbl = tbl.append_column(
                     pa.field("taxon_key", pa.string()),
                     pa.array([taxon_key] * len(tbl), type=pa.string()),
                 )
-                frames.append(tbl)
+                batch.append(tbl)
+                if len(batch) >= batch_size:
+                    chunk = pa.concat_tables(batch, promote_options="default")
+                    if writer is None:
+                        writer = pq.ParquetWriter(tmp_path, chunk.schema)
+                    writer.write_table(chunk, row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
+                    total_rows += len(chunk)
+                    batch.clear()
+                if n % 10_000 == 0:
+                    print(f"[consolidate] {label}: {n}/{len(paths)}  [{time.monotonic()-t0:.1f}s]")
 
-            if not frames:
-                print(f"[consolidate] {label}: no files found, skipping")
-                continue
+            if batch:
+                chunk = pa.concat_tables(batch, promote_options="default")
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp_path, chunk.schema)
+                writer.write_table(chunk, row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
+                total_rows += len(chunk)
+                batch.clear()
+        finally:
+            if writer:
+                writer.close()
 
-            combined = pa.concat_tables(frames, promote_options="default")
-            sort_idx = pc.sort_indices(combined, sort_keys=[("taxon_key", "ascending")])
-            combined = combined.take(sort_idx)
-            atomic_write_parquet(
-                tmp_dir / filename, combined,
-                row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE,
-            )
-            print(
-                f"[consolidate] {label}: {len(frames)} taxa"
-                f"  {len(combined)} rows"
-                f"  → {filename}"
-                f"  [{time.monotonic() - t0:.1f}s]"
-            )
-
-        # All files written successfully — move into place atomically
-        for _, filename in _STATS_FILES:
-            src = tmp_dir / filename
-            if src.exists():
-                src.replace(GLOBAL_STATS_DIR / filename)
-    finally:
-        import shutil as _shutil
-        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Move into final location only after fully written.
+        tmp_path.replace(dest)
+        print(
+            f"[consolidate] {label}: {len(paths)} taxa  {total_rows} rows"
+            f"  → {filename}  [{time.monotonic() - t0:.1f}s]"
+        )
 
     # Extract per-taxon phenology counts from numerical_stats metadata → global file
     pheno_rows: list[dict] = []
@@ -203,31 +336,50 @@ def run_consolidation() -> None:
         n_taxa = len(set(r["taxon_key"] for r in pheno_rows))
         print(f"[consolidate] phenology: {len(pheno_rows)} rows for {n_taxa} taxa  [{time.monotonic() - t0:.1f}s]")
 
-    # Remove per-node stats files and any leftover {rank}.parquet catalogs
+    # Remove per-node stats files, accumulator state, rank catalogs, and any tmp parquets
     removed = 0
     patterns = [filename for _, filename in _STATS_FILES] + [
         PHENOLOGY_COUNTS_FILE,
         "species.parquet", "subspecies.parquet", "genus.parquet",
         "family.parquet", "order.parquet", "variety.parquet", "form.parquet",
+        ".acc",
+        POSITION_FILE,  # old per-taxon positions files (new approach never creates them)
     ]
     for filename in patterns:
         for path in TREE_ROOT.rglob(filename):
             path.unlink()
             removed += 1
+    for path in TREE_ROOT.rglob("tmp*.parquet"):
+        path.unlink()
+        removed += 1
     print(f"[consolidate] removed {removed} per-node files")
+
+    cache_file = GLOBAL_STATS_DIR.parent / "stats_cache.pkl.gz"
+    if cache_file.exists():
+        cache_file.unlink()
+        print(f"[consolidate] removed {cache_file.name}")
+
     print(f"[consolidate] done — {time.monotonic() - t0:.1f}s total")
 
 
-def run_stats() -> None:
+def run_stats(resume: bool = False) -> None:
     layers, layer_meta, by_depth, stats_levels, _, total = _setup()
-    print(f"[process_tree] {total} taxa — stats:{STATS_WORKERS} workers")
-    task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta)
+    print(f"[process_tree] {total} taxa — stats:{STATS_WORKERS} workers" + (" — RESUME" if resume else ""))
+    task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta, resume=resume)
     _level_pass(by_depth, stats_levels, task, max_workers=STATS_WORKERS, label="stats", total=total)
 
 
 def run_rankings() -> None:
     layers, _, by_depth, _, rank_levels, total = _setup()
     print(f"[process_tree] {total} taxa — rankings:{RANK_WORKERS} workers")
+    removed = 0
+    for pattern in ["tmp*.parquet", POSITION_CTX_GLOB, POSITION_FILE]:
+        for p in TREE_ROOT.rglob(pattern):
+            p.unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        print(f"[process_tree] cleaned up {removed} stale position/tmp files")
+    preload_stats_cache(layers)
     task = partial(compute_relative_ranks, layers=layers)
     _level_pass(by_depth, rank_levels, task, max_workers=RANK_WORKERS, label="rankings", total=total)
 
@@ -239,6 +391,11 @@ def main() -> None:
         choices=["stats", "rankings", "consolidate", "all"],
         default="all",
         help="Run stats, rankings, consolidate, or all (default: all).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip taxa whose stats files are already written (for restarts).",
     )
     args, _ = parser.parse_known_args()
 
@@ -252,10 +409,11 @@ def main() -> None:
         f"[process_tree] {total} taxa across {len(stats_levels)} levels"
         f" — stats:{STATS_WORKERS} workers  rankings:{RANK_WORKERS} workers"
         f" — phase:{args.phase}"
+        + (" — RESUME" if args.resume else "")
     )
 
     if args.phase in ("stats", "all"):
-        task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta)
+        task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta, resume=args.resume)
         _level_pass(
             by_depth, stats_levels, task,
             max_workers=STATS_WORKERS, label="stats", total=total,
@@ -264,6 +422,14 @@ def main() -> None:
             print("[process_tree] stats complete — starting rankings pass")
 
     if args.phase in ("rankings", "all"):
+        removed = 0
+        for pattern in ["tmp*.parquet", POSITION_CTX_GLOB, POSITION_FILE]:
+            for p in TREE_ROOT.rglob(pattern):
+                p.unlink(missing_ok=True)
+                removed += 1
+        if removed:
+            print(f"[process_tree] cleaned up {removed} stale position/tmp files")
+        preload_stats_cache(layers)
         task = partial(compute_relative_ranks, layers=layers)
         _level_pass(
             by_depth, rank_levels, task,

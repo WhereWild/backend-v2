@@ -13,7 +13,7 @@ data directory (preserving sync_state.json) and runs the full pipeline:
   8. enrich_tree     — sample GIS layer values into per-taxon occurrence parquets
   9. enrich_temporal — enrich occurrences with time-windowed ERA5 weather statistics
  10. process_tree    — compute per-taxon summary statistics and KDE density graphs
- 11. push_b2         — sync data/ to B2 (only with --push)
+ 11. push            — sync data/ to production server (only with --push)
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -151,43 +151,22 @@ def _release_inhibitor(proc: "subprocess.Popen | None") -> None:
 # data directory
 # ---------------------------------------------------------------------------
 
-_DEFAULT_B2_BUCKET = "wherewild-data"
-_DEFAULT_B2_PREFIX = "data"
-_DEFAULT_B2_ENDPOINT = "https://s3.us-west-004.backblazeb2.com"
-
-
-def _push_b2_stage() -> None:
-    """Push taxonomy and location data to B2.
-
-    GIS raster layers (gis/layers/) are not pushed — they live on GamBase and
-    the production server's local disk and are large enough that B2 storage
-    costs are not justified when nothing reads them from there.
-    """
-    remote = os.environ.get("WW_B2_WRITER_REMOTE", "wherewild-localdev-writer")
-    bucket = os.environ.get("WW_B2_BUCKET", _DEFAULT_B2_BUCKET)
-    prefix = os.environ.get("WW_B2_PREFIX", _DEFAULT_B2_PREFIX)
+def _push_stage() -> None:
+    """Sync the full data/ directory to the production server via rclone."""
+    dest = os.environ.get("WW_SYNC_DEST")
+    if not dest:
+        raise RuntimeError("WW_SYNC_DEST env var must be set (e.g. gambaby:/path/to/data)")
     transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
-    base_dest = f"{remote}:{bucket}/{prefix}" if prefix else f"{remote}:{bucket}"
-
-    base_flags = ["--fast-list", "--transfers", transfers, "--stats-one-line", "--stats", "1m"]
-
-    taxonomy_src = DATA_DIR / "taxonomy"
-    taxonomy_dest = f"{base_dest}/taxonomy"
-    print(f"  rclone sync {taxonomy_src} → {taxonomy_dest}")
-    r = subprocess.run([
-        "rclone", "sync", str(taxonomy_src), taxonomy_dest,
-        "--exclude", "cache/**",
-        *base_flags,
-    ])
+    flags = [
+        "--exclude", "taxonomy/cache/**",
+        "--exclude", "gis/temporal/rasters/**",
+        "--transfers", transfers,
+        "--stats-one-line", "--stats", "1m",
+    ]
+    print(f"  rclone sync {DATA_DIR} → {dest}")
+    r = subprocess.run(["rclone", "sync", str(DATA_DIR), dest, *flags])
     if r.returncode != 0:
-        raise RuntimeError(f"rclone sync taxonomy failed with exit code {r.returncode}")
-
-    locations_src = DATA_DIR / "gis" / "locations"
-    locations_dest = f"{base_dest}/gis/locations"
-    print(f"  rclone sync {locations_src} → {locations_dest}")
-    r = subprocess.run(["rclone", "sync", str(locations_src), locations_dest, *base_flags])
-    if r.returncode != 0:
-        raise RuntimeError(f"rclone sync gis/locations failed with exit code {r.returncode}")
+        raise RuntimeError(f"rclone sync failed with exit code {r.returncode}")
 
 
 def _run_download_gis(gis_dir: Path | None = None) -> None:
@@ -255,16 +234,6 @@ def wipe_data_dir() -> None:
 # pipeline
 # ---------------------------------------------------------------------------
 
-def _pid_alive(pid: int | None) -> bool:
-    """Return True if a process with the given PID is currently running."""
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
-
 
 def _sync_gbif_stage() -> None:
     sync_gbif.main()
@@ -284,9 +253,9 @@ STAGES: list[tuple[str, str, object]] = [
     ("process_tree",    "Processing tree (summary stats + KDE)",              lambda: process_tree.main()),
 ]
 
-# push_b2 is not in STAGES — it's always the final action when --push is passed,
+# push is not in STAGES — it's always the final action when --push is passed,
 # regardless of which stage the run started at.
-_PUSH_B2_STAGE = ("push_b2", "Pushing data/ to B2", lambda: _push_b2_stage())
+_PUSH_STAGE = ("push", "Syncing data/ to production server", lambda: _push_stage())
 
 
 
@@ -316,24 +285,17 @@ def main() -> None:
         "--push",
         action="store_true",
         help=(
-            "After all pipeline stages complete, sync data/ to B2 (overwriting the remote). "
-            "Uses WW_B2_WRITER_REMOTE / WW_B2_BUCKET / WW_B2_PREFIX env vars or rclone defaults. "
-            "Excludes data/cache/."
+            "After all pipeline stages complete, sync data/ to the production server. "
+            "Destination set via WW_SYNC_DEST env var (required, e.g. server:/path/to/data). "
+            "Transfer count via WW_RCLONE_TRANSFERS (default: 16)."
         ),
     )
     args = parser.parse_args()
 
-    # Detect a previous crash: if a prior run left status=in_progress but its
-    # PID is gone, it never finished cleanly (OOM, power loss, etc.).
-    # If the PID is still alive, another instance is already running — exit.
     existing = _read_sync_state().get("pipeline", {})
     resuming = False
 
     if existing.get("status") == "in_progress":
-        running_pid = existing.get("pid")
-        if _pid_alive(running_pid):
-            print(f"Pipeline already running (pid {running_pid}), exiting.")
-            return
         crashed_at = _now()
         _update_pipeline({"status": "crashed", "finished_at": crashed_at})
         print("WARNING: previous pipeline run did not finish — marked as crashed")
@@ -423,7 +385,7 @@ def main() -> None:
             _set_stage(stage_id, "completed")
 
         if args.push:
-            push_id, push_label, push_fn = _PUSH_B2_STAGE
+            push_id, push_label, push_fn = _PUSH_STAGE
             print(f"\n--- {push_label} ---")
             _set_stage(push_id, "in_progress")
             push_fn()

@@ -23,7 +23,7 @@ services:
     environment:
       - RCLONE_CONFIG=/workspace/docker/rclone.conf
       - WHEREWILD_MODE=api
-      - WHEREWILD_PARQUET_STORAGE=b2
+      - WHEREWILD_PARQUET_STORAGE=local
     restart: unless-stopped
 
   frontend:

@@ -14,7 +14,7 @@ import util.stats as st_module
 import util.taxa as taxa
 import util.tiles as tiles
 from main import app
-from util.indexing import OCCURRENCE_INDEX_FILE, build_leaf_index
+from util.indexing import build_leaf_index
 
 client = TestClient(app)
 

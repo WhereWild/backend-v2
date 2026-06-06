@@ -44,6 +44,11 @@ from util.temporal import (
     write_back,
 )
 
+# Chunks with this many observations or fewer are read via HTTP range requests
+# instead of a full download. Pre-2010 chunks and carry-forward tails are
+# typically sparse, so this avoids downloading GB-sized files for a handful of points.
+_RANGE_REQUEST_THRESHOLD = int(os.environ.get("TEMPORAL_RANGE_REQUEST_THRESHOLD", "1000"))
+
 CATALOG_PATH = Path("config/gis/catalog.json")
 
 _raw_vars = os.environ.get("VARS_TO_ENRICH", "")
@@ -165,11 +170,29 @@ def _run_layer(
 
         chunks_this_batch = [e for e in chunks_eligible if e.chunk_num in batch_chunk_worklists]
 
-        # Prefetch primary source only; secondary sources are looked up by time range
-        # inside process_chunk_* and cached on first download.
-        with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as dl_pool:
-            for fut in [dl_pool.submit(_download_layer_chunk, e, layer.model, [primary_var], cfg.temporal_cache_dir) for e in chunks_this_batch]:
-                fut.result()
+        # Split chunks by observation density. Sparse chunks use HTTP range
+        # requests to read only the needed grid cells; dense chunks are downloaded
+        # in full first since the per-cell overhead would dominate otherwise.
+        sparse_set = {
+            e.chunk_num for e in chunks_this_batch
+            if batch_chunk_worklists[e.chunk_num].num_rows <= _RANGE_REQUEST_THRESHOLD
+        }
+        dense_chunks = [e for e in chunks_this_batch if e.chunk_num not in sparse_set]
+
+        print(
+            f"[prefetch] {layer.id} batch={batch_num}: "
+            f"{len(dense_chunks)} download + {len(sparse_set)} range-req "
+            f"({sum(batch_chunk_worklists[e.chunk_num].num_rows for e in dense_chunks)} dense obs, "
+            f"{sum(batch_chunk_worklists[e.chunk_num].num_rows for e in chunks_this_batch if e.chunk_num in sparse_set)} sparse obs)"
+        )
+
+        # Prefetch primary source for dense chunks only.
+        if dense_chunks:
+            t_dl = time.monotonic()
+            with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as dl_pool:
+                for fut in [dl_pool.submit(_download_layer_chunk, e, layer.model, [primary_var], cfg.temporal_cache_dir) for e in dense_chunks]:
+                    fut.result()
+            print(f"[prefetch] {layer.id} batch={batch_num}: downloads done ({time.monotonic() - t_dl:.1f}s)")
 
         batch_rows_done = 0
         tail_buffer: TailBuffer = {}
@@ -181,6 +204,11 @@ def _run_layer(
                 stopped = True
                 break
             chunk_worklist = batch_chunk_worklists[chunk_entry.chunk_num]
+            use_range = chunk_entry.chunk_num in sparse_set
+            print(
+                f"[chunk] {layer.id} chunk={chunk_entry.chunk_num} "
+                f"obs={chunk_worklist.num_rows} mode={'range-req' if use_range else 'download'}"
+            )
             try:
                 if layer.id == "vapor_pressure_deficit":
                     updates, tail_buffer = process_chunk_vpd(
@@ -188,6 +216,7 @@ def _run_layer(
                         layer.model, layer.sources, layer.id,
                         steps, chunk_index.resolution, cfg.temporal_cache_dir,
                         secondary_indices=secondary_indices,
+                        range_request=use_range,
                     )
                 elif layer.sources:
                     updates, tail_buffer = process_chunk_mode(
@@ -195,11 +224,13 @@ def _run_layer(
                         layer.model, layer.sources, layer.id,
                         steps, chunk_index.resolution, cfg.temporal_cache_dir,
                         secondary_indices=secondary_indices,
+                        range_request=use_range,
                     )
                 else:
                     updates, tail_buffer = process_chunk(
                         chunk_entry, chunk_worklist, tail_buffer,
                         layer.model, layer.id, steps, layer.agg, cfg.temporal_cache_dir,
+                        range_request=use_range,
                     )
                 for tpath, colmap in updates.items():
                     batch_updates.setdefault(tpath, {})
@@ -266,13 +297,12 @@ def main() -> None:
             for w in layer.windows
         ]
 
-        print(f"[occ_index] scanning root={str(cfg.plantae_key)} min_year={cfg.temporal_min_year}")
+        print(f"[occ_index] scanning root={str(cfg.plantae_key)}")
         n_obs = build_occ_index(
             str(cfg.plantae_key),
             cfg.data_root,
             cfg.occurrence_parquet_filename,
             occ_index_path,
-            min_year=cfg.temporal_min_year,
             skip_if_cols=skip_cols if skip_cols else None,
         )
         print(f"[occ_index] {n_obs} observations")

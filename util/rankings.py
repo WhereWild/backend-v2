@@ -15,10 +15,12 @@ import csv
 import json
 import math
 import os
+import re as _re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -28,15 +30,37 @@ from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_
 from util.storage import ParquetStorageProxy, atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
 
+_TEMPORAL_RE = _re.compile(r'_\d+h$')
+
 _storage = ParquetStorageProxy(
     data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
     project_root=Path(__file__).parent.parent,
 )
 
+# Module-level cache populated by preload_stats_cache().
+# Format: taxon_key → (sample_count: int, values: np.ndarray float32)
+# values is indexed by _metric_vocab; NaN means metric not present for this taxon.
+# ~1.5GB total vs ~8GB if Python float dicts were used.
+_stats_cache: dict[str, tuple[int, np.ndarray]] | None = None
+_metric_vocab: list[str] = []       # sorted list of all metric keys
+_metric_to_idx: dict[str, int] = {} # reverse lookup
+# Boolean mask over _metric_vocab: True = include in rank indexes, False = skip.
+# Temporal variables (layer IDs ending in _\d+h) are excluded — too many columns.
+_rankings_mask: np.ndarray | None = None  # shape (len(_metric_vocab),), dtype bool
+
+def _build_rankings_mask() -> None:
+    global _rankings_mask
+    _rankings_mask = np.array(
+        [not _TEMPORAL_RE.search(k.split("::")[0]) for k in _metric_vocab],
+        dtype=bool,
+    )
+
 CONFIG = load_config("global")
 
 TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
+_CACHE_FILE = TREE_ROOT.parent / "stats_cache.pkl.gz"
 POSITION_FILE = "relative_ranks_positions.parquet"
+POSITION_CTX_GLOB = "*_positions.parquet"  # per-context files written during rankings pass
 
 # Canonical taxonomy rank order used to determine descendant catalog targets.
 _RANK_ORDER: tuple[str, ...] = (
@@ -45,11 +69,12 @@ _RANK_ORDER: tuple[str, ...] = (
 
 
 _POSITION_SCHEMA = pa.schema([
+    pa.field("taxon_key", pa.string()),
     pa.field("variable", pa.string()),
     pa.field("metric", pa.string()),
-    pa.field("position", pa.int64()),
-    pa.field("count", pa.int64()),
-    pa.field("sampleCount", pa.int64()),
+    pa.field("position", pa.int32()),
+    pa.field("count", pa.int32()),
+    pa.field("sampleCount", pa.int32()),
     pa.field("contextTaxonId", pa.string()),
     pa.field("contextLabel", pa.string()),
 ])
@@ -72,7 +97,7 @@ def _safe_finite(x) -> bool:
         return False
 
 def _atomic_write(path: Path, table: pa.Table) -> None:
-    atomic_write_parquet(path, table, row_group_size=256)
+    atomic_write_parquet(path, table, row_group_size=50_000)
 
 
 def _resolve_context_label(taxon: TaxonRecord) -> str:
@@ -115,8 +140,220 @@ def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
             return ()
 
 
+def _preload_one_taxon(
+    num_path: Path,
+    ratio_interval_ids: set[str],
+    circular_ids: set[str],
+    nominal_ids: set[str],
+    layer_metrics: dict[str, tuple[str, ...]],
+    nominal_metrics: set[str],
+    circ_metrics: tuple[str, ...],
+) -> tuple[str, dict]:
+    taxon_key = num_path.parent.name.rsplit("_", 1)[-1]
+    entry: dict = {"__sample_count__": 0}
+    taxon_dir = num_path.parent
+
+    # numerical stats — wide format: one row per variable, metric columns
+    try:
+        tbl = pq.ParquetFile(num_path).read()
+        col_names = set(tbl.schema.names)
+        variables = tbl.column("variable").to_pylist()
+        counts = tbl.column("count").to_pylist() if "count" in col_names else [None] * len(variables)
+        needed_metrics: set[str] = set()
+        for var in variables:
+            if var in ratio_interval_ids:
+                needed_metrics.update(layer_metrics.get(var, ()))
+        metric_cols = {m: tbl.column(m).to_pylist() for m in needed_metrics if m in col_names}
+        for i, variable in enumerate(variables):
+            if not variable or variable not in ratio_interval_ids:
+                continue
+            cnt = counts[i]
+            if cnt and entry["__sample_count__"] == 0:
+                try:
+                    entry["__sample_count__"] = int(cnt)
+                except (TypeError, ValueError):
+                    pass
+            for metric in layer_metrics.get(variable, ()):
+                col = metric_cols.get(metric)
+                if col is None:
+                    continue
+                val = col[i]
+                if val is not None and _safe_finite(val):
+                    entry[f"{variable}::{metric}"] = float(val)
+    except Exception:
+        pass
+
+    # nominal stats — long format: columns variable, metric, value
+    nom_path = taxon_dir / NOMINAL_STATS_FILE
+    if nom_path.exists():
+        try:
+            tbl = pq.ParquetFile(nom_path).read()
+            nom_variables = tbl.column("variable").to_pylist()
+            nom_metrics_col = tbl.column("metric").to_pylist()
+            nom_values = tbl.column("value").to_pylist()
+            for variable, metric, val in zip(nom_variables, nom_metrics_col, nom_values):
+                variable = str(variable or "")
+                metric = str(metric or "")
+                if variable not in nominal_ids:
+                    continue
+                if metric not in nominal_metrics and not metric.startswith("class_"):
+                    continue
+                if entry["__sample_count__"] == 0 and metric == "total_samples":
+                    try:
+                        entry["__sample_count__"] = int(float(val or 0))
+                    except (TypeError, ValueError):
+                        pass
+                if _safe_finite(val):
+                    entry[f"{variable}::{metric}"] = float(val)
+        except Exception:
+            pass
+
+    # circular stats — wide format: one row per variable, metric columns
+    circ_path = taxon_dir / CIRCULAR_STATS_FILE
+    if circ_path.exists():
+        try:
+            tbl = pq.ParquetFile(circ_path).read()
+            col_names = set(tbl.schema.names)
+            circ_variables = tbl.column("variable").to_pylist()
+            circ_metric_cols = {m: tbl.column(m).to_pylist() for m in circ_metrics if m in col_names}
+            for i, variable in enumerate(circ_variables):
+                if not variable or variable not in circular_ids:
+                    continue
+                for metric in circ_metrics:
+                    col = circ_metric_cols.get(metric)
+                    if col is None:
+                        continue
+                    val = col[i]
+                    if val is not None and _safe_finite(val):
+                        entry[f"{variable}::{metric}"] = float(val)
+        except Exception:
+            pass
+
+    return taxon_key, entry
+
+
+def preload_stats_cache(layers: list[dict]) -> None:
+    """Walk all per-node stats files once and populate the module-level cache.
+
+    Call this before the rankings pass so every lookup is an O(1) dict access
+    instead of a disk read. Uses pyarrow column access directly (no pandas) and
+    a thread pool so pyarrow I/O can overlap across threads (GIL released during reads).
+    """
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+    from concurrent.futures import as_completed as _as_completed
+    from functools import partial as _partial
+
+    global _stats_cache
+    _stats_cache = {}
+    layer_by_id = {lay["id"]: lay for lay in layers}
+    nominal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.NOMINAL}
+    nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL])
+
+    ratio_interval_ids: set[str] = set()
+    circular_ids: set[str] = set()
+    layer_metrics: dict[str, tuple[str, ...]] = {}
+    for lid, lay in layer_by_id.items():
+        try:
+            vtype = ValueType(lay.get("value_type", ""))
+        except ValueError:
+            continue
+        if vtype in (ValueType.RATIO, ValueType.INTERVAL):
+            ratio_interval_ids.add(lid)
+            layer_metrics[lid] = _metrics_for_vtype(lay, vtype)
+        elif vtype == ValueType.CIRCULAR:
+            circular_ids.add(lid)
+    circ_metrics = METRICS_BY_TYPE[ValueType.CIRCULAR]
+
+    worker = _partial(
+        _preload_one_taxon,
+        ratio_interval_ids=ratio_interval_ids,
+        circular_ids=circular_ids,
+        nominal_ids=nominal_ids,
+        layer_metrics=layer_metrics,
+        nominal_metrics=nominal_metrics,
+        circ_metrics=circ_metrics,
+    )
+
+    import gzip as _gzip
+    import pickle as _pickle
+
+    # Fast path: load from disk cache if it exists
+    if _CACHE_FILE.exists():
+        print(f"[rankings] loading stats cache from disk ({_CACHE_FILE.name})...")
+        t0 = _time.monotonic()
+        try:
+            with _gzip.open(_CACHE_FILE, "rb") as f:
+                saved = _pickle.load(f)
+            _metric_vocab[:] = saved["vocab"]
+            _metric_to_idx.update({k: i for i, k in enumerate(_metric_vocab)})
+            _stats_cache.update(saved["cache"])
+            _build_rankings_mask()
+            print(f"[rankings] cache loaded from disk: {len(_stats_cache):,} taxa  [{_time.monotonic()-t0:.1f}s]")
+            return
+        except Exception as e:
+            print(f"[rankings] disk cache load failed ({e}), rebuilding...")
+            _stats_cache.clear()
+            _metric_vocab.clear()
+            _metric_to_idx.clear()
+
+    all_paths = list(TREE_ROOT.rglob(NUMERICAL_STATS_FILE))
+    total_paths = len(all_paths)
+    t0 = _time.monotonic()
+    # Phase 1: read all stats files in parallel, collect raw dicts
+    raw: dict[str, dict] = {}
+    print(f"[rankings] preloading stats cache for {total_paths:,} taxa...")
+    with _ThreadPoolExecutor(max_workers=4) as executor:
+        futs = {executor.submit(worker, p): p for p in all_paths}
+        for fut in _as_completed(futs):
+            try:
+                taxon_key, entry = fut.result()
+                raw[taxon_key] = entry
+            except Exception:
+                pass
+
+    # Phase 2: build global metric vocab and convert to numpy float32 arrays (~6x RAM reduction)
+    all_keys: set[str] = set()
+    for entry in raw.values():
+        all_keys.update(k for k in entry if k != "__sample_count__")
+    _metric_vocab[:] = sorted(all_keys)
+    _metric_to_idx.update({k: i for i, k in enumerate(_metric_vocab)})
+    _build_rankings_mask()
+    n_metrics = len(_metric_vocab)
+
+    for taxon_key, entry in raw.items():
+        sc = int(entry.get("__sample_count__", 0))
+        arr = np.full(n_metrics, np.nan, dtype=np.float32)
+        for k, v in entry.items():
+            if k != "__sample_count__":
+                idx = _metric_to_idx.get(k)
+                if idx is not None:
+                    arr[idx] = np.float32(v)
+        _stats_cache[taxon_key] = (sc, arr)
+    del raw
+
+    elapsed = _time.monotonic() - t0
+    print(f"[rankings] stats cache ready: {len(_stats_cache):,} taxa  {n_metrics:,} metrics  [{elapsed:.1f}s]")
+
+    # Phase 3: persist to disk for fast restart
+    print("[rankings] saving cache to disk...")
+    try:
+        _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CACHE_FILE.with_suffix(".tmp")
+        with _gzip.open(tmp, "wb", compresslevel=1) as f:
+            _pickle.dump({"vocab": list(_metric_vocab), "cache": dict(_stats_cache)}, f, protocol=5)
+        tmp.replace(_CACHE_FILE)
+        print(f"[rankings] cache saved ({_CACHE_FILE.stat().st_size / 1e9:.2f}GB)  [{_time.monotonic()-t0:.1f}s total]")
+    except Exception as e:
+        print(f"[rankings] cache save failed (non-fatal): {e}")
+
+
 def _infer_sample_count(taxon_dir: Path) -> int:
-    """Return observation count from stats files or occurrence index."""
+    """Return observation count from stats files."""
+    if _stats_cache is not None:
+        taxon_key = taxon_dir.name.rsplit("_", 1)[-1]
+        entry = _stats_cache.get(taxon_key)
+        return entry[0] if entry is not None else 0
     stats_path = taxon_dir / NUMERICAL_STATS_FILE
     if stats_path.exists():
         try:
@@ -138,12 +375,6 @@ def _infer_sample_count(taxon_dir: Path) -> int:
             rows = df[df["metric"] == "total_samples"]
             if not rows.empty:
                 return int(float(rows.iloc[0]["value"]))
-        except Exception:
-            pass
-    idx_path = taxon_dir / "occurrence_index.parquet"
-    if idx_path.exists():
-        try:
-            return pq.read_metadata(idx_path).num_rows
         except Exception:
             pass
     return 0
@@ -307,6 +538,16 @@ def _collect_all_entries(
     sample_count: int,
     layers: list[dict],
 ) -> dict[str, dict[str, Any]]:
+    if _stats_cache is not None:
+        entry = _stats_cache.get(taxon_key)
+        if not entry:
+            return {}
+        _, values_arr = entry
+        non_nan = np.where(~np.isnan(values_arr))[0]
+        return {
+            _metric_vocab[i]: {"taxon_key": taxon_key, "value": float(values_arr[i]), "sample_count": sample_count}
+            for i in non_nan
+        }
     entries = _collect_entries_from_numerical_stats(taxon_key, taxon_dir, sample_count, layers)
     entries.update(_collect_entries_from_nominal_stats(taxon_key, taxon_dir, sample_count, layers))
     entries.update(_collect_entries_from_circular_stats(taxon_key, taxon_dir, sample_count, layers))
@@ -325,40 +566,152 @@ def _build_rank_index(
         index_path.unlink(missing_ok=True)
         return
 
-    column_entries: dict[str, list[dict[str, Any]]] = {}
-    for t in descendants:
-        taxon_key = str(t["taxon_key"])
-        taxon_path = t.get("path", "")
-        if not taxon_path:
-            continue
-        sample_count = _infer_sample_count(TREE_ROOT / taxon_path)
-        for col_key, entry in _collect_all_entries(
-            taxon_key, TREE_ROOT / taxon_path, sample_count, layers
-        ).items():
-            column_entries.setdefault(col_key, []).append(entry)
+    # Collect lightweight (taxon_key, cached_dict) pairs — just references into _stats_cache,
+    # no data copying. Then process one column at a time so only one Python list of entries
+    # is alive at a time; each is immediately converted to a compact Arrow array (C memory)
+    # and the Python list is discarded. This keeps peak Python heap usage to ~one column's
+    # worth of data regardless of how many descendants or metrics there are.
+    if _stats_cache is not None:
+        desc_data: list[tuple[str, tuple]] = []
+        for t in descendants:
+            taxon_key = str(t["taxon_key"])
+            entry = _stats_cache.get(taxon_key)
+            if entry is not None:
+                desc_data.append((taxon_key, entry))
 
-    if not column_entries:
-        index_path.unlink(missing_ok=True)
-        return
+        if not desc_data:
+            index_path.unlink(missing_ok=True)
+            return
+
+        all_taxon_keys = [tk for tk, _ in desc_data]
+        all_sample_counts = np.array([e[0] for _, e in desc_data], dtype=np.int64)
+
+        # Single pass using numpy: for each taxon, find non-NaN metric indices and
+        # append (position, value) to per-column lists. No Python float objects created
+        # for cached values — they stay as float32 in the numpy array until appended.
+        col_idx: dict[str, list[int]] = {}
+        col_val: dict[str, list[float]] = {}
+        vocab = _metric_vocab
+        include = _rankings_mask  # excludes temporal vars; None before preload (shouldn't happen)
+        for i, (_, entry) in enumerate(desc_data):
+            values_arr = entry[1]
+            active = ~np.isnan(values_arr)
+            if include is not None:
+                active &= include
+            for metric_idx in np.where(active)[0]:
+                k = vocab[metric_idx]
+                v = float(values_arr[metric_idx])
+                if k in col_idx:
+                    col_idx[k].append(i)
+                    col_val[k].append(v)
+                else:
+                    col_idx[k] = [i]
+                    col_val[k] = [v]
+
+    else:
+        # Fallback: collect via disk reads (no cache loaded)
+        col_idx_fb: dict[str, list[tuple[str, float, int]]] = {}
+        for t in descendants:
+            taxon_key = str(t["taxon_key"])
+            taxon_path = t.get("path", "")
+            if not taxon_path:
+                continue
+            taxon_dir = TREE_ROOT / taxon_path
+            sample_count = _infer_sample_count(taxon_dir)
+            for col_key, entry in _collect_all_entries(taxon_key, taxon_dir, sample_count, layers).items():
+                col_idx_fb.setdefault(col_key, []).append(
+                    (entry["taxon_key"], entry["value"], entry["sample_count"])
+                )
+        if not col_idx_fb:
+            index_path.unlink(missing_ok=True)
+            return
+
+    context_taxon_id = str(ancestor["taxon_key"])
+    context_label = _resolve_context_label(ancestor)
 
     struct_type = pa.struct(_STRUCT_FIELDS)
-    max_len = 0
     arrays: dict[str, pa.Array] = {}
     column_lengths: dict[str, int] = {}
+    max_len = 0
 
-    for col_name, entries in column_entries.items():
-        sorted_entries = sorted(entries, key=lambda e: (e["value"], e["taxon_key"]))
-        column_lengths[col_name] = len(sorted_entries)
-        max_len = max(max_len, len(sorted_entries))
-        arr = pa.StructArray.from_arrays(
-            [
-                pa.array([e["taxon_key"] for e in sorted_entries], type=pa.string()),
-                pa.array([e["value"] for e in sorted_entries], type=pa.float64()),
-                pa.array([e["sample_count"] for e in sorted_entries], type=pa.int64()),
-            ],
-            fields=_STRUCT_FIELDS,
-        )
-        arrays[col_name] = arr
+    # Positions accumulators — numpy chunks for ints (no Python int objects),
+    # plain lists for strings (references to existing objects, no copies).
+    pos_tks:  list[str] = []
+    pos_vars: list[str] = []
+    pos_mets: list[str] = []
+    pos_pos_chunks: list[np.ndarray] = []
+    pos_cnt_chunks: list[np.ndarray] = []
+    pos_sc_chunks:  list[np.ndarray] = []
+
+
+
+    if _stats_cache is not None:
+        for col_key in sorted(col_idx):
+            idx_list = col_idx.pop(col_key)
+            val_list = col_val.pop(col_key)
+            if not idx_list:
+                continue
+            val_np = np.array(val_list, dtype=np.float64)
+            idx_np = np.array(idx_list, dtype=np.int32)
+            del val_list, idx_list
+            order = np.argsort(val_np, kind="stable")
+            sorted_tks = [all_taxon_keys[i] for i in idx_np[order]]
+            sorted_scs = all_sample_counts[idx_np[order]]
+            n = len(sorted_tks)
+            column_lengths[col_key] = n
+            max_len = max(max_len, n)
+            arrays[col_key] = pa.StructArray.from_arrays(
+                [
+                    pa.array(sorted_tks, type=pa.string()),
+                    pa.array(val_np[order], type=pa.float64()),
+                    pa.array(sorted_scs, type=pa.int64()),
+                ],
+                fields=_STRUCT_FIELDS,
+            )
+
+            # Collect positions inline — data is already sorted, no re-read needed.
+            variable, metric = col_key.split("::", 1)
+            if metric not in _ANGULAR_METRICS and n > 0:
+                sorted_vals = val_np[order]
+                # Vectorised min_rank_pos: tied values share the first position in their group.
+                is_new = np.empty(n, dtype=bool)
+                is_new[0] = True
+                if n > 1:
+                    is_new[1:] = sorted_vals[1:] != sorted_vals[:-1]
+                group_starts = np.where(is_new)[0]
+                group_ids = np.cumsum(is_new) - 1
+                min_rank_arr = group_starts[group_ids].astype(np.int32)
+
+                if metric.startswith("class_"):
+                    indices = np.where(sorted_vals != 0.0)[0]
+                else:
+                    indices = np.arange(n, dtype=np.int32)
+
+                if len(indices):
+                    pos_tks.extend([sorted_tks[i] for i in indices])
+                    pos_vars.extend([variable] * len(indices))
+                    pos_mets.extend([metric] * len(indices))
+                    pos_pos_chunks.append(min_rank_arr[indices])
+                    pos_cnt_chunks.append(np.full(len(indices), n, dtype=np.int32))
+                    pos_sc_chunks.append(sorted_scs[indices].astype(np.int32))
+    else:
+        for col_key, entries in col_idx_fb.items():  # type: ignore[possibly-undefined]
+            entries.sort(key=lambda e: (e[1], e[0]))
+            n = len(entries)
+            column_lengths[col_key] = n
+            max_len = max(max_len, n)
+            arrays[col_key] = pa.StructArray.from_arrays(
+                [
+                    pa.array([e[0] for e in entries], type=pa.string()),
+                    pa.array([e[1] for e in entries], type=pa.float64()),
+                    pa.array([e[2] for e in entries], type=pa.int64()),
+                ],
+                fields=_STRUCT_FIELDS,
+            )
+
+    if not arrays:
+        index_path.unlink(missing_ok=True)
+        return
 
     for col_name, arr in arrays.items():
         if len(arr) < max_len:
@@ -369,6 +722,30 @@ def _build_rank_index(
     table = pa.table(arrays)
     metadata = {b"column_lengths": json.dumps(column_lengths).encode("utf-8")}
     _atomic_write(index_path, table.replace_schema_metadata(metadata))
+    del arrays, table
+
+    # Write per-(ancestor,rank) positions file — no distribute pass needed.
+    if pos_tks and pos_pos_chunks:
+        all_pos = np.concatenate(pos_pos_chunks)
+        all_cnt = np.concatenate(pos_cnt_chunks)
+        all_sc  = np.concatenate(pos_sc_chunks)
+        del pos_pos_chunks, pos_cnt_chunks, pos_sc_chunks
+        n_pos = len(pos_tks)
+        pos_table = pa.table({
+            "taxon_key":     pa.array(pos_tks,  type=pa.string()),
+            "variable":      pa.array(pos_vars, type=pa.string()),
+            "metric":        pa.array(pos_mets, type=pa.string()),
+            "position":      pa.array(all_pos),
+            "count":         pa.array(all_cnt),
+            "sampleCount":   pa.array(all_sc),
+            "contextTaxonId": pa.array([context_taxon_id] * n_pos, type=pa.string()),
+            "contextLabel":   pa.array([context_label]    * n_pos, type=pa.string()),
+        }, schema=_POSITION_SCHEMA)
+        del pos_tks, pos_vars, pos_mets, all_pos, all_cnt, all_sc
+        # Sort by taxon_key so consolidation can merge-sort efficiently.
+        pos_table = pos_table.sort_by([("taxon_key", "ascending")])
+        ctx_pos_path = index_path.parent / f"{rank.lower()}_positions.parquet"
+        _atomic_write(ctx_pos_path, pos_table)
 
 
 def build_rank_indexes(ancestor: TaxonRecord, layers: list[dict]) -> None:
@@ -399,114 +776,6 @@ def _load_column_lengths(index_path: Path) -> dict[str, int]:
         return {}
 
 
-def _load_existing_positions(positions_path: Path) -> list[dict[str, Any]]:
-    if not positions_path.exists():
-        return []
-    try:
-        rows = pq.read_table(positions_path).to_pylist()
-        return [r for r in rows if r.get("variable") and r.get("metric")]
-    except Exception:
-        return []
-
-
-def _distribute_positions(ancestor: TaxonRecord, index_path: Path) -> None:
-    """Read one rank index and upsert position rows into each descendant's file."""
-    if not index_path.exists():
-        return
-    try:
-        schema = pq.read_schema(index_path)
-    except Exception:
-        return
-
-    metric_columns = [n for n in schema.names if "::" in n]
-    if not metric_columns:
-        return
-
-    column_lengths = _load_column_lengths(index_path)
-    context_taxon_id = str(ancestor["taxon_key"])
-    context_label = _resolve_context_label(ancestor)
-
-    try:
-        table = pq.read_table(index_path, columns=metric_columns)
-    except Exception:
-        return
-
-    rows_by_taxon: dict[str, list[dict[str, Any]]] = {}
-    for col_name in metric_columns:
-        variable, metric = col_name.split("::", 1)
-        if metric in _ANGULAR_METRICS:
-            continue  # bearings have no meaningful percentile position
-        is_class_metric = metric.startswith("class_")
-        column = table.column(col_name).combine_chunks()
-        col_len = min(column_lengths.get(col_name, len(column)), len(column))
-        if col_len <= 0:
-            continue
-
-        # Extract struct fields into flat arrays — much faster than per-entry as_py()
-        col_slice = column[:col_len]
-        taxon_keys_list = col_slice.field("taxonKey").to_pylist()
-        values_list = col_slice.field("value").to_pylist()
-        sample_counts_list = col_slice.field("sampleCount").to_pylist()
-
-        prev_value: float | None = None
-        min_rank_pos = 0
-        for position in range(col_len):
-            taxon_key = taxon_keys_list[position]
-            if taxon_key is None:
-                continue
-            value = values_list[position]
-            # Track min-rank position: all tied values share the first position
-            # in their group rather than getting arbitrary alphabetical positions.
-            if value != prev_value:
-                min_rank_pos = position
-                prev_value = value
-            # Zero-class entries exist in the index for search but are meaningless
-            # on the species page (the species was never observed in that class).
-            if is_class_metric and value == 0.0:
-                continue
-            sample_count = sample_counts_list[position]
-            rows_by_taxon.setdefault(taxon_key, []).append({
-                "variable": variable,
-                "metric": metric,
-                "position": min_rank_pos,
-                "count": col_len,
-                "sampleCount": int(sample_count) if sample_count is not None else None,
-                "contextTaxonId": context_taxon_id,
-                "contextLabel": context_label,
-            })
-
-    for taxon_key, new_rows in rows_by_taxon.items():
-        taxon = get_taxon_by_id(taxon_key)
-        if taxon is None:
-            continue
-        positions_path = TREE_ROOT / taxon["path"] / POSITION_FILE
-        existing = _load_existing_positions(positions_path)
-        # Keep rows from other ancestor contexts; replace rows from this context.
-        kept = [r for r in existing if r["contextTaxonId"] != context_taxon_id]
-        merged = kept + new_rows
-        tbl = pa.Table.from_arrays(
-            [
-                pa.array([r["variable"] for r in merged], type=pa.string()),
-                pa.array([r["metric"] for r in merged], type=pa.string()),
-                pa.array([r["position"] for r in merged], type=pa.int64()),
-                pa.array([r["count"] for r in merged], type=pa.int64()),
-                pa.array([r["sampleCount"] for r in merged], type=pa.int64()),
-                pa.array([r["contextTaxonId"] for r in merged], type=pa.string()),
-                pa.array([r["contextLabel"] for r in merged], type=pa.string()),
-            ],
-            schema=_POSITION_SCHEMA,
-        )
-        _atomic_write(positions_path, tbl)
-
-
-def distribute_all_positions(ancestor: TaxonRecord) -> None:
-    """Distribute position rows from all rank indexes under ancestor's directory."""
-    ancestor_rank = ancestor.get("rank") or ""
-    targets = _descendant_rank_targets(ancestor_rank)
-    ancestor_dir = TREE_ROOT / ancestor["path"]
-    for rank in targets:
-        index_path = ancestor_dir / f"{rank.lower()}_index.parquet"
-        _distribute_positions(ancestor, index_path)
 
 
 # ---------------------------------------------------------------------------
@@ -514,13 +783,12 @@ def distribute_all_positions(ancestor: TaxonRecord) -> None:
 # ---------------------------------------------------------------------------
 
 def compute_relative_ranks(ancestor: TaxonRecord, layers: list[dict]) -> None:
-    """Build descendant catalogs, rank indexes, and distribute positions for one ancestor.
+    """Build descendant rank indexes (and inline positions files) for one ancestor.
 
-    Designed to be called per-ancestor in a top-down (shallowest-first) BFS pass
-    after the bottom-up stats pass is complete.
+    Positions are written as positions_ctx_{id}_{rank}.parquet alongside each index.
+    Consolidation merges them into the global positions file. No separate distribute pass.
     """
     build_rank_indexes(ancestor, layers)
-    distribute_all_positions(ancestor)
 
 
 # ---------------------------------------------------------------------------

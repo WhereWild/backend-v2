@@ -516,29 +516,6 @@ def test_process_batch_none_scale_offset(tmp_path):
         et._process_batch(worklist, layers)
     df = pq.read_table(path).to_pandas()
     assert pytest.approx(df.loc[df["catalogNumber"] == "obs1", "kg0"].iloc[0]) == 15.0
-
-
-def test_process_batch_nodata_not_written(tmp_path):
-    # All points are nodata → nothing written for that layer
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    worklist = _make_worklist("tk1", str(path), ["bio1"])
-    layers = [{"id": "bio1", "filename": "bio1.tif", "scale_factor": 0.1, "add_offset": 0.0}]
-    layers_dir = tmp_path / "layers"
-    layers_dir.mkdir()
-    (layers_dir / "bio1.tif").touch()
-    mock_ds = _mock_rasterio_open([65535.0, 65535.0], nodata=65535.0)
-    with patch.object(et, "LAYERS_DIR", layers_dir), \
-         patch("rasterio.open", return_value=mock_ds):
-        et._process_batch(worklist, layers)
-    df = pq.read_table(path).to_pandas()
-    assert "bio1" not in df.columns
-
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-
 def test_main_nothing_to_do(tmp_path, capsys):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))

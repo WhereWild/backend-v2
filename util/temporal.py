@@ -19,6 +19,7 @@ no-op: obs_elev is NaN → offset is 0.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -530,6 +531,14 @@ def _open_chunk(entry: ChunkRange, model: str, variable: str) -> OmFileReader:
     return OmFileReader.from_fsspec(fs, path)
 
 
+def _open_chunk_s3(entry: ChunkRange, model: str, variable: str) -> OmFileReader:
+    """Open a chunk directly from S3 via HTTP range requests — no local download."""
+    filename = _chunk_filename(entry)
+    path = f"openmeteo/data/{model}/{variable}/{filename}"
+    fs = fsspec.filesystem("s3", anon=True)
+    return OmFileReader.from_fsspec(fs, path)
+
+
 def _download_chunk(
     chunk_entry: ChunkRange,
     model: str,
@@ -553,6 +562,7 @@ def _download_chunk(
 
 
 _PREFETCH_WORKERS = 8
+_RANGE_FETCH_WORKERS = 8
 
 
 def _download_layer_chunk(
@@ -733,12 +743,17 @@ def build_occ_index(
 
     tree_root = Path(data_root) / "taxonomy" / "tree"
     total_rows = 0
+    total_skipped = 0
+    n_files = 0
+    t0 = time.monotonic()
+    last_report = t0
 
     with pq.ParquetWriter(index_path, _OCC_INDEX_SCHEMA) as writer:
         for node in iter_descendants(root, include_self=True):
             occ_path = tree_root / node["path"] / occ_filename
             if not occ_path.exists():
                 continue
+            n_files += 1
             schema = pq.read_schema(occ_path)
             read_cols = [_LAT_COL, _LON_COL, _TIME_COL]
             has_elev = "elevation" in schema.names
@@ -756,6 +771,7 @@ def build_occ_index(
                 if len(present) == len(skip_if_cols):
                     skip_df = pq.read_table(occ_path, columns=present).to_pandas()
                     already_done = skip_df.notna().any(axis=1)
+                    total_skipped += int(already_done.sum())
                     valid &= ~already_done.values
 
             if not valid.any():
@@ -783,6 +799,20 @@ def build_occ_index(
             writer.write_table(chunk_table)
             total_rows += len(row_idx)
 
+            now = time.monotonic()
+            if now - last_report >= 30:
+                print(
+                    f"[occ_index] {n_files} files scanned  "
+                    f"found={total_rows}  skipped={total_skipped}  "
+                    f"elapsed={now - t0:.0f}s"
+                )
+                last_report = now
+
+    elapsed = time.monotonic() - t0
+    print(
+        f"[occ_index] done: {n_files} files  found={total_rows}  "
+        f"skipped={total_skipped}  elapsed={elapsed:.1f}s"
+    )
     return total_rows
 
 
@@ -877,6 +907,7 @@ def process_chunk(
     steps: dict[int, int],
     agg_mode: str,
     cache_dir: str,
+    range_request: bool = False,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Download, process, and delete one .om chunk.
 
@@ -904,8 +935,8 @@ def process_chunk(
     """
     max_window_steps = max(steps.values()) if steps else 0
 
-    local_path = _download_chunk(chunk_entry, model, variable, cache_dir)
-    reader = OmFileReader(str(local_path))
+    reader = (_open_chunk_s3(chunk_entry, model, variable) if range_request
+              else OmFileReader(str(_download_chunk(chunk_entry, model, variable, cache_dir))))
     ny, nx, _ = reader.shape
 
     data = worklist_slice.to_pydict()
@@ -947,6 +978,19 @@ def process_chunk(
     group_starts = np.flatnonzero(change)
     group_ends = np.append(group_starts[1:], len(lat))
 
+    # Parallel-prefetch all unique grid cells upfront when using range requests,
+    # avoiding O(cells) serial round trips.
+    _cell_cache: dict[tuple[int, int], np.ndarray] = {}
+    if range_request and group_starts.size > 0:
+        _unique = [(int(lat[s]), int(lon[s])) for s in group_starts]
+        def _fetch(li_lo: tuple[int, int]) -> tuple[tuple[int, int], np.ndarray]:
+            try:
+                return li_lo, np.asarray(reader[li_lo[0], li_lo[1], :], dtype=np.float64)
+            except Exception:
+                return li_lo, np.empty(0, dtype=np.float64)
+        with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
+            _cell_cache = dict(_ex.map(_fetch, _unique))
+
     updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
     new_tail: TailBuffer = {}
 
@@ -954,10 +998,13 @@ def process_chunk(
         li = int(lat[s])
         lo = int(lon[s])
 
-        try:
-            series = np.asarray(reader[li, lo, :], dtype=np.float64)
-        except Exception:
-            continue
+        if range_request:
+            series = _cell_cache.get((li, lo), np.empty(0, dtype=np.float64))
+        else:
+            try:
+                series = np.asarray(reader[li, lo, :], dtype=np.float64)
+            except Exception:
+                continue
         if series.size == 0:
             continue
 
@@ -1032,6 +1079,7 @@ def process_chunk_mode(
     resolution: float,
     cache_dir: str,
     secondary_indices: dict[str, ChunkIndex] | None = None,
+    range_request: bool = False,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Download multiple .om files, derive a per-timestep series, apply sliding-window mode.
 
@@ -1046,22 +1094,24 @@ def process_chunk_mode(
     _precip_idx = _sv.index("precipitation")
     _snow_idx   = _sv.index("snowfall_water_equivalent")
 
+    def _open(entry: ChunkRange, var: str) -> OmFileReader:
+        return (_open_chunk_s3(entry, model, var) if range_request
+                else OmFileReader(str(_download_chunk(entry, model, var, cache_dir))))
+
     primary_var = source_variables[0]
-    readers: list[OmFileReader | None] = [
-        OmFileReader(str(_download_chunk(chunk_entry, model, primary_var, cache_dir)))
-    ]
+    readers: list[OmFileReader | None] = [_open(chunk_entry, primary_var)]
     sec_offsets: list[int] = [0]
     for var in source_variables[1:]:
         if secondary_indices is not None and var in secondary_indices:
             sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
             if sec_entry is not None:
-                readers.append(OmFileReader(str(_download_chunk(sec_entry, model, var, cache_dir))))
+                readers.append(_open(sec_entry, var))
                 sec_offsets.append(sec_t0)
             else:
                 readers.append(None)
                 sec_offsets.append(0)
         else:
-            readers.append(OmFileReader(str(_download_chunk(chunk_entry, model, var, cache_dir))))
+            readers.append(_open(chunk_entry, var))
             sec_offsets.append(0)
     ny, nx, _ = readers[0].shape
 
@@ -1101,6 +1151,22 @@ def process_chunk_mode(
     group_starts = np.flatnonzero(change)
     group_ends = np.append(group_starts[1:], len(lat))
 
+    # Parallel-prefetch all (reader, cell) combinations at once when range-requesting.
+    _reader_caches: list[dict[tuple[int, int], np.ndarray]] = [{} for _ in readers]
+    if range_request and group_starts.size > 0:
+        _unique = [(int(lat[s]), int(lon[s])) for s in group_starts]
+        _tasks = [(r_idx, r, li, lo) for r_idx, r in enumerate(readers) if r is not None
+                  for li, lo in _unique]
+        def _fetch_multi(task: tuple) -> tuple:
+            r_idx, r, li, lo = task
+            try:
+                return r_idx, li, lo, np.asarray(r[li, lo, :], dtype=np.float64)
+            except Exception:
+                return r_idx, li, lo, np.empty(0, dtype=np.float64)
+        with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
+            for _r_idx, _li, _lo, _arr in _ex.map(_fetch_multi, _tasks):
+                _reader_caches[_r_idx][(_li, _lo)] = _arr
+
     updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
     new_tail: TailBuffer = {}
 
@@ -1108,14 +1174,20 @@ def process_chunk_mode(
         li, lo = int(lat[s]), int(lon[s])
 
         try:
-            primary_arr = np.asarray(readers[0][li, lo, :], dtype=np.float64)
+            if range_request:
+                primary_arr = _reader_caches[0].get((li, lo), np.empty(0, dtype=np.float64))
+            else:
+                primary_arr = np.asarray(readers[0][li, lo, :], dtype=np.float64)
             primary_len = len(primary_arr)
             raw: list[np.ndarray] = [primary_arr]
-            for r, off in zip(readers[1:], sec_offsets[1:]):
+            for r_idx, (r, off) in enumerate(zip(readers[1:], sec_offsets[1:]), start=1):
                 if r is None:
                     raw.append(np.full(primary_len, np.nan, dtype=np.float64))
                 else:
-                    arr = np.asarray(r[li, lo, :], dtype=np.float64)
+                    if range_request:
+                        arr = _reader_caches[r_idx].get((li, lo), np.empty(0, dtype=np.float64))
+                    else:
+                        arr = np.asarray(r[li, lo, :], dtype=np.float64)
                     sliced = arr[off:off + primary_len]
                     if len(sliced) < primary_len:
                         padded = np.full(primary_len, np.nan, dtype=np.float64)
@@ -1194,6 +1266,7 @@ def process_chunk_vpd(
     resolution: float,
     cache_dir: str,
     secondary_indices: dict[str, ChunkIndex] | None = None,
+    range_request: bool = False,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Derive VPD per-timestep from temperature_2m and dew_point_2m, then avg over windows.
 
@@ -1202,22 +1275,24 @@ def process_chunk_vpd(
     """
     max_window_steps = max(steps.values()) if steps else 0
 
+    def _open(entry: ChunkRange, var: str) -> OmFileReader:
+        return (_open_chunk_s3(entry, model, var) if range_request
+                else OmFileReader(str(_download_chunk(entry, model, var, cache_dir))))
+
     primary_var = source_variables[0]
-    readers: list[OmFileReader | None] = [
-        OmFileReader(str(_download_chunk(chunk_entry, model, primary_var, cache_dir)))
-    ]
+    readers: list[OmFileReader | None] = [_open(chunk_entry, primary_var)]
     sec_offsets: list[int] = [0]
     for var in source_variables[1:]:
         if secondary_indices is not None and var in secondary_indices:
             sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
             if sec_entry is not None:
-                readers.append(OmFileReader(str(_download_chunk(sec_entry, model, var, cache_dir))))
+                readers.append(_open(sec_entry, var))
                 sec_offsets.append(sec_t0)
             else:
                 readers.append(None)
                 sec_offsets.append(0)
         else:
-            readers.append(OmFileReader(str(_download_chunk(chunk_entry, model, var, cache_dir))))
+            readers.append(_open(chunk_entry, var))
             sec_offsets.append(0)
 
     ny, nx, _ = readers[0].shape
@@ -1254,6 +1329,22 @@ def process_chunk_vpd(
     group_starts = np.flatnonzero(change)
     group_ends = np.append(group_starts[1:], len(lat))
 
+    # Parallel-prefetch all (reader, cell) combinations at once when range-requesting.
+    _reader_caches_vpd: list[dict[tuple[int, int], np.ndarray]] = [{} for _ in readers]
+    if range_request and group_starts.size > 0:
+        _unique = [(int(lat[s]), int(lon[s])) for s in group_starts]
+        _tasks = [(r_idx, r, li, lo) for r_idx, r in enumerate(readers) if r is not None
+                  for li, lo in _unique]
+        def _fetch_vpd(task: tuple) -> tuple:
+            r_idx, r, li, lo = task
+            try:
+                return r_idx, li, lo, np.asarray(r[li, lo, :], dtype=np.float64)
+            except Exception:
+                return r_idx, li, lo, np.empty(0, dtype=np.float64)
+        with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
+            for _r_idx, _li, _lo, _arr in _ex.map(_fetch_vpd, _tasks):
+                _reader_caches_vpd[_r_idx][(_li, _lo)] = _arr
+
     updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
     new_tail: TailBuffer = {}
 
@@ -1261,14 +1352,20 @@ def process_chunk_vpd(
         li, lo = int(lat[s]), int(lon[s])
 
         try:
-            primary_arr = np.asarray(readers[0][li, lo, :], dtype=np.float64)
+            if range_request:
+                primary_arr = _reader_caches_vpd[0].get((li, lo), np.empty(0, dtype=np.float64))
+            else:
+                primary_arr = np.asarray(readers[0][li, lo, :], dtype=np.float64)
             primary_len = len(primary_arr)
             raw: list[np.ndarray] = [primary_arr]
-            for r, off in zip(readers[1:], sec_offsets[1:]):
+            for r_idx, (r, off) in enumerate(zip(readers[1:], sec_offsets[1:]), start=1):
                 if r is None:
                     raw.append(np.full(primary_len, np.nan, dtype=np.float64))
                 else:
-                    arr = np.asarray(r[li, lo, :], dtype=np.float64)
+                    if range_request:
+                        arr = _reader_caches_vpd[r_idx].get((li, lo), np.empty(0, dtype=np.float64))
+                    else:
+                        arr = np.asarray(r[li, lo, :], dtype=np.float64)
                     sliced = arr[off:off + primary_len]
                     if len(sliced) < primary_len:
                         padded = np.full(primary_len, np.nan, dtype=np.float64)
@@ -1343,7 +1440,7 @@ def process_chunk_vpd(
 
 def _atomic_write(parquet_path: Path, table: pa.Table) -> None:
     from util.storage import atomic_write_parquet
-    atomic_write_parquet(parquet_path, table, row_group_size=256)
+    atomic_write_parquet(parquet_path, table, row_group_size=50_000)
 
 
 def _apply_updates_arrow(

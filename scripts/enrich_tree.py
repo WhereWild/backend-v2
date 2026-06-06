@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import rasterio
 import rasterio.transform
@@ -94,7 +95,7 @@ def _load_layers() -> list[dict]:
 
 def _atomic_write(path: Path, table: pa.Table) -> None:
     from util.storage import atomic_write_parquet
-    atomic_write_parquet(path, table, row_group_size=256)
+    atomic_write_parquet(path, table, row_group_size=50_000)
 
 
 @functools.lru_cache(maxsize=1)
@@ -142,9 +143,13 @@ def _missing_rows_for_taxon(taxon: TaxonRecord, layer_ids: list[str]) -> pa.Tabl
         return None
     _drop_stale_gis_columns(df, layer_ids, data_path)
 
-    # Build a boolean matrix: null_matrix[i, j] = True if row i is missing layer_ids[j]
+    # Use pc.is_null on the Arrow table (not pandas isna) so that no-coverage
+    # sentinels (NaN for continuous, -1 for nominal) are not re-queued.
+    # pc.is_null returns False for both NaN and -1 since they are real values,
+    # so a single check handles all cases.
     null_cols = [
-        df[lid].isna().values if lid in df.columns else np.ones(len(df), dtype=bool)
+        np.asarray(pc.is_null(table.column(lid))) if lid in table.schema.names
+        else np.ones(table.num_rows, dtype=bool)
         for lid in layer_ids
     ]
     if not null_cols:
@@ -426,13 +431,13 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
         if not data_file.exists():
             continue
 
-        # Collect layers with any non-NaN values for this taxon
-        taxon_updates: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        # Include ALL sampled rows (even NaN = no-coverage) so we can stamp the
+        # no-coverage sentinel and avoid re-processing them on future rebuilds.
+        taxon_updates: dict[str, np.ndarray] = {}
         for layer_id, full_values in layer_results.items():
             t_vals = full_values[row_indices]
-            valid_mask = ~np.isnan(t_vals)
-            if np.any(valid_mask):
-                taxon_updates[layer_id] = (catalogs[row_indices[valid_mask]], t_vals[valid_mask])
+            if t_vals.size > 0:
+                taxon_updates[layer_id] = t_vals
 
         if not taxon_updates:
             continue
@@ -445,17 +450,33 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
         catalog_arr = df_taxon["catalogNumber"].astype(str).to_numpy()
         catalog_index = {v: i for i, v in enumerate(catalog_arr)}
 
-        for layer_id, (cat_nums, values) in taxon_updates.items():
+        for layer_id, t_vals in taxon_updates.items():
             if layer_id not in df_taxon.columns:
                 df_taxon[layer_id] = np.nan
             col = df_taxon[layer_id].to_numpy(dtype=np.float64, copy=True)
-            # Vectorized catalog lookup and assignment
-            df_indices = np.array([catalog_index.get(c, -1) for c in cat_nums])
+            df_indices = np.array([catalog_index.get(c, -1) for c in catalogs[row_indices]])
             valid = df_indices >= 0
-            col[df_indices[valid]] = values[valid]
+            col[df_indices[valid]] = t_vals[valid]
             df_taxon[layer_id] = col
 
-        _atomic_write(data_file, pa.Table.from_pandas(df_taxon, preserve_index=False))
+        # Stamp NaN (not null) for no-coverage rows so they aren't re-queued on
+        # future rebuilds. pa.Table.from_pandas converts NaN→null for float cols,
+        # so we restore NaN in Arrow after the conversion.
+        # NaN is ignored by all stats computation (same as for continuous layers).
+        arrow_table = pa.Table.from_pandas(df_taxon, preserve_index=False)
+        new_columns = {}
+        for layer_id in taxon_updates:
+            if layer_id not in arrow_table.schema.names:
+                continue
+            col = arrow_table.column(layer_id)
+            if pa.types.is_floating(col.type):
+                new_columns[layer_id] = pc.if_else(pc.is_null(col), float("nan"), col)
+        if new_columns:
+            for col_name, new_col in new_columns.items():
+                idx = arrow_table.schema.get_field_index(col_name)
+                arrow_table = arrow_table.set_column(idx, col_name, new_col)
+
+        _atomic_write(data_file, arrow_table)
 
 
 def _sample_cog(

@@ -23,11 +23,7 @@ from starlette.concurrency import run_in_threadpool
 import util.rankings as rankings
 from config.config import load_config
 from util import citations, gis, taxa, tiles, units, upload
-from util.indexing import OCCURRENCE_INDEX_FILE
-from util.indexing import lookup_value as _index_lookup_value
-from util.indexing import read_all_values as _index_read_all_values
-from util.indexing import read_slice as _index_read_slice
-from util.rankings import POSITION_FILE
+from util.rankings import TREE_ROOT as RANKINGS_TREE_ROOT
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -97,10 +93,17 @@ def _load_legend(layer_id: str) -> list:
 
 
 def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
-    """Read a precomputed env value for a known observation from occurrence_index.parquet."""
-    index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
+    """Read an env value for a known observation directly from occurrence.parquet."""
+    occ_path = TREE_ROOT / taxon["path"] / "occurrence.parquet"
     try:
-        return _index_lookup_value(index_path, variable_id, catalog_number)
+        import pyarrow.parquet as _pq
+        tbl = _pq.read_table(occ_path, columns=["catalogNumber", variable_id])
+        df = tbl.to_pandas()
+        row = df[df["catalogNumber"] == catalog_number]
+        if row.empty or variable_id not in row.columns:
+            return None
+        val = row.iloc[0][variable_id]
+        return float(val) if val is not None and pd.notna(val) else None
     except Exception:
         return None
 
@@ -649,28 +652,43 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
 # ---------------------------------------------------------------------------
 
 def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
-    """Read relative_ranks_positions.parquet from global file for one taxon+variable."""
-    try:
-        rows = _storage.read_table(
-            GLOBAL_STATS_DIR / POSITION_FILE,
-            filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
-        ).to_pylist()
-    except Exception:
+    """Read per-context {rank}_positions.parquet files for one taxon+variable."""
+    taxon = taxa.get_taxon_by_id(taxon_key)
+    if not taxon:
         return []
+    path = taxon.get("path", "")
+    rank = (taxon.get("rank") or "").lower()
+    if not path or not rank:
+        return []
+
+    parts = path.split("/")
     result = []
-    for row in rows:
-        position = row.get("position") or 0
-        count = row.get("count") or 0
-        percentile = round(position / count, 3) if count > 0 else 0.0
-        result.append({
-            "metric": row.get("metric"),
-            "position": position + 1,
-            "count": count,
-            "percentile": percentile,
-            "sampleCount": row.get("sampleCount"),
-            "context_label": row.get("contextLabel"),
-            "label": row.get("contextLabel"),
-        })
+    cumulative = ""
+    for i, part in enumerate(parts[:-1]):
+        cumulative = part if i == 0 else f"{cumulative}/{part}"
+        positions_file = RANKINGS_TREE_ROOT / cumulative / f"{rank}_positions.parquet"
+        if not positions_file.exists():
+            continue
+        try:
+            rows = _storage.read_table(
+                positions_file,
+                filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
+            ).to_pylist()
+        except Exception:
+            continue
+        for row in rows:
+            position = row.get("position") or 0
+            count = row.get("count") or 0
+            percentile = round(position / count, 3) if count > 0 else 0.0
+            result.append({
+                "metric": row.get("metric"),
+                "position": position + 1,
+                "count": count,
+                "percentile": percentile,
+                "sampleCount": row.get("sampleCount"),
+                "context_label": row.get("contextLabel"),
+                "label": row.get("contextLabel"),
+            })
     return result
 
 
@@ -1210,24 +1228,6 @@ def get_species_locations(taxon_id: str, level: int | None = None, parent: str |
     return results[:limit]
 
 
-def _read_index_for_slice(
-    index_path: Path,
-    variable_id: str,
-    *,
-    value_min: float | None = None,
-    value_max: float | None = None,
-    circular_wrap: bool = False,
-    class_value: float | None = None,
-    limit: int | None = None,
-) -> list[dict]:
-    """Binary-search occurrence_index.parquet by value range or class."""
-    return _index_read_slice(
-        index_path, variable_id,
-        value_min=value_min, value_max=value_max,
-        circular_wrap=circular_wrap, class_value=class_value,
-        limit=limit,
-    )
-
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/observation-values")
 def get_observation_variable_values(
@@ -1235,11 +1235,7 @@ def get_observation_variable_values(
     variable_id: str,
     unit_system: str | None = None,
 ):
-    """Return raw GIS values for all observations of a taxon for one variable.
-
-    Reads occurrence_index.parquet directly (no range filtering) and converts
-    to the requested unit system. Nodes without a built index are silently skipped.
-    """
+    """Return raw GIS values for all observations of a taxon for one variable."""
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -1251,22 +1247,35 @@ def get_observation_variable_values(
 
     collected: dict[str, float] = {}
 
-    def _read_index(path: Path) -> None:
-        for cat, raw_val in _index_read_all_values(path, variable_id):
-            if cat not in collected:
-                converted = units.convert_value(raw_val, layer, unit_system)
-                if converted is not None:
-                    collected[cat] = converted
+    def _read_occ(path: Path) -> None:
+        if not path.exists():
+            return
+        try:
+            import pyarrow.parquet as _pq
+            schema_names = set(_pq.read_schema(path).names)
+            extra = [c for c in ("obscured", "coordinateUncertaintyInMeters") if c in schema_names]
+            tbl = _pq.read_table(path, columns=["catalogNumber", variable_id] + extra).to_pandas()
+            if "obscured" in tbl.columns:
+                tbl = tbl[tbl["obscured"] == "No"]
+            if "coordinateUncertaintyInMeters" in tbl.columns:
+                tbl = tbl[tbl["coordinateUncertaintyInMeters"] <= 500]
+            for cat, val in zip(tbl["catalogNumber"].tolist(), tbl[variable_id].tolist()):
+                if cat not in collected and val is not None and not (isinstance(val, float) and math.isnan(val)):
+                    converted = units.convert_value(float(val), layer, unit_system)
+                    if converted is not None:
+                        collected[cat] = converted
+        except Exception:
+            pass
 
     is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
     if taxon["rank"] == _CONFIG.species_rank:
         for desc in iter_descendants(taxon, include_self=True):
-            _read_index(TREE_ROOT / desc["path"] / OCCURRENCE_INDEX_FILE)
+            _read_occ(TREE_ROOT / desc["path"] / "occurrence.parquet")
     elif is_leaf:
-        _read_index(TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE)
+        _read_occ(TREE_ROOT / taxon["path"] / "occurrence.parquet")
     else:
         for desc in iter_descendants(taxon, include_self=False):
-            _read_index(TREE_ROOT / desc["path"] / OCCURRENCE_INDEX_FILE)
+            _read_occ(TREE_ROOT / desc["path"] / "occurrence.parquet")
 
     vals = collected.values()
     obs_min = min(vals) if collected else None
@@ -1312,38 +1321,19 @@ def get_species_environment_slice(
     # Convert display-unit min/max back to raw (metric) values for querying.
     raw_min = units.convert_value_from_display(min_value, layer, unit_system)
     raw_max = units.convert_value_from_display(max_value, layer, unit_system)
-    if location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None:
-        filter_col = _location_filter_col(location) if location is not None else None
-        if location is None or filter_col is not None:
-            observations = _slice_from_raw_occ(
-                taxon, variable_id, filter_col, location,
-                raw_min, raw_max, circular_wrap, limit,
-                phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
-            )
-            observations = [
-                {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
-                for obs in observations
-            ]
-            return {
-                "species_id": taxon.get("taxon_key"),
-                "variable": variable_id,
-                "range": {"min": min_value, "max": max_value},
-                "count": len(observations),
-                "observations": observations,
-            }
-    index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
-    try:
-        observations = _read_index_for_slice(
-            index_path, variable_id,
-            value_min=raw_min, value_max=raw_max, circular_wrap=circular_wrap,
-            limit=limit,
+    filter_col = _location_filter_col(location) if location is not None else None
+    if location is None or filter_col is not None:
+        observations = _slice_from_raw_occ(
+            taxon, variable_id, filter_col, location,
+            raw_min, raw_max, circular_wrap, limit,
+            phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
         )
-    except Exception:
-        raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")
-    observations = [
-        {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
-        for obs in observations
-    ]
+        observations = [
+            {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
+            for obs in observations
+        ]
+    else:
+        observations = []
     return {
         "species_id": taxon.get("taxon_key"),
         "variable": variable_id,
@@ -1382,26 +1372,13 @@ def get_species_environment_class_samples(
             parsed = int(parsed)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid class value: {class_value!r}")
-    if location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None:
-        filter_col = _location_filter_col(location) if location is not None else None
-        if location is None or filter_col is not None:
-            observations = _class_samples_from_raw_occ(
-                taxon, variable_id, filter_col, location, float(parsed), limit, phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
-            )
-            return {
-                "species_id": taxon.get("taxon_key"),
-                "variable": variable_id,
-                "class_value": parsed,
-                "count": len(observations),
-                "observations": observations,
-            }
-    index_path = TREE_ROOT / taxon["path"] / OCCURRENCE_INDEX_FILE
-    try:
-        observations = _read_index_for_slice(
-            index_path, variable_id, class_value=float(parsed), limit=limit,
+    filter_col = _location_filter_col(location) if location is not None else None
+    if location is None or filter_col is not None:
+        observations = _class_samples_from_raw_occ(
+            taxon, variable_id, filter_col, location, float(parsed), limit, phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
         )
-    except Exception:
-        raise HTTPException(status_code=404, detail="Occurrence index not built for this taxon")
+    else:
+        observations = []
     return {
         "species_id": taxon.get("taxon_key"),
         "variable": variable_id,

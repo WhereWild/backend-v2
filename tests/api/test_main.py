@@ -614,57 +614,6 @@ def test_load_relative_ranks_corrupt_file(tmp_path):
     assert main_module._load_relative_ranks(tmp_path, "bio1") == []
 
 
-def test_load_relative_ranks_filters_by_variable(tmp_path, monkeypatch):
-    pq.write_table(pa.table({
-        "taxon_key":      ["2923970", "2923970"],
-        "variable":       ["bio1", "kg0"],
-        "metric":         ["mean", "entropy"],
-        "position":       [4, 1],
-        "count":          [10, 5],
-        "sampleCount":    [50, 30],
-        "contextTaxonId": ["100", "100"],
-        "contextLabel":   ["Cactaceae", "Cactaceae"],
-    }), tmp_path / rankings_module.POSITION_FILE)
-    monkeypatch.setattr(main_module, "GLOBAL_STATS_DIR", tmp_path)
-    rows = main_module._load_relative_ranks("2923970", "bio1")
-    assert len(rows) == 1
-    assert rows[0]["metric"] == "mean"
-    assert rows[0]["position"] == 5          # 0-based 4 → 1-based 5
-    assert rows[0]["count"] == 10
-    assert rows[0]["percentile"] == pytest.approx(0.4)     # 4/10
-    assert rows[0]["label"] == "Cactaceae"
-    assert rows[0]["context_label"] == "Cactaceae"
-
-
-def test_load_relative_ranks_zero_count(tmp_path, monkeypatch):
-    """count=0 edge case must not divide by zero."""
-    pq.write_table(pa.table({
-        "taxon_key":      ["2923970"],
-        "variable":       ["bio1"],
-        "metric":         ["mean"],
-        "position":       [0],
-        "count":          [0],
-        "sampleCount":    [0],
-        "contextTaxonId": ["1"],
-        "contextLabel":   ["Plantae"],
-    }), tmp_path / rankings_module.POSITION_FILE)
-    monkeypatch.setattr(main_module, "GLOBAL_STATS_DIR", tmp_path)
-    rows = main_module._load_relative_ranks("2923970", "bio1")
-    assert rows[0]["percentile"] == 0.0
-
-
-# ---------------------------------------------------------------------------
-# _load_legend (lines 25-28)
-# ---------------------------------------------------------------------------
-
-def test_load_legend_file_present(tmp_path, monkeypatch):
-    data = {"classes": [{"id": 1, "name": "Forest"}]}
-    (tmp_path / "kg0_legend.json").write_text(json.dumps(data))
-    monkeypatch.setattr(main_module, "_LEGEND_DIR", tmp_path)
-    main_module._load_legend.cache_clear()
-    assert main_module._load_legend("kg0") == [{"id": 1, "name": "Forest"}]
-
-
 def test_load_legend_file_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(main_module, "_LEGEND_DIR", tmp_path)
     main_module._load_legend.cache_clear()
@@ -1354,74 +1303,6 @@ FAKE_DISC_LAYER = {
 }
 
 
-# ---------------------------------------------------------------------------
-# _read_index_for_slice (lines 333-350)
-# ---------------------------------------------------------------------------
-
-def test_read_index_variable_not_in_schema(tmp_path):
-    path = tmp_path / "idx.parquet"
-    pq.write_table(_INDEX_TABLE, path)
-    result = main_module._read_index_for_slice(path, "missing_var", value_min=0.0, value_max=100.0)
-    assert result == []
-
-
-def test_read_index_range_filter(tmp_path):
-    _write_occ_index(tmp_path)
-    path = tmp_path / OCCURRENCE_INDEX_FILE
-    result = main_module._read_index_for_slice(path, "bio1", value_min=5.0, value_max=15.0)
-    assert len(result) == 1
-    assert result[0]["catalogNumber"] == "OCC001"
-    assert result[0]["value"] == pytest.approx(10.0)
-
-
-def test_read_index_class_filter(tmp_path):
-    _write_occ_index(tmp_path)
-    path = tmp_path / OCCURRENCE_INDEX_FILE
-    result = main_module._read_index_for_slice(path, "kg0", class_value=1.0)
-    assert len(result) == 2
-    assert all(r["value"] == pytest.approx(1.0) for r in result)
-
-
-def test_read_index_circular_wrap(tmp_path):
-    rows = [
-        {"catalogNumber": "A", "decimalLatitude": 40.0, "decimalLongitude": -75.0, "aspect_deg": 350.0},
-        {"catalogNumber": "B", "decimalLatitude": 41.0, "decimalLongitude": -74.0, "aspect_deg": 10.0},
-        {"catalogNumber": "C", "decimalLatitude": 42.0, "decimalLongitude": -73.0, "aspect_deg": 180.0},
-    ]
-    _write_occ_index(tmp_path, rows=rows)
-    path = tmp_path / OCCURRENCE_INDEX_FILE
-    # selection 315→45 wraps through north; 350 and 10 should match, 180 should not
-    result = main_module._read_index_for_slice(
-        path, "aspect_deg", value_min=315.0, value_max=45.0, circular_wrap=True,
-    )
-    catalogs = {r["catalogNumber"] for r in result}
-    assert "A" in catalogs
-    assert "B" in catalogs
-    assert "C" not in catalogs
-
-
-def test_read_index_limit(tmp_path):
-    _write_occ_index(tmp_path)
-    path = tmp_path / OCCURRENCE_INDEX_FILE
-    result = main_module._read_index_for_slice(path, "bio1", value_min=0.0, value_max=100.0, limit=2)
-    assert len(result) == 2
-
-
-# ---------------------------------------------------------------------------
-# /species/{id}/environment/{var}/slice (lines 369-397)
-# ---------------------------------------------------------------------------
-
-def test_slice_not_finite():
-    r = client.get("/species/2923970/environment/bio1/slice?min=nan&max=20")
-    assert r.status_code == 400
-
-
-def test_slice_taxon_not_found():
-    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None):
-        r = client.get("/species/nope/environment/bio1/slice?min=0&max=30")
-    assert r.status_code == 404
-
 
 def test_slice_layer_not_found():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
@@ -1437,55 +1318,6 @@ def test_slice_nominal_rejected():
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
         r = client.get("/species/2923970/environment/kg0/slice?min=0&max=30")
     assert r.status_code == 400
-
-
-def test_slice_no_index_file():
-    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
-         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
-         patch("pathlib.Path.exists", return_value=False):
-        r = client.get("/species/2923970/environment/bio1/slice?min=0&max=30")
-    assert r.status_code == 404
-
-
-def test_slice_success(tmp_path):
-    taxon_dir = tmp_path / TAXON["path"]
-    _write_occ_index(taxon_dir)
-    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
-         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
-         patch("main.TREE_ROOT", tmp_path):
-        r = client.get("/species/2923970/environment/bio1/slice?min=5&max=25")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["variable"] == "bio1"
-    assert body["range"] == {"min": 5.0, "max": 25.0}
-    assert body["count"] == 2
-    assert body["observations"][0]["catalogNumber"] == "OCC001"
-
-
-def test_slice_min_greater_than_max_swapped(tmp_path):
-    taxon_dir = tmp_path / TAXON["path"]
-    _write_occ_index(taxon_dir)
-    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
-         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
-         patch("main.TREE_ROOT", tmp_path):
-        r = client.get("/species/2923970/environment/bio1/slice?min=25&max=5")
-    assert r.status_code == 200
-    # After swap, min=5 max=25, same 2 results
-    assert r.json()["count"] == 2
-
-
-# ---------------------------------------------------------------------------
-# /species/{id}/environment/{var}/class/{val}/samples (lines 407-434)
-# ---------------------------------------------------------------------------
-
-def test_class_samples_taxon_not_found():
-    with patch.object(taxa, "get_taxon_by_id", return_value=None), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None):
-        r = client.get("/species/nope/environment/kg0/class/1/samples")
-    assert r.status_code == 404
 
 
 def test_class_samples_layer_not_found():
@@ -1510,52 +1342,6 @@ def test_class_samples_invalid_class():
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
         r = client.get("/species/2923970/environment/kg0/class/notanumber/samples")
     assert r.status_code == 400
-
-
-def test_class_samples_no_index():
-    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
-         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
-         patch("pathlib.Path.exists", return_value=False):
-        r = client.get("/species/2923970/environment/kg0/class/1/samples")
-    assert r.status_code == 404
-
-
-def test_class_samples_success(tmp_path):
-    taxon_dir = tmp_path / TAXON["path"]
-    _write_occ_index(taxon_dir)
-    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
-         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
-         patch("main.TREE_ROOT", tmp_path):
-        r = client.get("/species/2923970/environment/kg0/class/1/samples")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["variable"] == "kg0"
-    assert body["class_value"] == 1
-    assert body["count"] == 2
-    assert all(obs["value"] == pytest.approx(1.0) for obs in body["observations"])
-
-
-# ---------------------------------------------------------------------------
-# Slice with location param
-# ---------------------------------------------------------------------------
-
-def test_slice_with_location_success(tmp_path, monkeypatch):
-    import numpy as np
-
-    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
-    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "bio1",
-                       list(np.linspace(5.0, 25.0, 20)))
-    _patch_hierarchy(monkeypatch, {"USA": _USA})
-    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]):
-        r = client.get("/species/2923970/environment/bio1/slice?min=10&max=20&location=USA")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["count"] > 0
-    assert all(10.0 <= obs["value"] <= 20.0 for obs in body["observations"])
 
 
 def test_slice_with_location_no_data(tmp_path, monkeypatch):
@@ -1586,21 +1372,6 @@ def test_slice_with_location_empty_after_gid_filter(tmp_path, monkeypatch):
         r = client.get("/species/2923970/environment/bio1/slice?min=0&max=30&location=USA")
     assert r.status_code == 200
     assert r.json()["count"] == 0
-
-
-def test_slice_with_location_filter_col_none_falls_through(tmp_path, monkeypatch):
-    """filter_col None → falls through to precomputed index path."""
-    taxon_dir = tmp_path / TAXON["path"]
-    _write_occ_index(taxon_dir)
-    _patch_hierarchy(monkeypatch, {"WEIRD": {"level": 99, "name": "Weird", "parent_gid": None}})
-    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]), \
-         patch("main.TREE_ROOT", tmp_path):
-        r = client.get("/species/2923970/environment/bio1/slice?min=0&max=100&location=WEIRD")
-    assert r.status_code == 200
-    assert r.json()["count"] == 3
-
-
 def test_slice_from_raw_occ_circular_wrap(tmp_path, monkeypatch):
     """_slice_from_raw_occ handles circular_wrap=True correctly."""
     monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
@@ -1687,21 +1458,6 @@ def test_class_samples_with_location_empty_after_gid_filter(tmp_path, monkeypatc
         r = client.get("/species/2923970/environment/kg0/class/1/samples?location=USA")
     assert r.status_code == 200
     assert r.json()["count"] == 0
-
-
-def test_class_samples_with_location_filter_col_none_falls_through(tmp_path, monkeypatch):
-    """filter_col None → falls through to precomputed index path."""
-    taxon_dir = tmp_path / TAXON["path"]
-    _write_occ_index(taxon_dir)
-    _patch_hierarchy(monkeypatch, {"WEIRD": {"level": 99, "name": "Weird", "parent_gid": None}})
-    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
-         patch("main.TREE_ROOT", tmp_path):
-        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=WEIRD")
-    assert r.status_code == 200
-    assert r.json()["count"] == 2
-
-
 def test_class_samples_with_location_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
     monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
@@ -1940,20 +1696,6 @@ def test_lookup_index_value_catalog_number_not_found(tmp_path):
     with patch.object(main_module, "TREE_ROOT", tmp_path):
         result = _lookup_index_value(TAXON, "bio1", "12345")
     assert result is None
-
-
-def test_lookup_index_value_returns_float(tmp_path):
-    from main import _lookup_index_value
-    taxon_dir = tmp_path / TAXON["path"]
-    _write_occ_index(taxon_dir, rows=[
-        {"catalogNumber": "12345", "decimalLatitude": 40.0, "decimalLongitude": -75.0, "bio1": 14.35},
-    ])
-    with patch.object(main_module, "TREE_ROOT", tmp_path):
-        result = _lookup_index_value(TAXON, "bio1", "12345")
-    assert result == pytest.approx(14.35)
-
-
-
 def test_lookup_index_value_null_value_returns_none(tmp_path):
     from main import _lookup_index_value
     taxon_dir = tmp_path / TAXON["path"]

@@ -20,8 +20,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-_TEMPORAL_RE = _re.compile(r'_\d+h$')
-
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -31,6 +29,8 @@ from config.config import METRICS_BY_TYPE, ValueType, load_config
 from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE
 from util.storage import ParquetStorageProxy, atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
+
+_TEMPORAL_RE = _re.compile(r'_\d+h$')
 
 _storage = ParquetStorageProxy(
     data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
@@ -240,7 +240,8 @@ def preload_stats_cache(layers: list[dict]) -> None:
     a thread pool so pyarrow I/O can overlap across threads (GIL released during reads).
     """
     import time as _time
-    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
+    from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+    from concurrent.futures import as_completed as _as_completed
     from functools import partial as _partial
 
     global _stats_cache
@@ -302,7 +303,7 @@ def preload_stats_cache(layers: list[dict]) -> None:
     # Phase 1: read all stats files in parallel, collect raw dicts
     raw: dict[str, dict] = {}
     print(f"[rankings] preloading stats cache for {total_paths:,} taxa...")
-    with _TPE(max_workers=4) as executor:
+    with _ThreadPoolExecutor(max_workers=4) as executor:
         futs = {executor.submit(worker, p): p for p in all_paths}
         for fut in _as_completed(futs):
             try:
@@ -335,7 +336,7 @@ def preload_stats_cache(layers: list[dict]) -> None:
     print(f"[rankings] stats cache ready: {len(_stats_cache):,} taxa  {n_metrics:,} metrics  [{elapsed:.1f}s]")
 
     # Phase 3: persist to disk for fast restart
-    print(f"[rankings] saving cache to disk...")
+    print("[rankings] saving cache to disk...")
     try:
         _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _CACHE_FILE.with_suffix(".tmp")

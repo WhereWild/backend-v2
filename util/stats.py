@@ -27,7 +27,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fastdigest import TDigest
-from scipy.stats import circmean, circstd, circvar, vonmises
+from scipy.stats import circmean, circstd, circvar
 from scipy.stats import entropy as _scipy_entropy
 
 from config.config import ValueType, load_config
@@ -606,7 +606,6 @@ def _von_mises_kde_curve(values_deg: np.ndarray) -> dict | None:
         if not np.isfinite(cstd_rad) or cstd_rad < 1e-6:
             return None
         h = max((4.0 / (3.0 * n)) ** 0.2 * cstd_rad, 0.05)
-        kappa = 1.0 / h ** 2
         grid_deg = np.linspace(0.0, 360.0, _KDE_N_POINTS, endpoint=False)
         # FFT-based circular KDE: bin on [0,360) grid, convolve with wrapped Gaussian.
         counts, _ = np.histogram(np.degrees(values_rad) % 360.0,

@@ -152,23 +152,20 @@ def _release_inhibitor(proc: "subprocess.Popen | None") -> None:
 # ---------------------------------------------------------------------------
 
 def _push_stage() -> None:
-    """Sync taxonomy and location data to the production server via rclone."""
+    """Sync the full data/ directory to the production server via rclone."""
     dest = os.environ.get("WW_SYNC_DEST")
     if not dest:
-        raise RuntimeError("WW_SYNC_DEST env var must be set (e.g. server:/path/to/data)")
+        raise RuntimeError("WW_SYNC_DEST env var must be set (e.g. gambaby:/path/to/data)")
     transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
-    base_flags = ["--transfers", transfers, "--stats-one-line", "--stats", "1m"]
-
-    syncs = [
-        (DATA_DIR / "taxonomy",           f"{dest}/taxonomy",       ["--exclude", "cache/**"]),
-        (DATA_DIR / "gis" / "locations",  f"{dest}/gis/locations",  []),
+    flags = [
+        "--exclude", "taxonomy/cache/**",
+        "--transfers", transfers,
+        "--stats-one-line", "--stats", "1m",
     ]
-
-    for src, dst, extra_flags in syncs:
-        print(f"  rclone sync {src} → {dst}")
-        r = subprocess.run(["rclone", "sync", str(src), dst, *extra_flags, *base_flags])
-        if r.returncode != 0:
-            raise RuntimeError(f"rclone sync {src} failed with exit code {r.returncode}")
+    print(f"  rclone sync {DATA_DIR} → {dest}")
+    r = subprocess.run(["rclone", "sync", str(DATA_DIR), dest, *flags])
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone sync failed with exit code {r.returncode}")
 
 
 def _run_download_gis(gis_dir: Path | None = None) -> None:

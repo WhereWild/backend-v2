@@ -22,13 +22,14 @@ import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from config.config import load_config
-from util.rankings import POSITION_FILE, POSITION_CTX_GLOB, compute_relative_ranks, preload_stats_cache
+from util.rankings import POSITION_CTX_GLOB, POSITION_FILE, compute_relative_ranks, preload_stats_cache
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -38,7 +39,6 @@ from util.stats import (
     PHENOLOGY_COUNTS_FILE,
     TREE_ROOT,
     compute_taxon_stats,
-    stats_complete,
 )
 from util.storage import atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants
@@ -72,8 +72,8 @@ def _level_pass(
     completed = 0
     failed = 0
     t0 = time.monotonic()
-    _WINDOW = 500
-    recent: deque[float] = deque(maxlen=_WINDOW)
+    window = 500
+    recent: deque[float] = deque(maxlen=window)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for depth in levels:
@@ -207,14 +207,14 @@ def _consolidate_positions(t0: float) -> None:
               f"{total_rows:,} rows  [{time.monotonic()-t0:.1f}s]", flush=True)
 
         # Phase 2 — iterative merge until one run remains
-        GROUP = 10
+        group = 10
         pass_num = 0
         while len(run_paths) > 1:
             pass_num += 1
             next_runs: list[Path] = []
-            for i in range(0, len(run_paths), GROUP):
-                group = run_paths[i : i + GROUP]
-                tbls = [pq.read_table(p) for p in group]
+            for i in range(0, len(run_paths), group):
+                chunk = run_paths[i : i + group]
+                tbls = [pq.read_table(p) for p in chunk]
                 merged = pa.concat_tables(tbls).sort_by(
                     [("taxon_key", "ascending"), ("variable", "ascending")]
                 )
@@ -223,10 +223,10 @@ def _consolidate_positions(t0: float) -> None:
                 pq.write_table(merged, out, compression="snappy",
                                row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
                 del merged
-                for p in group:
+                for p in chunk:
                     p.unlink(missing_ok=True)
                 next_runs.append(out)
-                print(f"[consolidate/positions] pass {pass_num} merge {len(next_runs)}/{-(-len(run_paths)//GROUP)}  "
+                print(f"[consolidate/positions] pass {pass_num} merge {len(next_runs)}/{-(-len(run_paths)//group)}  "
                       f"[{time.monotonic()-t0:.1f}s]", flush=True)
             run_paths = next_runs
 
@@ -274,7 +274,7 @@ def run_consolidation() -> None:
         writer: pq.ParquetWriter | None = None
         batch: list[pa.Table] = []
         total_rows = 0
-        _BATCH = 100_000
+        batch_size = 100_000
         try:
             for n, path in enumerate(paths, 1):
                 taxon_key = path.parent.name.rsplit("_", 1)[-1]
@@ -284,7 +284,7 @@ def run_consolidation() -> None:
                     pa.array([taxon_key] * len(tbl), type=pa.string()),
                 )
                 batch.append(tbl)
-                if len(batch) >= _BATCH:
+                if len(batch) >= batch_size:
                     chunk = pa.concat_tables(batch, promote_options="default")
                     if writer is None:
                         writer = pq.ParquetWriter(tmp_path, chunk.schema)

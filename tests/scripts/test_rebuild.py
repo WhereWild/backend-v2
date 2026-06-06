@@ -434,58 +434,6 @@ def test_wipe_data_dir_preserves_taxonomy_cache(monkeypatch, tmp_path):
     assert not (data_dir / "taxonomy" / "catalog.pkl").exists()
 
 
-def test_pid_alive_current_process():
-    assert rebuild._pid_alive(os.getpid()) is True
-
-
-def test_pid_alive_dead_pid():
-    assert rebuild._pid_alive(99999999) is False
-
-
-def test_pid_alive_none():
-    assert rebuild._pid_alive(None) is False
-
-
-def test_main_already_running_exits(tmp_path, monkeypatch):
-    monkeypatch.setattr("sys.argv", ["rebuild"])
-    sync_state_path = tmp_path / "data" / "sync_state.json"
-    sync_state_path.parent.mkdir(parents=True, exist_ok=True)
-    sync_state_path.write_text(json.dumps({
-        "pipeline": {"status": "in_progress", "pid": 99999, "stage": "build_tree", "stages": {}}
-    }))
-
-    with patch("scripts.rebuild._pid_alive", return_value=True), \
-         patch("scripts.rebuild._acquire_shutdown_inhibitor") as mock_inhibitor:
-        rebuild.main()
-
-    mock_inhibitor.assert_not_called()
-    p = json.loads(sync_state_path.read_text())["pipeline"]
-    assert p["status"] == "in_progress"  # unchanged — exited before touching it
-
-
-def test_main_force_skips_freshness_check(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr("sys.argv", ["rebuild", "--force"])
-    with patch("scripts.sync_gbif.latest_crawl_finished") as mock_check, \
-         patch("scripts.sync_gbif.main"), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
-         patch("scripts.rebuild.wipe_data_dir"), \
-         patch("scripts.build_tree.main"), \
-         patch("scripts.populate_tree.main"), \
-         patch("scripts.gis.process_gadm.main"), \
-         patch("scripts.rebuild._run_download_gis"), \
-         patch("scripts.gis.build_overviews.main"), \
-         patch("scripts.enrich_tree.main"), \
-         patch("scripts.enrich_temporal.main"), \
-         patch("scripts.process_tree.main"), \
-         patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
-         patch("scripts.rebuild._release_inhibitor"), \
-         patch("scripts.rebuild.notify"):
-        rebuild.main()
-
-    mock_check.assert_not_called()
-    assert "--force" in capsys.readouterr().out
-
-
 def test_main_force_clears_gbif_crawl_timestamps(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["rebuild", "--force"])
     sync_state_path = tmp_path / "data" / "sync_state.json"
@@ -560,8 +508,7 @@ def test_main_resume_skips_completed_stages(tmp_path, monkeypatch):
     }))
 
     call_order = []
-    with patch("scripts.rebuild._pid_alive", return_value=False), \
-         patch("scripts.rebuild.wipe_data_dir"), \
+    with patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.sync_gbif.main", side_effect=lambda: call_order.append("sync_gbif")), \
          patch("scripts.sync_gbif.sync_occurrences"), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("build_tree")), \

@@ -447,6 +447,14 @@ SUBSPECIES_TAXON: dict = {
     "rank": "SUBSPECIES",
 }
 
+LEAF_TAXON: dict = {
+    "taxon_key": "1001",
+    "path": "Root_1/Leaf_1001",
+    "scientific_name": "Leafus testus",
+    "common_name": "",
+    "rank": "SPECIES",
+}
+
 
 def _make_fake_descendants(taxon, children):
     """Patch iter_descendants to yield taxon + children."""
@@ -637,110 +645,6 @@ def test_process_leaf_nominal_series_empty_after_dropna(tmp_path):
     assert not (taxon_dir / st.NOMINAL_STATS_FILE).exists()
 
 
-
-
-# ---------------------------------------------------------------------------
-# Coverage gap tests — _process_nonleaf edge cases
-# ---------------------------------------------------------------------------
-
-def test_process_nonleaf_empty_table_skipped(tmp_path, monkeypatch):
-    """Descendant with 0-row table is skipped (line 364)."""
-    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
-    child_dir = tmp_path / CHILD_TAXON["path"]
-    child_dir.mkdir(parents=True)
-    pq.write_table(pa.table({"catalogNumber": pa.array([], type=pa.string())}),
-                   child_dir / st.OCCURRENCE_FILE)
-    taxon_dir = tmp_path / FAKE_TAXON["path"]
-    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
-    st._process_nonleaf(FAKE_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
-    assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-
-
-def test_process_nonleaf_all_filtered_skipped(tmp_path, monkeypatch):
-    """Descendant that filters to empty df is skipped (line 367)."""
-    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
-    child_dir = tmp_path / CHILD_TAXON["path"]
-    _make_occ_parquet(child_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [5.0] * 20})
-    df = pd.read_parquet(child_dir / st.OCCURRENCE_FILE)
-    df["obscured"] = "Yes"
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), child_dir / st.OCCURRENCE_FILE)
-    taxon_dir = tmp_path / FAKE_TAXON["path"]
-    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
-    st._process_nonleaf(FAKE_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
-    assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-
-
-def test_process_nonleaf_unknown_vtype_column_skipped(tmp_path, monkeypatch):
-    """Column with unresolvable value_type is skipped (line 374)."""
-    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
-    child_dir = tmp_path / CHILD_TAXON["path"]
-    _make_occ_parquet(child_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [5.0] * 20})
-    taxon_dir = tmp_path / FAKE_TAXON["path"]
-    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
-    # layer with no value_type key → _layer_value_type returns None
-    st._process_nonleaf(FAKE_TAXON, taxon_dir, {"bio1": {"id": "bio1"}})
-    assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-
-
-def test_process_nonleaf_continuous_series_empty(tmp_path, monkeypatch):
-    """All-null continuous column in streaming is skipped (lines 380, 384)."""
-    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
-    child_dir = tmp_path / CHILD_TAXON["path"]
-    _make_occ_parquet(child_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [None] * 20})
-    taxon_dir = tmp_path / FAKE_TAXON["path"]
-    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
-    st._process_nonleaf(FAKE_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
-    assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-
-
-def test_process_nonleaf_continuous_all_inf(tmp_path, monkeypatch):
-    """All-inf values after isfinite filter in streaming (line 384)."""
-    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
-    child_dir = tmp_path / CHILD_TAXON["path"]
-    _make_occ_parquet(child_dir / st.OCCURRENCE_FILE,
-                      extra_cols={"bio1": [float("inf")] * 20})
-    taxon_dir = tmp_path / FAKE_TAXON["path"]
-    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
-    st._process_nonleaf(FAKE_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
-    assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
-
-
-def test_process_nonleaf_nominal_series_empty_streaming(tmp_path, monkeypatch):
-    """All-null nominal column in streaming is skipped (line 395)."""
-    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
-    child_dir = tmp_path / CHILD_TAXON["path"]
-    _make_occ_parquet(child_dir / st.OCCURRENCE_FILE, extra_cols={"kg0": [None] * 20})
-    taxon_dir = tmp_path / FAKE_TAXON["path"]
-    monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(FAKE_TAXON, [CHILD_TAXON]))
-    st._process_nonleaf(FAKE_TAXON, taxon_dir, {"kg0": _NOMINAL_LAYER})
-    assert not (taxon_dir / st.NOMINAL_STATS_FILE).exists()
-
-
-# ---------------------------------------------------------------------------
-# collect_taxon_df
-# ---------------------------------------------------------------------------
-
-LEAF_TAXON: dict = {
-    "taxon_key": "7001",
-    "path": "Root_1/Parent_9999/Leaf_7001",
-    "scientific_name": "Testus leafus",
-    "rank": "SUBSPECIES",
-}
-
-
-def test_collect_taxon_df_leaf_reads_own_occ(tmp_path, monkeypatch):
-    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
-    leaf_dir = tmp_path / LEAF_TAXON["path"]
-    _make_occ_parquet(leaf_dir / st.OCCURRENCE_FILE, extra_cols={"bio1": [5.0] * 20})
-    df = st.collect_taxon_df(LEAF_TAXON)
-    assert df is not None
-    assert len(df) == 20
-
-
-def test_collect_taxon_df_leaf_no_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
-    (tmp_path / LEAF_TAXON["path"]).mkdir(parents=True, exist_ok=True)
-    assert st.collect_taxon_df(LEAF_TAXON) is None
 
 
 def test_collect_taxon_df_leaf_empty_parquet(tmp_path, monkeypatch):

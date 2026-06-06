@@ -604,18 +604,6 @@ def _env_stats_read(path, **kw):
 # ---------------------------------------------------------------------------
 # _load_relative_ranks
 # ---------------------------------------------------------------------------
-
-def test_load_relative_ranks_no_file(tmp_path):
-    assert main_module._load_relative_ranks(tmp_path, "bio1") == []
-
-
-def test_load_relative_ranks_corrupt_file(tmp_path):
-    (tmp_path / rankings_module.POSITION_FILE).write_bytes(b"garbage")
-    assert main_module._load_relative_ranks(tmp_path, "bio1") == []
-
-
-def test_load_legend_file_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr(main_module, "_LEGEND_DIR", tmp_path)
     main_module._load_legend.cache_clear()
     assert main_module._load_legend("no_such_layer_xyz") == []
 

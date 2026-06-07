@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.136.1",
     "fastdigest>=0.12.0",
+    "KDEpy>=1.1.0",
     "httpx>=0.28.1",
     "numpy>=2.4.6",
     "pandas>=2.3.0",

@@ -27,6 +27,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fastdigest import TDigest
+from KDEpy import FFTKDE
 from scipy.stats import circmean, circstd, circvar
 from scipy.stats import entropy as _scipy_entropy
 
@@ -534,7 +535,7 @@ def _atomic_write(path: Path, table: pa.Table, custom_metadata: dict[str, str] |
 # KDE / density curve
 # ---------------------------------------------------------------------------
 
-_FFT_GRID = 512  # fine grid for FFT convolution — power of 2 for efficiency
+_FFT_GRID = 512  # grid size for FFTKDE — power of 2 for efficiency
 
 
 def _gaussian_kde_curve(values: np.ndarray, bounded_at_zero: bool = False) -> dict | None:
@@ -549,41 +550,28 @@ def _gaussian_kde_curve(values: np.ndarray, bounded_at_zero: bool = False) -> di
         n = len(values)
         std = float(np.std(values, ddof=1))
         if std == 0.0:
-            return None
-        h = 1.06 * std * n ** (-0.2)
-
-        # For ratio-scale variables (min ≥ 0), the FFT treats the signal as
-        # periodic, so mass near 0 wraps around and appears as a fake spike at
-        # the upper end. Fix: reflect data at 0 → compute KDE on [-max, max] →
-        # extract [0, max] and double (fold correction). Bandwidth h is still
-        # derived from the original data so Scott's rule is unaffected.
-        if bounded_at_zero and min_val >= 0.0:
-            work_vals = np.concatenate([-values, values])
-            work_min, work_max = -max_val, max_val
+            # All values identical — use a small bandwidth so the curve is a narrow spike
+            h = abs(float(values[0])) * 0.01 or 0.1
         else:
-            work_vals, work_min, work_max = values, min_val, max_val
-
-        # FFT-based KDE: bin → convolve in frequency domain → sample output points.
-        # O(n + M log M) vs O(n × 128) for direct kernel eval. Exact same result.
-        counts, bin_edges = np.histogram(work_vals, bins=_FFT_GRID, range=(work_min, work_max))
-        bin_width = (work_max - work_min) / _FFT_GRID
-        freqs = np.fft.rfftfreq(_FFT_GRID, d=bin_width)
-        kernel_fft = np.exp(-2.0 * math.pi ** 2 * freqs ** 2 * h ** 2)
-        density_fine = np.fft.irfft(np.fft.rfft(counts.astype(np.float64)) * kernel_fft)[:_FFT_GRID]
-        density_fine = np.maximum(density_fine, 0.0)
-        area = density_fine.sum() * bin_width
-        if area > 0:
-            density_fine /= area
-        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+            h = 1.06 * std * n ** (-0.2)
 
         if bounded_at_zero and min_val >= 0.0:
+            # Reflection at 0: mirror data into the negative half so the KDE
+            # boundary at 0 gets a zero-derivative correction, then fold back.
+            work_vals = np.concatenate([-values, values])
+            x_fine, density_fine = FFTKDE(bw=h).fit(work_vals).evaluate(_FFT_GRID)
+            mask = x_fine >= 0.0
+            x_fine, density_fine = x_fine[mask], density_fine[mask] * 2.0
+            area = np.trapezoid(density_fine, x_fine)
+            if area > 0:
+                density_fine /= area
             xs = np.linspace(0.0, max_val, _KDE_N_POINTS)
-            density = np.interp(xs, bin_centers, density_fine) * 2.0
             min_val = 0.0
         else:
+            x_fine, density_fine = FFTKDE(bw=h).fit(values).evaluate(_FFT_GRID)
             xs = np.linspace(min_val, max_val, _KDE_N_POINTS)
-            density = np.interp(xs, bin_centers, density_fine)
 
+        density = np.maximum(np.interp(xs, x_fine, density_fine), 0.0)
         return {
             "points": xs.tolist(),
             "density": density.tolist(),

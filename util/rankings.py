@@ -67,6 +67,8 @@ _RANK_ORDER: tuple[str, ...] = (
     "KINGDOM", "PHYLUM", "CLASS", "ORDER", "FAMILY", "GENUS", "SPECIES", "SUBSPECIES",
 )
 
+MIN_RANKING_SAMPLES = 10  # taxa with fewer observations for a variable are excluded from rankings
+
 
 _POSITION_SCHEMA = pa.schema([
     pa.field("taxon_key", pa.string()),
@@ -431,6 +433,9 @@ def _collect_entries_from_numerical_stats(
         variable = str(record.get("variable") or "")
         if not variable or variable not in layer_by_id:
             continue
+        var_count = record.get("count")
+        if var_count is None or int(var_count) < MIN_RANKING_SAMPLES:
+            continue
         layer = layer_by_id[variable]
         try:
             vtype = ValueType(layer.get("value_type", ""))
@@ -471,10 +476,18 @@ def _collect_entries_from_nominal_stats(
     nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL])
     entries: dict[str, dict[str, Any]] = {}
 
+    # Build per-variable total_samples lookup for threshold filtering
+    var_totals: dict[str, int] = {}
+    for record in df.to_dict("records"):
+        if str(record.get("metric") or "") == "total_samples":
+            var_totals[str(record.get("variable") or "")] = int(float(record.get("value") or 0))
+
     for record in df.to_dict("records"):
         variable = str(record.get("variable") or "")
         metric = str(record.get("metric") or "")
         if variable not in nominal_ids:
+            continue
+        if var_totals.get(variable, 0) < MIN_RANKING_SAMPLES:
             continue
         if metric not in nominal_metrics and not metric.startswith("class_"):
             continue
@@ -510,6 +523,9 @@ def _collect_entries_from_circular_stats(
     for record in df.to_dict("records"):
         variable = str(record.get("variable") or "")
         if not variable or variable not in layer_by_id:
+            continue
+        var_count = record.get("count")
+        if var_count is None or int(var_count) < MIN_RANKING_SAMPLES:
             continue
         layer = layer_by_id[variable]
         try:
@@ -600,6 +616,13 @@ def _build_rank_index(
                 active &= include
             for metric_idx in np.where(active)[0]:
                 k = vocab[metric_idx]
+                # Check per-variable sample count threshold using {variable}::count
+                variable = k.split("::")[0]
+                count_idx = _metric_to_idx.get(f"{variable}::count")
+                if count_idx is not None:
+                    var_count = values_arr[count_idx]
+                    if np.isnan(var_count) or int(var_count) < MIN_RANKING_SAMPLES:
+                        continue
                 v = float(values_arr[metric_idx])
                 if k in col_idx:
                     col_idx[k].append(i)

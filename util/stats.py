@@ -549,8 +549,8 @@ def _gaussian_kde_curve(values: np.ndarray, bounded_at_zero: bool = False) -> di
     try:
         n = len(values)
         std = float(np.std(values, ddof=1))
-        if std == 0.0:
-            # All values identical — use a small bandwidth so the curve is a narrow spike
+        if std < 1e-10:
+            # All values effectively identical (std may be float noise) — use a small bandwidth
             h = abs(float(values[0])) * 0.01 or 0.1
         else:
             h = 1.06 * std * n ** (-0.2)

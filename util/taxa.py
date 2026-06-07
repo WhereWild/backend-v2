@@ -44,8 +44,8 @@ def format_common_name(value: str) -> str:
             first = (parts[0][0].upper() + parts[0][1:]) if parts[0] else ""
             words.append(f"{first}'{parts[1]}" if parts[1] else first)
         else:
-            w = word.lower()
-            words.append(w[:1].upper() + w[1:])
+            parts = word.lower().split("-")
+            words.append("-".join((p[0].upper() + p[1:]) if p else p for p in parts))
     return " ".join(words).strip()
 
 

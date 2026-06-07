@@ -560,12 +560,17 @@ def get_taxon(taxon_id: str):
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
     sci = taxon.get("scientific_name", "")
-    def _title_name(s: str) -> str:
-        def cap_word(w: str) -> str:
-            return re.sub(r"(^|(?<=-))[a-z]", lambda m: m.group().upper(), w.lower())
-        return " ".join(cap_word(w) for w in s.split())
-    vnames = [_title_name(n) for n in taxon.get("vernacular_names") or []]
-    return {**taxon, "scientific_name": sci.replace("_", " "), "vernacular_names": vnames, **_image_fields(taxon)}
+    vnames = [format_common_name(n) for n in taxon.get("vernacular_names") or []]
+    preferred_raw = taxon.get("inat_preferred_common_name") or ""
+    common_raw = taxon.get("common_name") or ""
+    return {
+        **taxon,
+        "scientific_name": sci.replace("_", " "),
+        "vernacular_names": vnames,
+        "inat_preferred_common_name": format_common_name(preferred_raw) or None,
+        "common_name": format_common_name(preferred_raw or common_raw) or None,
+        **_image_fields(taxon),
+    }
 
 
 @app.get("/api/species/{taxon_id}/obscured")
@@ -657,38 +662,51 @@ def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
     if not taxon:
         return []
     path = taxon.get("path", "")
-    rank = (taxon.get("rank") or "").lower()
+    rank = (taxon.get("rank") or "").upper()
     if not path or not rank:
         return []
+
+    # Subspecies-equivalent taxa (SUBSPECIES/VARIETY/FORM) appear in two kinds of
+    # positions files, depending on the ancestor level:
+    #   - subspecies_positions.parquet at their parent SPECIES directory
+    #   - species_positions.parquet at GENUS/FAMILY/etc. directories (treated as species)
+    # Regular SPECIES appear only in species_positions.parquet at each ancestor.
+    # Higher taxa appear only in {rank.lower()}_positions.parquet.
+    if rank in _CONFIG.subspecies_equivalents:
+        candidate_files = {"subspecies_positions.parquet", "species_positions.parquet"}
+    else:
+        candidate_files = {f"{rank.lower()}_positions.parquet"}
 
     parts = path.split("/")
     result = []
     cumulative = ""
     for i, part in enumerate(parts[:-1]):
         cumulative = part if i == 0 else f"{cumulative}/{part}"
-        positions_file = RANKINGS_TREE_ROOT / cumulative / f"{rank}_positions.parquet"
-        if not positions_file.exists():
-            continue
-        try:
-            rows = _storage.read_table(
-                positions_file,
-                filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
-            ).to_pylist()
-        except Exception:
-            continue
-        for row in rows:
-            position = row.get("position") or 0
-            count = row.get("count") or 0
-            percentile = round(position / count, 3) if count > 0 else 0.0
-            result.append({
-                "metric": row.get("metric"),
-                "position": position + 1,
-                "count": count,
-                "percentile": percentile,
-                "sampleCount": row.get("sampleCount"),
-                "context_label": row.get("contextLabel"),
-                "label": row.get("contextLabel"),
-            })
+        for filename in candidate_files:
+            positions_file = RANKINGS_TREE_ROOT / cumulative / filename
+            if not positions_file.exists():
+                continue
+            try:
+                rows = _storage.read_table(
+                    positions_file,
+                    filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
+                ).to_pylist()
+            except Exception:
+                continue
+            for row in rows:
+                position = row.get("position") or 0
+                count = row.get("count") or 0
+                # (position + 1) / count: rank n/n = 100th percentile
+                percentile = round((position + 1) / count, 3) if count > 0 else 0.0
+                result.append({
+                    "metric": row.get("metric"),
+                    "position": position + 1,
+                    "count": count,
+                    "percentile": percentile,
+                    "sampleCount": row.get("sampleCount"),
+                    "context_label": row.get("contextLabel"),
+                    "label": row.get("contextLabel"),
+                })
     return result
 
 
@@ -1522,12 +1540,20 @@ def query_taxa(
     for item in result["results"]:
         taxon = item["taxon"]
         preferred = taxon.get("inat_preferred_common_name") or taxon.get("common_name") or ""
+        match_name = item.get("match_name") or ""
+        # Show the matched vernacular name when the query hit a non-preferred name
+        # (e.g. searching "canyonlands pricklypear" shows "Canyonlands Pricklypear",
+        # not the preferred "Navajo Bridge Pricklypear"). Fall back to preferred when
+        # the match was against the scientific name or there was no text query.
+        sci_norm = normalize_name(taxon.get("scientific_name") or "")
+        use_match = bool(match_name) and normalize_name(match_name) != sci_norm
+        display_name = format_common_name(match_name if use_match else preferred)
         raw_sort = item.get("sort_value")
         converted_sort = units.convert_value(raw_sort, sort_layer, unit_system, metric=sort_metric) if sort_layer else raw_sort
         serialized.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
-            "common_name": format_common_name(preferred) or None,
+            "common_name": display_name or None,
             "common_names": None,
             "rank": taxon.get("rank"),
             "slug": taxon_slug(taxon.get("scientific_name")),

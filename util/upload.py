@@ -53,8 +53,7 @@ def _load_gadm_gdf():
         return _gadm_gdf
     if not _GADM_PATH.exists():
         return None
-    gdf = gpd.read_file(_GADM_PATH, layer="gadm_410", engine="pyogrio", columns=["GID_0", "GID_1", "GID_2", "geom"])
-    gdf = gdf.set_geometry("geom")
+    gdf = gpd.read_file(_GADM_PATH, layer="gadm_410", engine="pyogrio", columns=["GID_0", "GID_1", "GID_2"])
     _gadm_gdf = gdf
     return _gadm_gdf
 
@@ -257,7 +256,7 @@ def enrich_with_gadm(df: pd.DataFrame) -> pd.DataFrame:
         geometry=gpd.points_from_xy(df["decimalLongitude"], df["decimalLatitude"]),
         crs="EPSG:4326",
     )
-    joined = gpd.sjoin(points, gdf[["GID_0", "GID_1", "GID_2", "geom"]], how="left", predicate="within")
+    joined = gpd.sjoin(points, gdf[["GID_0", "GID_1", "GID_2", gdf.geometry.name]], how="left", predicate="within")
     # deduplicate in case a point lands on a shared boundary
     joined = joined[~joined.index.duplicated(keep="first")]
 

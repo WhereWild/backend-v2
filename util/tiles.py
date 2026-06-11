@@ -98,7 +98,7 @@ def _get_circular_cmap_lut(name: str) -> np.ndarray:
     xs = np.linspace(0.0, 1.0, 256, endpoint=False)
     rgba = cmap(xs)
     lut = (rgba[:, :3] * 255.0).astype(np.float32)  # (256, 3)
-    return np.roll(lut, phase, axis=0)
+    return np.roll(lut, -phase, axis=0)
 
 
 # ---------------------------------------------------------------------------

@@ -19,14 +19,13 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import rasterio
 from fastapi import HTTPException
-
-import geopandas as gpd
 
 from config.config import ZERO_NODATA_LAYERS
 from util.gis import DERIVED_FROM_ELEVATION, hilbert_index, sample_aspect_batch, sample_slope_batch

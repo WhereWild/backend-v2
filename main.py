@@ -506,7 +506,10 @@ async def gis_point_value(
 
 
 @app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
-async def variable_tile_compat(variable_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis")):
+async def variable_tile_compat(
+    variable_id: str, z: int, x: int, y: int,
+    tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis"),
+):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
     return await layer_tile(layer_id, z, x, y, tile_size, colormap)

@@ -30,6 +30,7 @@ from typing import Any
 import fsspec
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from omfiles import OmFileReader
 from rasterio.crs import CRS as _CRS

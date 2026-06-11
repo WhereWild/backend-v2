@@ -167,7 +167,7 @@ class _MockCfg:
     plantae_key = 1
     data_root = "/data"
     occurrence_parquet_filename = "occurrence.parquet"
-    temporal_min_year = 2000
+    temporal_min_date = "2000-01-01"
     temporal_cache_dir = "/tmp/test_cache"
 
 
@@ -306,7 +306,7 @@ class TestMain:
             plantae_key = 1
             data_root = str(tmp_path)
             occurrence_parquet_filename = "occurrence.parquet"
-            temporal_min_year = 2000
+            temporal_min_date = "2000-01-01"
             temporal_cache_dir = str(tmp_path / "cache")
 
         monkeypatch.setattr("scripts.enrich_temporal.load_config", lambda _: _Cfg())

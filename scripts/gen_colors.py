@@ -38,7 +38,6 @@ import math
 import os
 import sys
 from collections import defaultdict
-from typing import Dict, List, Tuple
 
 # ---------------------------------------------------------------------------
 # LCH ↔ sRGB (no external deps required)
@@ -50,7 +49,7 @@ _EPS_LIN = 0.04045
 _EPS_DELIN = 0.0031308
 _CBRT_EPS = 0.2069  # ≈ (6/29)
 
-def _hex_to_rgb(h: str) -> Tuple[float, float, float]:
+def _hex_to_rgb(h: str) -> tuple[float, float, float]:
     h = h.lstrip('#')
     return int(h[0:2], 16) / 255.0, int(h[2:4], 16) / 255.0, int(h[4:6], 16) / 255.0
 
@@ -65,13 +64,13 @@ def _lin(c: float) -> float:
 def _delin(c: float) -> float:
     return c * 12.92 if c <= _EPS_DELIN else 1.055 * c ** (1.0 / 2.4) - 0.055
 
-def _rgb_lin_to_xyz(r: float, g: float, b: float) -> Tuple[float, float, float]:
+def _rgb_lin_to_xyz(r: float, g: float, b: float) -> tuple[float, float, float]:
     x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375
     y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750
     z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041
     return x, y, z
 
-def _xyz_to_rgb_lin(x: float, y: float, z: float) -> Tuple[float, float, float]:
+def _xyz_to_rgb_lin(x: float, y: float, z: float) -> tuple[float, float, float]:
     r =  x *  3.2404542 + y * -1.5371385 + z * -0.4985314
     g =  x * -0.9692660 + y *  1.8760108 + z *  0.0415560
     b =  x *  0.0556434 + y * -0.2040259 + z *  1.0572252
@@ -83,19 +82,19 @@ def _lab_f(t: float) -> float:
 def _lab_f_inv(t: float) -> float:
     return t ** 3.0 if t > _CBRT_EPS else (t - 16.0 / 116.0) / 7.787
 
-def hex_to_lch(h: str) -> Tuple[float, float, float]:
+def hex_to_lch(h: str) -> tuple[float, float, float]:
     r, g, b = _hex_to_rgb(h)
     rl, gl, bl = _lin(r), _lin(g), _lin(b)
     x, y, z = _rgb_lin_to_xyz(rl, gl, bl)
     xn, yn, zn = x / _D65[0], y / _D65[1], z / _D65[2]
-    L = 116.0 * _lab_f(yn) - 16.0
+    L = 116.0 * _lab_f(yn) - 16.0  # noqa: N806
     a = 500.0 * (_lab_f(xn) - _lab_f(yn))
     b2 = 200.0 * (_lab_f(yn) - _lab_f(zn))
-    C = math.sqrt(a * a + b2 * b2)
-    H = math.degrees(math.atan2(b2, a)) % 360.0
+    C = math.sqrt(a * a + b2 * b2)  # noqa: N806
+    H = math.degrees(math.atan2(b2, a)) % 360.0  # noqa: N806
     return L, C, H
 
-def lch_to_hex(L: float, C: float, H: float) -> str:
+def lch_to_hex(L: float, C: float, H: float) -> str:  # noqa: N803
     a = C * math.cos(math.radians(H))
     b2 = C * math.sin(math.radians(H))
     fy = (L + 16.0) / 116.0
@@ -122,7 +121,7 @@ def lch_to_hex(L: float, C: float, H: float) -> str:
 # ---------------------------------------------------------------------------
 
 # fmt: off
-_PALETTE_OKABE_ITO: List[str] = [
+_PALETTE_OKABE_ITO: list[str] = [
     '#D55E00',  # vermillion
     '#0072B2',  # blue
     '#009E73',  # bluish green
@@ -132,7 +131,7 @@ _PALETTE_OKABE_ITO: List[str] = [
     '#CC79A7',  # reddish purple
 ]
 
-_PALETTE_TOL_MUTED: List[str] = [
+_PALETTE_TOL_MUTED: list[str] = [
     '#332288',  # indigo
     '#44AA99',  # teal
     '#AA4499',  # purple
@@ -145,7 +144,7 @@ _PALETTE_TOL_MUTED: List[str] = [
     '#DDDDDD',  # pale gray
 ]
 
-_PALETTE_KRZYWINSKI_12: List[str] = [
+_PALETTE_KRZYWINSKI_12: list[str] = [
     '#006655',  # blue-green
     '#009988',  # teal
     '#44BB99',  # light teal
@@ -172,7 +171,7 @@ _SHAPES = [
     'pentagon', 'arrow',
 ]
 
-def _select_palette(n_groups: int) -> List[str]:
+def _select_palette(n_groups: int) -> list[str]:
     if n_groups <= len(_PALETTE_OKABE_ITO):
         return _PALETTE_OKABE_ITO
     elif n_groups <= len(_PALETTE_TOL_MUTED):
@@ -184,26 +183,26 @@ def _select_palette(n_groups: int) -> List[str]:
 # Palette slot assignment
 # ---------------------------------------------------------------------------
 
-def _lab(hex_color: str) -> Tuple[float, float, float]:
-    L, C, H = hex_to_lch(hex_color)
+def _lab(hex_color: str) -> tuple[float, float, float]:
+    L, C, H = hex_to_lch(hex_color)  # noqa: N806
     return L, C * math.cos(math.radians(H)), C * math.sin(math.radians(H))
 
 def _lab_dist(a: str, b: str) -> float:
-    L1, a1, b1 = _lab(a)
-    L2, a2, b2 = _lab(b)
+    L1, a1, b1 = _lab(a)  # noqa: N806
+    L2, a2, b2 = _lab(b)  # noqa: N806
     return math.sqrt((L1 - L2) ** 2 + (a1 - a2) ** 2 + (b1 - b2) ** 2)
 
 def _lab_dist_t(
-    a: Tuple[float, float, float], b: Tuple[float, float, float]
+    a: tuple[float, float, float], b: tuple[float, float, float]
 ) -> float:
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
-def _lab_centroid(hex_colors: List[str]) -> Tuple[float, float, float]:
+def _lab_centroid(hex_colors: list[str]) -> tuple[float, float, float]:
     labs = [_lab(h) for h in hex_colors]
     n = len(labs)
-    return (sum(l[0] for l in labs) / n, sum(l[1] for l in labs) / n, sum(l[2] for l in labs) / n)
+    return (sum(p[0] for p in labs) / n, sum(p[1] for p in labs) / n, sum(p[2] for p in labs) / n)
 
-def _farthest_point_slots(palette: List[str], n: int) -> List[int]:
+def _farthest_point_slots(palette: list[str], n: int) -> list[int]:
     """Pick n palette indices that maximise minimum pairwise Lab distance."""
     gray = '#808080'
     chosen = [max(range(len(palette)), key=lambda i: _lab_dist(palette[i], gray))]
@@ -214,10 +213,10 @@ def _farthest_point_slots(palette: List[str], n: int) -> List[int]:
         remaining.remove(best)
     return chosen
 
-def _linear_sum_assignment(cost: List[List[float]]) -> List[int]:
+def _linear_sum_assignment(cost: list[list[float]]) -> list[int]:
     """Hungarian algorithm (O(n³)). Returns assignment[i] = j for row i → col j."""
     n = len(cost)
-    INF = float('inf')
+    inf = float('inf')
     u = [0.0] * (n + 1)
     v = [0.0] * (n + 1)
     p = [0] * (n + 1)   # p[j] = row assigned to column j (1-indexed)
@@ -225,11 +224,11 @@ def _linear_sum_assignment(cost: List[List[float]]) -> List[int]:
     for i in range(1, n + 1):
         p[0] = i
         j0 = 0
-        minval = [INF] * (n + 1)
+        minval = [inf] * (n + 1)
         used = [False] * (n + 1)
         while True:
             used[j0] = True
-            i0, delta, j1 = p[j0], INF, -1
+            i0, delta, j1 = p[j0], inf, -1
             for j in range(1, n + 1):
                 if not used[j]:
                     cur = cost[i0 - 1][j - 1] - u[i0] - v[j]
@@ -257,9 +256,9 @@ def _linear_sum_assignment(cost: List[List[float]]) -> List[int]:
     return result
 
 def _assign_palette_slots(
-    groups: Dict[str, List[dict]],
-    palette: List[str],
-) -> Dict[str, str]:
+    groups: dict[str, list[dict]],
+    palette: list[str],
+) -> dict[str, str]:
     """
     Solve the Linear Sum Assignment Problem (Hungarian algorithm) to find the
     bijection from groups → palette slots that minimises total Lab (ΔE76)
@@ -296,7 +295,7 @@ def _assign_palette_slots(
 # Achromatopsia L assignment
 # ---------------------------------------------------------------------------
 
-def _ach_l_values(all_count: int, group_rank: int, group_size: int) -> List[float]:
+def _ach_l_values(all_count: int, group_rank: int, group_size: int) -> list[float]:
     """
     Spread ALL classes across L [12, 88] by group rank, then vary slightly
     within the group. Step scales with available space to avoid collisions.
@@ -311,14 +310,14 @@ def _ach_l_values(all_count: int, group_rank: int, group_size: int) -> List[floa
 # Main generation
 # ---------------------------------------------------------------------------
 
-def generate_variable(classes: List[dict]) -> Dict[str, Dict]:
+def generate_variable(classes: list[dict]) -> dict[str, dict]:
     """Return {'cb', 'ach', 'shapes'} → {class_id → value} dicts."""
-    groups: Dict[str, List[dict]] = defaultdict(list)
+    groups: dict[str, list[dict]] = defaultdict(list)
     for cls in classes:
         groups[cls['group']].append(cls)
 
     # Track first-appearance order for stable shape assignment
-    seen_groups: List[str] = []
+    seen_groups: list[str] = []
     for cls in classes:
         if cls['group'] not in seen_groups:
             seen_groups.append(cls['group'])
@@ -327,7 +326,7 @@ def generate_variable(classes: List[dict]) -> Dict[str, Dict]:
     for members in groups.values():
         members.sort(key=lambda c: hex_to_lch(c['traits']['color'])[0])
 
-    result: Dict[str, Dict] = {'cb': {}, 'ach': {}, 'shapes': {}}
+    result: dict[str, dict] = {'cb': {}, 'ach': {}, 'shapes': {}}
 
     # Shapes: sequential from _SHAPES by first-appearance group order
     for gi, g in enumerate(seen_groups):
@@ -339,9 +338,9 @@ def generate_variable(classes: List[dict]) -> Dict[str, Dict]:
     group_order = list(groups.keys())
     for gi, g in enumerate(group_order):
         members = groups[g]
-        L_vals = _ach_l_values(len(group_order), gi, len(members))
+        l_vals = _ach_l_values(len(group_order), gi, len(members))
         for idx, cls in enumerate(members):
-            result['ach'][cls['id']] = lch_to_hex(max(8.0, min(92.0, L_vals[idx])), 0.0, 0.0)
+            result['ach'][cls['id']] = lch_to_hex(max(8.0, min(92.0, l_vals[idx])), 0.0, 0.0)
 
     # Colorblind-friendly: palette slot per group, small L variation within.
     # Neutral groups (filled, undefined) get a fixed gray and are excluded
@@ -355,13 +354,13 @@ def generate_variable(classes: List[dict]) -> Dict[str, Dict]:
 
     for g, members in groups.items():
         base_hex = slot_assignment[g]
-        base_L, base_C, base_H = hex_to_lch(base_hex)
+        base_l, base_c, base_h = hex_to_lch(base_hex)
         n = len(members)
         step = min(4.0, 16.0 / max(n - 1, 1)) if n > 1 else 0.0
         half = (n - 1) * step / 2.0
         for idx, cls in enumerate(members):
-            L = max(8.0, min(92.0, base_L - half + idx * step))
-            result['cb'][cls['id']] = lch_to_hex(L, base_C, base_H)
+            lightness = max(8.0, min(92.0, base_l - half + idx * step))
+            result['cb'][cls['id']] = lch_to_hex(lightness, base_c, base_h)
 
     return result
 
@@ -374,18 +373,20 @@ _TS_HEADER = """\
 // Re-run the script to regenerate after updating legend JSON files.
 
 export type CbMode = 'colorblind' | 'achromatopsia';
-export type ShapeKey = 'circle' | 'square' | 'triangle' | 'diamond' | 'ring' | 'triangle-down' | 'cross' | 'plus' | 'star' | 'hexagon' | 'pentagon' | 'arrow';
+export type ShapeKey =
+  | 'circle' | 'square' | 'triangle' | 'diamond' | 'ring'
+  | 'triangle-down' | 'cross' | 'plus' | 'star' | 'hexagon' | 'pentagon' | 'arrow';
 
 /** Maps variable layer_id → CB mode → class ID → CB-safe hex color. */
 export const CB_CLASS_COLORS: Record<string, Partial<Record<CbMode, Record<number, string>>>> = {
 """
 
-_MODE_TS_KEY: Dict[str, str] = {
+_MODE_TS_KEY: dict[str, str] = {
     'cb':  'colorblind',
     'ach': 'achromatopsia',
 }
 
-def _format_variable(layer_id: str, data: Dict[str, Dict]) -> str:
+def _format_variable(layer_id: str, data: dict[str, dict]) -> str:
     lines = [f'  {layer_id}: {{']
     for mode_key, ts_key in _MODE_TS_KEY.items():
         entries = data[mode_key]
@@ -394,7 +395,7 @@ def _format_variable(layer_id: str, data: Dict[str, Dict]) -> str:
     lines.append('  },')
     return '\n'.join(lines)
 
-def _format_shapes_variable(layer_id: str, shapes: Dict[int, str]) -> str:
+def _format_shapes_variable(layer_id: str, shapes: dict[int, str]) -> str:
     inner = ', '.join(f"{cid}: '{s}'" for cid, s in sorted(shapes.items()))
     return f'  {layer_id}: {{ {inner} }},'
 

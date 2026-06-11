@@ -69,6 +69,17 @@ _MERCATOR_HALF    = 2 * math.pi * 6378137 / 2.0
 SUPPORTED_COLORMAPS = frozenset({"viridis", "plasma", "inferno", "magma", "cividis"})
 _DEFAULT_COLORMAP = "viridis"
 
+SUPPORTED_CIRCULAR_COLORMAPS = frozenset({"twilight", "twilight_90", "twilight_180", "twilight_270"})
+_DEFAULT_CIRCULAR_COLORMAP = "twilight_90"
+
+# Phase offsets (in LUT entries out of 256) for each twilight variant
+_TWILIGHT_PHASE_OFFSETS: dict[str, int] = {
+    "twilight":     0,
+    "twilight_90":  64,
+    "twilight_180": 128,
+    "twilight_270": 192,
+}
+
 @lru_cache(maxsize=16)
 def _get_cmap_lut(name: str) -> np.ndarray:
     from matplotlib import colormaps
@@ -76,6 +87,18 @@ def _get_cmap_lut(name: str) -> np.ndarray:
     xs = np.linspace(0.0, 1.0, 256)
     rgba = cmap(xs)  # (256, 4) float64 in [0,1]
     return (rgba[:, :3] * 255.0).astype(np.float32)  # (256, 3)
+
+
+@lru_cache(maxsize=8)
+def _get_circular_cmap_lut(name: str) -> np.ndarray:
+    """Return a 256-entry RGB LUT for the named circular (twilight) colormap."""
+    from matplotlib import colormaps
+    phase = _TWILIGHT_PHASE_OFFSETS.get(name, 0)
+    cmap = colormaps["twilight"]
+    xs = np.linspace(0.0, 1.0, 256, endpoint=False)
+    rgba = cmap(xs)
+    lut = (rgba[:, :3] * 255.0).astype(np.float32)  # (256, 3)
+    return np.roll(lut, -phase, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -208,19 +231,10 @@ def tile_bounds_wgs84(z: int, x: int, y: int) -> tuple[float, float, float, floa
 # Colorization
 # ---------------------------------------------------------------------------
 
-# 4-stop cyclic ramp peaking exactly at cardinal directions:
-# N=0°→red, E=90°→yellow, S=180°→green, W=270°→blue
-_ASPECT_STOPS = np.array(
-    [[40, 95, 220], [45, 175, 65], [240, 195, 15], [220, 50, 50]],
-    dtype=np.float32,
-)
+def _colorize_circular(values: np.ndarray, colormap: str = _DEFAULT_CIRCULAR_COLORMAP) -> np.ndarray:
+    """Colorize angular values (0–360°) using a twilight circular colormap.
 
-
-def _colorize_aspect(values: np.ndarray) -> np.ndarray:
-    """Colorize aspect (0–360°) with a 4-stop cyclic ramp.
-
-    Cardinal peaks: N=blue, E=green, S=yellow, W=red.
-    Blends linearly between stops so transitions are unambiguous.
+    Maps degrees cyclically to the LUT so 0° and 360° return the same color.
     NaN pixels (nodata) are fully transparent.
     """
     rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
@@ -228,19 +242,47 @@ def _colorize_aspect(values: np.ndarray) -> np.ndarray:
     if not np.any(finite):
         return rgba
 
-    t = (values[finite] % 360.0) / 90.0  # [0, 4)
-    seg = np.floor(t).astype(np.int32) % 4
-    frac = (t - np.floor(t))[:, np.newaxis]
-    rgb = _ASPECT_STOPS[seg] + frac * (_ASPECT_STOPS[(seg + 1) % 4] - _ASPECT_STOPS[seg])
-
-    rgba[finite, 0] = rgb[:, 0].astype(np.uint8)
-    rgba[finite, 1] = rgb[:, 1].astype(np.uint8)
-    rgba[finite, 2] = rgb[:, 2].astype(np.uint8)
+    name = colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP
+    lut = _get_circular_cmap_lut(name)
+    indices = np.clip(
+        ((values[finite] % 360.0) / 360.0 * len(lut)).astype(np.int32) % len(lut),
+        0, len(lut) - 1,
+    )
+    rgba[finite, 0] = lut[indices, 0].astype(np.uint8)
+    rgba[finite, 1] = lut[indices, 1].astype(np.uint8)
+    rgba[finite, 2] = lut[indices, 2].astype(np.uint8)
     rgba[finite, 3] = 200
     return rgba
 
 
 _LEGEND_DIR = Path("config/gis/legends")
+_CB_COLORS_PATH = Path("config/gis/cb_colors.json")
+
+SUPPORTED_CB_MODES = frozenset({"colorblind", "achromatopsia"})
+
+
+@lru_cache(maxsize=1)
+def _load_cb_colors() -> dict:
+    """Return {layer_id: {mode: {str(class_id): hex}}} from cb_colors.json."""
+    if not _CB_COLORS_PATH.exists():
+        return {}
+    return json.loads(_CB_COLORS_PATH.read_text())
+
+
+def _cb_colormap_for_layer(layer_id: str, cb_mode: str) -> dict[int, tuple[int, int, int]]:
+    """Return {class_id: (R, G, B)} for the given CB mode, or {} if not available."""
+    import re
+    base_id = re.sub(r'_(avg|sum|mode|snapshot)_\d+h$', '', layer_id, flags=re.IGNORECASE)
+    cb_data = _load_cb_colors().get(base_id, {}).get(cb_mode, {})
+    result: dict[int, tuple[int, int, int]] = {}
+    for k, hex_color in cb_data.items():
+        if isinstance(hex_color, str) and hex_color.startswith("#") and len(hex_color) == 7:
+            result[int(k)] = (
+                int(hex_color[1:3], 16),
+                int(hex_color[3:5], 16),
+                int(hex_color[5:7], 16),
+            )
+    return result
 
 
 @lru_cache(maxsize=16)
@@ -351,6 +393,7 @@ def render_temporal_tile_bytes(
     y: int,
     tile_size: int = 256,
     colormap: str = _DEFAULT_COLORMAP,
+    cb_mode: str = "",
 ) -> bytes:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
@@ -410,7 +453,10 @@ def render_temporal_tile_bytes(
         vmax = vmax if vmax is not None else 1.0
 
     if nominal:
-        nominal_cmap = _load_nominal_colormap(layer_id)
+        if cb_mode in SUPPORTED_CB_MODES:
+            nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
+        else:
+            nominal_cmap = _load_nominal_colormap(layer_id)
         rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
@@ -596,7 +642,7 @@ def _render_derived_elevation_tile_bytes(
         pass
 
     if layer["id"] == "aspect":
-        rgba = _colorize_aspect(dest)
+        rgba = _colorize_circular(dest, colormap)
     else:
         rgba = _colorize(dest, vmin or 0.0, vmax or 90.0, colormap)
     img  = Image.fromarray(rgba, mode="RGBA")
@@ -612,11 +658,12 @@ def render_layer_tile_bytes(
     y: int,
     tile_size: int = 256,
     colormap: str = _DEFAULT_COLORMAP,
+    cb_mode: str = "",
 ) -> bytes:
     from util.gis import DERIVED_FROM_ELEVATION, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
-        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap)
+        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode)
     if layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
         return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap)
@@ -708,7 +755,10 @@ def render_layer_tile_bytes(
     vmax = vmax if vmax is not None else 1.0
 
     if nominal:
-        nominal_cmap = _load_nominal_colormap(layer_id)
+        if cb_mode in SUPPORTED_CB_MODES:
+            nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
+        else:
+            nominal_cmap = _load_nominal_colormap(layer_id)
         rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)

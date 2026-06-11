@@ -69,6 +69,17 @@ _MERCATOR_HALF    = 2 * math.pi * 6378137 / 2.0
 SUPPORTED_COLORMAPS = frozenset({"viridis", "plasma", "inferno", "magma", "cividis"})
 _DEFAULT_COLORMAP = "viridis"
 
+SUPPORTED_CIRCULAR_COLORMAPS = frozenset({"twilight", "twilight_90", "twilight_180", "twilight_270"})
+_DEFAULT_CIRCULAR_COLORMAP = "twilight_90"
+
+# Phase offsets (in LUT entries out of 256) for each twilight variant
+_TWILIGHT_PHASE_OFFSETS: dict[str, int] = {
+    "twilight":     0,
+    "twilight_90":  64,
+    "twilight_180": 128,
+    "twilight_270": 192,
+}
+
 @lru_cache(maxsize=16)
 def _get_cmap_lut(name: str) -> np.ndarray:
     from matplotlib import colormaps
@@ -76,6 +87,18 @@ def _get_cmap_lut(name: str) -> np.ndarray:
     xs = np.linspace(0.0, 1.0, 256)
     rgba = cmap(xs)  # (256, 4) float64 in [0,1]
     return (rgba[:, :3] * 255.0).astype(np.float32)  # (256, 3)
+
+
+@lru_cache(maxsize=8)
+def _get_circular_cmap_lut(name: str) -> np.ndarray:
+    """Return a 256-entry RGB LUT for the named circular (twilight) colormap."""
+    from matplotlib import colormaps
+    phase = _TWILIGHT_PHASE_OFFSETS.get(name, 0)
+    cmap = colormaps["twilight"]
+    xs = np.linspace(0.0, 1.0, 256, endpoint=False)
+    rgba = cmap(xs)
+    lut = (rgba[:, :3] * 255.0).astype(np.float32)  # (256, 3)
+    return np.roll(lut, phase, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -208,19 +231,10 @@ def tile_bounds_wgs84(z: int, x: int, y: int) -> tuple[float, float, float, floa
 # Colorization
 # ---------------------------------------------------------------------------
 
-# 4-stop cyclic ramp peaking exactly at cardinal directions:
-# N=0°→red, E=90°→yellow, S=180°→green, W=270°→blue
-_ASPECT_STOPS = np.array(
-    [[40, 95, 220], [45, 175, 65], [240, 195, 15], [220, 50, 50]],
-    dtype=np.float32,
-)
+def _colorize_circular(values: np.ndarray, colormap: str = _DEFAULT_CIRCULAR_COLORMAP) -> np.ndarray:
+    """Colorize angular values (0–360°) using a twilight circular colormap.
 
-
-def _colorize_aspect(values: np.ndarray) -> np.ndarray:
-    """Colorize aspect (0–360°) with a 4-stop cyclic ramp.
-
-    Cardinal peaks: N=blue, E=green, S=yellow, W=red.
-    Blends linearly between stops so transitions are unambiguous.
+    Maps degrees cyclically to the LUT so 0° and 360° return the same color.
     NaN pixels (nodata) are fully transparent.
     """
     rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
@@ -228,14 +242,15 @@ def _colorize_aspect(values: np.ndarray) -> np.ndarray:
     if not np.any(finite):
         return rgba
 
-    t = (values[finite] % 360.0) / 90.0  # [0, 4)
-    seg = np.floor(t).astype(np.int32) % 4
-    frac = (t - np.floor(t))[:, np.newaxis]
-    rgb = _ASPECT_STOPS[seg] + frac * (_ASPECT_STOPS[(seg + 1) % 4] - _ASPECT_STOPS[seg])
-
-    rgba[finite, 0] = rgb[:, 0].astype(np.uint8)
-    rgba[finite, 1] = rgb[:, 1].astype(np.uint8)
-    rgba[finite, 2] = rgb[:, 2].astype(np.uint8)
+    name = colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP
+    lut = _get_circular_cmap_lut(name)
+    indices = np.clip(
+        ((values[finite] % 360.0) / 360.0 * len(lut)).astype(np.int32) % len(lut),
+        0, len(lut) - 1,
+    )
+    rgba[finite, 0] = lut[indices, 0].astype(np.uint8)
+    rgba[finite, 1] = lut[indices, 1].astype(np.uint8)
+    rgba[finite, 2] = lut[indices, 2].astype(np.uint8)
     rgba[finite, 3] = 200
     return rgba
 
@@ -596,7 +611,7 @@ def _render_derived_elevation_tile_bytes(
         pass
 
     if layer["id"] == "aspect":
-        rgba = _colorize_aspect(dest)
+        rgba = _colorize_circular(dest, colormap)
     else:
         rgba = _colorize(dest, vmin or 0.0, vmax or 90.0, colormap)
     img  = Image.fromarray(rgba, mode="RGBA")

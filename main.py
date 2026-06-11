@@ -517,7 +517,7 @@ async def variable_tile_compat(
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
 async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis")):
-    if colormap not in tiles.SUPPORTED_COLORMAPS:
+    if colormap not in tiles.SUPPORTED_COLORMAPS and colormap not in tiles.SUPPORTED_CIRCULAR_COLORMAPS:
         colormap = "viridis"
     try:
         layer = tiles.get_layer(layer_id)

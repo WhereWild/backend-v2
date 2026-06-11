@@ -885,9 +885,18 @@ def get_species_environment(
                         "min": stats.get("min"),
                         "mean": stats.get("mean"),
                         "max": stats.get("max"),
+                        "median": stats.get("median"),
+                        "mode": stats.get("mode"),
+                        "std": stats.get("std"),
                         "stddev": stats.get("std"),
+                        "variance": stats.get("variance"),
+                        "range": stats.get("range"),
                         "q10": stats.get("10th_percentile"),
+                        "q25": stats.get("25th_percentile"),
+                        "q75": stats.get("75th_percentile"),
                         "q90": stats.get("90th_percentile"),
+                        "iqr": stats.get("iqr"),
+                        "10_90_range": stats.get("10_90_range"),
                     }
                     return {
                         "species_id": taxon.get("taxon_key"),
@@ -911,6 +920,8 @@ def get_species_environment(
                             "circular_mean": stats.get("circular_mean"),
                             "rbar": stats.get("rbar"),
                             "circular_std": stats.get("circular_std"),
+                            "circular_var": stats.get("circular_var"),
+                            "mode": stats.get("mode"),
                         },
                         "density_curve": result["density_curve"],
                         "categorical_distribution": None,
@@ -1008,6 +1019,8 @@ def get_species_environment(
             "circular_mean": row.get("circular_mean"),
             "rbar": row.get("rbar"),
             "circular_std": row.get("circular_std"),
+            "circular_var": row.get("circular_var"),
+            "mode": row.get("mode"),
         }
         den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
         den_row = den_rows[0] if den_rows else None
@@ -1035,9 +1048,18 @@ def get_species_environment(
         "min": row.get("min"),
         "mean": row.get("mean"),
         "max": row.get("max"),
+        "median": row.get("median"),
+        "mode": row.get("mode"),
+        "std": row.get("std"),
         "stddev": row.get("std"),
+        "variance": row.get("variance"),
+        "range": row.get("range"),
         "q10": row.get("10th_percentile"),
+        "q25": row.get("25th_percentile"),
+        "q75": row.get("75th_percentile"),
         "q90": row.get("90th_percentile"),
+        "iqr": row.get("iqr"),
+        "10_90_range": row.get("10_90_range"),
     }
 
     den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()

@@ -5,8 +5,8 @@
     {
       "id": 0,
       "name": "Clear sky",
-      "group": "cloud",
-      "group_label": "Cloud cover",
+      "group": "clear",
+      "group_label": "Clear",
       "traits": {
         "color": "#FFD700"
       }

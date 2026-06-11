@@ -30,6 +30,7 @@ from typing import Any
 import fsspec
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from omfiles import OmFileReader
 from rasterio.crs import CRS as _CRS
@@ -588,7 +589,7 @@ def build_chunk_index(
     model: str,
     variable: str,
     *,
-    min_year: int | None = None,
+    min_date: str | None = None,
 ) -> ChunkIndex:
     """Build a time-ordered index of all .om files for a model/variable.
 
@@ -673,8 +674,8 @@ def build_chunk_index(
 
     ranges.sort(key=lambda r: r.start)
 
-    if min_year is not None:
-        cutoff = datetime(min_year, 1, 1, tzinfo=UTC).timestamp()
+    if min_date is not None:
+        cutoff = datetime.fromisoformat(min_date).replace(tzinfo=UTC).timestamp()
         ranges = [r for r in ranges if r.end >= cutoff]
 
     result = ChunkIndex(
@@ -720,7 +721,7 @@ def build_occ_index(
     data_root: str,
     occ_filename: str,
     index_path: Path,
-    min_year: int | None = None,
+    min_date: str | None = None,
     skip_if_cols: list[str] | None = None,
 ) -> int:
     """Scan all descendant occurrence parquets and write a flat index to disk.
@@ -736,8 +737,8 @@ def build_occ_index(
         raise RuntimeError(f"Unknown root taxon {root_taxon_id}")
 
     cutoff = (
-        datetime(min_year, 1, 1, tzinfo=UTC).timestamp()
-        if min_year is not None
+        datetime.fromisoformat(min_date).replace(tzinfo=UTC).timestamp()
+        if min_date is not None
         else None
     )
 
@@ -769,10 +770,15 @@ def build_occ_index(
             if skip_if_cols:
                 present = [c for c in skip_if_cols if c in schema.names]
                 if len(present) == len(skip_if_cols):
-                    skip_df = pq.read_table(occ_path, columns=present).to_pandas()
-                    already_done = skip_df.notna().any(axis=1)
+                    skip_table = pq.read_table(occ_path, columns=present)
+                    # Use pc.is_null on Arrow (not pandas notna) so NaN sentinels
+                    # ("tried, no coverage") are treated as already-done — NaN is a
+                    # real float value in Arrow, so is_null returns False for it.
+                    already_done = np.zeros(skip_table.num_rows, dtype=bool)
+                    for c in present:
+                        already_done |= np.asarray(pc.invert(pc.is_null(skip_table.column(c))))
                     total_skipped += int(already_done.sum())
-                    valid &= ~already_done.values
+                    valid &= ~already_done
 
             if not valid.any():
                 continue

@@ -274,7 +274,7 @@ class TestBuildChunkIndex:
 
     def test_min_year_filters_old_ranges(self, monkeypatch):
         _mock_s3(monkeypatch)
-        idx = util.temporal.build_chunk_index("copernicus_era5", "precipitation", min_year=2023)
+        idx = util.temporal.build_chunk_index("copernicus_era5", "precipitation", min_date="2023-01-01")
         cutoff = datetime(2023, 1, 1, tzinfo=UTC).timestamp()
         for r in idx.ranges:
             assert r.end >= cutoff
@@ -364,9 +364,9 @@ class TestBuildOccIndex:
         return {"taxon_key": "1", "path": str(path), "scientific_name": "X",
                 "common_name": "", "rank": "SPECIES"}
 
-    def _build(self, tmp_path, root_id, data_root, occ_filename, min_year=None, **kw):
+    def _build(self, tmp_path, root_id, data_root, occ_filename, min_date=None, **kw):
         idx = tmp_path / "occ_index.parquet"
-        util.temporal.build_occ_index(root_id, data_root, occ_filename, idx, min_year=min_year, **kw)
+        util.temporal.build_occ_index(root_id, data_root, occ_filename, idx, min_date=min_date, **kw)
         return pq.read_table(idx)
 
     def test_unknown_root_raises(self, tmp_path, monkeypatch):
@@ -397,7 +397,7 @@ class TestBuildOccIndex:
         node = self._node(tmp_path)
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
         monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet", min_year=2000)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet", min_date="2000-01-01")
         assert result.num_rows == 1
         assert result["timestamp"][0].as_py() == pytest.approx(t_new)
 

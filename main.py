@@ -150,7 +150,8 @@ async def _upload_consumer() -> None:
             continue
         job.status = "processing"
         try:
-            df = await run_in_threadpool(upload.enrich_with_gis, job.df)
+            df = await run_in_threadpool(upload.enrich_with_gadm, job.df)
+            df = await run_in_threadpool(upload.enrich_with_gis, df)
             archive_path, archive_name, work_dir = await run_in_threadpool(upload.build_archive, df)
             job.archive_path = archive_path
             job.archive_name = archive_name
@@ -505,14 +506,16 @@ async def gis_point_value(
 
 
 @app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
-async def variable_tile_compat(variable_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024)):
+async def variable_tile_compat(variable_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis")):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size)
+    return await layer_tile(layer_id, z, x, y, tile_size, colormap)
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
-async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024)):
+async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis")):
+    if colormap not in tiles.SUPPORTED_COLORMAPS:
+        colormap = "viridis"
     try:
         layer = tiles.get_layer(layer_id)
     except KeyError:
@@ -520,7 +523,7 @@ async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Que
 
     payload = await run_in_threadpool(
         tiles.render_layer_tile_bytes,
-        layer_id, z, x, y, tile_size,
+        layer_id, z, x, y, tile_size, colormap,
     )
     is_temporal = layer.get("window_hours") is not None
     cache_max_age = 300 if is_temporal else 604800

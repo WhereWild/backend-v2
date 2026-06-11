@@ -26,6 +26,9 @@ import pyarrow.parquet as pq
 import rasterio
 from fastapi import HTTPException
 
+import geopandas as gpd
+
+from config.config import ZERO_NODATA_LAYERS
 from util.gis import DERIVED_FROM_ELEVATION, hilbert_index, sample_aspect_batch, sample_slope_batch
 from util.stats import (
     CIRCULAR_STATS_FILE,
@@ -38,6 +41,99 @@ from util.stats import (
 from util.tiles import LAYERS_DIR, load_layers_with_category
 
 _LEGEND_DIR = Path("config/gis/legends")
+_GADM_PATH = Path("data/gis/gadm.gpkg")
+_HIERARCHY_PATH = Path("data/gis/locations/hierarchy.csv")
+
+_gadm_gdf = None
+_hierarchy: dict[str, dict] | None = None
+
+
+def _load_gadm_gdf():
+    global _gadm_gdf
+    if _gadm_gdf is not None:
+        return _gadm_gdf
+    if not _GADM_PATH.exists():
+        return None
+    gdf = gpd.read_file(_GADM_PATH, layer="gadm_410", engine="pyogrio", columns=["GID_0", "GID_1", "GID_2", "geom"])
+    gdf = gdf.set_geometry("geom")
+    _gadm_gdf = gdf
+    return _gadm_gdf
+
+
+def _load_hierarchy() -> dict[str, dict]:
+    global _hierarchy
+    if _hierarchy is not None:
+        return _hierarchy
+    if not _HIERARCHY_PATH.exists():
+        _hierarchy = {}
+        return _hierarchy
+    import csv as _csv
+    result: dict[str, dict] = {}
+    with _HIERARCHY_PATH.open(encoding="utf-8") as f:
+        for row in _csv.DictReader(f):
+            gid = row.get("gid", "")
+            if gid:
+                result[gid] = {
+                    "name": row.get("name", gid),
+                    "level": int(row["level"]),
+                    "parent_gid": row.get("parent_gid") or None,
+                }
+    _hierarchy = result
+    return _hierarchy
+
+
+def _resolve_hierarchy(gid: str, by_gid: dict[str, dict]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    current = by_gid.get(gid, {}).get("parent_gid")
+    while current:
+        if current in seen:
+            break
+        seen.add(current)
+        rec = by_gid.get(current)
+        if rec is None:
+            break
+        names.append(rec["name"])
+        current = rec.get("parent_gid")
+    names.reverse()
+    return names
+
+
+def build_locations_table(df: pd.DataFrame) -> pa.Table | None:
+    """Build a locations table from the GID columns present in df."""
+    by_gid = _load_hierarchy()
+    if not by_gid:
+        return None
+
+    level_cols = [("level2Gid", 2), ("level1Gid", 1), ("level0Gid", 0)]
+    seen: set[str] = set()
+    rows_gid: list[str] = []
+    rows_name: list[str] = []
+    rows_level: list[int] = []
+    rows_hierarchy: list[str] = []  # JSON-encoded list
+
+    for col, level in level_cols:
+        if col not in df.columns:
+            continue
+        for gid in df[col].dropna().unique():
+            if not gid or gid in seen:
+                continue
+            seen.add(gid)
+            rec = by_gid.get(gid)
+            rows_gid.append(gid)
+            rows_name.append(rec["name"] if rec else gid)
+            rows_level.append(level)
+            rows_hierarchy.append(json.dumps(_resolve_hierarchy(gid, by_gid)))
+
+    if not rows_gid:
+        return None
+
+    return pa.table({
+        "gid": pa.array(rows_gid, type=pa.string()),
+        "name": pa.array(rows_name, type=pa.string()),
+        "level": pa.array(rows_level, type=pa.int32()),
+        "hierarchy": pa.array(rows_hierarchy, type=pa.string()),
+    })
 
 # ---------------------------------------------------------------------------
 # Column alias resolution
@@ -149,6 +245,37 @@ def check_reserved_columns(df: pd.DataFrame, layer_ids: set[str]) -> None:
 # GIS enrichment
 # ---------------------------------------------------------------------------
 
+def enrich_with_gadm(df: pd.DataFrame) -> pd.DataFrame:
+    """Add level0Gid/level1Gid/level2Gid columns via point-in-polygon against GADM 4.1."""
+    if df.empty:
+        return df.copy()
+    gdf = _load_gadm_gdf()
+    if gdf is None:
+        return df.copy()
+
+    points = gpd.GeoDataFrame(
+        {"_orig_index": df.index},
+        geometry=gpd.points_from_xy(df["decimalLongitude"], df["decimalLatitude"]),
+        crs="EPSG:4326",
+    )
+    joined = gpd.sjoin(points, gdf[["GID_0", "GID_1", "GID_2", "geom"]], how="left", predicate="within")
+    # deduplicate in case a point lands on a shared boundary
+    joined = joined[~joined.index.duplicated(keep="first")]
+
+    result = df.copy()
+    for src, dst in [("GID_0", "level0Gid"), ("GID_1", "level1Gid"), ("GID_2", "level2Gid")]:
+        col = joined[src].reindex(df.index)
+        result[dst] = col.where(col.notna(), other=None)
+
+    # single most-specific GID per row for frontend filtering
+    result["locationGid"] = (
+        result["level2Gid"]
+        .where(result["level2Gid"].notna(), result["level1Gid"])
+        .where(result["level1Gid"].notna() | result["level2Gid"].notna(), result["level0Gid"])
+    )
+    return result
+
+
 def _sample_layer(
     path: Path,
     lats: np.ndarray,
@@ -156,14 +283,19 @@ def _sample_layer(
     scale: float,
     offset: float,
     nodata: float | None,
+    layer_id: str = "",
 ) -> list[float | None]:
     coords = list(zip(lons.tolist(), lats.tolist()))
+    zero_nodata = layer_id in ZERO_NODATA_LAYERS
     with rasterio.open(path) as ds:
         nd = ds.nodata if nodata is None else nodata
         results: list[float | None] = []
         for point in ds.sample(coords):
             v = float(point[0])
-            results.append(None if (nd is not None and v == nd) else v * scale + offset)
+            if nd is not None and v == nd:
+                results.append(0.0 if zero_nodata else None)
+            else:
+                results.append(v * scale + offset)
     return results
 
 
@@ -232,7 +364,7 @@ def enrich_with_gis(df: pd.DataFrame) -> pd.DataFrame:
                     continue
                 scale  = layer.get("scale_factor") or 1.0
                 offset = layer.get("add_offset")   or 0.0
-                sorted_vals = _sample_layer(cog_path, s_lats, s_lons, scale, offset, nodata=None)
+                sorted_vals = _sample_layer(cog_path, s_lats, s_lons, scale, offset, nodata=None, layer_id=layer_id)
                 result[layer_id] = [sorted_vals[i] for i in restore]
         except Exception:
             pass
@@ -310,6 +442,11 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
         if meta_rows:
             pq.write_table(pa.Table.from_pylist(meta_rows), meta_path)
 
+        locations_path = work_dir / "locations.parquet"
+        locations_table = build_locations_table(df)
+        if locations_table is not None:
+            pq.write_table(locations_table, locations_path)
+
         archive_name = "processed_observations.zip"
         archive_path = work_dir / archive_name
         files_to_zip = [
@@ -320,6 +457,7 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
             (work_dir / DENSITY_FILE,               DENSITY_FILE),
             (lookup_path,                           "categorical_value_lookup.parquet"),
             (meta_path,                             "variable_metadata.parquet"),
+            (locations_path,                        "locations.parquet"),
         ]
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for parquet_path, arcname in files_to_zip:

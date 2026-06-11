@@ -1,11 +1,11 @@
 {
   "layer_id": "kg0",
-  "source": "Karger et al. 2021 / CHELSA v2.1 — kg0 variant (As/Aw distinction)",
+  "source": "Karger et al. 2021 / CHELSA v2.1 \u2014 kg0 variant (As/Aw distinction)",
   "classes": [
     {
       "id": 1,
       "name": "Tropical, rainforest",
-      "group": "rainforest",
+      "group": "tropical",
       "group_label": "Rainforest",
       "traits": {
         "code": "AF",
@@ -15,7 +15,7 @@
     {
       "id": 2,
       "name": "Tropical, monsoon",
-      "group": "monsoon",
+      "group": "tropical",
       "group_label": "Monsoon",
       "traits": {
         "code": "AM",
@@ -166,7 +166,7 @@
     {
       "id": 16,
       "name": "Temperate, dry winter warm summer",
-      "group": "highland",
+      "group": "temperate",
       "group_label": "Highland",
       "traits": {
         "thermal": "warm",
@@ -177,7 +177,7 @@
     {
       "id": 17,
       "name": "Temperate, dry winter cold summer",
-      "group": "highland",
+      "group": "temperate",
       "group_label": "Highland",
       "traits": {
         "thermal": "cool",

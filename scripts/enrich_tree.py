@@ -28,7 +28,7 @@ import pyarrow.parquet as pq
 import rasterio
 import rasterio.transform
 
-from config.config import load_config
+from config.config import ZERO_NODATA_LAYERS, load_config
 from util.gis import (
     DERIVED_FROM_ELEVATION,
     sample_aspect_batch,
@@ -45,15 +45,18 @@ CATALOG_PATH = Path("config/gis/catalog.json")
 OCCURRENCE_FILE = "occurrence.parquet"
 ROW_LIMIT = 2_500_000
 
-_LAYER_WORKERS = int(os.environ.get("ENRICH_LAYER_WORKERS", "4"))
+_LAYER_WORKERS = int(os.environ.get("ENRICH_LAYER_WORKERS", "1"))
 # Rasters whose uncompressed footprint fits under this limit are loaded fully
 # into RAM and sampled with vectorized numpy indexing. The array is held only
 # for the duration of the sampling call and freed immediately after — no
 # persistent cache, so at most _LAYER_WORKERS rasters live in memory at once.
-_MEMORY_MB_THRESHOLD = int(os.environ.get("ENRICH_MEMORY_MB_THRESHOLD", "5000"))
+# Default 24 GB covers SoilGrids (23 GB each). With _LAYER_WORKERS=1 this means
+# peak RAM for rasters is one SoilGrids array at a time — safe on 64 GB hosts.
+# Raising workers above 1 requires lowering this threshold proportionally.
+_MEMORY_MB_THRESHOLD = int(os.environ.get("ENRICH_MEMORY_MB_THRESHOLD", "24000"))
 
-# GDAL block cache for the ds.sample() large-raster path (elevation, landcover,
-# soilgrids). In-memory rasters bypass GDAL entirely so this doesn't affect them.
+# GDAL block cache for the ds.sample() large-raster path (elevation, landcover).
+# In-memory rasters bypass GDAL entirely so this doesn't affect them.
 # Default: total RAM − 16 GB OS floor − in-memory raster budget − 4 GB working data,
 # capped at 48 GB. Overridable via GDAL_CACHEMAX in the environment (MB).
 def _default_gdal_cachemax_mb() -> int:
@@ -261,7 +264,7 @@ def _sample_cog_batch(
                     vals = data[rows[valid], cols[valid]].astype(np.float64)
                     if nodata is not None:
                         nd = vals == float(nodata)
-                        vals[nd] = 0.0 if layer_id == "swe" else np.nan
+                        vals[nd] = 0.0 if layer_id in ZERO_NODATA_LAYERS else np.nan
                     out[valid] = vals * scale + offset
             else:
                 # Too large to load: ds.sample() with hilbert-sorted coords.
@@ -269,7 +272,7 @@ def _sample_cog_batch(
                 for i, point in enumerate(ds.sample(coords)):
                     v = float(point[0])
                     if nodata is not None and v == nodata:
-                        out[i] = 0.0 if layer_id == "swe" else np.nan
+                        out[i] = 0.0 if layer_id in ZERO_NODATA_LAYERS else np.nan
                     else:
                         out[i] = v * scale + offset
     except Exception:
@@ -385,7 +388,30 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
         return terrain_sentinel, out
 
     # Build the work queue: one job per non-terrain layer, one combined job for terrain.
-    non_terrain_ids = [lid for lid in layer_rows if lid not in _terrain_ids]
+    # Sort so in-memory layers run before ds.sample() layers (elevation, landcover).
+    # With workers=1 this means the numpy-loaded layers (fast once in RAM) all
+    # complete before the slow tile-by-tile passes start. Largest in-memory layers
+    # (SoilGrids) go first within the in-memory group.
+    def _layer_unc_mb(lid: str) -> float:
+        meta = layer_meta.get(lid)
+        if not meta or not meta.get("filename"):
+            return 0.0
+        p = LAYERS_DIR / meta["filename"]
+        if not p.exists():
+            return 0.0
+        try:
+            with rasterio.open(p) as ds:
+                itemsize = np.dtype(ds.dtypes[0]).itemsize
+                return ds.width * ds.height * itemsize / 1e6
+        except Exception:
+            return 0.0
+
+    candidate_ids = [lid for lid in layer_rows if lid not in _terrain_ids]
+    unc_mb_map = {lid: _layer_unc_mb(lid) for lid in candidate_ids}
+    non_terrain_ids = sorted(
+        candidate_ids,
+        key=lambda lid: (0 if unc_mb_map[lid] <= _MEMORY_MB_THRESHOLD else 1, -unc_mb_map[lid]),
+    )
     total = len(non_terrain_ids) + (len(_terrain_ids) if _terrain_ids else 0)
     layer_results: dict[str, np.ndarray] = {}
     completed = 0

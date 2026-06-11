@@ -301,7 +301,7 @@ def test_build_rank_index_sorts_by_value(tmp_path, monkeypatch):
     sp_a_dir = tmp_path / _SPECIES_A["path"]
     sp_b_dir = tmp_path / _SPECIES_B["path"]
     _write_numerical_stats(sp_a_dir, "bio1", count=10, mean=3.0)
-    _write_numerical_stats(sp_b_dir, "bio1", count=8, mean=7.0)
+    _write_numerical_stats(sp_b_dir, "bio1", count=10, mean=7.0)
 
     with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A, _SPECIES_B]):
         rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
@@ -337,7 +337,7 @@ def test_build_rank_index_stores_column_lengths_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
     index_path = tmp_path / "si.parquet"
     sp_dir = tmp_path / _SPECIES_A["path"]
-    _write_numerical_stats(sp_dir, "bio1", count=5, mean=1.0)
+    _write_numerical_stats(sp_dir, "bio1", count=10, mean=1.0)
     with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A]):
         rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
     lengths = rk._load_column_lengths(index_path)

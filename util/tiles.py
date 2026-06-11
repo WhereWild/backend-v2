@@ -256,6 +256,33 @@ def _colorize_circular(values: np.ndarray, colormap: str = _DEFAULT_CIRCULAR_COL
 
 
 _LEGEND_DIR = Path("config/gis/legends")
+_CB_COLORS_PATH = Path("config/gis/cb_colors.json")
+
+SUPPORTED_CB_MODES = frozenset({"colorblind", "achromatopsia"})
+
+
+@lru_cache(maxsize=1)
+def _load_cb_colors() -> dict:
+    """Return {layer_id: {mode: {str(class_id): hex}}} from cb_colors.json."""
+    if not _CB_COLORS_PATH.exists():
+        return {}
+    return json.loads(_CB_COLORS_PATH.read_text())
+
+
+def _cb_colormap_for_layer(layer_id: str, cb_mode: str) -> dict[int, tuple[int, int, int]]:
+    """Return {class_id: (R, G, B)} for the given CB mode, or {} if not available."""
+    import re
+    base_id = re.sub(r'_(avg|sum|mode|snapshot)_\d+h$', '', layer_id, flags=re.IGNORECASE)
+    cb_data = _load_cb_colors().get(base_id, {}).get(cb_mode, {})
+    result: dict[int, tuple[int, int, int]] = {}
+    for k, hex_color in cb_data.items():
+        if isinstance(hex_color, str) and hex_color.startswith("#") and len(hex_color) == 7:
+            result[int(k)] = (
+                int(hex_color[1:3], 16),
+                int(hex_color[3:5], 16),
+                int(hex_color[5:7], 16),
+            )
+    return result
 
 
 @lru_cache(maxsize=16)
@@ -366,6 +393,7 @@ def render_temporal_tile_bytes(
     y: int,
     tile_size: int = 256,
     colormap: str = _DEFAULT_COLORMAP,
+    cb_mode: str = "",
 ) -> bytes:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
@@ -425,7 +453,10 @@ def render_temporal_tile_bytes(
         vmax = vmax if vmax is not None else 1.0
 
     if nominal:
-        nominal_cmap = _load_nominal_colormap(layer_id)
+        if cb_mode in SUPPORTED_CB_MODES:
+            nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
+        else:
+            nominal_cmap = _load_nominal_colormap(layer_id)
         rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
@@ -627,11 +658,12 @@ def render_layer_tile_bytes(
     y: int,
     tile_size: int = 256,
     colormap: str = _DEFAULT_COLORMAP,
+    cb_mode: str = "",
 ) -> bytes:
     from util.gis import DERIVED_FROM_ELEVATION, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
-        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap)
+        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode)
     if layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
         return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap)
@@ -723,7 +755,10 @@ def render_layer_tile_bytes(
     vmax = vmax if vmax is not None else 1.0
 
     if nominal:
-        nominal_cmap = _load_nominal_colormap(layer_id)
+        if cb_mode in SUPPORTED_CB_MODES:
+            nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
+        else:
+            nominal_cmap = _load_nominal_colormap(layer_id)
         rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)

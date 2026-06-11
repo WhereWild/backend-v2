@@ -509,16 +509,19 @@ async def gis_point_value(
 async def variable_tile_compat(
     variable_id: str, z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis"),
+    cb_mode: str = Query(""),
 ):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size, colormap)
+    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode)
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
-async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis")):
+async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis"), cb_mode: str = Query("")):
     if colormap not in tiles.SUPPORTED_COLORMAPS and colormap not in tiles.SUPPORTED_CIRCULAR_COLORMAPS:
         colormap = "viridis"
+    if cb_mode not in tiles.SUPPORTED_CB_MODES:
+        cb_mode = ""
     try:
         layer = tiles.get_layer(layer_id)
     except KeyError:
@@ -526,7 +529,7 @@ async def layer_tile(layer_id: str, z: int, x: int, y: int, tile_size: int = Que
 
     payload = await run_in_threadpool(
         tiles.render_layer_tile_bytes,
-        layer_id, z, x, y, tile_size, colormap,
+        layer_id, z, x, y, tile_size, colormap, cb_mode,
     )
     is_temporal = layer.get("window_hours") is not None
     cache_max_age = 300 if is_temporal else 604800

@@ -66,10 +66,16 @@ WEB_MERCATOR      = CRS.from_epsg(3857)
 WGS84             = CRS.from_epsg(4326)
 _MERCATOR_HALF    = 2 * math.pi * 6378137 / 2.0
 
-HEATMAP_COLOR_STOPS = np.asarray(
-    [[68, 1, 84], [59, 82, 139], [33, 145, 140], [94, 201, 98], [253, 231, 37]],
-    dtype=np.float32,
-)
+SUPPORTED_COLORMAPS = frozenset({"viridis", "plasma", "inferno", "magma", "cividis"})
+_DEFAULT_COLORMAP = "viridis"
+
+@lru_cache(maxsize=16)
+def _get_cmap_lut(name: str) -> np.ndarray:
+    from matplotlib import colormaps
+    cmap = colormaps[name]
+    xs = np.linspace(0.0, 1.0, 256)
+    rgba = cmap(xs)  # (256, 4) float64 in [0,1]
+    return (rgba[:, :3] * 255.0).astype(np.float32)  # (256, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -292,20 +298,21 @@ def _colorize_nominal(values: np.ndarray, colormap: dict[int, tuple[int, int, in
     return rgba
 
 
-def _colorize(values: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
+def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEFAULT_COLORMAP) -> np.ndarray:
     rgba   = np.zeros((*values.shape, 4), dtype=np.uint8)
     finite = np.isfinite(values)
     if not np.any(finite):
         return rgba
 
+    lut         = _get_cmap_lut(colormap if colormap in SUPPORTED_COLORMAPS else _DEFAULT_COLORMAP)
     span        = max(float(vmax) - float(vmin), 1e-6)
     norm        = np.clip((values - vmin) / span, 0.0, 1.0)
     finite_norm = norm[finite]
-    positions   = np.linspace(0.0, 1.0, HEATMAP_COLOR_STOPS.shape[0], dtype=np.float32)
+    indices     = np.clip((finite_norm * (len(lut) - 1)).astype(np.int32), 0, len(lut) - 1)
 
-    rgba[finite, 0] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 0]).astype(np.uint8)
-    rgba[finite, 1] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 1]).astype(np.uint8)
-    rgba[finite, 2] = np.interp(finite_norm, positions, HEATMAP_COLOR_STOPS[:, 2]).astype(np.uint8)
+    rgba[finite, 0] = lut[indices, 0].astype(np.uint8)
+    rgba[finite, 1] = lut[indices, 1].astype(np.uint8)
+    rgba[finite, 2] = lut[indices, 2].astype(np.uint8)
     rgba[finite, 3] = np.clip(40.0 + finite_norm * 215.0, 0.0, 255.0).astype(np.uint8)
     return rgba
 
@@ -343,6 +350,7 @@ def render_temporal_tile_bytes(
     x: int,
     y: int,
     tile_size: int = 256,
+    colormap: str = _DEFAULT_COLORMAP,
 ) -> bytes:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
@@ -402,10 +410,10 @@ def render_temporal_tile_bytes(
         vmax = vmax if vmax is not None else 1.0
 
     if nominal:
-        colormap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, colormap) if colormap else _colorize(dest, vmin or 0.0, vmax or 1.0)
+        nominal_cmap = _load_nominal_colormap(layer_id)
+        rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
     else:
-        rgba = _colorize(dest, vmin, vmax)
+        rgba = _colorize(dest, vmin, vmax, colormap)
     img = Image.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -535,6 +543,7 @@ def _render_derived_elevation_tile_bytes(
     y: int,
     tile_size: int,
     derive_fn,
+    colormap: str = _DEFAULT_COLORMAP,
 ) -> bytes:
     """Render a tile for a layer derived on-the-fly from elevation.tif."""
     elev_path = LAYERS_DIR / "elevation.tif"
@@ -589,7 +598,7 @@ def _render_derived_elevation_tile_bytes(
     if layer["id"] == "aspect":
         rgba = _colorize_aspect(dest)
     else:
-        rgba = _colorize(dest, vmin or 0.0, vmax or 90.0)
+        rgba = _colorize(dest, vmin or 0.0, vmax or 90.0, colormap)
     img  = Image.fromarray(rgba, mode="RGBA")
     buf  = io.BytesIO()
     img.save(buf, format="PNG")
@@ -602,14 +611,15 @@ def render_layer_tile_bytes(
     x: int,
     y: int,
     tile_size: int = 256,
+    colormap: str = _DEFAULT_COLORMAP,
 ) -> bytes:
     from util.gis import DERIVED_FROM_ELEVATION, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
-        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size)
+        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap)
     if layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
-        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn)
+        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap)
     path    = LAYERS_DIR / layer["filename"]
     scale   = layer.get("scale_factor") or 1.0
     offset  = layer.get("add_offset")   or 0.0
@@ -698,10 +708,10 @@ def render_layer_tile_bytes(
     vmax = vmax if vmax is not None else 1.0
 
     if nominal:
-        colormap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, colormap) if colormap else _colorize(dest, vmin, vmax)
+        nominal_cmap = _load_nominal_colormap(layer_id)
+        rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
     else:
-        rgba = _colorize(dest, vmin, vmax)
+        rgba = _colorize(dest, vmin, vmax, colormap)
     img  = Image.fromarray(rgba, mode="RGBA")
     buf  = io.BytesIO()
     img.save(buf, format="PNG")

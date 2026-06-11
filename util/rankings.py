@@ -67,6 +67,8 @@ _RANK_ORDER: tuple[str, ...] = (
     "KINGDOM", "PHYLUM", "CLASS", "ORDER", "FAMILY", "GENUS", "SPECIES", "SUBSPECIES",
 )
 
+MIN_RANKING_SAMPLES = 10  # taxa with fewer observations for a variable are excluded from rankings
+
 
 _POSITION_SCHEMA = pa.schema([
     pa.field("taxon_key", pa.string()),
@@ -431,6 +433,9 @@ def _collect_entries_from_numerical_stats(
         variable = str(record.get("variable") or "")
         if not variable or variable not in layer_by_id:
             continue
+        var_count = record.get("count")
+        if var_count is None or int(var_count) < MIN_RANKING_SAMPLES:
+            continue
         layer = layer_by_id[variable]
         try:
             vtype = ValueType(layer.get("value_type", ""))
@@ -471,10 +476,18 @@ def _collect_entries_from_nominal_stats(
     nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL])
     entries: dict[str, dict[str, Any]] = {}
 
+    # Build per-variable total_samples lookup for threshold filtering
+    var_totals: dict[str, int] = {}
+    for record in df.to_dict("records"):
+        if str(record.get("metric") or "") == "total_samples":
+            var_totals[str(record.get("variable") or "")] = int(float(record.get("value") or 0))
+
     for record in df.to_dict("records"):
         variable = str(record.get("variable") or "")
         metric = str(record.get("metric") or "")
         if variable not in nominal_ids:
+            continue
+        if var_totals.get(variable, 0) < MIN_RANKING_SAMPLES:
             continue
         if metric not in nominal_metrics and not metric.startswith("class_"):
             continue
@@ -510,6 +523,9 @@ def _collect_entries_from_circular_stats(
     for record in df.to_dict("records"):
         variable = str(record.get("variable") or "")
         if not variable or variable not in layer_by_id:
+            continue
+        var_count = record.get("count")
+        if var_count is None or int(var_count) < MIN_RANKING_SAMPLES:
             continue
         layer = layer_by_id[variable]
         try:
@@ -600,6 +616,16 @@ def _build_rank_index(
                 active &= include
             for metric_idx in np.where(active)[0]:
                 k = vocab[metric_idx]
+                # Check per-variable sample count threshold using {variable}::count
+                # (continuous/circular) or {variable}::total_samples (nominal).
+                variable = k.split("::")[0]
+                count_idx = _metric_to_idx.get(f"{variable}::count")
+                if count_idx is None:
+                    count_idx = _metric_to_idx.get(f"{variable}::total_samples")
+                if count_idx is not None:
+                    var_count = values_arr[count_idx]
+                    if np.isnan(var_count) or int(var_count) < MIN_RANKING_SAMPLES:
+                        continue
                 v = float(values_arr[metric_idx])
                 if k in col_idx:
                     col_idx[k].append(i)
@@ -949,10 +975,12 @@ def _query_ranked_scoped(
     # Mode 3: restrict to text-matched taxon keys
     candidate_keys: frozenset[str] | None = None
     match_scores: dict[str, float] = {}
+    match_names: dict[str, str] = {}
     if q:
         text_matches = search_taxa_by_name(q, limit=max(limit * 10, 200))
         candidate_keys = frozenset(str(t["taxon_key"]) for t, _, _ in text_matches if str(t["taxon_key"]) in index_map)
         match_scores = {str(t["taxon_key"]): score for t, score, _ in text_matches}
+        match_names = {str(t["taxon_key"]): name for t, _, name in text_matches}
 
     accepted_ranks = _accepted_ranks(descendant_rank, include_species_like)
 
@@ -1009,6 +1037,7 @@ def _query_ranked_scoped(
         results.append({
             "taxon": taxon,
             "match_score": match_scores.get(tk),
+            "match_name": match_names.get(tk),
             "sample_count": loc_counts.get(tk) or sc or None,
             "sort_value": val,
             "location_count": loc_counts.get(tk) or None,
@@ -1046,8 +1075,8 @@ def _query_ranked_text(
 
     is_circular_bearing = sort_metric in _ANGULAR_METRICS and reference_value is not None
 
-    enriched: list[tuple[TaxonRecord, float, float, int]] = []  # taxon, score, sort_val, sc
-    for taxon, score, _ in candidates:
+    enriched: list[tuple[TaxonRecord, float, float, int, str]] = []  # taxon, score, sort_val, sc, match_name
+    for taxon, score, match_name in candidates:
         tk = str(taxon["taxon_key"])
         if loc_keys is not None and tk not in loc_keys:
             continue
@@ -1063,7 +1092,7 @@ def _query_ranked_text(
             rbar = _taxon_metric_value(taxon_dir, sort_variable, "rbar")
             if rbar is None or rbar < min_rbar:
                 continue
-        enriched.append((taxon, score, val, sc))
+        enriched.append((taxon, score, val, sc, match_name))
 
     if is_circular_bearing:
         ref = float(reference_value)  # type: ignore[arg-type]
@@ -1079,11 +1108,12 @@ def _query_ranked_text(
     page = enriched[offset:offset + limit]
 
     results = []
-    for taxon, score, val, sc in page:
+    for taxon, score, val, sc, match_name in page:
         tk = str(taxon["taxon_key"])
         results.append({
             "taxon": taxon,
             "match_score": score,
+            "match_name": match_name,
             "sample_count": loc_counts.get(tk) or sc or None,
             "sort_value": val,
             "location_count": loc_counts.get(tk) or None,
@@ -1122,8 +1152,8 @@ def _query_text(
 
     accepted_ranks = _accepted_ranks(descendant_rank, include_species_like) if descendant_rank else None
 
-    filtered: list[tuple[TaxonRecord, float, int]] = []
-    for taxon, score, _ in candidates:
+    filtered: list[tuple[TaxonRecord, float, int, str]] = []
+    for taxon, score, match_name in candidates:
         tk = str(taxon["taxon_key"])
         if scope_keys is not None and tk not in scope_keys:
             continue
@@ -1135,17 +1165,18 @@ def _query_text(
         effective_sc = loc_counts.get(tk, 0) if loc_counts else sc
         if effective_sc < min_samples:
             continue
-        filtered.append((taxon, score, sc))
+        filtered.append((taxon, score, sc, match_name))
 
     total = len(filtered)
     page = filtered[offset:offset + limit]
 
     results = []
-    for taxon, score, sc in page:
+    for taxon, score, sc, match_name in page:
         tk = str(taxon["taxon_key"])
         results.append({
             "taxon": taxon,
             "match_score": score,
+            "match_name": match_name,
             "sample_count": loc_counts.get(tk) or sc or None,
             "sort_value": None,
             "location_count": loc_counts.get(tk) or None,

@@ -34,6 +34,16 @@ METRICS_BY_TYPE: dict[ValueType, tuple[str, ...]] = {
     ValueType.AGGREGATE: (),
 }
 
+# GIS layers where the raster nodata value means the property is absent (= 0),
+# not that the data is missing. E.g. scd=nodata at the equator → 0 snow cover days.
+ZERO_NODATA_LAYERS: frozenset[str] = frozenset({
+    "swe", "scd", "fcf",
+    "gdd0", "gdd5", "gdd10",
+    "gddlgd0", "gddlgd5", "gddlgd10",
+    "ngd0", "ngd5", "ngd10",
+    "gsl",
+})
+
 _REGISTRY: dict[str, type] = {}
 _CACHE: dict[str, Any] = {}
 
@@ -90,7 +100,9 @@ class GlobalConfig:
     data_root: str = "data"
 
     # Temporal enrichment
-    temporal_min_year: int = 1940  # ERA5 coverage starts 1940; raise to limit processing time
+    # ERA5 starts 1940-01-01; earliest obs needs a full 90-day (2160h) lookback,
+    # so the first enrichable date is 1940-01-01 + 90d = 1940-04-01.
+    temporal_min_date: str = "1940-04-01"
     temporal_worklist_batch_rows: int = 100_000
     temporal_cache_dir: str = "data/cache/temporal"
     temporal_overwrite_all: bool = False

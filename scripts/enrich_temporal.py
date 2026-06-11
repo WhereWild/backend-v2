@@ -117,7 +117,7 @@ def _run_layer(
     chunk_var = layer.sources[0] if layer.sources else layer.id
     try:
         chunk_index = build_chunk_index(
-            layer.model, chunk_var, min_year=cfg.temporal_min_year
+            layer.model, chunk_var, min_date=cfg.temporal_min_date
         )
     except Exception as exc:
         print(f"[skip] {layer.id}: could not build chunk index — {exc}")
@@ -138,7 +138,7 @@ def _run_layer(
     for src_var in layer.sources[1:]:
         try:
             secondary_indices[src_var] = build_chunk_index(
-                layer.model, src_var, min_year=cfg.temporal_min_year
+                layer.model, src_var, min_date=cfg.temporal_min_date
             )
         except Exception as exc:
             print(f"[warn] {layer.id}: could not build chunk index for {src_var} — {exc}")
@@ -303,6 +303,7 @@ def main() -> None:
             cfg.data_root,
             cfg.occurrence_parquet_filename,
             occ_index_path,
+            min_date=cfg.temporal_min_date,
             skip_if_cols=skip_cols if skip_cols else None,
         )
         print(f"[occ_index] {n_obs} observations")

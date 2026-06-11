@@ -480,5 +480,17 @@ def main() -> None:
         f.write(ts)
     print(f'Written → {out_path}')
 
+    # Also write a backend-readable JSON so tile renderer can apply CB overrides.
+    cb_json_path = os.path.join(backend_dir, 'config', 'gis', 'cb_colors.json')
+    cb_json: dict = {}
+    for lid, data in variables.items():
+        cb_json[lid] = {
+            'colorblind':    {str(k): v for k, v in data['cb'].items()},
+            'achromatopsia': {str(k): v for k, v in data['ach'].items()},
+        }
+    with open(cb_json_path, 'w') as f:
+        json.dump(cb_json, f, indent=2)
+    print(f'Written → {cb_json_path}')
+
 if __name__ == '__main__':
     main()

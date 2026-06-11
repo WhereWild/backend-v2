@@ -290,11 +290,11 @@ def main() -> None:
         active_layers = _filter_layers(all_layers, VARS_TO_ENRICH)
         print(f"[init] active layers: {[layer.id for layer in active_layers]}")
 
-        skip_cols: list[str] = [
-            f"{layer.id}_{layer.agg}_{w}h"
+        # One group per non-derived layer: a row is re-queued if ANY layer is incomplete.
+        skip_col_groups: list[list[str]] = [
+            [f"{layer.id}_{layer.agg}_{w}h" for w in layer.windows]
             for layer in active_layers
             if not layer.derived
-            for w in layer.windows
         ]
 
         print(f"[occ_index] scanning root={str(cfg.plantae_key)}")
@@ -304,7 +304,7 @@ def main() -> None:
             cfg.occurrence_parquet_filename,
             occ_index_path,
             min_date=cfg.temporal_min_date,
-            skip_if_cols=skip_cols if skip_cols else None,
+            skip_if_cols=skip_col_groups if skip_col_groups else None,
         )
         print(f"[occ_index] {n_obs} observations")
 

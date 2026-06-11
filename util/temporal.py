@@ -672,6 +672,37 @@ def build_chunk_index(
     if not ranges:
         raise RuntimeError(f"No .om files found for {model}/{variable}")
 
+    # Year files are authoritative archival data. Where a rolling chunk overlaps
+    # a year file, clip the chunk's effective start to just after the year file
+    # ends so searchsorted always prefers the complete year file for that period.
+    year_ranges = [r for r in ranges if r.source == "year"]
+    if year_ranges:
+        clipped: list[ChunkRange] = []
+        for r in ranges:
+            if r.source != "chunk":
+                clipped.append(r)
+                continue
+            # Find the latest year-file end that overlaps this chunk
+            overlap_end = max(
+                (y.end for y in year_ranges if y.start <= r.end and y.end >= r.start),
+                default=None,
+            )
+            if overlap_end is None:
+                clipped.append(r)  # no overlap — keep as-is
+                continue
+            new_start = overlap_end + resolution
+            if new_start > r.end:
+                continue  # chunk entirely within year file(s) — drop it
+            new_time_idx = int(round((new_start - r.start) / resolution))
+            clipped.append(ChunkRange(
+                chunk_num=r.chunk_num,
+                start=new_start,
+                end=r.end,
+                time_len=r.time_len - new_time_idx,
+                source=r.source,
+            ))
+        ranges = clipped
+
     ranges.sort(key=lambda r: r.start)
 
     if min_date is not None:
@@ -722,15 +753,16 @@ def build_occ_index(
     occ_filename: str,
     index_path: Path,
     min_date: str | None = None,
-    skip_if_cols: list[str] | None = None,
+    skip_if_cols: list[list[str]] | None = None,
 ) -> int:
     """Scan all descendant occurrence parquets and write a flat index to disk.
 
     Streams one taxon at a time so memory usage is bounded regardless of total
     observation count. Returns the total number of rows written.
 
-    skip_if_cols: rows where ALL of these columns are present and non-null are
-    excluded (already enriched by carry_forward).
+    skip_if_cols: list of per-layer column groups. A row is excluded only when
+    every group is fully non-null (i.e. every active layer is already enriched
+    for that row). Rows needing enrichment for any one layer are included.
     """
     root = get_taxon_by_id(root_taxon_id)
     if root is None:
@@ -768,15 +800,26 @@ def build_occ_index(
                 valid &= df[_TIME_COL] >= cutoff
 
             if skip_if_cols:
-                present = [c for c in skip_if_cols if c in schema.names]
-                if len(present) == len(skip_if_cols):
-                    skip_table = pq.read_table(occ_path, columns=present)
-                    # Use pc.is_null on Arrow (not pandas notna) so NaN sentinels
-                    # ("tried, no coverage") are treated as already-done — NaN is a
-                    # real float value in Arrow, so is_null returns False for it.
-                    already_done = np.zeros(skip_table.num_rows, dtype=bool)
-                    for c in present:
-                        already_done |= np.asarray(pc.invert(pc.is_null(skip_table.column(c))))
+                all_skip_cols = list({c for group in skip_if_cols for c in group})
+                present_set = {c for c in all_skip_cols if c in schema.names}
+                if present_set:
+                    skip_table = pq.read_table(occ_path, columns=list(present_set))
+                    # A row is skippable only when ALL layer groups are complete.
+                    # Within each group: done = all columns non-null (AND).
+                    # Across groups: skippable = all groups done (AND).
+                    # NaN is a real float value in Arrow so is_null returns False —
+                    # NaN sentinels ("tried, no coverage") correctly count as done.
+                    already_done = np.ones(skip_table.num_rows, dtype=bool)
+                    for group in skip_if_cols:
+                        present_g = [c for c in group if c in present_set]
+                        if len(present_g) < len(group):
+                            # Layer columns absent — not yet enriched, include all rows
+                            already_done[:] = False
+                            break
+                        layer_done = np.ones(skip_table.num_rows, dtype=bool)
+                        for c in present_g:
+                            layer_done &= np.asarray(pc.invert(pc.is_null(skip_table.column(c))))
+                        already_done &= layer_done
                     total_skipped += int(already_done.sum())
                     valid &= ~already_done
 
@@ -1107,18 +1150,33 @@ def process_chunk_mode(
     primary_var = source_variables[0]
     readers: list[OmFileReader | None] = [_open(chunk_entry, primary_var)]
     sec_offsets: list[int] = [0]
+    # (ext_reader, ext_offset, ext_steps) — stitch when secondary ends before primary
+    _sec_exts: list[tuple[OmFileReader | None, int, int]] = [(None, 0, 0)]
     for var in source_variables[1:]:
         if secondary_indices is not None and var in secondary_indices:
             sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
             if sec_entry is not None:
                 readers.append(_open(sec_entry, var))
                 sec_offsets.append(sec_t0)
+                sec_available = sec_entry.time_len - sec_t0
+                if sec_available < chunk_entry.time_len:
+                    _ext_e, _ext_t0 = _chunk_entry_for_time(
+                        secondary_indices[var], sec_entry.end + resolution
+                    )
+                    if _ext_e is not None:
+                        _sec_exts.append((_open(_ext_e, var), _ext_t0, chunk_entry.time_len - sec_available))
+                    else:
+                        _sec_exts.append((None, 0, 0))
+                else:
+                    _sec_exts.append((None, 0, 0))
             else:
                 readers.append(None)
                 sec_offsets.append(0)
+                _sec_exts.append((None, 0, 0))
         else:
             readers.append(_open(chunk_entry, var))
             sec_offsets.append(0)
+            _sec_exts.append((None, 0, 0))
     ny, nx, _ = readers[0].shape
 
     data = worklist_slice.to_pydict()
@@ -1196,9 +1254,20 @@ def process_chunk_mode(
                         arr = np.asarray(r[li, lo, :], dtype=np.float64)
                     sliced = arr[off:off + primary_len]
                     if len(sliced) < primary_len:
-                        padded = np.full(primary_len, np.nan, dtype=np.float64)
-                        padded[:len(sliced)] = sliced
-                        raw.append(padded)
+                        ext_r, ext_off, ext_n = _sec_exts[r_idx]
+                        if ext_r is not None and ext_n > 0:
+                            try:
+                                ext_arr = np.asarray(ext_r[li, lo, :], dtype=np.float64)
+                                ext_slice = ext_arr[ext_off:ext_off + ext_n]
+                                sliced = np.concatenate([sliced, ext_slice])
+                            except Exception:
+                                pass
+                        if len(sliced) < primary_len:
+                            padded = np.full(primary_len, np.nan, dtype=np.float64)
+                            padded[:len(sliced)] = sliced
+                            raw.append(padded)
+                        else:
+                            raw.append(sliced[:primary_len])
                     else:
                         raw.append(sliced)
         except Exception:
@@ -1288,18 +1357,33 @@ def process_chunk_vpd(
     primary_var = source_variables[0]
     readers: list[OmFileReader | None] = [_open(chunk_entry, primary_var)]
     sec_offsets: list[int] = [0]
+    # (ext_reader, ext_offset, ext_steps) — stitch when secondary ends before primary
+    _sec_exts_vpd: list[tuple[OmFileReader | None, int, int]] = [(None, 0, 0)]
     for var in source_variables[1:]:
         if secondary_indices is not None and var in secondary_indices:
             sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
             if sec_entry is not None:
                 readers.append(_open(sec_entry, var))
                 sec_offsets.append(sec_t0)
+                sec_available = sec_entry.time_len - sec_t0
+                if sec_available < chunk_entry.time_len:
+                    _ext_e, _ext_t0 = _chunk_entry_for_time(
+                        secondary_indices[var], sec_entry.end + resolution
+                    )
+                    if _ext_e is not None:
+                        _sec_exts_vpd.append((_open(_ext_e, var), _ext_t0, chunk_entry.time_len - sec_available))
+                    else:
+                        _sec_exts_vpd.append((None, 0, 0))
+                else:
+                    _sec_exts_vpd.append((None, 0, 0))
             else:
                 readers.append(None)
                 sec_offsets.append(0)
+                _sec_exts_vpd.append((None, 0, 0))
         else:
             readers.append(_open(chunk_entry, var))
             sec_offsets.append(0)
+            _sec_exts_vpd.append((None, 0, 0))
 
     ny, nx, _ = readers[0].shape
 
@@ -1374,9 +1458,20 @@ def process_chunk_vpd(
                         arr = np.asarray(r[li, lo, :], dtype=np.float64)
                     sliced = arr[off:off + primary_len]
                     if len(sliced) < primary_len:
-                        padded = np.full(primary_len, np.nan, dtype=np.float64)
-                        padded[:len(sliced)] = sliced
-                        raw.append(padded)
+                        ext_r, ext_off, ext_n = _sec_exts_vpd[r_idx]
+                        if ext_r is not None and ext_n > 0:
+                            try:
+                                ext_arr = np.asarray(ext_r[li, lo, :], dtype=np.float64)
+                                ext_slice = ext_arr[ext_off:ext_off + ext_n]
+                                sliced = np.concatenate([sliced, ext_slice])
+                            except Exception:
+                                pass
+                        if len(sliced) < primary_len:
+                            padded = np.full(primary_len, np.nan, dtype=np.float64)
+                            padded[:len(sliced)] = sliced
+                            raw.append(padded)
+                        else:
+                            raw.append(sliced[:primary_len])
                     else:
                         raw.append(sliced)
         except Exception:

@@ -82,7 +82,7 @@ class TestLoadTemporalLayers:
     def test_model_and_grid_mode(self):
         layers = util.temporal.load_temporal_layers(_CATALOG)
         temp = next(la for la in layers if la.id == "temperature_2m")
-        assert temp.model == "copernicus_era5"
+        assert temp.model == "copernicus_era5_land"
         assert temp.grid_mode == "lat_asc_lon_pm180"
 
 

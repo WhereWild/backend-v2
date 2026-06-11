@@ -23,6 +23,7 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.transform import Affine, from_bounds
 from rasterio.warp import reproject as warp_reproject
+from rasterio.windows import Window
 from rasterio.windows import from_bounds as window_from_bounds
 from rasterio.windows import transform as window_transform
 
@@ -355,7 +356,7 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEF
     rgba[finite, 0] = lut[indices, 0].astype(np.uint8)
     rgba[finite, 1] = lut[indices, 1].astype(np.uint8)
     rgba[finite, 2] = lut[indices, 2].astype(np.uint8)
-    rgba[finite, 3] = np.clip(40.0 + finite_norm * 215.0, 0.0, 255.0).astype(np.uint8)
+    rgba[finite, 3] = 255
     return rgba
 
 
@@ -436,7 +437,7 @@ def render_temporal_tile_bytes(
         )
         mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
         dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
-        resample = Resampling.nearest if nominal else Resampling.bilinear
+        resample = Resampling.nearest
         warp_reproject(
             source=arr_nu,
             destination=dest,
@@ -613,30 +614,50 @@ def _render_derived_elevation_tile_bytes(
                 src_px_w = ds.width  * (rl1 - rl0) / (db.right - db.left)
                 src_px_h = ds.height * (rb1 - rb0) / (db.top   - db.bottom)
                 overviews = ds.overviews(1) or []
-                if overviews and src_px_w > tile_size:
-                    desired = src_px_w / tile_size
+                if overviews and src_px_w > tile_size * 2:
+                    desired = src_px_w / (tile_size * 2)
                     factor  = min(overviews, key=lambda f: abs(f - desired))
                     read_w  = max(1, round(src_px_w / factor))
                     read_h  = max(1, round(src_px_h / factor))
                 else:
                     read_w = max(1, round(src_px_w))
                     read_h = max(1, round(src_px_h))
-                raw = ds.read(1, window=src_window, out_shape=(read_h, read_w),
-                              resampling=Resampling.bilinear).astype(np.float32)
-                if ds.nodata is not None:
-                    raw[raw == ds.nodata] = np.nan
 
-                src_tf = window_transform(src_window, ds.transform) * Affine.scale(
-                    src_window.width / read_w, src_window.height / read_h,
+                # Pad the read window so np.gradient has real neighbor pixels at
+                # tile edges instead of one-sided differences, which cause seams.
+                _PAD = 8
+                col_off = src_window.col_off
+                row_off = src_window.row_off
+                win_w   = src_window.width
+                win_h   = src_window.height
+                pl = min(_PAD, col_off)
+                pt = min(_PAD, row_off)
+                pr = min(_PAD, ds.width  - (col_off + win_w))
+                pb = min(_PAD, ds.height - (row_off + win_h))
+                pad_win = Window(col_off - pl, row_off - pt, win_w + pl + pr, win_h + pt + pb)
+                rw_p = max(1, round(read_w * pad_win.width  / win_w))
+                rh_p = max(1, round(read_h * pad_win.height / win_h))
+
+                raw_p = ds.read(1, window=pad_win, out_shape=(rh_p, rw_p),
+                                resampling=Resampling.bilinear).astype(np.float32)
+                if ds.nodata is not None:
+                    raw_p[raw_p == ds.nodata] = np.nan
+
+                # Use the padded transform so derive_fn has real neighbors at edges.
+                # Pass the full padded derived array directly to warp_reproject —
+                # dst_transform covers only the original tile bounds, so rasterio
+                # samples the correct region without any manual cropping.
+                src_tf_p = window_transform(pad_win, ds.transform) * Affine.scale(
+                    pad_win.width / rw_p, pad_win.height / rh_p,
                 )
-                derived = derive_fn(raw, src_tf)
+                derived_p = derive_fn(raw_p, src_tf_p)
                 warp_reproject(
-                    source=derived, destination=dest,
-                    src_transform=src_tf, src_crs=ds.crs,
+                    source=derived_p, destination=dest,
+                    src_transform=src_tf_p, src_crs=ds.crs,
                     src_nodata=np.nan,
                     dst_transform=dst_transform, dst_crs=WEB_MERCATOR,
                     dst_nodata=np.nan,
-                    resampling=Resampling.bilinear,
+                    resampling=Resampling.nearest,
                 )
     except Exception:
         pass
@@ -674,7 +695,7 @@ def render_layer_tile_bytes(
     vmin    = layer.get("render_min")
     vmax    = layer.get("render_max")
 
-    resampling   = Resampling.nearest if nominal else Resampling.bilinear
+    resampling   = Resampling.nearest
     lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
     mx0,  my0,  mx1,  my1  = tile_bounds_mercator(z, x, y)
     dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
@@ -695,8 +716,11 @@ def render_layer_tile_bytes(
             src_px_h = ds.height * (rb1 - rb0) / (db.top   - db.bottom)
             overviews = ds.overviews(1) or []
 
-            if overviews and src_px_w > tile_size:
-                desired  = src_px_w / tile_size
+            # For continuous layers, oversample 2x so bilinear warp has enough
+            # source pixels to interpolate sharp detail rather than just blur.
+            read_target = tile_size if nominal else tile_size * 2
+            if overviews and src_px_w > read_target:
+                desired  = src_px_w / read_target
                 factor   = min(overviews, key=lambda f: abs(f - desired))
                 read_w   = max(1, round(src_px_w / factor))
                 read_h   = max(1, round(src_px_h / factor))

@@ -1486,7 +1486,9 @@ def list_taxa_ranking_options(
     except Exception:
         return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": []}
 
-    variable_order = {v["id"]: i for i, v in enumerate(tiles.load_layers())}
+    all_layers = tiles.load_layers()
+    variable_order = {v["id"]: i for i, v in enumerate(all_layers)}
+    layer_value_types = {v["id"]: v.get("value_type", "") for v in all_layers}
 
     legend_cache: dict[str, dict[int, str]] = {}
 
@@ -1511,6 +1513,8 @@ def list_taxa_ranking_options(
         if count <= 0:
             continue
         variable, metric = col.split("::", 1)
+        if metric == "mode" and layer_value_types.get(variable) == "nominal":
+            continue
         if metric.startswith("class_"):
             label = _class_label(variable, metric)
         else:
@@ -1580,6 +1584,7 @@ def query_taxa(
     )
 
     sort_layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == norm_sort_variable), None) if norm_sort_variable else None
+    is_class_metric = bool(sort_metric and sort_metric.startswith("class_"))
     serialized: list[dict] = []
     for item in result["results"]:
         taxon = item["taxon"]
@@ -1593,7 +1598,10 @@ def query_taxa(
         use_match = bool(match_name) and normalize_name(match_name) != sci_norm
         display_name = format_common_name(match_name if use_match else preferred)
         raw_sort = item.get("sort_value")
-        converted_sort = units.convert_value(raw_sort, sort_layer, unit_system, metric=sort_metric) if sort_layer else raw_sort
+        if is_class_metric:
+            converted_sort = raw_sort * 100 if raw_sort is not None else None
+        else:
+            converted_sort = units.convert_value(raw_sort, sort_layer, unit_system, metric=sort_metric) if sort_layer else raw_sort
         serialized.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
@@ -1626,7 +1634,7 @@ def query_taxa(
             "variable": sort_variable,
             "metric": sort_metric,
             "order": sort_order,
-            "units": units.display_units(sort_layer, unit_system) if sort_layer else None,
+            "units": "%" if is_class_metric else (units.display_units(sort_layer, unit_system, metric=sort_metric) if sort_layer else None),
         },
         "total": result["total"],
         "matched_total": result["matched_total"],

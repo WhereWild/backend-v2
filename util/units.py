@@ -19,6 +19,14 @@ _CONVERSION: dict[tuple[str, str], tuple[float, float]] = {
     ("mph", "m s⁻¹"):     (1 / 2.2369362921, 0.0),
 }
 
+# Metrics whose values are dimensionless (counts, fractions, angular stats).
+# These are never converted and never carry a unit label.
+_DIMENSIONLESS_METRICS = frozenset({
+    "count", "unique_samples", "total_samples", "unique_classes",
+    "entropy",
+    "rbar", "circular_var", "circular_std", "circular_mean",
+})
+
 # Summary metrics that measure spread rather than position.
 # For these, the conversion offset is never applied even on interval-scale variables
 # (e.g. stddev of temperature in °C converts to °F by ×9/5 only, not +32).
@@ -50,8 +58,13 @@ def _convert(value: float, from_unit: str, to_unit: str, *, offset: bool, metric
     return value * factor + (off if offset else 0.0)
 
 
-def display_units(layer: dict, unit_system: str | None) -> str | None:
-    """Return the unit label that should be shown for the given system."""
+def display_units(layer: dict, unit_system: str | None, *, metric: str | None = None) -> str | None:
+    """Return the unit label that should be shown for the given system.
+
+    Returns None for dimensionless metrics regardless of the layer's declared units.
+    """
+    if metric is not None and metric in _DIMENSIONLESS_METRICS:
+        return None
     if unit_system == "imperial":
         return layer.get("imperial_unit") or layer.get("units") or None
     return layer.get("units") or None
@@ -66,6 +79,8 @@ def convert_value_from_display(
 ) -> float:
     """Convert a value FROM display units BACK TO raw (metric) units."""
     if unit_system != "imperial":
+        return value
+    if metric is not None and metric in _DIMENSIONLESS_METRICS:
         return value
     from_unit = layer.get("imperial_unit") or ""
     to_unit = layer.get("units") or ""
@@ -83,6 +98,8 @@ def convert_value(
 ) -> float | None:
     """Convert a single scalar value to the target unit system."""
     if value is None or unit_system != "imperial":
+        return value
+    if metric is not None and metric in _DIMENSIONLESS_METRICS:
         return value
     from_unit = layer.get("units") or ""
     to_unit = layer.get("imperial_unit") or ""
@@ -105,7 +122,7 @@ def convert_summary(
 
     result: dict[str, Any] = {}
     for key, val in summary.items():
-        if isinstance(val, (int, float)) and key not in ("count",):
+        if isinstance(val, (int, float)) and key not in _DIMENSIONLESS_METRICS:
             result[key] = _convert(float(val), from_unit, to_unit, offset=_apply_offset(layer, key), metric=key)
         else:
             result[key] = val

@@ -1543,7 +1543,7 @@ def query_taxa(
     sort_order: str = Query("asc", pattern="^(asc|desc)$"),
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    min_samples: int = Query(10, ge=10),
+    min_samples: int = Query(10, ge=0),
     include_species_like: bool = Query(False),
     location: str | None = Query(None),
     unit_system: str | None = Query(None),

@@ -240,7 +240,8 @@ def test_colorize_uniform():
 def test_colorize_min_max_alpha():
     values = np.array([[0.0, 1.0]], dtype=np.float32)
     rgba = tiles._colorize(values, 0.0, 1.0)
-    assert rgba[0, 0, 3] < rgba[0, 1, 3]
+    assert rgba[0, 0, 3] == 255
+    assert rgba[0, 1, 3] == 255
 
 
 def test_colorize_clamps_out_of_range():

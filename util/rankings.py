@@ -1021,12 +1021,6 @@ def _query_ranked_scoped(
             filtered.sort(key=lambda e: ((ref - e[2]) % 360.0, e[1]))
         else:
             filtered.sort(key=lambda e: ((e[2] - ref) % 360.0, e[1]))
-    elif reference_value is not None:
-        ref = float(reference_value)
-        if sort_order == "desc":
-            filtered.sort(key=lambda e: (-abs(e[2] - ref), e[1]))
-        else:
-            filtered.sort(key=lambda e: (abs(e[2] - ref), e[1]))
     else:
         reverse = (sort_order == "desc")
         filtered.sort(key=lambda e: (e[2], e[1]), reverse=reverse)
@@ -1106,12 +1100,6 @@ def _query_ranked_text(
             enriched.sort(key=lambda e: ((ref - e[2]) % 360.0, str(e[0]["taxon_key"])))
         else:
             enriched.sort(key=lambda e: ((e[2] - ref) % 360.0, str(e[0]["taxon_key"])))
-    elif reference_value is not None:
-        ref = float(reference_value)
-        if sort_order == "desc":
-            enriched.sort(key=lambda e: (-abs(e[2] - ref), str(e[0]["taxon_key"])))
-        else:
-            enriched.sort(key=lambda e: (abs(e[2] - ref), str(e[0]["taxon_key"])))
     else:
         reverse = (sort_order == "desc")
         enriched.sort(key=lambda e: (e[2], str(e[0]["taxon_key"])), reverse=reverse)

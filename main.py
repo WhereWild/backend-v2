@@ -885,9 +885,18 @@ def get_species_environment(
                         "min": stats.get("min"),
                         "mean": stats.get("mean"),
                         "max": stats.get("max"),
+                        "median": stats.get("median"),
+                        "mode": stats.get("mode"),
+                        "std": stats.get("std"),
                         "stddev": stats.get("std"),
+                        "variance": stats.get("variance"),
+                        "range": stats.get("range"),
                         "q10": stats.get("10th_percentile"),
+                        "q25": stats.get("25th_percentile"),
+                        "q75": stats.get("75th_percentile"),
                         "q90": stats.get("90th_percentile"),
+                        "iqr": stats.get("iqr"),
+                        "10_90_range": stats.get("10_90_range"),
                     }
                     return {
                         "species_id": taxon.get("taxon_key"),
@@ -911,6 +920,8 @@ def get_species_environment(
                             "circular_mean": stats.get("circular_mean"),
                             "rbar": stats.get("rbar"),
                             "circular_std": stats.get("circular_std"),
+                            "circular_var": stats.get("circular_var"),
+                            "mode": stats.get("mode"),
                         },
                         "density_curve": result["density_curve"],
                         "categorical_distribution": None,
@@ -1008,6 +1019,8 @@ def get_species_environment(
             "circular_mean": row.get("circular_mean"),
             "rbar": row.get("rbar"),
             "circular_std": row.get("circular_std"),
+            "circular_var": row.get("circular_var"),
+            "mode": row.get("mode"),
         }
         den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
         den_row = den_rows[0] if den_rows else None
@@ -1035,9 +1048,18 @@ def get_species_environment(
         "min": row.get("min"),
         "mean": row.get("mean"),
         "max": row.get("max"),
+        "median": row.get("median"),
+        "mode": row.get("mode"),
+        "std": row.get("std"),
         "stddev": row.get("std"),
+        "variance": row.get("variance"),
+        "range": row.get("range"),
         "q10": row.get("10th_percentile"),
+        "q25": row.get("25th_percentile"),
+        "q75": row.get("75th_percentile"),
         "q90": row.get("90th_percentile"),
+        "iqr": row.get("iqr"),
+        "10_90_range": row.get("10_90_range"),
     }
 
     den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
@@ -1464,7 +1486,9 @@ def list_taxa_ranking_options(
     except Exception:
         return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": []}
 
-    variable_order = {v["id"]: i for i, v in enumerate(tiles.load_layers())}
+    all_layers = tiles.load_layers()
+    variable_order = {v["id"]: i for i, v in enumerate(all_layers)}
+    layer_value_types = {v["id"]: v.get("value_type", "") for v in all_layers}
 
     legend_cache: dict[str, dict[int, str]] = {}
 
@@ -1489,6 +1513,8 @@ def list_taxa_ranking_options(
         if count <= 0:
             continue
         variable, metric = col.split("::", 1)
+        if metric == "mode" and layer_value_types.get(variable) == "nominal":
+            continue
         if metric.startswith("class_"):
             label = _class_label(variable, metric)
         else:
@@ -1521,11 +1547,11 @@ def query_taxa(
     sort_order: str = Query("asc", pattern="^(asc|desc)$"),
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    min_samples: int = Query(0, ge=0),
+    min_samples: int = Query(10, ge=0),
     include_species_like: bool = Query(False),
     location: str | None = Query(None),
     unit_system: str | None = Query(None),
-    sort_reference: float | None = Query(None, ge=0.0, lt=360.0),
+    sort_reference: float | None = Query(None),
     min_rbar: float | None = Query(None, ge=0.0, le=1.0),
 ):
     normalized_q = normalize_name(q or "") or None
@@ -1558,6 +1584,7 @@ def query_taxa(
     )
 
     sort_layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == norm_sort_variable), None) if norm_sort_variable else None
+    is_class_metric = bool(sort_metric and sort_metric.startswith("class_"))
     serialized: list[dict] = []
     for item in result["results"]:
         taxon = item["taxon"]
@@ -1571,7 +1598,10 @@ def query_taxa(
         use_match = bool(match_name) and normalize_name(match_name) != sci_norm
         display_name = format_common_name(match_name if use_match else preferred)
         raw_sort = item.get("sort_value")
-        converted_sort = units.convert_value(raw_sort, sort_layer, unit_system, metric=sort_metric) if sort_layer else raw_sort
+        if is_class_metric:
+            converted_sort = raw_sort * 100 if raw_sort is not None else None
+        else:
+            converted_sort = units.convert_value(raw_sort, sort_layer, unit_system, metric=sort_metric) if sort_layer else raw_sort
         serialized.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
@@ -1604,7 +1634,7 @@ def query_taxa(
             "variable": sort_variable,
             "metric": sort_metric,
             "order": sort_order,
-            "units": units.display_units(sort_layer, unit_system) if sort_layer else None,
+            "units": "%" if is_class_metric else (units.display_units(sort_layer, unit_system, metric=sort_metric) if sort_layer else None),
         },
         "total": result["total"],
         "matched_total": result["matched_total"],

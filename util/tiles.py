@@ -625,15 +625,15 @@ def _render_derived_elevation_tile_bytes(
 
                 # Pad the read window so np.gradient has real neighbor pixels at
                 # tile edges instead of one-sided differences, which cause seams.
-                _PAD = 8
+                pad = 8
                 col_off = src_window.col_off
                 row_off = src_window.row_off
                 win_w   = src_window.width
                 win_h   = src_window.height
-                pl = min(_PAD, col_off)
-                pt = min(_PAD, row_off)
-                pr = min(_PAD, ds.width  - (col_off + win_w))
-                pb = min(_PAD, ds.height - (row_off + win_h))
+                pl = min(pad, col_off)
+                pt = min(pad, row_off)
+                pr = min(pad, ds.width  - (col_off + win_w))
+                pb = min(pad, ds.height - (row_off + win_h))
                 pad_win = Window(col_off - pl, row_off - pt, win_w + pl + pr, win_h + pt + pb)
                 rw_p = max(1, round(read_w * pad_win.width  / win_w))
                 rh_p = max(1, round(read_h * pad_win.height / win_h))

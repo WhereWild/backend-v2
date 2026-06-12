@@ -68,7 +68,8 @@ def test_get_taxon_not_found():
 
 
 def test_query_taxa():
-    with patch.object(rankings_module, "search_taxa_by_name", return_value=[(TAXON, 95.0, "opuntia humifusa")]):
+    with patch.object(rankings_module, "search_taxa_by_name", return_value=[(TAXON, 95.0, "opuntia humifusa")]), \
+         patch.object(rankings_module, "_infer_sample_count", return_value=100):
         response = client.get("/api/taxa/query?q=opuntia")
     assert response.status_code == 200
     body = response.json()

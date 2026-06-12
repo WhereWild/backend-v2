@@ -19,10 +19,22 @@ _CONVERSION: dict[tuple[str, str], tuple[float, float]] = {
     ("mph", "m s⁻¹"):     (1 / 2.2369362921, 0.0),
 }
 
+# Metrics whose values are dimensionless (counts, fractions, angular stats).
+# These are never converted and never carry a unit label.
+_DIMENSIONLESS_METRICS = frozenset({
+    "count", "unique_samples", "total_samples", "unique_classes",
+    "entropy",
+    "rbar", "circular_var", "circular_std", "circular_mean",
+})
+
 # Summary metrics that measure spread rather than position.
 # For these, the conversion offset is never applied even on interval-scale variables
 # (e.g. stddev of temperature in °C converts to °F by ×9/5 only, not +32).
-_SPREAD_METRICS = frozenset({"std", "stddev", "range", "iqr", "bandwidth"})
+_SPREAD_METRICS = frozenset({"std", "stddev", "variance", "range", "iqr", "10_90_range", "bandwidth"})
+
+# Variance is in squared units: Var(T_°F) = (9/5)² × Var(T_°C).
+# The base conversion factor must be squared for these metrics.
+_SQUARED_FACTOR_METRICS = frozenset({"variance"})
 
 
 def _is_interval(layer: dict) -> bool:
@@ -34,18 +46,25 @@ def _apply_offset(layer: dict, metric: str | None) -> bool:
     return _is_interval(layer) and (metric is None or metric not in _SPREAD_METRICS)
 
 
-def _convert(value: float, from_unit: str, to_unit: str, *, offset: bool) -> float:
+def _convert(value: float, from_unit: str, to_unit: str, *, offset: bool, metric: str | None = None) -> float:
     if from_unit == to_unit:
         return value
     params = _CONVERSION.get((from_unit, to_unit))
     if params is None:
         return value
     factor, off = params
+    if metric is not None and metric in _SQUARED_FACTOR_METRICS:
+        factor = factor ** 2
     return value * factor + (off if offset else 0.0)
 
 
-def display_units(layer: dict, unit_system: str | None) -> str | None:
-    """Return the unit label that should be shown for the given system."""
+def display_units(layer: dict, unit_system: str | None, *, metric: str | None = None) -> str | None:
+    """Return the unit label that should be shown for the given system.
+
+    Returns None for dimensionless metrics regardless of the layer's declared units.
+    """
+    if metric is not None and metric in _DIMENSIONLESS_METRICS:
+        return None
     if unit_system == "imperial":
         return layer.get("imperial_unit") or layer.get("units") or None
     return layer.get("units") or None
@@ -61,11 +80,13 @@ def convert_value_from_display(
     """Convert a value FROM display units BACK TO raw (metric) units."""
     if unit_system != "imperial":
         return value
+    if metric is not None and metric in _DIMENSIONLESS_METRICS:
+        return value
     from_unit = layer.get("imperial_unit") or ""
     to_unit = layer.get("units") or ""
     if not from_unit or not to_unit or from_unit == to_unit:
         return value
-    return _convert(float(value), from_unit, to_unit, offset=_apply_offset(layer, metric))
+    return _convert(float(value), from_unit, to_unit, offset=_apply_offset(layer, metric), metric=metric)
 
 
 def convert_value(
@@ -78,11 +99,13 @@ def convert_value(
     """Convert a single scalar value to the target unit system."""
     if value is None or unit_system != "imperial":
         return value
+    if metric is not None and metric in _DIMENSIONLESS_METRICS:
+        return value
     from_unit = layer.get("units") or ""
     to_unit = layer.get("imperial_unit") or ""
     if not from_unit or not to_unit or from_unit == to_unit:
         return value
-    return _convert(float(value), from_unit, to_unit, offset=_apply_offset(layer, metric))
+    return _convert(float(value), from_unit, to_unit, offset=_apply_offset(layer, metric), metric=metric)
 
 
 def convert_summary(
@@ -99,8 +122,8 @@ def convert_summary(
 
     result: dict[str, Any] = {}
     for key, val in summary.items():
-        if isinstance(val, (int, float)) and key not in ("count",):
-            result[key] = _convert(float(val), from_unit, to_unit, offset=_apply_offset(layer, key))
+        if isinstance(val, (int, float)) and key not in _DIMENSIONLESS_METRICS:
+            result[key] = _convert(float(val), from_unit, to_unit, offset=_apply_offset(layer, key), metric=key)
         else:
             result[key] = val
     return result

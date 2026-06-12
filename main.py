@@ -1547,7 +1547,7 @@ def query_taxa(
     include_species_like: bool = Query(False),
     location: str | None = Query(None),
     unit_system: str | None = Query(None),
-    sort_reference: float | None = Query(None, ge=0.0, lt=360.0),
+    sort_reference: float | None = Query(None),
     min_rbar: float | None = Query(None, ge=0.0, le=1.0),
 ):
     normalized_q = normalize_name(q or "") or None

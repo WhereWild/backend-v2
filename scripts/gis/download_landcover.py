@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """
 Download GLC_FCS30D v2 land cover tiles from Zenodo and build a global COG
 for the most recent year (2022).

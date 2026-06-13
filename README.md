@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
 # WhereWild Backend v2
 
 ![CI](https://github.com/WhereWild/backend-v2/actions/workflows/ci.yml/badge.svg)

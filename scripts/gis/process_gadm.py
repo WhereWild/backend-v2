@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Download the GADM 4.1 GeoPackage and build location lookup tables.
 
 Downloads the zipped GeoPackage from the UC Davis geodata mirror via aria2c,

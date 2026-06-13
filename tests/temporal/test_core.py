@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Phase 2 unit tests for util/temporal.py — all RED until Phase 3.
 
 Tests pure functions only: no S3, no file I/O, no fixtures.

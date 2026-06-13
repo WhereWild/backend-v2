@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """
 Build internal overviews for all GeoTIFFs in data/gis/layers/, converting
 each to a Cloud Optimized GeoTIFF (COG) with appropriate overview levels.

@@ -1,0 +1,23 @@
+version = 1
+
+[[annotations]]
+path = [
+  ".env.example",
+  ".python-version",
+  "Caddyfile",
+  "deploy/wherewild.service",
+  "docker/rclone.conf.template",
+  "pyproject.toml",
+]
+SPDX-FileCopyrightText = "2025-2026 The WhereWild Contributors (see CONTRIBUTORS)"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+[[annotations]]
+path = "tests/fixtures/inaturalist_sample.csv"
+SPDX-FileCopyrightText = "iNaturalist and GBIF Contributors"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+[[annotations]]
+path = "uv.lock"
+SPDX-FileCopyrightText = "2025-2026 The WhereWild Contributors (see CONTRIBUTORS)"
+SPDX-License-Identifier = "CC0-1.0"

@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """API-fixture-grounded correctness tests for the raster accumulation pipeline.
 
 Each test uses the same Open-Meteo archive fixture JSON already fetched for

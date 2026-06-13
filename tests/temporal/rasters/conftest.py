@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Raster-specific test helpers, layered on top of the temporal conftest."""
 from __future__ import annotations
 

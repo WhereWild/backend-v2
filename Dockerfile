@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 FROM ghcr.io/osgeo/gdal:ubuntu-full-latest
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv

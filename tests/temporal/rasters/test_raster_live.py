@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025-2026 The WhereWild Contributors (see CONTRIBUTORS)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Live end-to-end tests for the raster accumulation pipeline.
 
 Validates that accumulate_raster() + grid_indices() produces the same cell

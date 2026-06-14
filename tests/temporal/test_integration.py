@@ -793,11 +793,11 @@ class TestElevationCorrection:
         )
         assert updates == {}
 
-    def test_trailing_nan_clamps_to_last_valid(self, tmp_path, monkeypatch):
-        """Obs in trailing-NaN zone is clamped to last valid timestep."""
+    def test_trailing_nan_obs_past_last_valid_skips(self, tmp_path, monkeypatch):
+        """Obs whose raw_local > last_valid in a trailing-NaN slice is skipped (left null)."""
         occ_path = tmp_path / "occ.parquet"
         _write_occ(occ_path, _BERLIN_LAT, _BERLIN_LON, 5 * 3600.0)
-        # [3, 4, nan, nan] falls in series_slice for time_idx=5, window=4
+        # series_slice=series[2:6]=[3,4,nan,nan]; raw_local=3 > last_valid=1 → skip
         series = np.array([1.0, 2.0, 3.0, 4.0, np.nan, np.nan])
         chunk_entry = self._make_chunk(6)
         worklist = pa.table({
@@ -806,21 +806,17 @@ class TestElevationCorrection:
             "chunk_num": pa.array([1], type=pa.int32()),
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
-            "time_idx": pa.array([5], type=pa.int32()),  # in NaN zone
+            "time_idx": pa.array([5], type=pa.int32()),  # past last valid timestep
         })
         dummy = tmp_path / "dummy.om"
         dummy.write_bytes(b"")
         monkeypatch.setattr("util.temporal._download_chunk", lambda *a, **kw: dummy)
         monkeypatch.setattr("util.temporal.OmFileReader", lambda fh: _FakeReader(series))
-        # window=4: series_slice=series[2:6]=[3,4,nan,nan]; clamped local_time=1
-        # avg of series_slice[0:2]=[3,4] = 3.5
         updates, _ = process_chunk(
             chunk_entry, worklist, {}, "copernicus_era5",
             "precipitation", {4: 4}, "avg", str(tmp_path),
         )
-        write_back(updates)
-        result = pq.read_table(occ_path).to_pydict()
-        assert result["precipitation_avg_4h"][0] == pytest.approx(3.5, abs=1e-3)
+        assert updates == {}
 
     def test_elevation_correction_in_process_chunk_mode(self, tmp_path, monkeypatch):
         """Lapse-rate correction on temperature shifts weather code derivation."""

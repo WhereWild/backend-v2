@@ -17,11 +17,8 @@ Sidecar files per raster:
   {var}_{window}.sums.npz  — raw component sums / mode count grids (for incremental updates)
 
 Sources:
-  - ERA5-land (copernicus_era5_land, 0.1°): temp, soil, dew_point, snow_depth
-  - ERA5      (copernicus_era5,     0.25°): cloud, precip, swe, weather_code
-  - GFS013    (ncep_gfs013,         0.125°): ~6-day ERA5 gap fill
-
-Output resolutions match the primary source (no blanket 0.25° downsampling).
+  - ERA5 (copernicus_era5, 0.25°): temp, dew_point, soil, vpd, cloud, precip, swe, weather_code
+  - GFS013 (ncep_gfs013, 0.125°): ~6-day ERA5 gap fill
 """
 from __future__ import annotations
 
@@ -76,33 +73,27 @@ FORECAST_HOURS = [1, 8, 24, 72, 168]
 
 VAR_CONFIGS: dict[str, dict] = {
     "temperature_2m": {
-        "era5_model": "copernicus_era5_land",
+        "era5_model": "copernicus_era5",
         "era5_var": "temperature_2m",
         "gfs_var": "temperature_2m",
         "agg": "avg",
     },
     "dew_point_2m": {
-        "era5_model": "copernicus_era5_land",
+        "era5_model": "copernicus_era5",
         "era5_var": "dew_point_2m",
         "gfs_derived_needs": ["temperature_2m", "relative_humidity_2m"],
         "agg": "avg",
     },
     "soil_temperature_0_to_7cm": {
-        "era5_model": "copernicus_era5_land",
+        "era5_model": "copernicus_era5",
         "era5_var": "soil_temperature_0_to_7cm",
         "gfs_var": "soil_temperature_0_to_10cm",
         "agg": "avg",
     },
     "soil_moisture_0_to_7cm": {
-        "era5_model": "copernicus_era5_land",
+        "era5_model": "copernicus_era5",
         "era5_var": "soil_moisture_0_to_7cm",
         "gfs_var": "soil_moisture_0_to_10cm",
-        "agg": "avg",
-    },
-    "snow_depth": {
-        "era5_model": "copernicus_era5_land",
-        "era5_var": "snow_depth",
-        "gfs_var": "snow_depth",  # probed at startup; removed if absent from GFS S3
         "agg": "avg",
     },
     "cloud_cover": {
@@ -124,7 +115,7 @@ VAR_CONFIGS: dict[str, dict] = {
         "agg": "sum",
     },
     "vapor_pressure_deficit": {
-        "era5_model": "copernicus_era5_land",
+        "era5_model": "copernicus_era5",
         "era5_derived_needs": ["temperature_2m", "dew_point_2m"],
         "gfs_derived_needs": ["temperature_2m", "relative_humidity_2m"],
         "agg": "avg",
@@ -132,8 +123,7 @@ VAR_CONFIGS: dict[str, dict] = {
     "weather_code_simple": {
         "era5_model": "copernicus_era5",
         "agg": "mode",
-        # sources: cloud_cover, precipitation, snowfall_water_equivalent
-        # temperature_2m reprojected from ERA5-land 0.1° → 0.25° for snow/rain cutoff
+        # sources: cloud_cover, precipitation, snowfall_water_equivalent, temperature_2m
     },
 }
 
@@ -214,14 +204,13 @@ def _full_build(
             print(f"  [{window_label}] {var_id}: no ERA5 cloud_cover, skipping")
             return
 
-        # Reproject temperature to 0.25° ERA5 grid once per window if available
+        # Accumulate mean temperature at ERA5 0.25° for snow/rain cutoff
         temp_grid_025: np.ndarray | None = None
         if t_cidx:
-            t_sum, t_n = accumulate_raster("copernicus_era5_land", "temperature_2m",
+            t_sum, t_n = accumulate_raster("copernicus_era5", "temperature_2m",
                                            w_start, era5_end_ts, t_cidx)
             if t_n > 0:
-                t_avg = (t_sum / t_n).astype(np.float32)
-                temp_grid_025 = _reproject_gfs_to(t_avg, "copernicus_era5")
+                temp_grid_025 = (t_sum / t_n).astype(np.float32)
 
         era5_counts = accumulate_raster_mode(
             era5_model, w_start, era5_end_ts,
@@ -949,13 +938,13 @@ def main() -> None:
             era5_model = vcfg["era5_model"]
             era5_cidx: dict[str, ChunkIndex] = {}
             raw_vars = _era5_raw_vars(vcfg)
-            # For weather_code, also pre-fetch temperature from ERA5-land
+            # For weather_code, also pre-fetch temperature (ERA5 0.25° for snow/rain cutoff)
             if var_id == "weather_code_simple":
                 raw_vars = ["cloud_cover", "precipitation", "snowfall_water_equivalent"]
                 try:
-                    era5_cidx["_temperature_for_wc"] = build_chunk_index("copernicus_era5_land", "temperature_2m")
+                    era5_cidx["_temperature_for_wc"] = build_chunk_index("copernicus_era5", "temperature_2m")
                 except Exception as e:
-                    print(f"  ERA5-land temperature_2m (for weather_code): {e}")
+                    print(f"  ERA5 temperature_2m (for weather_code): {e}")
             for rv in raw_vars:
                 try:
                     era5_cidx[rv] = build_chunk_index(era5_model, rv)

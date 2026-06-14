@@ -427,7 +427,7 @@ def list_variables(unit_system: str | None = Query(None)):
             "value_type": value_type,
             "domain": layer.get("domain") or None,
             "category": category.get("display_name", "Other"),
-            "source_ids": [layer["source"]] if layer.get("source") else None,
+            "source_ids": list(dict.fromkeys(filter(None, [layer.get("source"), layer.get("model")]))) or None,
             "legend_classes": legend_classes,
             "render_min": units.convert_value(rmin, layer, unit_system),
             "render_max": units.convert_value(rmax, layer, unit_system),

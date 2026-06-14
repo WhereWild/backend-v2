@@ -67,9 +67,9 @@ class TestLoadTemporalLayers:
 
     def test_layer_window_override(self):
         layers = util.temporal.load_temporal_layers(_CATALOG)
-        snow = next(la for la in layers if la.id == "snow_depth")
-        # snow_depth inherits category windows (no per-layer override)
-        assert len(snow.windows) > 1
+        temp = next(la for la in layers if la.id == "temperature_2m")
+        # temperature_2m inherits category windows (no per-layer override)
+        assert len(temp.windows) > 1
 
     def test_weather_code_sources(self):
         layers = util.temporal.load_temporal_layers(_CATALOG)
@@ -86,7 +86,7 @@ class TestLoadTemporalLayers:
     def test_model_and_grid_mode(self):
         layers = util.temporal.load_temporal_layers(_CATALOG)
         temp = next(la for la in layers if la.id == "temperature_2m")
-        assert temp.model == "copernicus_era5_land"
+        assert temp.model == "copernicus_era5"
         assert temp.grid_mode == "lat_asc_lon_pm180"
 
 

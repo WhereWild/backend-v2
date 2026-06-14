@@ -40,7 +40,14 @@
     "url": "https://www.gbif.org/occurrence/download",
     "license": "CC BY 4.0",
     "license_url": "https://creativecommons.org/licenses/by/4.0/",
-    "note": "Citation, DOI, download_url, and references are populated at runtime from data/sync_state.json"
+    "references": []
+  },
+  "inat_observations": {
+    "name": "iNaturalist Research-grade Observations",
+    "url": "https://www.inaturalist.org/",
+    "license": "Varies by record (CC BY, CC BY-NC, or CC0)",
+    "license_url": "https://www.gbif.org/terms",
+    "references": []
   },
   "gbif_backbone": {
     "name": "GBIF Backbone Taxonomy",
@@ -75,7 +82,7 @@
     ]
   },
   "open_meteo": {
-    "name": "Open-Meteo (ERA5 / ERA5-Land)",
+    "name": "Open-Meteo",
     "url": "https://open-meteo.com/",
     "license": "CC BY 4.0",
     "license_url": "https://creativecommons.org/licenses/by/4.0/",
@@ -88,13 +95,51 @@
         "title": "Open-Meteo.com Weather API",
         "journal": "Zenodo",
         "doi": "https://doi.org/10.5281/ZENODO.7970649"
-      },
+      }
+    ]
+  },
+  "copernicus_era5": {
+    "name": "ERA5",
+    "url": "https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "references": [
       {
         "authors": "Hersbach, H., Bell, B., Berrisford, P., et al.",
         "year": 2023,
         "title": "ERA5 hourly data on single levels from 1940 to present",
         "journal": "ECMWF",
         "doi": "https://doi.org/10.24381/cds.adbb2d47"
+      }
+    ]
+  },
+  "copernicus_era5_land": {
+    "name": "ERA5-Land",
+    "url": "https://cds.climate.copernicus.eu/datasets/reanalysis-era5-land",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "references": [
+      {
+        "authors": "Muñoz Sabater, J.",
+        "year": 2019,
+        "title": "ERA5-Land hourly data from 2001 to present",
+        "journal": "ECMWF",
+        "doi": "https://doi.org/10.24381/CDS.E2161BAC"
+      }
+    ]
+  },
+  "gfs": {
+    "name": "NCEP GFS 0.13° via Open-Meteo",
+    "url": "https://open-meteo.com/",
+    "license": "Public Domain",
+    "license_url": "https://www.weather.gov/disclaimer",
+    "references": [
+      {
+        "authors": "Zippenfenig, P.",
+        "year": 2023,
+        "title": "Open-Meteo.com Weather API",
+        "journal": "Zenodo",
+        "doi": "https://doi.org/10.5281/ZENODO.7970649"
       }
     ]
   },
@@ -117,6 +162,21 @@
       }
     ]
   },
+  "glc_fcs30d_v2": {
+    "name": "GLC_FCS30D v2",
+    "url": "https://zenodo.org/records/15063683",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "references": [
+      {
+        "authors": "Liu, L., Zhang, X., and Li, Z.",
+        "year": 2025,
+        "title": "GLC_FCS30D: the first global 30-m land-cover dynamic monitoring product with fine classification system from 1985 to 2022 (Version v2)",
+        "journal": "Zenodo",
+        "doi": "https://doi.org/10.5281/zenodo.8239304"
+      }
+    ]
+  },
   "chelsa_v2_1": {
     "name": "CHELSA v2.1",
     "url": "https://chelsa-climate.org/",
@@ -131,6 +191,20 @@
         "title": "Climatologies at high resolution for the Earth land surface areas (CHELSA)",
         "journal": "Scientific Data",
         "doi": "https://doi.org/10.1038/sdata.2017.122"
+      }
+    ]
+  },
+  "gadm": {
+    "name": "GADM (Global Administrative Areas)",
+    "url": "https://gadm.org/",
+    "license": "Free for academic, research, and teaching use. Redistribution and commercial use not permitted without prior permission.",
+    "license_url": "https://gadm.org/license.html",
+    "references": [
+      {
+        "authors": "Hijmans, R.J., Garcia, N., Kapoor, J., Rala, A., Maunahan, A., and Wieczorek, J.",
+        "year": 2012,
+        "title": "Global Administrative Areas (GADM database of Global Administrative Areas)",
+        "url": "https://gadm.org/data.html"
       }
     ]
   }

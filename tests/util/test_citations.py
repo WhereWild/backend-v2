@@ -30,13 +30,13 @@ def test_gbif_backbone_has_doi():
 
 def test_inat_taxonomy_fields():
     src = cit.load_data_sources()["inat_taxonomy"]
-    assert "inaturalist" in src["citation"].lower()
+    assert "inaturalist" in src["name"].lower()
     assert src["doi"] == ""
 
 
 def test_gbif_occurrence_reads_sync_state(monkeypatch, tmp_path):
     state = {
-        "gbif_taxonomy": {
+        "gbif_occurrences": {
             "doi": "10.15468/dl.test",
             "citation": "GBIF.org (01 Jan 2026) GBIF Occurrence Download https://doi.org/10.15468/dl.test",
             "download_link": "https://api.gbif.org/v1/occurrence/download/request/0000000-000000.zip",
@@ -54,6 +54,6 @@ def test_gbif_occurrence_reads_sync_state(monkeypatch, tmp_path):
 def test_gbif_occurrence_missing_sync_state(monkeypatch, tmp_path):
     monkeypatch.setattr(cit, "SYNC_STATE_PATH", tmp_path / "nonexistent.json")
     src = cit.load_data_sources()["gbif_occurrence"]
-    assert src["citation"] == ""
-    assert src["doi"] == ""
-    assert src["download_url"] == ""
+    assert src.get("citation", "") == ""
+    assert src.get("doi", "") == ""
+    assert src.get("download_url", "") == ""

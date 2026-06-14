@@ -1332,49 +1332,6 @@ def test_main_incremental_path(monkeypatch, tmp_path: Path):
     assert "temperature_2m" in incremental_calls
 
 
-def test_main_gfs_snow_depth_available(monkeypatch, tmp_path: Path):
-    """GFS snow_depth ls() succeeds → gfs_var stays in config."""
-    _patch_main_base(monkeypatch, tmp_path, force=True, vars_str="snow_depth")
-
-    fs_mock = MagicMock()
-    fs_mock.ls.return_value = ["s3://openmeteo/data/ncep_gfs013/snow_depth/some_file"]
-    meta_data = json.dumps({"data_end_time": str(NOW_TS - 5 * 3600)}).encode()
-
-    class _FakeFile:
-        def __enter__(self): return self
-        def __exit__(self, *a): pass
-        def read(self): return meta_data
-
-    fs_mock.open.return_value = _FakeFile()
-    monkeypatch.setattr("scripts.build_temporal.fsspec.filesystem", lambda *a, **kw: fs_mock)
-
-    full_build_calls = []
-    monkeypatch.setattr("scripts.build_temporal._full_build",
-                        lambda *a, **kw: full_build_calls.append(a[0]))
-    bt.main()
-    # snow_depth should be in gfs_raw_needed
-    assert "snow_depth" in full_build_calls
-
-
-def test_main_gfs_snow_depth_unavailable(monkeypatch, tmp_path: Path, capsys):
-    """GFS snow_depth ls() raises → gfs_var removed from snow_depth config."""
-    _patch_main_base(monkeypatch, tmp_path, force=True, vars_str="snow_depth")
-
-    fs_mock = MagicMock()
-    fs_mock.ls.side_effect = FileNotFoundError("not found")
-    meta_data = json.dumps({"data_end_time": str(NOW_TS - 5 * 3600)}).encode()
-
-    class _FakeFile:
-        def __enter__(self): return self
-        def __exit__(self, *a): pass
-        def read(self): return meta_data
-
-    fs_mock.open.return_value = _FakeFile()
-    monkeypatch.setattr("scripts.build_temporal.fsspec.filesystem", lambda *a, **kw: fs_mock)
-
-    bt.main()
-    out = capsys.readouterr().out
-    assert "not found" in out or "ERA5-land only" in out
 
 
 
@@ -1415,14 +1372,14 @@ def test_main_build_chunk_index_exception(monkeypatch, tmp_path: Path, capsys):
 
 
 def test_main_weather_code_temperature_prefetch_exception(monkeypatch, tmp_path: Path, capsys):
-    """weather_code_simple: ERA5-land temperature prefetch fails → logged, continues."""
+    """weather_code_simple: ERA5 temperature prefetch fails → logged, continues."""
     _patch_main_base(monkeypatch, tmp_path, force=True, vars_str="weather_code_simple", windows_str="1h")
 
     call_count = {"n": 0}
 
     def _selective_fail(model, var):
         call_count["n"] += 1
-        if model == "copernicus_era5_land" and var == "temperature_2m":
+        if model == "copernicus_era5" and var == "temperature_2m":
             raise RuntimeError("temperature unavailable")
         return _make_chunk_index()
 

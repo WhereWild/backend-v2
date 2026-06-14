@@ -95,10 +95,11 @@ def _read_model_elevation(model: str, lat_idx: np.ndarray, lon_idx: np.ndarray) 
 @dataclass
 class ChunkRange:
     chunk_num: int
-    start: float    # Unix timestamp of first step
+    start: float    # Unix timestamp of first VALID step (may be after file start)
     end: float      # Unix timestamp of last step
-    time_len: int   # Number of timesteps
+    time_len: int   # Number of VALID timesteps (from start, not from file start)
     source: str     # "chunk" or "year"
+    file_offset: int = 0  # steps from file position 0 to the first valid step
 
 
 @dataclass
@@ -700,6 +701,7 @@ def build_chunk_index(
                 end=r.end,
                 time_len=r.time_len - new_time_idx,
                 source=r.source,
+                file_offset=new_time_idx,
             ))
         ranges = clipped
 
@@ -719,10 +721,10 @@ def build_chunk_index(
 
 
 def _chunk_entry_for_time(idx: ChunkIndex, ts: float) -> tuple[ChunkRange | None, int]:
-    """Return the ChunkRange containing ts and the 0-based time index within it."""
+    """Return the ChunkRange containing ts and the file-position index within it."""
     for entry in idx.ranges:
         if entry.start <= ts <= entry.end:
-            return entry, int(round((ts - entry.start) / idx.resolution))
+            return entry, int(round((ts - entry.start) / idx.resolution)) + entry.file_offset
     return None, -1
 
 
@@ -916,6 +918,7 @@ def map_to_worklist(
     asc_starts = np.array([r.start for r in chunk_index.ranges], dtype=np.float64)
     asc_chunk_nums = np.array([r.chunk_num for r in chunk_index.ranges], dtype=np.int32)
     asc_time_lens = np.array([r.time_len for r in chunk_index.ranges], dtype=np.int32)
+    asc_file_offsets = np.array([r.file_offset for r in chunk_index.ranges], dtype=np.int32)
 
     chunk_lookup = np.searchsorted(asc_starts, times, side="right") - 1
     chunk_lookup = np.clip(chunk_lookup, 0, len(asc_starts) - 1)
@@ -923,10 +926,18 @@ def map_to_worklist(
     chunk_nums = asc_chunk_nums[chunk_lookup]
     chunk_starts = asc_starts[chunk_lookup]
     chunk_time_lens = asc_time_lens[chunk_lookup]
+    chunk_file_offsets = asc_file_offsets[chunk_lookup]
 
-    # Floor to hour boundary (ERA5 is hourly)
-    time_indices = np.floor((times - chunk_starts) / chunk_index.resolution).astype(np.int32)
-    time_indices = np.clip(time_indices, 0, chunk_time_lens - 1)
+    # Floor to hour boundary then add file_offset to get the true file position
+    time_indices = (
+        np.floor((times - chunk_starts) / chunk_index.resolution).astype(np.int32)
+        + chunk_file_offsets
+    )
+    time_indices = np.clip(
+        time_indices,
+        chunk_file_offsets,
+        chunk_file_offsets + chunk_time_lens - 1,
+    )
 
     return pa.table({
         "taxon_path": taxon_path_col,
@@ -1083,20 +1094,30 @@ def process_chunk(
             (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
         )
 
-        # Cap observations that fall in a trailing NaN zone (e.g. ERA5 processing lag)
-        # to the last valid timestep so they receive data instead of NaN.
+        # Observations past the last valid timestep are in the ERA5 lag zone.
+        # Leave them null so the next enrich run picks them up once ERA5 catches up.
+        lag_keep: np.ndarray | None = None
         if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
             finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
             if finite_in_slice.size == 0:
                 continue
             last_valid = int(finite_in_slice[-1])
-            local_time = np.minimum(local_time, last_valid)
+            raw_local = (time_slice + prev_len) - slice_start
+            lag_keep = np.flatnonzero(raw_local <= last_valid)
+            if lag_keep.size == 0:
+                continue
+            local_time = local_time[lag_keep]
 
         window_sums, window_counts = window_stats_batch(series_slice, local_time, steps)
 
         paths_slice = taxon_path[s:e]
         rows_slice = row_idx[s:e]
         corr_slice = elev_correction[s:e] if elev_correction is not None else None
+        if lag_keep is not None:
+            paths_slice = paths_slice[lag_keep]
+            rows_slice = rows_slice[lag_keep]
+            if corr_slice is not None:
+                corr_slice = corr_slice[lag_keep]
         for tpath in np.unique(paths_slice):
             mask = paths_slice == tpath
             row_ids = rows_slice[mask]
@@ -1152,19 +1173,23 @@ def process_chunk_mode(
     sec_offsets: list[int] = [0]
     # (ext_reader, ext_offset, ext_steps) — stitch when secondary ends before primary
     _sec_exts: list[tuple[OmFileReader | None, int, int]] = [(None, 0, 0)]
+    # Align secondary to the primary's actual file start (before any year-file clip)
+    primary_file_start_ts = chunk_entry.start - chunk_entry.file_offset * resolution
     for var in source_variables[1:]:
         if secondary_indices is not None and var in secondary_indices:
-            sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
+            sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], primary_file_start_ts)
             if sec_entry is not None:
                 readers.append(_open(sec_entry, var))
                 sec_offsets.append(sec_t0)
-                sec_available = sec_entry.time_len - sec_t0
-                if sec_available < chunk_entry.time_len:
+                primary_total = chunk_entry.file_offset + chunk_entry.time_len
+                sec_total = sec_entry.file_offset + sec_entry.time_len
+                sec_available = sec_total - sec_t0
+                if sec_available < primary_total:
                     _ext_e, _ext_t0 = _chunk_entry_for_time(
                         secondary_indices[var], sec_entry.end + resolution
                     )
                     if _ext_e is not None:
-                        _sec_exts.append((_open(_ext_e, var), _ext_t0, chunk_entry.time_len - sec_available))
+                        _sec_exts.append((_open(_ext_e, var), _ext_t0, primary_total - sec_available))
                     else:
                         _sec_exts.append((None, 0, 0))
                 else:
@@ -1359,19 +1384,23 @@ def process_chunk_vpd(
     sec_offsets: list[int] = [0]
     # (ext_reader, ext_offset, ext_steps) — stitch when secondary ends before primary
     _sec_exts_vpd: list[tuple[OmFileReader | None, int, int]] = [(None, 0, 0)]
+    # Align secondary to the primary's actual file start (before any year-file clip)
+    primary_file_start_ts_vpd = chunk_entry.start - chunk_entry.file_offset * resolution
     for var in source_variables[1:]:
         if secondary_indices is not None and var in secondary_indices:
-            sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], chunk_entry.start)
+            sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], primary_file_start_ts_vpd)
             if sec_entry is not None:
                 readers.append(_open(sec_entry, var))
                 sec_offsets.append(sec_t0)
-                sec_available = sec_entry.time_len - sec_t0
-                if sec_available < chunk_entry.time_len:
+                primary_total_vpd = chunk_entry.file_offset + chunk_entry.time_len
+                sec_total_vpd = sec_entry.file_offset + sec_entry.time_len
+                sec_available = sec_total_vpd - sec_t0
+                if sec_available < primary_total_vpd:
                     _ext_e, _ext_t0 = _chunk_entry_for_time(
                         secondary_indices[var], sec_entry.end + resolution
                     )
                     if _ext_e is not None:
-                        _sec_exts_vpd.append((_open(_ext_e, var), _ext_t0, chunk_entry.time_len - sec_available))
+                        _sec_exts_vpd.append((_open(_ext_e, var), _ext_t0, primary_total_vpd - sec_available))
                     else:
                         _sec_exts_vpd.append((None, 0, 0))
                 else:
@@ -1510,17 +1539,25 @@ def process_chunk_vpd(
             (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
         )
 
+        lag_keep_vpd: np.ndarray | None = None
         if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
             finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
             if finite_in_slice.size == 0:
                 continue
             last_valid = int(finite_in_slice[-1])
-            local_time = np.minimum(local_time, last_valid)
+            raw_local = (time_slice + prev_len) - slice_start
+            lag_keep_vpd = np.flatnonzero(raw_local <= last_valid)
+            if lag_keep_vpd.size == 0:
+                continue
+            local_time = local_time[lag_keep_vpd]
 
         window_sums, window_counts = window_stats_batch(series_slice, local_time, steps)
 
         paths_slice = taxon_path[s:e]
         rows_slice = row_idx[s:e]
+        if lag_keep_vpd is not None:
+            paths_slice = paths_slice[lag_keep_vpd]
+            rows_slice = rows_slice[lag_keep_vpd]
         for tpath in np.unique(paths_slice):
             mask = paths_slice == tpath
             rids = rows_slice[mask]
@@ -1556,10 +1593,18 @@ def _apply_updates_arrow(
     for name in table.column_names:
         if name in updates:
             arr = table[name].combine_chunks()
+            was_null = pc.is_null(arr)
             np_arr = np.array(arr.to_numpy(zero_copy_only=False), copy=True, dtype=float)
+            written = np.zeros(length, dtype=bool)
             for row_ids, vals in updates[name]:
                 np_arr[row_ids] = vals
-            cols.append(pa.array(np_arr, type=pa.float64()))
+                written[row_ids] = True
+            # Rows that were Arrow null AND received no update stay null.
+            null_mask = np.asarray(was_null.to_pylist(), dtype=bool) & ~written
+            result = pa.array(np_arr, type=pa.float64())
+            if null_mask.any():
+                result = pc.if_else(pa.array(~null_mask), result, None)
+            cols.append(result)
         else:
             cols.append(table[name])
         names.append(name)
@@ -1711,8 +1756,9 @@ def accumulate_raster(
         if entry.start > end_ts:
             break
 
-        t0 = max(0, int(round((max(entry.start, start_ts) - entry.start) / resolution)))
-        t1 = min(entry.time_len, int(round((min(entry.end, end_ts) - entry.start) / resolution)) + 1)
+        t0 = int(round((max(entry.start, start_ts) - entry.start) / resolution)) + entry.file_offset
+        t1 = int(round((min(entry.end, end_ts) - entry.start) / resolution)) + 1 + entry.file_offset
+        t1 = min(entry.file_offset + entry.time_len, t1)
         if t1 <= t0:
             continue
 
@@ -1770,8 +1816,9 @@ def accumulate_vpd_raster(
         if t_entry.start > end_ts:
             break
 
-        t0 = max(0, int(round((max(t_entry.start, start_ts) - t_entry.start) / resolution)))
-        t1 = min(t_entry.time_len, int(round((min(t_entry.end, end_ts) - t_entry.start) / resolution)) + 1)
+        t0 = int(round((max(t_entry.start, start_ts) - t_entry.start) / resolution)) + t_entry.file_offset
+        t1 = int(round((min(t_entry.end, end_ts) - t_entry.start) / resolution)) + 1 + t_entry.file_offset
+        t1 = min(t_entry.file_offset + t_entry.time_len, t1)
         if t1 <= t0:
             continue
 
@@ -1784,7 +1831,7 @@ def accumulate_vpd_raster(
         sub = 24
         for ts in range(t0, t1, sub):
             te = min(ts + sub, t1)
-            step_ts = t_entry.start + ts * resolution
+            step_ts = t_entry.start + (ts - t_entry.file_offset) * resolution
 
             t_data = np.asarray(
                 t_reader.read_array((slice(0, ny), slice(0, nx), slice(ts, te))),
@@ -1854,8 +1901,9 @@ def accumulate_vpd_raster_gfs(
         if t_entry.start > end_ts:
             break
 
-        t0 = max(0, int(round((max(t_entry.start, start_ts) - t_entry.start) / resolution)))
-        t1 = min(t_entry.time_len, int(round((min(t_entry.end, end_ts) - t_entry.start) / resolution)) + 1)
+        t0 = int(round((max(t_entry.start, start_ts) - t_entry.start) / resolution)) + t_entry.file_offset
+        t1 = int(round((min(t_entry.end, end_ts) - t_entry.start) / resolution)) + 1 + t_entry.file_offset
+        t1 = min(t_entry.file_offset + t_entry.time_len, t1)
         if t1 <= t0:
             continue
 
@@ -1868,7 +1916,7 @@ def accumulate_vpd_raster_gfs(
         sub = 24
         for ts in range(t0, t1, sub):
             te = min(ts + sub, t1)
-            step_ts = t_entry.start + ts * resolution
+            step_ts = t_entry.start + (ts - t_entry.file_offset) * resolution
 
             t_data = np.asarray(
                 t_reader.read_array((slice(0, ny), slice(0, nx), slice(ts, te))),
@@ -1939,21 +1987,15 @@ def accumulate_raster_mode(
 
     counts: dict[int, np.ndarray | None] = {c: None for c in RASTER_WC_CODES}
 
-    def _cidx_entry_for(cidx: ChunkIndex, ts: float) -> tuple[ChunkRange | None, int]:
-        for entry in cidx.ranges:
-            if entry.start <= ts <= entry.end:
-                idx = int(round((ts - entry.start) / cidx.resolution))
-                return entry, idx
-        return None, -1
-
     for cc_entry in cloud_index.ranges:
         if cc_entry.end < start_ts:
             continue
         if cc_entry.start > end_ts:
             break
 
-        t0 = max(0, int(round((max(cc_entry.start, start_ts) - cc_entry.start) / resolution)))
-        t1 = min(cc_entry.time_len, int(round((min(cc_entry.end, end_ts) - cc_entry.start) / resolution)) + 1)
+        t0 = int(round((max(cc_entry.start, start_ts) - cc_entry.start) / resolution)) + cc_entry.file_offset
+        t1 = int(round((min(cc_entry.end, end_ts) - cc_entry.start) / resolution)) + 1 + cc_entry.file_offset
+        t1 = min(cc_entry.file_offset + cc_entry.time_len, t1)
         if t1 <= t0:
             continue
 
@@ -1972,7 +2014,7 @@ def accumulate_raster_mode(
         _sw_readers: dict[int, object] = {}
 
         for i in range(t1 - t0):
-            step_ts = cc_entry.start + (t0 + i) * resolution
+            step_ts = cc_entry.start + (t0 + i - cc_entry.file_offset) * resolution
 
             cc_slice = np.asarray(
                 cc_reader.read_array((slice(0, ny), slice(0, nx), slice(t0 + i, t0 + i + 1))),
@@ -1980,7 +2022,7 @@ def accumulate_raster_mode(
             )[:, :, 0]
 
             pr_slice = np.zeros((ny, nx), dtype=np.float64)
-            pr_entry, pr_idx = _cidx_entry_for(precip_index, step_ts)
+            pr_entry, pr_idx = _chunk_entry_for_time(precip_index, step_ts)
             if pr_entry is not None:
                 if pr_entry.chunk_num not in _pr_readers:
                     _pr_readers[pr_entry.chunk_num] = _open_chunk(pr_entry, model, "precipitation")
@@ -1992,7 +2034,7 @@ def accumulate_raster_mode(
                 )[:, :, 0]
 
             sw_slice = np.zeros((ny, nx), dtype=np.float64)
-            sw_entry, sw_idx = _cidx_entry_for(swe_index, step_ts)
+            sw_entry, sw_idx = _chunk_entry_for_time(swe_index, step_ts)
             if sw_entry is not None:
                 if sw_entry.chunk_num not in _sw_readers:
                     _sw_readers[sw_entry.chunk_num] = _open_chunk(sw_entry, model, "snowfall_water_equivalent")

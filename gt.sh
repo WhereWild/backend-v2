@@ -6,7 +6,7 @@ project_dir="$script_dir"
 
 needs_rebuild() {
     local container_start
-    container_start=$(docker inspect wherewild-v2-gdal-1 --format '{{.State.StartedAt}}' 2>/dev/null) || return 0
+    container_start=$(docker compose --project-directory "$project_dir" ps -q gdal 2>/dev/null | xargs -r docker inspect --format '{{.State.StartedAt}}' 2>/dev/null) || return 0
     local container_epoch
     container_epoch=$(date -d "$container_start" +%s 2>/dev/null) || return 0
     local newest

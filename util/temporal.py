@@ -17,8 +17,8 @@ Elevation correction: lapse-rate correction (model_elev - obs_elev) * 0.0065 °C
 is applied to temperature-like variables.  Model elevation comes from
 s3://openmeteo/data/{model}/static/HSURF.om (cached per model).  Observation
 elevation comes from the `elevation` column in occurrence parquets, written by
-the DEM pipeline (not yet built).  Until that column exists the correction is a
-no-op: obs_elev is NaN → offset is 0.
+the DEM pipeline.  When the column is absent or contains NaN (e.g. the upload
+path), the correction is a no-op: obs_elev is NaN → offset is 0.
 """
 from __future__ import annotations
 
@@ -972,6 +972,7 @@ def process_chunk(
     agg_mode: str,
     cache_dir: str,
     range_request: bool = False,
+    raw_cache: dict | None = None,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Download, process, and delete one .om chunk.
 
@@ -1018,7 +1019,7 @@ def process_chunk(
     lon = np.clip(lon, 0, nx - 1)
 
     # Elevation correction: compute per-observation offset upfront.
-    # No-op while obs_elev is all-NaN (DEM pipeline not yet built).
+    # No-op when obs_elev is all-NaN (e.g. upload path).
     do_elev = variable in ELEVATION_CORRECTABLE_VARS
     elev_correction: np.ndarray | None = None
     if do_elev and np.isfinite(obs_elev).any():
@@ -1047,13 +1048,23 @@ def process_chunk(
     _cell_cache: dict[tuple[int, int], np.ndarray] = {}
     if range_request and group_starts.size > 0:
         _unique = [(int(lat[s]), int(lon[s])) for s in group_starts]
-        def _fetch(li_lo: tuple[int, int]) -> tuple[tuple[int, int], np.ndarray]:
-            try:
-                return li_lo, np.asarray(reader[li_lo[0], li_lo[1], :], dtype=np.float64)
-            except Exception:
-                return li_lo, np.empty(0, dtype=np.float64)
-        with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
-            _cell_cache = dict(_ex.map(_fetch, _unique))
+        if raw_cache is not None:
+            for li, lo in _unique:
+                hit = raw_cache.get((model, variable, chunk_entry.chunk_num, li, lo))
+                if hit is not None:
+                    _cell_cache[(li, lo)] = hit
+        _to_fetch = [(li, lo) for li, lo in _unique if (li, lo) not in _cell_cache]
+        if _to_fetch:
+            def _fetch(li_lo: tuple[int, int]) -> tuple[tuple[int, int], np.ndarray]:
+                try:
+                    return li_lo, np.asarray(reader[li_lo[0], li_lo[1], :], dtype=np.float64)
+                except Exception:
+                    return li_lo, np.empty(0, dtype=np.float64)
+            with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
+                for li_lo, arr in _ex.map(_fetch, _to_fetch):
+                    _cell_cache[li_lo] = arr
+                    if raw_cache is not None:
+                        raw_cache[(model, variable, chunk_entry.chunk_num, li_lo[0], li_lo[1])] = arr
 
     updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
     new_tail: TailBuffer = {}
@@ -1154,6 +1165,7 @@ def process_chunk_mode(
     cache_dir: str,
     secondary_indices: dict[str, ChunkIndex] | None = None,
     range_request: bool = False,
+    raw_cache: dict | None = None,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Download multiple .om files, derive a per-timestep series, apply sliding-window mode.
 
@@ -1174,6 +1186,8 @@ def process_chunk_mode(
 
     primary_var = source_variables[0]
     readers: list[OmFileReader | None] = [_open(chunk_entry, primary_var)]
+    reader_vars: list[str] = [primary_var]
+    reader_chunk_nums: list[int] = [chunk_entry.chunk_num]
     sec_offsets: list[int] = [0]
     # (ext_reader, ext_offset, ext_steps) — stitch when secondary ends before primary
     _sec_exts: list[tuple[OmFileReader | None, int, int]] = [(None, 0, 0)]
@@ -1184,6 +1198,8 @@ def process_chunk_mode(
             sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], primary_file_start_ts)
             if sec_entry is not None:
                 readers.append(_open(sec_entry, var))
+                reader_vars.append(var)
+                reader_chunk_nums.append(sec_entry.chunk_num)
                 sec_offsets.append(sec_t0)
                 primary_total = chunk_entry.file_offset + chunk_entry.time_len
                 sec_total = sec_entry.file_offset + sec_entry.time_len
@@ -1200,10 +1216,14 @@ def process_chunk_mode(
                     _sec_exts.append((None, 0, 0))
             else:
                 readers.append(None)
+                reader_vars.append(var)
+                reader_chunk_nums.append(chunk_entry.chunk_num)
                 sec_offsets.append(0)
                 _sec_exts.append((None, 0, 0))
         else:
             readers.append(_open(chunk_entry, var))
+            reader_vars.append(var)
+            reader_chunk_nums.append(chunk_entry.chunk_num)
             sec_offsets.append(0)
             _sec_exts.append((None, 0, 0))
     ny, nx, _ = readers[0].shape
@@ -1248,17 +1268,30 @@ def process_chunk_mode(
     _reader_caches: list[dict[tuple[int, int], np.ndarray]] = [{} for _ in readers]
     if range_request and group_starts.size > 0:
         _unique = [(int(lat[s]), int(lon[s])) for s in group_starts]
-        _tasks = [(r_idx, r, li, lo) for r_idx, r in enumerate(readers) if r is not None
-                  for li, lo in _unique]
+        if raw_cache is not None:
+            for r_idx, (rvar, rcnum) in enumerate(zip(reader_vars, reader_chunk_nums)):
+                for li, lo in _unique:
+                    hit = raw_cache.get((model, rvar, rcnum, li, lo))
+                    if hit is not None:
+                        _reader_caches[r_idx][(li, lo)] = hit
+        _tasks = [
+            (r_idx, r, li, lo)
+            for r_idx, r in enumerate(readers) if r is not None
+            for li, lo in _unique
+            if (li, lo) not in _reader_caches[r_idx]
+        ]
         def _fetch_multi(task: tuple) -> tuple:
             r_idx, r, li, lo = task
             try:
                 return r_idx, li, lo, np.asarray(r[li, lo, :], dtype=np.float64)
             except Exception:
                 return r_idx, li, lo, np.empty(0, dtype=np.float64)
-        with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
-            for _r_idx, _li, _lo, _arr in _ex.map(_fetch_multi, _tasks):
-                _reader_caches[_r_idx][(_li, _lo)] = _arr
+        if _tasks:
+            with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
+                for _r_idx, _li, _lo, _arr in _ex.map(_fetch_multi, _tasks):
+                    _reader_caches[_r_idx][(_li, _lo)] = _arr
+                    if raw_cache is not None:
+                        raw_cache[(model, reader_vars[_r_idx], reader_chunk_nums[_r_idx], _li, _lo)] = _arr
 
     updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
     new_tail: TailBuffer = {}
@@ -1371,6 +1404,7 @@ def process_chunk_vpd(
     cache_dir: str,
     secondary_indices: dict[str, ChunkIndex] | None = None,
     range_request: bool = False,
+    raw_cache: dict | None = None,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Derive VPD per-timestep from temperature_2m and dew_point_2m, then avg over windows.
 
@@ -1385,6 +1419,8 @@ def process_chunk_vpd(
 
     primary_var = source_variables[0]
     readers: list[OmFileReader | None] = [_open(chunk_entry, primary_var)]
+    reader_vars_vpd: list[str] = [primary_var]
+    reader_chunk_nums_vpd: list[int] = [chunk_entry.chunk_num]
     sec_offsets: list[int] = [0]
     # (ext_reader, ext_offset, ext_steps) — stitch when secondary ends before primary
     _sec_exts_vpd: list[tuple[OmFileReader | None, int, int]] = [(None, 0, 0)]
@@ -1395,6 +1431,8 @@ def process_chunk_vpd(
             sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], primary_file_start_ts_vpd)
             if sec_entry is not None:
                 readers.append(_open(sec_entry, var))
+                reader_vars_vpd.append(var)
+                reader_chunk_nums_vpd.append(sec_entry.chunk_num)
                 sec_offsets.append(sec_t0)
                 primary_total_vpd = chunk_entry.file_offset + chunk_entry.time_len
                 sec_total_vpd = sec_entry.file_offset + sec_entry.time_len
@@ -1411,10 +1449,14 @@ def process_chunk_vpd(
                     _sec_exts_vpd.append((None, 0, 0))
             else:
                 readers.append(None)
+                reader_vars_vpd.append(var)
+                reader_chunk_nums_vpd.append(chunk_entry.chunk_num)
                 sec_offsets.append(0)
                 _sec_exts_vpd.append((None, 0, 0))
         else:
             readers.append(_open(chunk_entry, var))
+            reader_vars_vpd.append(var)
+            reader_chunk_nums_vpd.append(chunk_entry.chunk_num)
             sec_offsets.append(0)
             _sec_exts_vpd.append((None, 0, 0))
 
@@ -1456,17 +1498,30 @@ def process_chunk_vpd(
     _reader_caches_vpd: list[dict[tuple[int, int], np.ndarray]] = [{} for _ in readers]
     if range_request and group_starts.size > 0:
         _unique = [(int(lat[s]), int(lon[s])) for s in group_starts]
-        _tasks = [(r_idx, r, li, lo) for r_idx, r in enumerate(readers) if r is not None
-                  for li, lo in _unique]
+        if raw_cache is not None:
+            for r_idx, (rvar, rcnum) in enumerate(zip(reader_vars_vpd, reader_chunk_nums_vpd)):
+                for li, lo in _unique:
+                    hit = raw_cache.get((model, rvar, rcnum, li, lo))
+                    if hit is not None:
+                        _reader_caches_vpd[r_idx][(li, lo)] = hit
+        _tasks = [
+            (r_idx, r, li, lo)
+            for r_idx, r in enumerate(readers) if r is not None
+            for li, lo in _unique
+            if (li, lo) not in _reader_caches_vpd[r_idx]
+        ]
         def _fetch_vpd(task: tuple) -> tuple:
             r_idx, r, li, lo = task
             try:
                 return r_idx, li, lo, np.asarray(r[li, lo, :], dtype=np.float64)
             except Exception:
                 return r_idx, li, lo, np.empty(0, dtype=np.float64)
-        with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
-            for _r_idx, _li, _lo, _arr in _ex.map(_fetch_vpd, _tasks):
-                _reader_caches_vpd[_r_idx][(_li, _lo)] = _arr
+        if _tasks:
+            with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
+                for _r_idx, _li, _lo, _arr in _ex.map(_fetch_vpd, _tasks):
+                    _reader_caches_vpd[_r_idx][(_li, _lo)] = _arr
+                    if raw_cache is not None:
+                        raw_cache[(model, reader_vars_vpd[_r_idx], reader_chunk_nums_vpd[_r_idx], _li, _lo)] = _arr
 
     updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
     new_tail: TailBuffer = {}

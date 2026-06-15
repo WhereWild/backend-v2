@@ -156,6 +156,7 @@ async def _upload_consumer() -> None:
         try:
             df = await run_in_threadpool(upload.enrich_with_gadm, job.df)
             df = await run_in_threadpool(upload.enrich_with_gis, df)
+            df = await run_in_threadpool(upload.enrich_with_temporal, df)
             archive_path, archive_name, work_dir = await run_in_threadpool(upload.build_archive, df)
             job.archive_path = archive_path
             job.archive_name = archive_name
@@ -1698,6 +1699,7 @@ async def upload_raw_observations(
     }
 
     df = upload.normalize_coordinate_columns(df)
+    df = upload.normalize_timestamp_column(df)
     df = upload.ensure_catalog_numbers(df)
     df = upload.ensure_observation_names(df)
     df = upload.validate_coordinates(df)

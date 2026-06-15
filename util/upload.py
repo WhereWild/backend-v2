@@ -21,14 +21,13 @@ import re
 import shutil
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import time as _time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import rasterio
@@ -422,9 +421,9 @@ def normalize_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
     if col is None:
         return df
 
-    _UTC = _dt.timezone.utc
-    _NOON_OFFSET = 12 * 3600.0
-    _SENTINEL = {"", "none", "nan", "nat", "null"}
+    utc = _dt.UTC
+    noon_offset = 12 * 3600.0
+    sentinel = {"", "none", "nan", "nat", "null"}
 
     def _parse(raw_val) -> float:
         if raw_val is None:
@@ -432,18 +431,18 @@ def normalize_timestamp_column(df: pd.DataFrame) -> pd.DataFrame:
         if isinstance(raw_val, float) and np.isnan(raw_val):
             return float("nan")
         s = str(raw_val).strip()
-        if s.lower() in _SENTINEL:
+        if s.lower() in sentinel:
             return float("nan")
         try:
             ts = pd.to_datetime(s)
             if ts is pd.NaT:
                 return float("nan")
             if ts.tzinfo is None:
-                unix = ts.replace(tzinfo=_UTC).timestamp()
+                unix = ts.replace(tzinfo=utc).timestamp()
             else:
-                unix = ts.astimezone(_UTC).timestamp()
+                unix = ts.astimezone(utc).timestamp()
             if ":" not in s:
-                unix += _NOON_OFFSET
+                unix += noon_offset
             return unix
         except Exception:
             return float("nan")
@@ -502,8 +501,6 @@ def _apply_temporal_updates(
 
 
 def _process_one_layer(
-    layer_i: int,
-    n_layers: int,
     layer,
     occ_table: pa.Table,
     raw_cache: dict | None = None,
@@ -514,25 +511,19 @@ def _process_one_layer(
     Intended to be called concurrently across layers, which are independent.
     """
     updates_out: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
-    t_layer = _time.monotonic()
     primary_var = layer.sources[0] if layer.sources else layer.id
-    tag = f"[upload/temporal] layer {layer_i+1}/{n_layers} ({layer.id})"
-    print(f"{tag} starting (var={primary_var})")
 
     try:
         chunk_index = build_chunk_index(layer.model, primary_var)
-    except Exception as e:
-        print(f"{tag} chunk_index failed: {e} — skipping")
+    except Exception:
         return updates_out
 
     worklist = map_to_worklist(occ_table, chunk_index, layer.grid_mode, layer.grid_step)
     if worklist.num_rows == 0:
-        print(f"{tag} worklist empty — skipping")
         return updates_out
 
     chunk_nums_present = set(worklist.column("chunk_num").to_pylist())
     chunks_to_process = [e for e in chunk_index.ranges if e.chunk_num in chunk_nums_present]
-    print(f"{tag} {len(chunks_to_process)} chunks to fetch")
 
     steps = window_steps(chunk_index.resolution, tuple(layer.windows))
 
@@ -551,7 +542,6 @@ def _process_one_layer(
         )
         if chunk_worklist.num_rows == 0:
             continue
-        t_chunk = _time.monotonic()
         try:
             if layer.id == "vapor_pressure_deficit":
                 chunk_updates, tail_buffer = process_chunk_vpd(
@@ -582,12 +572,9 @@ def _process_one_layer(
                 updates_out.setdefault(tpath, {})
                 for col, pairs in col_map.items():
                     updates_out[tpath].setdefault(col, []).extend(pairs)
-            print(f"{tag} chunk {ci+1}/{len(chunks_to_process)} (#{chunk_entry.chunk_num}) — {_time.monotonic()-t_chunk:.2f}s")
-        except Exception as e:
-            print(f"{tag} chunk {ci+1}/{len(chunks_to_process)} (#{chunk_entry.chunk_num}) error: {e}")
+        except Exception:
             continue
 
-    print(f"{tag} done [{_time.monotonic()-t_layer:.1f}s]")
     return updates_out
 
 
@@ -602,31 +589,20 @@ def enrich_with_temporal(df: pd.DataFrame) -> pd.DataFrame:
     Skipped silently if eventTimestamp is absent or entirely null. Rows with
     null timestamps get NaN in all temporal output columns.
     """
-    t_total = _time.monotonic()
-
     if "eventTimestamp" not in df.columns or df["eventTimestamp"].notna().sum() == 0:
-        print("[upload/temporal] no eventTimestamp column or all null — skipping")
         return df
-
-    n_rows = len(df)
-    n_timestamped = int(df["eventTimestamp"].notna().sum())
-    print(f"[upload/temporal] starting enrichment: {n_rows} rows, {n_timestamped} with timestamps")
 
     try:
         temporal_layers = load_temporal_layers(_CATALOG_PATH)
-    except Exception as e:
-        print(f"[upload/temporal] failed to load temporal layers: {e}")
+    except Exception:
         return df
 
-    active_layers = [l for l in temporal_layers if not l.derived]
-    base_layers = [l for l in active_layers if not l.sources]
-    composite_layers = [l for l in active_layers if l.sources]
-    n_layers = len(active_layers)
-    print(f"[upload/temporal] {n_layers} active layers ({len(base_layers)} base, {len(composite_layers)} composite)")
+    active_layers = [lay for lay in temporal_layers if not lay.derived]
+    base_layers = [lay for lay in active_layers if not lay.sources]
+    composite_layers = [lay for lay in active_layers if lay.sources]
 
     occ_table = _df_to_occ_table(df)
     if occ_table.num_rows == 0:
-        print("[upload/temporal] occ_table empty after conversion — skipping")
         return df
 
     # Shared raw cell data cache: (model, variable, chunk_num, lat_idx, lon_idx) -> array.
@@ -639,35 +615,29 @@ def enrich_with_temporal(df: pd.DataFrame) -> pd.DataFrame:
 
     def _collect(futures: dict) -> None:
         for future in as_completed(futures):
-            layer = futures[future]
             try:
                 layer_updates = future.result()
-            except Exception as e:
-                print(f"[upload/temporal] layer {layer.id} raised unexpectedly: {e}")
+            except Exception:
                 continue
             for tpath, col_map in layer_updates.items():
                 all_updates.setdefault(tpath, {})
                 for col, pairs in col_map.items():
                     all_updates[tpath].setdefault(col, []).extend(pairs)
 
-    print(f"[upload/temporal] phase 1: base layers")
     with ThreadPoolExecutor(max_workers=min(_UPLOAD_TEMPORAL_WORKERS, len(base_layers) or 1)) as pool:
         _collect({
-            pool.submit(_process_one_layer, i, n_layers, layer, occ_table, raw_cell_cache): layer
-            for i, layer in enumerate(base_layers)
+            pool.submit(_process_one_layer, layer, occ_table, raw_cell_cache): layer
+            for layer in base_layers
         })
 
     if composite_layers:
-        print(f"[upload/temporal] phase 2: composite layers (cache has {len(raw_cell_cache)} entries)")
         with ThreadPoolExecutor(max_workers=min(_UPLOAD_TEMPORAL_WORKERS, len(composite_layers))) as pool:
             _collect({
-                pool.submit(_process_one_layer, len(base_layers) + i, n_layers, layer, occ_table, raw_cell_cache): layer
-                for i, layer in enumerate(composite_layers)
+                pool.submit(_process_one_layer, layer, occ_table, raw_cell_cache): layer
+                for layer in composite_layers
             })
 
-    result = _apply_temporal_updates(df, all_updates)
-    print(f"[upload/temporal] enrichment complete [{_time.monotonic()-t_total:.1f}s total]")
-    return result
+    return _apply_temporal_updates(df, all_updates)
 
 
 def _build_temporal_var_meta(df: pd.DataFrame) -> list[dict]:

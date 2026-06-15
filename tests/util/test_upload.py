@@ -80,7 +80,7 @@ def test_normalize_coordinate_columns_fallback_contains():
 
 
 def test_normalize_coordinate_columns_no_match_unchanged():
-    df = pd.DataFrame({"x": [1.0], "y": [2.0]})
+    df = pd.DataFrame({"foo": [1.0], "bar": [2.0]})
     result = up.normalize_coordinate_columns(df)
     assert "decimalLatitude" not in result.columns
     assert "decimalLongitude" not in result.columns

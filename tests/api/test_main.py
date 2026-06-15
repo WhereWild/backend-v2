@@ -1834,7 +1834,7 @@ def test_upload_invalid_csv_raises_422():
 
 
 def test_upload_missing_coordinates_raises_422():
-    csv = b"x,y\n1,2\n"
+    csv = b"foo,bar\n1,2\n"
     r = client.post("/upload/raw-observations",
                     files=[("file", ("obs.csv", csv, "text/csv"))])
     assert r.status_code == 422

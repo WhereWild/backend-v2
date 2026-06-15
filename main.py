@@ -156,6 +156,7 @@ async def _upload_consumer() -> None:
         try:
             df = await run_in_threadpool(upload.enrich_with_gadm, job.df)
             df = await run_in_threadpool(upload.enrich_with_gis, df)
+            df = await run_in_threadpool(upload.enrich_with_temporal, df)
             archive_path, archive_name, work_dir = await run_in_threadpool(upload.build_archive, df)
             job.archive_path = archive_path
             job.archive_name = archive_name
@@ -509,15 +510,18 @@ async def gis_point_value(
     }
 
 
+_VALID_FORECAST_HOURS = {0, 1, 8, 24, 72, 168}
+
+
 @app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
 async def variable_tile_compat(
     variable_id: str, z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis"),
-    cb_mode: str = Query(""),
+    cb_mode: str = Query(""), forecast_h: int = Query(0, ge=0),
 ):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode)
+    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h)
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
@@ -526,19 +530,23 @@ async def layer_tile(
     tile_size: int = Query(256, ge=32, le=1024),
     colormap: str = Query("viridis"),
     cb_mode: str = Query(""),
+    forecast_h: int = Query(0, ge=0),
 ):
     if colormap not in tiles.SUPPORTED_COLORMAPS and colormap not in tiles.SUPPORTED_CIRCULAR_COLORMAPS:
         colormap = "viridis"
     if cb_mode not in tiles.SUPPORTED_CB_MODES:
         cb_mode = ""
+    if forecast_h not in _VALID_FORECAST_HOURS:
+        forecast_h = 0
     try:
         layer = tiles.get_layer(layer_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Layer '{layer_id}' not found")
 
+    forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h > 0 else ""
     payload = await run_in_threadpool(
         tiles.render_layer_tile_bytes,
-        layer_id, z, x, y, tile_size, colormap, cb_mode,
+        layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix,
     )
     is_temporal = layer.get("window_hours") is not None
     cache_max_age = 300 if is_temporal else 604800
@@ -1691,6 +1699,7 @@ async def upload_raw_observations(
     }
 
     df = upload.normalize_coordinate_columns(df)
+    df = upload.normalize_timestamp_column(df)
     df = upload.ensure_catalog_numbers(df)
     df = upload.ensure_observation_names(df)
     df = upload.validate_coordinates(df)

@@ -399,6 +399,7 @@ def render_temporal_tile_bytes(
     tile_size: int = 256,
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
+    forecast_suffix: str = "",
 ) -> bytes:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
@@ -406,7 +407,7 @@ def render_temporal_tile_bytes(
     model = layer.get("model", "copernicus_era5")
     nominal = str(layer.get("value_type") or "").lower() == "nominal"
 
-    npy_path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}.npy"
+    npy_path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{forecast_suffix}.npy"
     arr = _load_temporal_npy(npy_path)
 
     dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
@@ -684,11 +685,12 @@ def render_layer_tile_bytes(
     tile_size: int = 256,
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
+    forecast_suffix: str = "",
 ) -> bytes:
     from util.gis import DERIVED_FROM_ELEVATION, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
-        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode)
+        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix)
     if layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
         return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap)

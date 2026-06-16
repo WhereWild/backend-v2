@@ -28,15 +28,16 @@ from util.tiles import (
 )
 
 
-def sample_point(layer: dict, lat: float, lon: float) -> float | None:
+def sample_point(layer: dict, lat: float, lon: float, forecast_suffix: str = "") -> float | None:
     """Return the raster value for a layer at a lat/lon coordinate.
 
     For static COG layers: opens the file and reads a single pixel, applying
-    scale/offset from the catalog.  For temporal layers: samples the current
-    (no-forecast-offset) .npy grid.  Returns None for nodata or out-of-bounds.
+    scale/offset from the catalog.  For temporal layers: samples the .npy grid
+    for the given forecast offset (empty string = current window).
+    Returns None for nodata or out-of-bounds.
     """
     if layer.get("window_hours") is not None:
-        return _sample_temporal_point(layer, lat, lon)
+        return _sample_temporal_point(layer, lat, lon, forecast_suffix)
     if layer["id"] == "slope":
         return compute_slope_at_point(lat, lon)
     if layer["id"] == "aspect":
@@ -68,13 +69,13 @@ def _sample_cog_point(layer: dict, lat: float, lon: float) -> float | None:
         return None
 
 
-def _sample_temporal_point(layer: dict, lat: float, lon: float) -> float | None:
-    """Sample the current (no-forecast-offset) temporal .npy at a lat/lon."""
+def _sample_temporal_point(layer: dict, lat: float, lon: float, forecast_suffix: str = "") -> float | None:
+    """Sample a temporal .npy at a lat/lon for the given forecast offset."""
     var_id = layer["var_id"]
     window_label = layer["window_label"]
     model = layer.get("model", "copernicus_era5")
 
-    arr = _load_temporal_npy(TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}.npy")
+    arr = _load_temporal_npy(TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{forecast_suffix}.npy")
     if arr is None:
         return None
 

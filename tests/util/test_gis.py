@@ -76,7 +76,7 @@ def test_sample_point_dispatches_to_cog():
 def test_sample_point_dispatches_to_temporal():
     with patch.object(gis, "_sample_temporal_point", return_value=15.0) as mock:
         result = gis.sample_point(_TEMPORAL_LAYER, 40.0, -105.0)
-    mock.assert_called_once_with(_TEMPORAL_LAYER, 40.0, -105.0)
+    mock.assert_called_once_with(_TEMPORAL_LAYER, 40.0, -105.0, "")
     assert result == 15.0
 
 

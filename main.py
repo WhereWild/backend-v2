@@ -1351,13 +1351,23 @@ def get_observation_variable_values(
         for desc in iter_descendants(taxon, include_self=False):
             _read_occ(TREE_ROOT / desc["path"] / "occurrence.parquet")
 
-    vals = collected.values()
-    obs_min = min(vals) if collected else None
-    obs_max = max(vals) if collected else None
+    vals = list(collected.values())
+    obs_min = min(vals) if vals else None
+    obs_max = max(vals) if vals else None
+    obs_q01: float | None = None
+    obs_q99: float | None = None
+    if len(vals) >= 2:
+        import numpy as _np
+        obs_q01, obs_q99 = _np.percentile(vals, [0.1, 99.9]).tolist()
+    elif vals:
+        obs_q01 = obs_min
+        obs_q99 = obs_max
     return {
         "variable": variable_id,
         "min": obs_min,
         "max": obs_max,
+        "q01": obs_q01,
+        "q99": obs_q99,
         "observations": [{"catalogNumber": k, "value": v} for k, v in collected.items()],
     }
 

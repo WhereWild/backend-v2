@@ -19,7 +19,6 @@ import csv
 import json
 import math
 import os
-import re as _re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any

@@ -459,6 +459,7 @@ async def gis_point_value(
     taxon_id: str | None = Query(None),
     catalog_number: str | None = Query(None),
     unit_system: str | None = Query(None),
+    forecast_h: int = Query(0, ge=0),
 ):
     """Return the raster value for a variable at a lat/lon coordinate.
 
@@ -477,6 +478,10 @@ async def gis_point_value(
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Variable '{variable}' not found")
 
+    if forecast_h not in _VALID_FORECAST_HOURS:
+        forecast_h = 0
+    forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h > 0 else ""
+
     value: float | None = None
 
     if taxon_id and catalog_number:
@@ -485,7 +490,7 @@ async def gis_point_value(
             value = _lookup_index_value(taxon, variable, catalog_number)
 
     if value is None:
-        value = await run_in_threadpool(gis.sample_point, layer, lat, lon)
+        value = await run_in_threadpool(gis.sample_point, layer, lat, lon, forecast_suffix)
 
     class_name: str | None = None
     class_color: str | None = None

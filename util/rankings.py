@@ -34,8 +34,6 @@ from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_
 from util.storage import ParquetStorageProxy, atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
 
-_TEMPORAL_RE = _re.compile(r'_\d+h$')
-
 _storage = ParquetStorageProxy(
     data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
     project_root=Path(__file__).parent.parent,
@@ -48,16 +46,11 @@ _storage = ParquetStorageProxy(
 _stats_cache: dict[str, tuple[int, np.ndarray]] | None = None
 _metric_vocab: list[str] = []       # sorted list of all metric keys
 _metric_to_idx: dict[str, int] = {} # reverse lookup
-# Boolean mask over _metric_vocab: True = include in rank indexes, False = skip.
-# Temporal variables (layer IDs ending in _\d+h) are excluded — too many columns.
-_rankings_mask: np.ndarray | None = None  # shape (len(_metric_vocab),), dtype bool
+_rankings_mask: np.ndarray | None = None  # shape (len(_metric_vocab),), dtype bool; None = include all
 
 def _build_rankings_mask() -> None:
     global _rankings_mask
-    _rankings_mask = np.array(
-        [not _TEMPORAL_RE.search(k.split("::")[0]) for k in _metric_vocab],
-        dtype=bool,
-    )
+    _rankings_mask = None  # include all metrics (temporal vars included)
 
 CONFIG = load_config("global")
 
@@ -612,7 +605,7 @@ def _build_rank_index(
         col_idx: dict[str, list[int]] = {}
         col_val: dict[str, list[float]] = {}
         vocab = _metric_vocab
-        include = _rankings_mask  # excludes temporal vars; None before preload (shouldn't happen)
+        include = _rankings_mask  # None = include all metrics
         for i, (_, entry) in enumerate(desc_data):
             values_arr = entry[1]
             active = ~np.isnan(values_arr)

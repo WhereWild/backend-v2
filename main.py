@@ -459,6 +459,7 @@ async def gis_point_value(
     taxon_id: str | None = Query(None),
     catalog_number: str | None = Query(None),
     unit_system: str | None = Query(None),
+    forecast_h: int = Query(0, ge=0),
 ):
     """Return the raster value for a variable at a lat/lon coordinate.
 
@@ -477,6 +478,10 @@ async def gis_point_value(
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Variable '{variable}' not found")
 
+    if forecast_h not in _VALID_FORECAST_HOURS:
+        forecast_h = 0
+    forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h > 0 else ""
+
     value: float | None = None
 
     if taxon_id and catalog_number:
@@ -485,7 +490,7 @@ async def gis_point_value(
             value = _lookup_index_value(taxon, variable, catalog_number)
 
     if value is None:
-        value = await run_in_threadpool(gis.sample_point, layer, lat, lon)
+        value = await run_in_threadpool(gis.sample_point, layer, lat, lon, forecast_suffix)
 
     class_name: str | None = None
     class_color: str | None = None
@@ -1351,13 +1356,23 @@ def get_observation_variable_values(
         for desc in iter_descendants(taxon, include_self=False):
             _read_occ(TREE_ROOT / desc["path"] / "occurrence.parquet")
 
-    vals = collected.values()
-    obs_min = min(vals) if collected else None
-    obs_max = max(vals) if collected else None
+    vals = list(collected.values())
+    obs_min = min(vals) if vals else None
+    obs_max = max(vals) if vals else None
+    obs_q01: float | None = None
+    obs_q99: float | None = None
+    if len(vals) >= 2:
+        import numpy as _np
+        obs_q01, obs_q99 = _np.percentile(vals, [0.1, 99.9]).tolist()
+    elif vals:
+        obs_q01 = obs_min
+        obs_q99 = obs_max
     return {
         "variable": variable_id,
         "min": obs_min,
         "max": obs_max,
+        "q01": obs_q01,
+        "q99": obs_q99,
         "observations": [{"catalogNumber": k, "value": v} for k, v in collected.items()],
     }
 

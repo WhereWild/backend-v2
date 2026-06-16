@@ -65,6 +65,13 @@ ELEVATION_CORRECTABLE_VARS: frozenset[str] = frozenset({
 
 _LAPSE_RATE = 0.0065  # °C per metre
 
+# ERA5 coverage begins 1940-01-01; the longest enrichment window is 90 days,
+# so the earliest date a fully-covered value can be written is 1940-04-01.
+# For chunks whose data starts at or after this threshold, a cnts==0 result
+# means "no coverage YET" (e.g. an upstream S3 gap) — leave the row null so
+# it is retried next run.  Only pre-ERA5 observations get the NaN sentinel.
+_ERA5_MIN_TS: float = datetime(1940, 4, 1, tzinfo=UTC).timestamp()
+
 # Per-model HSURF elevation grid cache {model: np.ndarray shape (ny, nx)}.
 _MODEL_ELEV_CACHE: dict[str, np.ndarray] = {}
 
@@ -920,6 +927,7 @@ def map_to_worklist(
 
     # Map timestamps → chunk_num and per-chunk time index
     asc_starts = np.array([r.start for r in chunk_index.ranges], dtype=np.float64)
+    asc_ends   = np.array([r.end   for r in chunk_index.ranges], dtype=np.float64)
     asc_chunk_nums = np.array([r.chunk_num for r in chunk_index.ranges], dtype=np.int32)
     asc_time_lens = np.array([r.time_len for r in chunk_index.ranges], dtype=np.int32)
     asc_file_offsets = np.array([r.file_offset for r in chunk_index.ranges], dtype=np.int32)
@@ -929,8 +937,14 @@ def map_to_worklist(
 
     chunk_nums = asc_chunk_nums[chunk_lookup]
     chunk_starts = asc_starts[chunk_lookup]
+    chunk_ends = asc_ends[chunk_lookup]
     chunk_time_lens = asc_time_lens[chunk_lookup]
     chunk_file_offsets = asc_file_offsets[chunk_lookup]
+
+    # Drop observations whose timestamp falls past their assigned chunk's end —
+    # these are in a gap between chunks (missing S3 files) and should remain
+    # null rather than getting a stale value clamped from the wrong chunk.
+    in_range = times <= chunk_ends
 
     # Floor to hour boundary then add file_offset to get the true file position
     time_indices = (
@@ -944,13 +958,13 @@ def map_to_worklist(
     )
 
     return pa.table({
-        "taxon_path": taxon_path_col,
-        "row_idx": row_idx,
-        "chunk_num": chunk_nums,
-        "lat_idx": lat_idx,
-        "lon_idx": lon_idx,
-        "time_idx": time_indices,
-        "elevation": elevation,
+        "taxon_path": taxon_path_col.filter(in_range),
+        "row_idx": row_idx[in_range],
+        "chunk_num": chunk_nums[in_range],
+        "lat_idx": lat_idx[in_range],
+        "lon_idx": lon_idx[in_range],
+        "time_idx": time_indices[in_range],
+        "elevation": elevation[in_range],
     })
 
 
@@ -1133,6 +1147,7 @@ def process_chunk(
             rows_slice = rows_slice[lag_keep]
             if corr_slice is not None:
                 corr_slice = corr_slice[lag_keep]
+        pre_era5 = chunk_entry.start < _ERA5_MIN_TS
         for tpath in np.unique(paths_slice):
             mask = paths_slice == tpath
             row_ids = rows_slice[mask]
@@ -1145,10 +1160,17 @@ def process_chunk(
                     np.divide(sums, cnts, out=values, where=cnts > 0)
                     if corr_slice is not None:
                         values = values + corr_slice
+                v = values[mask]
+                r = row_ids
+                if not pre_era5:
+                    # For modern data, NaN means no coverage yet (e.g. S3 gap).
+                    # Leave null so the row is retried when data becomes available.
+                    finite = np.isfinite(v)
+                    if not finite.any():
+                        continue
+                    r, v = r[finite], v[finite]
                 col = f"{variable}_{agg_mode}_{hours}h"
-                updates.setdefault(str(tpath), {}).setdefault(col, []).append(
-                    (row_ids, values[mask])
-                )
+                updates.setdefault(str(tpath), {}).setdefault(col, []).append((r, v))
 
     return updates, new_tail
 

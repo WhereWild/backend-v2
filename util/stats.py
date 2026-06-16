@@ -23,6 +23,7 @@ import math
 import os
 import pickle
 import random
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -793,7 +794,8 @@ def _nominal_cat_entries(layer_id: str, layer: dict, counts: Counter, summary: d
     # Add zero entries for all legend classes not observed, so every class
     # appears in the rank index and search results include this taxon when
     # sorting by that class ascending.
-    legend_path = Path("config/gis/legends") / f"{layer_id}_legend.json"
+    base_id = re.sub(r'_(avg|sum|mode|mean|min|max)_\d+h$', '', layer_id)
+    legend_path = Path("config/gis/legends") / f"{base_id}_legend.json"
     if legend_path.exists():
         try:
             known_ids = {int(c["id"]) for c in json.loads(legend_path.read_text()).get("classes", [])}

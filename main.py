@@ -1408,8 +1408,9 @@ def get_species_environment_slice(
     if max_value < min_value and not circular_wrap:
         min_value, max_value = max_value, min_value
     # Convert display-unit min/max back to raw (metric) values for querying.
-    raw_min = units.convert_value_from_display(min_value, layer, unit_system)
-    raw_max = units.convert_value_from_display(max_value, layer, unit_system)
+    # Add a tiny epsilon buffer to absorb float round-trip error (ft→m→ft→m loses ~1e-13).
+    raw_min = units.convert_value_from_display(min_value, layer, unit_system) - 1e-9
+    raw_max = units.convert_value_from_display(max_value, layer, unit_system) + 1e-9
     filter_col = _location_filter_col(location) if location is not None else None
     if location is None or filter_col is not None:
         observations = _slice_from_raw_occ(

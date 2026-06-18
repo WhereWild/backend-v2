@@ -141,7 +141,11 @@ def _collect_synonymy(csv_path: Path) -> tuple[
     as a search alias for entries whose synonym name is "Escobaria chlorantha".
     """
     genus_synonym_map: dict[str, set[str]] = defaultdict(set)
-    old_to_new_genus: dict[str, str] = {}   # "Escobaria" → "Pelecyphora"
+    # Per-entry genus rename: ekey → (old_genus, new_genus).
+    # Scoped per accepted entry rather than global so that an unrelated rename
+    # (e.g. Opuntia colubrina → Salmonopuntia) does not pollute alias synthesis
+    # for other entries that share the same old genus name but weren't renamed.
+    entry_genus_rename: dict[str, tuple[str, str]] = {}
     pending_syn_keys: dict[str, list[str]] = defaultdict(list)
     pending_syn_names_raw: dict[str, list[str]] = defaultdict(list)
 
@@ -161,10 +165,9 @@ def _collect_synonymy(csv_path: Path) -> tuple[
                 sci_parts = row["scientificName"].split()
                 accepted_genus = row["genus"]
 
-                if sci_parts and sci_parts[0] != accepted_genus and row.get("genusKey"):
-                    old_genus = sci_parts[0]
-                    genus_synonym_map[row["genusKey"]].add(old_genus)
-                    old_to_new_genus[old_genus] = accepted_genus
+                genus_renamed = sci_parts and sci_parts[0] != accepted_genus
+                if genus_renamed and row.get("genusKey"):
+                    genus_synonym_map[row["genusKey"]].add(sci_parts[0])
 
                 if row_taxon_key != species_key:
                     syn_name = clean_name(row["scientificName"], row["taxonRank"])
@@ -172,12 +175,16 @@ def _collect_synonymy(csv_path: Path) -> tuple[
                     pending_syn_keys[species_key].append(row_taxon_key)
                     if syn_name:
                         pending_syn_names_raw[species_key].append(syn_name)
+                    if genus_renamed:
+                        entry_genus_rename[species_key] = (sci_parts[0], accepted_genus)
                     # Also the subspecies when acceptedTaxonKey ≠ speciesKey
                     # (e.g. Escobaria chlorantha → Pelecyphora dasyacantha subsp. dasyacantha)
                     if accepted_taxon_key and accepted_taxon_key != species_key:
                         pending_syn_keys[accepted_taxon_key].append(row_taxon_key)
                         if syn_name:
                             pending_syn_names_raw[accepted_taxon_key].append(syn_name)
+                        if genus_renamed:
+                            entry_genus_rename[accepted_taxon_key] = (sci_parts[0], accepted_genus)
 
             elif row["taxonRank"] in CONFIG.subspecies_equivalents:
                 sci_parts = row["scientificName"].split()
@@ -186,23 +193,29 @@ def _collect_synonymy(csv_path: Path) -> tuple[
                     old_name = clean_name(row["scientificName"], row["taxonRank"])
                     if old_name:
                         pending_syn_names_raw[row_taxon_key].append(old_name)
+                        entry_genus_rename[row_taxon_key] = (sci_parts[0], accepted_genus)
 
-    # Synthesise genus-renamed aliases using the genus map we just built.
-    # "Escobaria_chlorantha" → also add "Pelecyphora_chlorantha" so searching
-    # the new-genus form of an old name still finds the accepted taxon.
+    # Synthesise genus-renamed aliases — but only for entries where the rename
+    # was actually detected, and only for synonym names that start with that
+    # entry's specific old genus.  A global rename map would incorrectly create
+    # e.g. "Salmonopuntia_tortispina" for Opuntia macrorhiza just because an
+    # unrelated "Opuntia colubrina → Salmonopuntia" row exists in the CSV.
     pending_syn_names: dict[str, list[str]] = defaultdict(list)
     for ekey, raw_names in pending_syn_names_raw.items():
+        rename = entry_genus_rename.get(ekey)  # (old_g, new_g) or None
         seen: set[str] = set()
         for name in raw_names:
             if name not in seen:
                 pending_syn_names[ekey].append(name)
                 seen.add(name)
-            parts = name.split("_")
-            if parts and parts[0] in old_to_new_genus:
-                renamed = "_".join([old_to_new_genus[parts[0]]] + parts[1:])
-                if renamed not in seen:
-                    pending_syn_names[ekey].append(renamed)
-                    seen.add(renamed)
+            if rename:
+                old_g, new_g = rename
+                parts = name.split("_")
+                if parts and parts[0] == old_g:
+                    renamed = "_".join([new_g] + parts[1:])
+                    if renamed not in seen:
+                        pending_syn_names[ekey].append(renamed)
+                        seen.add(renamed)
 
     return dict(genus_synonym_map), dict(pending_syn_keys), dict(pending_syn_names)
 
@@ -321,9 +334,12 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
             existing: set[str] = set(genus_entry.get("genus_synonym_names") or [])
             genus_entry["genus_synonym_names"] = sorted(existing | old_names)
 
-    # Propagate species synonym names down to infra-specific children so that
-    # searching an old species name (e.g. "Escobaria chlorantha") also surfaces
-    # all subspecies/varieties under the accepted species.
+    # Propagate species synonym names down to infra-specific children, but ONLY
+    # when the parent species had a genus rename (i.e. at least one synonym name
+    # starts with a different genus than the parent's own genus).  This covers
+    # the Escobaria→Pelecyphora case (chlorantha aliases reach all dasyacantha
+    # subspecies) while avoiding noise for within-genus synonyms like
+    # "Opuntia tortispina → Opuntia macrorhiza" surfacing every macrorhiza variety.
     path_to_key = {t["path"]: k for k, t in catalog.items()}
     for key, taxon in catalog.items():
         if (taxon.get("rank") or "").upper() not in INFRA_RANKS:
@@ -334,8 +350,13 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
         parent_key = path_to_key.get(path.rsplit("/", 1)[0])
         if not parent_key:
             continue
-        parent_syn_names = catalog[parent_key].get("gbif_synonym_names") or []
+        parent = catalog[parent_key]
+        parent_syn_names = parent.get("gbif_synonym_names") or []
         if not parent_syn_names:
+            continue
+        # Detect genus rename: any synonym starts with a different genus than parent
+        parent_genus = (parent.get("scientific_name") or "").split("_")[0]
+        if not any(n.split("_")[0] != parent_genus for n in parent_syn_names if n):
             continue
         existing_names: list = taxon.setdefault("gbif_synonym_names", [])
         for syn_name in parent_syn_names:

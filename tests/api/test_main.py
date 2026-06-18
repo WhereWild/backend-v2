@@ -1637,7 +1637,8 @@ def test_ranking_options_returns_options(tmp_path, monkeypatch):
          patch.object(tiles, "load_layers", return_value=[
              {"id": "bio1", "display_name": "Temperature"},
              {"id": "bio12", "display_name": "Precipitation"},
-         ]):
+         ]), \
+         patch.object(main_module, "_load_legend", return_value=[{"id": 0, "name": "Dry"}]):
         r = client.get("/api/taxa/ranking-options?within_taxon=2923970&descendant_rank=SPECIES")
     assert r.status_code == 200
     body = r.json()

@@ -90,7 +90,7 @@ _REQUIRED_COLS = ("decimalLatitude", "decimalLongitude", "catalogNumber", "hilbe
 
 _LEGENDS_DIR = Path("config/gis/legends")
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _valid_class_ids(layer_id: str) -> frozenset[int] | None:
     """Return valid class IDs from the legend file, or None if no legend exists."""
     base_id = re.sub(r'_(avg|sum|mode|mean|min|max)_\d+h$', '', layer_id)

@@ -1146,14 +1146,14 @@ def propagate_images(catalog: dict) -> int:
 
     by_depth = sorted(catalog.keys(), key=lambda k: catalog[k]["path"].count("/"), reverse=True)
 
-    _INAT_IMG_FIELDS = (
+    inat_img_fields = (
         "inat_preferred_image",
         "inat_preferred_image_license",
         "inat_preferred_image_creator",
         "inat_preferred_image_attribution",
         "inat_preferred_image_references",
     )
-    _GBIF_IMG_FIELDS = (
+    gbif_img_fields = (
         "gbif_backup_image",
         "gbif_backup_image_license",
         "gbif_backup_image_creator",
@@ -1171,13 +1171,13 @@ def propagate_images(catalog: dict) -> int:
         for child_key in child_keys:
             child = catalog[child_key]
             if _clean(child.get("inat_preferred_image")):
-                inherited = {f: child.get(f, "") for f in _INAT_IMG_FIELDS}
+                inherited = {f: child.get(f, "") for f in inat_img_fields}
                 break
         if inherited is None:
             for child_key in child_keys:
                 child = catalog[child_key]
                 if _clean(child.get("gbif_backup_image")):
-                    inherited = {f: child.get(f, "") for f in _GBIF_IMG_FIELDS}
+                    inherited = {f: child.get(f, "") for f in gbif_img_fields}
                     break
         if inherited:
             taxon.update(inherited)

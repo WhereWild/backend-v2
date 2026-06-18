@@ -67,18 +67,18 @@ MIN_RANKING_SAMPLES = 10  # taxa with fewer observations for a variable are excl
 
 
 _POSITION_SCHEMA = pa.schema([
-    pa.field("taxon_key", pa.string()),
-    pa.field("variable", pa.string()),
-    pa.field("metric", pa.string()),
+    pa.field("taxon_key", pa.large_string()),
+    pa.field("variable", pa.large_string()),
+    pa.field("metric", pa.large_string()),
     pa.field("position", pa.int32()),
     pa.field("count", pa.int32()),
     pa.field("sampleCount", pa.int32()),
-    pa.field("contextTaxonId", pa.string()),
-    pa.field("contextLabel", pa.string()),
+    pa.field("contextTaxonId", pa.large_string()),
+    pa.field("contextLabel", pa.large_string()),
 ])
 
 _STRUCT_FIELDS = [
-    pa.field("taxonKey", pa.string()),
+    pa.field("taxonKey", pa.large_string()),
     pa.field("value", pa.float64()),
     pa.field("sampleCount", pa.int64()),
 ]
@@ -764,7 +764,7 @@ def _build_rank_index(
             max_len = max(max_len, n)
             arrays[col_key] = pa.StructArray.from_arrays(
                 [
-                    pa.array(sorted_tks, type=pa.string()),
+                    pa.array(sorted_tks, type=pa.large_string()),
                     pa.array(val_np[order], type=pa.float64()),
                     pa.array(sorted_scs, type=pa.int64()),
                 ],
@@ -805,7 +805,7 @@ def _build_rank_index(
             max_len = max(max_len, n)
             arrays[col_key] = pa.StructArray.from_arrays(
                 [
-                    pa.array([e[0] for e in entries], type=pa.string()),
+                    pa.array([e[0] for e in entries], type=pa.large_string()),
                     pa.array([e[1] for e in entries], type=pa.float64()),
                     pa.array([e[2] for e in entries], type=pa.int64()),
                 ],
@@ -835,14 +835,14 @@ def _build_rank_index(
         del pos_pos_chunks, pos_cnt_chunks, pos_sc_chunks
         n_pos = len(pos_tks)
         pos_table = pa.table({
-            "taxon_key":     pa.array(pos_tks,  type=pa.string()),
-            "variable":      pa.array(pos_vars, type=pa.string()),
-            "metric":        pa.array(pos_mets, type=pa.string()),
+            "taxon_key":     pa.array(pos_tks,  type=pa.large_string()),
+            "variable":      pa.array(pos_vars, type=pa.large_string()),
+            "metric":        pa.array(pos_mets, type=pa.large_string()),
             "position":      pa.array(all_pos),
             "count":         pa.array(all_cnt),
             "sampleCount":   pa.array(all_sc),
-            "contextTaxonId": pa.array([context_taxon_id] * n_pos, type=pa.string()),
-            "contextLabel":   pa.array([context_label]    * n_pos, type=pa.string()),
+            "contextTaxonId": pa.array([context_taxon_id] * n_pos, type=pa.large_string()),
+            "contextLabel":   pa.array([context_label]    * n_pos, type=pa.large_string()),
         }, schema=_POSITION_SCHEMA)
         del pos_tks, pos_vars, pos_mets, all_pos, all_cnt, all_sc
         # Sort by taxon_key so consolidation can merge-sort efficiently.

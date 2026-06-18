@@ -125,26 +125,120 @@ def clean_name(name: str, rank: str) -> str:
     return name.replace(" ", "_")
 
 
-def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]:
-    """Parse species list CSV and return (catalog, combined_name_index)."""
-    catalog: dict = {}
-    scientific_index: dict = {}
-    common_index: defaultdict = defaultdict(set)
-    # genus_key -> set of old genus names that were merged into it
-    _genus_synonym_map: dict[str, set[str]] = defaultdict(set)
+def _collect_synonymy(csv_path: Path) -> tuple[
+    dict[str, set[str]],   # genus_key → {old_genus_names}
+    dict[str, list[str]],  # accepted_entry_key → [old_taxon_keys]
+    dict[str, list[str]],  # accepted_entry_key → [old_sci_names (including genus-renamed aliases)]
+]:
+    """First CSV pass: collect all synonym relationships.
+
+    Separating collection from catalog construction means ACCEPTED rows that
+    overwrite catalog entries can never wipe synonym data collected from earlier
+    SYNONYM rows — the two concerns no longer race.
+
+    Also synthesises genus-renamed aliases: since we learn "Escobaria → Pelecyphora"
+    from the genus-merge rows, we can additionally index "Pelecyphora chlorantha"
+    as a search alias for entries whose synonym name is "Escobaria chlorantha".
+    """
+    genus_synonym_map: dict[str, set[str]] = defaultdict(set)
+    old_to_new_genus: dict[str, str] = {}   # "Escobaria" → "Pelecyphora"
+    pending_syn_keys: dict[str, list[str]] = defaultdict(list)
+    pending_syn_names_raw: dict[str, list[str]] = defaultdict(list)
+
+    _filters_ok = _csv_row_filters  # local alias for the shared filter logic
 
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter=TSV_DELIMITER)
         for row in reader:
-            if row["taxonRank"] not in CONFIG.leaf_rank_set:
+            if not _filters_ok(row):
                 continue
-            if row["taxonRank"] == CONFIG.species_rank and len(row["scientificName"].split()) < 2:
+
+            row_taxon_key = str(row["taxonKey"])
+
+            if row["taxonRank"] == CONFIG.species_rank:
+                species_key = str(row.get("speciesKey") or "")
+                accepted_taxon_key = str(row.get("acceptedTaxonKey") or "")
+                sci_parts = row["scientificName"].split()
+                accepted_genus = row["genus"]
+
+                if sci_parts and sci_parts[0] != accepted_genus and row.get("genusKey"):
+                    old_genus = sci_parts[0]
+                    genus_synonym_map[row["genusKey"]].add(old_genus)
+                    old_to_new_genus[old_genus] = accepted_genus
+
+                if row_taxon_key != species_key:
+                    syn_name = clean_name(row["scientificName"], row["taxonRank"])
+                    # Primary: parent species entry
+                    pending_syn_keys[species_key].append(row_taxon_key)
+                    if syn_name:
+                        pending_syn_names_raw[species_key].append(syn_name)
+                    # Also the subspecies when acceptedTaxonKey ≠ speciesKey
+                    # (e.g. Escobaria chlorantha → Pelecyphora dasyacantha subsp. dasyacantha)
+                    if accepted_taxon_key and accepted_taxon_key != species_key:
+                        pending_syn_keys[accepted_taxon_key].append(row_taxon_key)
+                        if syn_name:
+                            pending_syn_names_raw[accepted_taxon_key].append(syn_name)
+
+            elif row["taxonRank"] in CONFIG.subspecies_equivalents:
+                sci_parts = row["scientificName"].split()
+                accepted_genus = row["genus"]
+                if sci_parts and sci_parts[0] != accepted_genus:
+                    old_name = clean_name(row["scientificName"], row["taxonRank"])
+                    if old_name:
+                        pending_syn_names_raw[row_taxon_key].append(old_name)
+
+    # Synthesise genus-renamed aliases using the genus map we just built.
+    # "Escobaria_chlorantha" → also add "Pelecyphora_chlorantha" so searching
+    # the new-genus form of an old name still finds the accepted taxon.
+    pending_syn_names: dict[str, list[str]] = defaultdict(list)
+    for ekey, raw_names in pending_syn_names_raw.items():
+        seen: set[str] = set()
+        for name in raw_names:
+            if name not in seen:
+                pending_syn_names[ekey].append(name)
+                seen.add(name)
+            parts = name.split("_")
+            if parts and parts[0] in old_to_new_genus:
+                renamed = "_".join([old_to_new_genus[parts[0]]] + parts[1:])
+                if renamed not in seen:
+                    pending_syn_names[ekey].append(renamed)
+                    seen.add(renamed)
+
+    return dict(genus_synonym_map), dict(pending_syn_keys), dict(pending_syn_names)
+
+
+def _csv_row_filters(row: dict) -> bool:
+    """Shared row-filter predicate used by both CSV passes in build_catalog."""
+    if row["taxonRank"] not in CONFIG.leaf_rank_set:
+        return False
+    if row["taxonRank"] == CONFIG.species_rank and len(row["scientificName"].split()) < 2:
+        return False
+    if not row.get("genus") or not row.get("genusKey"):
+        return False
+    if row["taxonRank"] in CONFIG.subspecies_equivalents:
+        if not row.get("species") or not row.get("speciesKey"):
+            return False
+    return True
+
+
+def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]:
+    """Parse species list CSV and return (catalog, combined_name_index).
+
+    Uses two passes over the CSV: the first collects all synonym relationships
+    so that row ordering cannot cause ACCEPTED rows to silently discard synonym
+    data; the second builds the catalog entries using that complete picture.
+    """
+    genus_synonym_map, pending_syn_keys, pending_syn_names = _collect_synonymy(csv_path)
+
+    catalog: dict = {}
+    scientific_index: dict = {}
+    common_index: defaultdict = defaultdict(set)
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter=TSV_DELIMITER)
+        for row in reader:
+            if not _csv_row_filters(row):
                 continue
-            if not row.get("genus") or not row.get("genusKey"):
-                continue
-            if row["taxonRank"] in CONFIG.subspecies_equivalents:
-                if not row.get("species") or not row.get("speciesKey"):
-                    continue
 
             path_parts = []
             rel_path = ""
@@ -166,14 +260,12 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
 
             cleaned_name = clean_name(row["acceptedScientificName"], row["taxonRank"])
             taxon_key_to_write = row["taxonKey"]
-            synonym_sci_name: str | None = None  # old name to store for search
 
             if row["taxonRank"] in CONFIG.subspecies_equivalents:
                 sci_parts = row["scientificName"].split()
                 accepted_genus = row["genus"]
                 if sci_parts and sci_parts[0] != accepted_genus:
-                    # Genus rename: "Escobaria vivipara var. X" → "Pelecyphora vivipara var. X"
-                    synonym_sci_name = clean_name(row["scientificName"], row["taxonRank"])
+                    # Rename variety to use accepted genus in both name and path
                     sci_parts[0] = accepted_genus
                     cleaned_name = clean_name(" ".join(sci_parts), row["taxonRank"])
                 else:
@@ -182,11 +274,6 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
                 rel_path = "/".join(path_parts)
             elif row["taxonRank"] == CONFIG.species_rank:
                 taxon_key_to_write = row["speciesKey"]
-                # Detect genus rename from synonym species rows
-                sci_parts = row["scientificName"].split()
-                accepted_genus = row["genus"]
-                if sci_parts and sci_parts[0] != accepted_genus and row.get("genusKey"):
-                    _genus_synonym_map[row["genusKey"]].add(sci_parts[0])
 
             if write_dirs:
                 (TREE_ROOT / Path(*path_parts)).mkdir(parents=True, exist_ok=True)
@@ -201,28 +288,6 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
                 "rank": row["taxonRank"],
             }
 
-            # When taxonKey differs from the key we write under (synonym / reclassified
-            # species), preserve the original taxonKey as an alternate lookup key.  GBIF
-            # backbone vernacular names and older occurrence records may still be indexed
-            # under the synonym key (e.g. Escobaria vivipara → 3084514 while the accepted
-            # Pelecyphora vivipara → 11498251).
-            row_taxon_key = str(row["taxonKey"])
-            if row_taxon_key != entry_key:
-                alt_keys: list = catalog[entry_key].setdefault("gbif_synonym_keys", [])
-                if row_taxon_key not in alt_keys:
-                    alt_keys.append(row_taxon_key)
-                # Also store the synonym scientific name for search indexing.
-                syn_name = synonym_sci_name or clean_name(row["scientificName"], row["taxonRank"])
-                if syn_name:
-                    syn_names: list = catalog[entry_key].setdefault("gbif_synonym_names", [])
-                    if syn_name not in syn_names:
-                        syn_names.append(syn_name)
-            elif synonym_sci_name:
-                # Variety renamed in-place (same key): store old name as synonym for search.
-                syn_names = catalog[entry_key].setdefault("gbif_synonym_names", [])
-                if synonym_sci_name not in syn_names:
-                    syn_names.append(synonym_sci_name)
-
             scientific_name_key = _normalize_index_key(cleaned_name)
             if scientific_name_key:
                 scientific_index[scientific_name_key] = taxon_key_to_write
@@ -231,12 +296,51 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
             if common_name_key:
                 common_index[common_name_key].add(taxon_key_to_write)
 
-    # Apply detected genus synonymy to the genus catalog entries.
-    for genus_key, old_names in _genus_synonym_map.items():
+    # Apply all synonym data collected in pass 1.
+    for ekey, keys in pending_syn_keys.items():
+        entry = catalog.get(ekey)
+        if not entry:
+            continue
+        existing_keys: list = entry.setdefault("gbif_synonym_keys", [])
+        for k in keys:
+            if k not in existing_keys:
+                existing_keys.append(k)
+    for ekey, names in pending_syn_names.items():
+        entry = catalog.get(ekey)
+        if not entry:
+            continue
+        existing_names: list = entry.setdefault("gbif_synonym_names", [])
+        for n in names:
+            if n not in existing_names:
+                existing_names.append(n)
+
+    # Apply genus synonymy to genus catalog entries.
+    for genus_key, old_names in genus_synonym_map.items():
         genus_entry = catalog.get(str(genus_key))
         if genus_entry:
             existing: set[str] = set(genus_entry.get("genus_synonym_names") or [])
             genus_entry["genus_synonym_names"] = sorted(existing | old_names)
+
+    # Propagate species synonym names down to infra-specific children so that
+    # searching an old species name (e.g. "Escobaria chlorantha") also surfaces
+    # all subspecies/varieties under the accepted species.
+    path_to_key = {t["path"]: k for k, t in catalog.items()}
+    for key, taxon in catalog.items():
+        if (taxon.get("rank") or "").upper() not in INFRA_RANKS:
+            continue
+        path = taxon.get("path") or ""
+        if "/" not in path:
+            continue
+        parent_key = path_to_key.get(path.rsplit("/", 1)[0])
+        if not parent_key:
+            continue
+        parent_syn_names = catalog[parent_key].get("gbif_synonym_names") or []
+        if not parent_syn_names:
+            continue
+        existing_names: list = taxon.setdefault("gbif_synonym_names", [])
+        for syn_name in parent_syn_names:
+            if syn_name not in existing_names:
+                existing_names.append(syn_name)
 
     common_index_sorted = {k: sorted(v) for k, v in common_index.items()}
     combined_index: dict = {k: {v} for k, v in scientific_index.items()}
@@ -540,6 +644,46 @@ def resolve_species_synonym_ids(catalog: dict, dwca_bytes: bytes) -> int:
             continue
         for syn_name in (taxon.get("gbif_synonym_names") or []):
             syn_inat_id = inat_species_ids.get(normalize_name(syn_name.replace("_", " ")))
+            if syn_inat_id:
+                taxon["inat_id"] = syn_inat_id
+                updated += 1
+                break
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b-3: Infra-specific synonym iNat ID resolution
+# ---------------------------------------------------------------------------
+
+def resolve_subspecies_synonym_ids(catalog: dict, dwca_bytes: bytes) -> int:
+    """For varieties/subspecies with gbif_synonym_names and no inat_id, try synonym matching.
+
+    Genus-renamed infra-specific taxa (e.g. Pelecyphora vivipara var. neomexicana,
+    renamed from Escobaria vivipara var. neomexicana) can't be found by build_mapping
+    because iNat still uses the old genus name.  gbif_synonym_names always lists the
+    old-genus name first (before the synthesised new-genus alias), so the first hit
+    will be the one iNat actually knows about.
+    """
+    inat_infra_ids: dict[str, str] = {}
+    zf = zipfile.ZipFile(io.BytesIO(dwca_bytes))
+    with io.TextIOWrapper(zf.open(INAT_TAXA_FILENAME), encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            rank = (row.get("taxonRank") or "").strip().upper()
+            if rank not in INFRA_RANKS:
+                continue
+            name = normalize_name(row.get("scientificName") or "")
+            inat_id = (row.get("id") or "").strip()
+            if name and inat_id:
+                inat_infra_ids[name] = inat_id
+
+    updated = 0
+    for taxon_key, taxon in catalog.items():
+        if _clean(taxon.get("inat_id")):
+            continue
+        if (taxon.get("rank") or "").upper() not in INFRA_RANKS:
+            continue
+        for syn_name in (taxon.get("gbif_synonym_names") or []):
+            syn_inat_id = inat_infra_ids.get(normalize_name(syn_name.replace("_", " ")))
             if syn_inat_id:
                 taxon["inat_id"] = syn_inat_id
                 updated += 1
@@ -1194,6 +1338,8 @@ def main() -> None:
     print(f"Inferred inat_id for {inferred:,} additional species from children.")
     species_syn_resolved = resolve_species_synonym_ids(catalog, dwca_bytes)
     print(f"Resolved inat_id for {species_syn_resolved:,} species via synonym name matching.")
+    infra_syn_resolved = resolve_subspecies_synonym_ids(catalog, dwca_bytes)
+    print(f"Resolved inat_id for {infra_syn_resolved:,} infra-specific taxa via synonym name matching.")
     syn_ids_resolved = resolve_genus_synonym_ids(catalog, dwca_bytes)
     print(f"Resolved {syn_ids_resolved:,} inat_synonym_ids for genus nodes with synonym genera.")
 

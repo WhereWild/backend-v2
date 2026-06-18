@@ -207,7 +207,7 @@ def _image_fields(taxon: dict) -> dict:
     }
 
 
-_VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "categorical", "ordinal": "categorical"}
+_VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "categorical", "ordinal": "ordinal"}
 
 
 @app.get("/")
@@ -410,7 +410,7 @@ def list_variables(unit_system: str | None = Query(None)):
     for layer, category in tiles.load_layers_with_category():
         value_type = _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous")
         legend_classes = None
-        if value_type == "categorical":
+        if value_type in ("categorical", "ordinal"):
             raw = _load_legend(layer["id"])
             if raw:
                 legend_classes = [
@@ -1488,7 +1488,7 @@ def get_species_environment_class_samples(
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
         raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
-    if layer.get("value_type") != "nominal":
+    if layer.get("value_type") not in ("nominal", "ordinal"):
         raise HTTPException(status_code=400, detail="Numerical variables must use the slice endpoint")
     try:
         parsed: float | int = float(class_value)

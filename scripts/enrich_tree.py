@@ -87,6 +87,21 @@ _BASE_COLS = frozenset([
 ])
 _REQUIRED_COLS = ("decimalLatitude", "decimalLongitude", "catalogNumber", "hilbertIdx")
 
+_LEGENDS_DIR = Path("config/gis/legends")
+
+@functools.lru_cache(maxsize=None)
+def _valid_class_ids(layer_id: str) -> frozenset[int] | None:
+    """Return valid class IDs from the legend file, or None if no legend exists."""
+    base_id = re.sub(r'_(avg|sum|mode|mean|min|max)_\d+h$', '', layer_id)
+    legend_path = _LEGENDS_DIR / f"{base_id}_legend.json"
+    if not legend_path.exists():
+        return None
+    try:
+        classes = json.loads(legend_path.read_text()).get("classes", [])
+        return frozenset(int(c["id"]) for c in classes if "id" in c)
+    except Exception:
+        return None
+
 
 def _load_layers() -> list[dict]:
     with open(CATALOG_PATH) as f:
@@ -349,6 +364,13 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
             scale = layer.get("scale_factor") or 1.0
             offset = layer.get("add_offset") or 0.0
             vals = _sample_cog_batch(cog_path, layer_id, lats[arr], lons[arr], scale, offset)
+            vtype = layer.get("value_type", "")
+            if vtype in ("nominal", "ordinal"):
+                valid = _valid_class_ids(layer_id)
+                if valid is not None:
+                    finite = np.isfinite(vals)
+                    int_vals = np.where(finite, np.rint(vals).astype(np.int64), 0)
+                    vals[finite & ~np.isin(int_vals, np.array(sorted(valid), dtype=np.int64))] = np.nan
 
         full = np.full(len(lats), np.nan, dtype=np.float64)
         full[arr] = vals

@@ -121,6 +121,15 @@ def _descendant_rank_targets(ancestor_rank: str) -> list[str]:
 # excluded from relative_ranks_positions.parquet for circular variables only.
 _CIRCULAR_ANGULAR_METRICS: frozenset[str] = frozenset({"circular_mean", "mode"})
 
+# Metrics excluded from ranking for nominal/ordinal variables.
+# Ordinal percentiles are ordinal-scale class IDs — numeric ordering is meaningful
+# within a variable but not comparable across taxa.  Mode is a class ID too.
+_NOMINAL_SKIP_RANK_METRICS: frozenset[str] = frozenset({"mode"})
+_ORDINAL_SKIP_RANK_METRICS: frozenset[str] = frozenset({
+    "mode",
+    "10th_percentile", "25th_percentile", "median", "75th_percentile", "90th_percentile",
+})
+
 
 def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
     """Return rankable metric names for a value type.
@@ -275,9 +284,9 @@ def preload_stats_cache(layers: list[dict]) -> None:
     _stats_cache = {}
     layer_by_id = {lay["id"]: lay for lay in layers}
     nominal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.NOMINAL}
-    nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL])
+    nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL]) - _NOMINAL_SKIP_RANK_METRICS
     ordinal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.ORDINAL}
-    ordinal_metrics = set(METRICS_BY_TYPE[ValueType.ORDINAL])
+    ordinal_metrics = set(METRICS_BY_TYPE[ValueType.ORDINAL]) - _ORDINAL_SKIP_RANK_METRICS
 
     ratio_interval_ids: set[str] = set()
     circular_ids: set[str] = set()
@@ -502,7 +511,7 @@ def _collect_entries_from_nominal_stats(
         return {}
 
     nominal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.NOMINAL}
-    nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL])
+    nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL]) - _NOMINAL_SKIP_RANK_METRICS
     entries: dict[str, dict[str, Any]] = {}
 
     # Build per-variable total_samples lookup for threshold filtering
@@ -547,7 +556,7 @@ def _collect_entries_from_ordinal_stats(
         return {}
 
     ordinal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.ORDINAL}
-    ordinal_metrics = set(METRICS_BY_TYPE[ValueType.ORDINAL])
+    ordinal_metrics = set(METRICS_BY_TYPE[ValueType.ORDINAL]) - _ORDINAL_SKIP_RANK_METRICS
     entries: dict[str, dict[str, Any]] = {}
 
     var_totals: dict[str, int] = {}

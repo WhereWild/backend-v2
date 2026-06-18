@@ -3,15 +3,6 @@
   "source": "GLC_FCS30D v2 (Liu et al. 2025 / Zenodo 15063683)",
   "classes": [
     {
-      "id": 0,
-      "name": "Filled value",
-      "group": "filled",
-      "group_label": "Filled",
-      "traits": {
-        "color": "#FFFFFF"
-      }
-    },
-    {
       "id": 10,
       "name": "Rainfed cropland",
       "group": "cropland",
@@ -354,15 +345,6 @@
       "name": "Permanent ice and snow",
       "group": "ice_snow",
       "group_label": "Ice and Snow",
-      "traits": {
-        "color": "#FFFFFF"
-      }
-    },
-    {
-      "id": 250,
-      "name": "Filled value",
-      "group": "filled",
-      "group_label": "Filled",
       "traits": {
         "color": "#FFFFFF"
       }

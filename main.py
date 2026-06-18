@@ -1579,6 +1579,8 @@ def list_taxa_ranking_options(
             continue
         if metric.startswith("class_"):
             label = _class_label(variable, metric)
+            if label == metric:
+                continue
         else:
             label = _METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize())
         options.append({

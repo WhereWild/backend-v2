@@ -116,6 +116,33 @@ def _layer_value_type(layer: dict) -> ValueType | None:
         return None
 
 
+_legend_valid_ids_cache: dict[str, frozenset[int] | None] = {}
+
+def _valid_class_ids(layer_id: str) -> frozenset[int] | None:
+    """Return the set of valid class IDs from the legend file, or None if no legend exists."""
+    if layer_id in _legend_valid_ids_cache:
+        return _legend_valid_ids_cache[layer_id]
+    base_id = re.sub(r'_(avg|sum|mode|mean|min|max)_\d+h$', '', layer_id)
+    legend_path = Path("config/gis/legends") / f"{base_id}_legend.json"
+    result: frozenset[int] | None = None
+    if legend_path.exists():
+        try:
+            classes = json.loads(legend_path.read_text()).get("classes", [])
+            result = frozenset(int(c["id"]) for c in classes if "id" in c)
+        except Exception:
+            pass
+    _legend_valid_ids_cache[layer_id] = result
+    return result
+
+
+def _filter_to_known_classes(counts: Counter, layer_id: str) -> Counter:
+    """Remove class IDs not present in the legend. Returns counts unchanged if no legend."""
+    valid = _valid_class_ids(layer_id)
+    if valid is None:
+        return counts
+    return Counter({k: v for k, v in counts.items() if k in valid})
+
+
 def _is_discrete(layer: dict) -> bool:
     return layer.get("domain") == "discrete"
 
@@ -241,18 +268,18 @@ def _df_to_acc(df: pd.DataFrame, layer_meta: dict[str, dict]) -> dict:
                 series = df[col].dropna()
                 if series.empty:
                     continue
-                acc["nominal"][col] = {
-                    "counts": Counter(int(float(v)) for v in series),
-                    "unique": _col_unique(col),
-                }
+                counts_n = _filter_to_known_classes(Counter(int(float(v)) for v in series), col)
+                if not counts_n:
+                    continue
+                acc["nominal"][col] = {"counts": counts_n, "unique": _col_unique(col)}
             case ValueType.ORDINAL:
                 series = df[col].dropna()
                 if series.empty:
                     continue
-                acc["ordinal"][col] = {
-                    "counts": Counter(int(float(v)) for v in series),
-                    "unique": _col_unique(col),
-                }
+                counts_o = _filter_to_known_classes(Counter(int(float(v)) for v in series), col)
+                if not counts_o:
+                    continue
+                acc["ordinal"][col] = {"counts": counts_o, "unique": _col_unique(col)}
             case ValueType.CIRCULAR:
                 raw = df[col]
                 series = (raw.dropna() if raw.dtype == np.float64
@@ -1089,7 +1116,9 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                 if raw.empty:
                     continue
                 unique = _col_unique(col)
-                raw_counts: Counter = Counter(int(float(v)) for v in raw)
+                raw_counts: Counter = _filter_to_known_classes(Counter(int(float(v)) for v in raw), col)
+                if not raw_counts:
+                    continue
                 summary, _ = _nominal_stats(raw_counts, unique)
                 nominal_entries.extend(_nominal_cat_entries(col, layer, raw_counts, summary))
 
@@ -1098,7 +1127,9 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                 if raw.empty:
                     continue
                 unique = _col_unique(col)
-                ord_counts: Counter = Counter(int(float(v)) for v in raw)
+                ord_counts: Counter = _filter_to_known_classes(Counter(int(float(v)) for v in raw), col)
+                if not ord_counts:
+                    continue
                 stats = _ordinal_stats(ord_counts, unique)
                 if not stats:
                     continue

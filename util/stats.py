@@ -653,8 +653,11 @@ def _gaussian_kde_curve(values: np.ndarray, bounded_at_zero: bool = False) -> di
             area = np.trapezoid(density_fine, x_fine)
             if area > 0:
                 density_fine /= area
-            xs = np.linspace(0.0, max_val, _KDE_N_POINTS)
-            min_val = 0.0
+            # Sample output from actual data minimum, not from 0. The boundary
+            # reflection is a statistical technique on the fine internal grid;
+            # outputting from 0 extends the chart far into unobserved territory
+            # for species with min > 0 (e.g. desert plants with precip >> 0mm).
+            xs = np.linspace(min_val, max_val, _KDE_N_POINTS)
         else:
             x_fine, density_fine = FFTKDE(bw=h).fit(values).evaluate(_FFT_GRID)
             xs = np.linspace(min_val, max_val, _KDE_N_POINTS)

@@ -511,6 +511,43 @@ def resolve_genus_synonym_ids(catalog: dict, dwca_bytes: bytes) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2b-2: Species synonym iNat ID resolution
+# ---------------------------------------------------------------------------
+
+def resolve_species_synonym_ids(catalog: dict, dwca_bytes: bytes) -> int:
+    """For species with gbif_synonym_names and no inat_id, try synonym name matching.
+
+    Unlike genus synonyms (stored as inat_synonym_ids), species synonyms get
+    inat_id directly — the iNat page under the old name IS the taxon's page
+    (e.g. iNat still uses Escobaria vivipara while GBIF says Pelecyphora vivipara).
+    """
+    inat_species_ids: dict[str, str] = {}
+    zf = zipfile.ZipFile(io.BytesIO(dwca_bytes))
+    with io.TextIOWrapper(zf.open(INAT_TAXA_FILENAME), encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            if (row.get("taxonRank") or "").strip().upper() != "SPECIES":
+                continue
+            name = normalize_name(row.get("scientificName") or "")
+            inat_id = (row.get("id") or "").strip()
+            if name and inat_id:
+                inat_species_ids[name] = inat_id
+
+    updated = 0
+    for taxon_key, taxon in catalog.items():
+        if _clean(taxon.get("inat_id")):
+            continue
+        if (taxon.get("rank") or "").upper() != CONFIG.species_rank:
+            continue
+        for syn_name in (taxon.get("gbif_synonym_names") or []):
+            syn_inat_id = inat_species_ids.get(normalize_name(syn_name.replace("_", " ")))
+            if syn_inat_id:
+                taxon["inat_id"] = syn_inat_id
+                updated += 1
+                break
+    return updated
+
+
+# ---------------------------------------------------------------------------
 # Phase 2c: Observation-based iNat ID mapping
 # ---------------------------------------------------------------------------
 
@@ -1155,6 +1192,8 @@ def main() -> None:
     MAPPING_PATH.unlink(missing_ok=True)
     inferred = infer_species_inat_ids(catalog, dwca_bytes)
     print(f"Inferred inat_id for {inferred:,} additional species from children.")
+    species_syn_resolved = resolve_species_synonym_ids(catalog, dwca_bytes)
+    print(f"Resolved inat_id for {species_syn_resolved:,} species via synonym name matching.")
     syn_ids_resolved = resolve_genus_synonym_ids(catalog, dwca_bytes)
     print(f"Resolved {syn_ids_resolved:,} inat_synonym_ids for genus nodes with synonym genera.")
 

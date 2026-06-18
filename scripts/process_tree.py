@@ -40,6 +40,7 @@ from util.stats import (
     GLOBAL_STATS_DIR,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
+    ORDINAL_STATS_FILE,
     PHENOLOGY_COUNTS_FILE,
     TREE_ROOT,
     compute_taxon_stats,
@@ -136,6 +137,7 @@ def _setup() -> tuple[list[dict], dict[str, dict], dict[int, list[TaxonRecord]],
 _STATS_FILES = [
     ("numerical_stats", NUMERICAL_STATS_FILE),
     ("nominal_stats",   NOMINAL_STATS_FILE),
+    ("ordinal_stats",   ORDINAL_STATS_FILE),
     ("circular_stats",  CIRCULAR_STATS_FILE),
     ("density",         DENSITY_FILE),
     # positions handled separately — built inline during rank index pass, merged at consolidation

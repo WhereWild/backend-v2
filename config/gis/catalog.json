@@ -1093,7 +1093,10 @@
           "domain": "continuous",
           "agg": "avg",
           "derived": false,
-          "sources": ["temperature_2m", "dew_point_2m"],
+          "sources": [
+            "temperature_2m",
+            "dew_point_2m"
+          ],
           "filename": null,
           "download_url": null,
           "scale_factor": null,
@@ -1305,8 +1308,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 65.0,
+          "render_min": 2.3,
+          "render_max": 63.3,
           "domain": "continuous"
         },
         {
@@ -1320,8 +1323,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 100.0,
+          "render_min": 0.9,
+          "render_max": 94.5,
           "domain": "continuous"
         },
         {
@@ -1335,8 +1338,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 80.0,
+          "render_min": 2.9,
+          "render_max": 73.5,
           "domain": "continuous"
         },
         {
@@ -1351,7 +1354,7 @@
           "add_offset": 0.0,
           "resampling": "bilinear",
           "render_min": 0.0,
-          "render_max": 60.0,
+          "render_max": 50.9,
           "domain": "continuous"
         },
         {
@@ -1365,8 +1368,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 1.8,
+          "render_min": 0.25,
+          "render_max": 1.7,
           "domain": "continuous"
         },
         {
@@ -1380,8 +1383,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 10.0,
+          "render_min": 0.23,
+          "render_max": 23.5,
           "domain": "continuous"
         },
         {
@@ -1395,8 +1398,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 3.5,
-          "render_max": 10.0,
+          "render_min": 3.8,
+          "render_max": 9.3,
           "domain": "continuous"
         },
         {
@@ -1410,8 +1413,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 60.0,
+          "render_min": 3.2,
+          "render_max": 85.2,
           "domain": "continuous"
         },
         {
@@ -1425,9 +1428,20 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 200.0,
+          "render_min": 1.3,
+          "render_max": 398.8,
           "domain": "continuous"
+        },
+        {
+          "id": "salinity",
+          "source": "isric_salinity",
+          "display_name": "Soil Salinity",
+          "units": "",
+          "value_type": "ordinal",
+          "vrt_url": "https://files.isric.org/public/global_soil_salinity/salmap2016.vrt",
+          "filename": "salinity.tif",
+          "render_min": 0,
+          "render_max": 4
         },
         {
           "id": "wrb",

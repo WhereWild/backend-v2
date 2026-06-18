@@ -346,8 +346,8 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
             if not cog_path.exists():
                 print(f"[warn] {cog_path.name} not found; skipping {layer_id}")
                 return layer_id, np.full(len(lats), np.nan)
-            scale = layer["scale_factor"] if layer["scale_factor"] is not None else 1.0
-            offset = layer["add_offset"] if layer["add_offset"] is not None else 0.0
+            scale = layer.get("scale_factor") or 1.0
+            offset = layer.get("add_offset") or 0.0
             vals = _sample_cog_batch(cog_path, layer_id, lats[arr], lons[arr], scale, offset)
 
         full = np.full(len(lats), np.nan, dtype=np.float64)
@@ -378,8 +378,8 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
             if lid == elev_layer_id:
                 meta = layer_meta.get(lid)
                 if meta and meta.get("filename"):
-                    scale = meta["scale_factor"] if meta["scale_factor"] is not None else 1.0
-                    offset = meta["add_offset"] if meta["add_offset"] is not None else 0.0
+                    scale = meta.get("scale_factor") or 1.0
+                    offset = meta.get("add_offset") or 0.0
                     vals = vals * scale + offset
             full[common_arr] = vals
             out.append((lid, full))

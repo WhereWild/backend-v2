@@ -47,6 +47,7 @@ GLOBAL_STATS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxono
 OCCURRENCE_FILE = "occurrence.parquet"
 NUMERICAL_STATS_FILE = "numerical_stats.parquet"
 NOMINAL_STATS_FILE = "nominal_stats.parquet"
+ORDINAL_STATS_FILE = "ordinal_stats.parquet"
 CIRCULAR_STATS_FILE = "circular_stats.parquet"
 DENSITY_FILE = "density.parquet"
 PHENOLOGY_COUNTS_FILE = "phenology_counts.json"
@@ -197,7 +198,7 @@ _ACC_FILE = ".acc"
 
 def _df_to_acc(df: pd.DataFrame, layer_meta: dict[str, dict]) -> dict:
     """Build an in-memory accumulator dict from a filtered DataFrame."""
-    acc: dict = {"continuous": {}, "circular": {}, "nominal": {}, "pheno": {}}
+    acc: dict = {"continuous": {}, "circular": {}, "nominal": {}, "ordinal": {}, "pheno": {}}
     _total_unique: int | None = None
 
     def _col_unique(col: str) -> int:
@@ -239,6 +240,14 @@ def _df_to_acc(df: pd.DataFrame, layer_meta: dict[str, dict]) -> dict:
                 if series.empty:
                     continue
                 acc["nominal"][col] = {
+                    "counts": Counter(int(float(v)) for v in series),
+                    "unique": _col_unique(col),
+                }
+            case ValueType.ORDINAL:
+                series = df[col].dropna()
+                if series.empty:
+                    continue
+                acc["ordinal"][col] = {
                     "counts": Counter(int(float(v)) for v in series),
                     "unique": _col_unique(col),
                 }
@@ -291,7 +300,7 @@ def _reservoir_batch_merge(parts: list[tuple[list, int]]) -> tuple[list, int]:
 
 def _merge_accs_batch(accs: list[dict]) -> dict:
     """Merge a list of accumulators efficiently — single proportional reservoir draw per column."""
-    merged: dict = {"continuous": {}, "circular": {}, "nominal": {}, "pheno": {}}
+    merged: dict = {"continuous": {}, "circular": {}, "nominal": {}, "ordinal": {}, "pheno": {}}
 
     # Gather all per-column contributions, then merge in one shot.
     cont_parts: dict[str, list] = {}
@@ -313,6 +322,14 @@ def _merge_accs_batch(accs: list[dict]) -> dict:
                 merged["nominal"][col] = {"counts": Counter(s["counts"]), "unique": s["unique"]}
             else:
                 t = merged["nominal"][col]
+                t["counts"].update(s["counts"])
+                t["unique"] += s["unique"]
+
+        for col, s in acc.get("ordinal", {}).items():
+            if col not in merged["ordinal"]:
+                merged["ordinal"][col] = {"counts": Counter(s["counts"]), "unique": s["unique"]}
+            else:
+                t = merged["ordinal"][col]
                 t["counts"].update(s["counts"])
                 t["unique"] += s["unique"]
 
@@ -387,6 +404,14 @@ def _merge_acc_inplace(target: dict, source: dict) -> None:
             t["counts"].update(s["counts"])
             t["unique"] += s["unique"]
 
+    for col, s in source.get("ordinal", {}).items():
+        if col not in target["ordinal"]:
+            target["ordinal"][col] = {"counts": Counter(s["counts"]), "unique": s["unique"]}
+        else:
+            t = target["ordinal"][col]
+            t["counts"].update(s["counts"])
+            t["unique"] += s["unique"]
+
     for k, v in source.get("pheno", {}).items():
         target["pheno"][k] = target["pheno"].get(k, 0) + v
 
@@ -403,6 +428,8 @@ def _save_acc(taxon_dir: Path, acc: dict) -> None:
         "circular": {col: dict(a) for col, a in acc["circular"].items()},
         "nominal": {col: {"counts": dict(a["counts"]), "unique": a["unique"]}
                     for col, a in acc["nominal"].items()},
+        "ordinal": {col: {"counts": dict(a["counts"]), "unique": a["unique"]}
+                    for col, a in acc["ordinal"].items()},
         "pheno": acc["pheno"],
     }
     with open(taxon_dir / _ACC_FILE, "wb") as f:
@@ -430,6 +457,10 @@ def _load_acc(taxon_dir: Path) -> dict | None:
         "nominal": {
             col: {"counts": Counter(a["counts"]), "unique": a["unique"]}
             for col, a in data["nominal"].items()
+        },
+        "ordinal": {
+            col: {"counts": Counter(a["counts"]), "unique": a["unique"]}
+            for col, a in data.get("ordinal", {}).items()
         },
         "pheno": dict(data["pheno"]),
     }
@@ -517,7 +548,18 @@ def _write_stats_from_acc(taxon_dir: Path, acc: dict, layer_meta: dict[str, dict
         if summary:
             nominal_entries.extend(_nominal_cat_entries(col, layer, counts, summary))
 
-    if not numerical_stats and not nominal_entries and not circular_stats:
+    ordinal_entries: list[dict] = []
+    for col, a in acc["ordinal"].items():
+        if col not in layer_meta:
+            continue
+        layer = layer_meta[col]
+        counts = a["counts"]
+        stats = _ordinal_stats(counts, a["unique"])
+        if not stats:
+            continue
+        ordinal_entries.extend(_ordinal_stat_entries(col, layer, counts, stats))
+
+    if not numerical_stats and not nominal_entries and not circular_stats and not ordinal_entries:
         return
     pheno_acc = Counter(acc.get("pheno", {}))
     pheno_meta = {"phenology_counts": json.dumps(dict(pheno_acc))} if pheno_acc else None
@@ -525,6 +567,7 @@ def _write_stats_from_acc(taxon_dir: Path, acc: dict, layer_meta: dict[str, dict
     _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats, pheno_meta)
     _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
     _write_nominal_stats(taxon_dir, nominal_entries)
+    _write_ordinal_stats(taxon_dir, ordinal_entries)
     _write_density(taxon_dir, density_rows)
 
 
@@ -753,6 +796,72 @@ def _continuous_stats_streaming(digest: TDigest, unique_samples: int, kde: dict 
 
 
 # ---------------------------------------------------------------------------
+# Stats computation — ordinal
+# ---------------------------------------------------------------------------
+
+def _ordinal_quantile(counts: Counter, p: float) -> float:
+    """Exact pth quantile from a Counter of integer class IDs."""
+    total = sum(counts.values())
+    if total == 0:
+        return float(min(counts))
+    target = p * total
+    cum = 0
+    for val in sorted(counts):
+        cum += counts[val]
+        if cum >= target:
+            return float(val)
+    return float(max(counts))
+
+
+def _ordinal_stats(counts: Counter, unique_samples: int) -> dict:
+    """Ordinal summary stats: ordered quantiles + nominal distribution metrics."""
+    total = sum(counts.values())
+    if total == 0:
+        return {}
+    probs = np.array([counts[k] / total for k in sorted(counts)], dtype=float)
+    entropy = float(_scipy_entropy(probs))
+    mode_cls = counts.most_common(1)[0][0]
+    q = lambda p: _ordinal_quantile(counts, p)
+    return {
+        "count": total,
+        "unique_samples": unique_samples,
+        "total_samples": total,
+        "unique_classes": len(counts),
+        "entropy": entropy,
+        "mode": float(mode_cls),
+        "10th_percentile": q(0.10),
+        "25th_percentile": q(0.25),
+        "median": q(0.50),
+        "75th_percentile": q(0.75),
+        "90th_percentile": q(0.90),
+    }
+
+
+def _ordinal_stat_entries(layer_id: str, layer: dict, counts: Counter, stats: dict) -> list[dict]:
+    """All ordinal_stats.parquet tall rows for one variable: quantile metrics + class fractions."""
+    total = stats["total_samples"]
+    entries: list[dict] = []
+    for metric in (
+        "count", "unique_samples", "total_samples", "unique_classes", "entropy",
+        "mode", "10th_percentile", "25th_percentile", "median", "75th_percentile", "90th_percentile",
+    ):
+        entries.append({"variable": layer_id, "metric": metric, "value": float(stats[metric])})
+    for cls_id, count in counts.items():
+        entries.append({"variable": layer_id, "metric": f"class_{cls_id}", "value": count / total if total else 0.0})
+    base_id = re.sub(r'_(avg|sum|mode|mean|min|max)_\d+h$', '', layer_id)
+    legend_path = Path("config/gis/legends") / f"{base_id}_legend.json"
+    if legend_path.exists():
+        try:
+            known_ids = {int(c["id"]) for c in json.loads(legend_path.read_text()).get("classes", [])}
+            for cls_id in known_ids:
+                if cls_id not in counts:
+                    entries.append({"variable": layer_id, "metric": f"class_{cls_id}", "value": 0.0})
+        except Exception:
+            pass
+    return entries
+
+
+# ---------------------------------------------------------------------------
 # Stats computation — nominal
 # ---------------------------------------------------------------------------
 
@@ -827,6 +936,13 @@ def _write_nominal_stats(directory: Path, entries: list[dict]) -> None:
     _atomic_write(directory / NOMINAL_STATS_FILE, pa.Table.from_pandas(frame, preserve_index=False))
 
 
+def _write_ordinal_stats(directory: Path, entries: list[dict]) -> None:
+    if not entries:
+        return
+    frame = pd.DataFrame(entries)
+    _atomic_write(directory / ORDINAL_STATS_FILE, pa.Table.from_pandas(frame, preserve_index=False))
+
+
 def _write_density(directory: Path, rows: list[dict]) -> None:
     if not rows:
         return
@@ -847,6 +963,7 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
     numerical_stats: dict[str, dict] = {}
     circular_stats: dict[str, dict] = {}
     nominal_entries: list[dict] = []
+    ordinal_entries: list[dict] = []
     density_rows: list[dict] = []
 
     # Cache total unique count — reused across columns with no nulls (the common case).
@@ -920,6 +1037,17 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                 summary, _ = _nominal_stats(raw_counts, unique)
                 nominal_entries.extend(_nominal_cat_entries(col, layer, raw_counts, summary))
 
+            case ValueType.ORDINAL:
+                raw = df[col].dropna()
+                if raw.empty:
+                    continue
+                unique = _col_unique(col)
+                ord_counts: Counter = Counter(int(float(v)) for v in raw)
+                stats = _ordinal_stats(ord_counts, unique)
+                if not stats:
+                    continue
+                ordinal_entries.extend(_ordinal_stat_entries(col, layer, ord_counts, stats))
+
             case ValueType.CIRCULAR:
                 raw = df[col]
                 values = (raw.to_numpy(dtype=np.float64, na_value=np.nan)
@@ -957,6 +1085,7 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
     _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats, pheno_meta)
     _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
     _write_nominal_stats(taxon_dir, nominal_entries)
+    _write_ordinal_stats(taxon_dir, ordinal_entries)
     _write_density(taxon_dir, density_rows)
 
 
@@ -1131,6 +1260,19 @@ def compute_location_filtered_stats(
         raw_counts: Counter = Counter(int(float(v)) for v in series)
         summary, distribution = _nominal_stats(raw_counts, unique)
         return {"type": "nominal", "observation_count": summary["total_samples"], "summary": summary, "distribution": distribution}
+    if vtype == ValueType.ORDINAL:
+        series = df[variable_id].dropna()
+        if series.empty:
+            return None
+        ord_counts: Counter = Counter(int(float(v)) for v in series)
+        stats = _ordinal_stats(ord_counts, unique)
+        if not stats:
+            return None
+        distribution = sorted(
+            [{"class_id": k, "fraction": v / stats["total_samples"]} for k, v in ord_counts.items()],
+            key=lambda e: e["class_id"],
+        )
+        return {"type": "ordinal", "observation_count": stats["count"], "stats": stats, "distribution": distribution}
     if vtype == ValueType.CIRCULAR:
         series = pd.to_numeric(df[variable_id], errors="coerce").dropna()
         if series.empty:

@@ -1,0 +1,11 @@
+{
+  "layer_id": "salinity",
+  "source": "Ivushkin et al. (2019). Global Soil Salinity Map. Remote Sensing of Environment, 231, 111260.",
+  "classes": [
+    { "id": 0, "name": "Non saline",        "group": "Non saline",      "traits": { "color": "#6cf645" } },
+    { "id": 1, "name": "Slightly saline",   "group": "Somewhat saline", "traits": { "color": "#fffb49" } },
+    { "id": 2, "name": "Moderately saline", "group": "Somewhat saline", "traits": { "color": "#f3a931" } },
+    { "id": 3, "name": "Highly saline",     "group": "Very saline",     "traits": { "color": "#ea3517" } },
+    { "id": 4, "name": "Extremely saline",  "group": "Very saline",     "traits": { "color": "#84190a" } }
+  ]
+}

@@ -29,7 +29,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from config.config import METRICS_BY_TYPE, ValueType, load_config
-from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE
+from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE, ORDINAL_STATS_FILE
 from util.storage import ParquetStorageProxy, atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
 
@@ -125,13 +125,15 @@ _ANGULAR_METRICS: frozenset[str] = frozenset({"circular_mean", "mode"})
 def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
     """Return rankable metric names for a value type.
 
-    Returns () for types with no ranking metrics (ORDINAL, AGGREGATE).
+    Returns () for types with no ranking metrics (AGGREGATE, etc.).
     """
     match vtype:
         case ValueType.RATIO | ValueType.INTERVAL:
             return METRICS_BY_TYPE[vtype]
         case ValueType.NOMINAL:
             return METRICS_BY_TYPE[ValueType.NOMINAL]
+        case ValueType.ORDINAL:
+            return METRICS_BY_TYPE[ValueType.ORDINAL]
         case ValueType.CIRCULAR:
             return METRICS_BY_TYPE[ValueType.CIRCULAR]
         case _:
@@ -143,8 +145,10 @@ def _preload_one_taxon(
     ratio_interval_ids: set[str],
     circular_ids: set[str],
     nominal_ids: set[str],
+    ordinal_ids: set[str],
     layer_metrics: dict[str, tuple[str, ...]],
     nominal_metrics: set[str],
+    ordinal_metrics: set[str],
     circ_metrics: tuple[str, ...],
 ) -> tuple[str, dict]:
     taxon_key = num_path.parent.name.rsplit("_", 1)[-1]
@@ -206,6 +210,31 @@ def _preload_one_taxon(
         except Exception:
             pass
 
+    # ordinal stats — tall format: same as nominal_stats
+    ord_path = taxon_dir / ORDINAL_STATS_FILE
+    if ord_path.exists():
+        try:
+            tbl = pq.ParquetFile(ord_path).read()
+            ord_variables = tbl.column("variable").to_pylist()
+            ord_metrics_col = tbl.column("metric").to_pylist()
+            ord_values = tbl.column("value").to_pylist()
+            for variable, metric, val in zip(ord_variables, ord_metrics_col, ord_values):
+                variable = str(variable or "")
+                metric = str(metric or "")
+                if variable not in ordinal_ids:
+                    continue
+                if metric not in ordinal_metrics and not metric.startswith("class_"):
+                    continue
+                if entry["__sample_count__"] == 0 and metric == "total_samples":
+                    try:
+                        entry["__sample_count__"] = int(float(val or 0))
+                    except (TypeError, ValueError):
+                        pass
+                if _safe_finite(val):
+                    entry[f"{variable}::{metric}"] = float(val)
+        except Exception:
+            pass
+
     # circular stats — wide format: one row per variable, metric columns
     circ_path = taxon_dir / CIRCULAR_STATS_FILE
     if circ_path.exists():
@@ -247,6 +276,8 @@ def preload_stats_cache(layers: list[dict]) -> None:
     layer_by_id = {lay["id"]: lay for lay in layers}
     nominal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.NOMINAL}
     nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL])
+    ordinal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.ORDINAL}
+    ordinal_metrics = set(METRICS_BY_TYPE[ValueType.ORDINAL])
 
     ratio_interval_ids: set[str] = set()
     circular_ids: set[str] = set()
@@ -268,8 +299,10 @@ def preload_stats_cache(layers: list[dict]) -> None:
         ratio_interval_ids=ratio_interval_ids,
         circular_ids=circular_ids,
         nominal_ids=nominal_ids,
+        ordinal_ids=ordinal_ids,
         layer_metrics=layer_metrics,
         nominal_metrics=nominal_metrics,
+        ordinal_metrics=ordinal_metrics,
         circ_metrics=circ_metrics,
     )
 
@@ -498,6 +531,50 @@ def _collect_entries_from_nominal_stats(
     return entries
 
 
+def _collect_entries_from_ordinal_stats(
+    taxon_key: str,
+    taxon_dir: Path,
+    sample_count: int,
+    layers: list[dict],
+) -> dict[str, dict[str, Any]]:
+    """Read ordinal_stats.parquet → {variable::metric: entry dict}."""
+    stats_path = taxon_dir / ORDINAL_STATS_FILE
+    if not stats_path.exists():
+        return {}
+    try:
+        df = pq.read_table(stats_path).to_pandas()
+    except Exception:
+        return {}
+
+    ordinal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.ORDINAL}
+    ordinal_metrics = set(METRICS_BY_TYPE[ValueType.ORDINAL])
+    entries: dict[str, dict[str, Any]] = {}
+
+    var_totals: dict[str, int] = {}
+    for record in df.to_dict("records"):
+        if str(record.get("metric") or "") == "total_samples":
+            var_totals[str(record.get("variable") or "")] = int(float(record.get("value") or 0))
+
+    for record in df.to_dict("records"):
+        variable = str(record.get("variable") or "")
+        metric = str(record.get("metric") or "")
+        if variable not in ordinal_ids:
+            continue
+        if var_totals.get(variable, 0) < MIN_RANKING_SAMPLES:
+            continue
+        if metric not in ordinal_metrics and not metric.startswith("class_"):
+            continue
+        val = record.get("value")
+        if not _safe_finite(val):
+            continue
+        entries[f"{variable}::{metric}"] = {
+            "taxon_key": taxon_key,
+            "value": float(val),
+            "sample_count": sample_count,
+        }
+    return entries
+
+
 def _collect_entries_from_circular_stats(
     taxon_key: str,
     taxon_dir: Path,
@@ -562,6 +639,7 @@ def _collect_all_entries(
         }
     entries = _collect_entries_from_numerical_stats(taxon_key, taxon_dir, sample_count, layers)
     entries.update(_collect_entries_from_nominal_stats(taxon_key, taxon_dir, sample_count, layers))
+    entries.update(_collect_entries_from_ordinal_stats(taxon_key, taxon_dir, sample_count, layers))
     entries.update(_collect_entries_from_circular_stats(taxon_key, taxon_dir, sample_count, layers))
     return entries
 

@@ -203,6 +203,22 @@
       "15": "#dddddd"
     }
   },
+  "salinity": {
+    "colorblind": {
+      "0": "#009e73",
+      "2": "#eade3c",
+      "1": "#f6ea48",
+      "4": "#006dad",
+      "3": "#1477b7"
+    },
+    "achromatopsia": {
+      "0": "#1f1f1f",
+      "2": "#727272",
+      "1": "#7c7c7c",
+      "4": "#d7d7d7",
+      "3": "#e2e2e2"
+    }
+  },
   "weather_code_simple": {
     "colorblind": {
       "0": "#f0e442",

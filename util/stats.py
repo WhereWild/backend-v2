@@ -735,12 +735,18 @@ def _circular_entropy(rbar: float) -> float:
     """
     if rbar <= 0.0:
         return math.log(2 * math.pi)   # uniform: maximum entropy
-    if rbar >= 1.0:
-        return float("-inf")            # perfectly concentrated: entropy → -∞
-    # ive(1,k)/ive(0,k) = I1(k)/I0(k) (exp(-k) cancels) — no overflow at large k
-    kappa = _brentq(lambda k: _bessel_ive(1, k) / _bessel_ive(0, k) - rbar, 0.0, 1e6)
+    if rbar >= 1.0 - 1e-9:
+        return float("-inf")            # near-point-mass: kappa → ∞, entropy → -∞
+    # ive(1,k)/ive(0,k) = I1(k)/I0(k) (exp(-k) cancels) — no overflow at large k.
+    # A(κ) ≈ 1 - 1/(2κ) for large κ, so κ ≈ 1/(2*(1-rbar)).
+    upper = max(1e6, 1.0 / (1.0 - rbar))
+    try:
+        kappa = _brentq(lambda k: _bessel_ive(1, k) / _bessel_ive(0, k) - rbar, 0.0, upper)
+    except ValueError:
+        return float("-inf")
     # log(2π·I0(κ)) - κ·rbar  =  log(2π) + log(ive(0,κ)) + κ·(1 - rbar)
-    return float(math.log(2 * math.pi) + math.log(_bessel_ive(0, kappa)) + kappa * (1.0 - rbar))
+    v = float(math.log(2 * math.pi) + math.log(_bessel_ive(0, kappa)) + kappa * (1.0 - rbar))
+    return v if math.isfinite(v) else float("-inf")
 
 
 def _circ_stats_streaming(

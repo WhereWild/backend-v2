@@ -119,7 +119,7 @@ def _descendant_rank_targets(ancestor_rank: str) -> list[str]:
 
 # Circular metrics that are angular bearings — included in the sort index but
 # excluded from relative_ranks_positions.parquet for circular variables only.
-_CIRCULAR_CIRCULAR_ANGULAR_METRICS: frozenset[str] = frozenset({"circular_mean", "mode"})
+_CIRCULAR_ANGULAR_METRICS: frozenset[str] = frozenset({"circular_mean", "mode"})
 
 
 def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
@@ -649,8 +649,10 @@ def _build_rank_index(
     rank: str,
     index_path: Path,
     layers: list[dict],
+    circular_ids: frozenset[str] | None = None,
 ) -> None:
     """Collect per-taxon metrics for all descendants of rank and write sorted struct array index."""
+    _circular_ids: frozenset[str] = circular_ids if circular_ids is not None else frozenset()
     descendants = _descendants_for_rank(ancestor, rank)
     if not descendants:
         index_path.unlink(missing_ok=True)
@@ -771,7 +773,7 @@ def _build_rank_index(
 
             # Collect positions inline — data is already sorted, no re-read needed.
             variable, metric = col_key.split("::", 1)
-            is_angular = variable in circular_ids and metric in _CIRCULAR_ANGULAR_METRICS
+            is_angular = variable in _circular_ids and metric in _CIRCULAR_ANGULAR_METRICS
             if not is_angular and n > 0:
                 sorted_vals = val_np[order]
                 # Vectorised min_rank_pos: tied values share the first position in their group.
@@ -856,10 +858,14 @@ def build_rank_indexes(ancestor: TaxonRecord, layers: list[dict]) -> None:
     if not targets:
         return
 
+    circular_ids: frozenset[str] = frozenset(
+        lay["id"] for lay in layers
+        if lay.get("value_type") == ValueType.CIRCULAR and lay.get("id")
+    )
     ancestor_dir = TREE_ROOT / ancestor["path"]
     for rank in targets:
         index_path = ancestor_dir / f"{rank.lower()}_index.parquet"
-        _build_rank_index(ancestor, rank, index_path, layers)
+        _build_rank_index(ancestor, rank, index_path, layers, circular_ids)
 
 
 # ---------------------------------------------------------------------------

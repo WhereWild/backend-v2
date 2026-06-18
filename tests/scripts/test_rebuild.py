@@ -475,6 +475,7 @@ def test_main_stage_flag_skips_prior_stages(tmp_path, monkeypatch):
 
     with patch("scripts.sync_gbif.main", side_effect=lambda: call_order.append("sync_gbif")), \
          patch("scripts.sync_gbif.sync_occurrences"), \
+         patch.object(rebuild, "SKIPPABLE_REBUILD_STAGES", frozenset()), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("build_tree")), \
          patch("scripts.populate_tree.main", side_effect=lambda: call_order.append("populate_tree")), \
@@ -494,6 +495,7 @@ def test_main_stage_flag_skips_prior_stages(tmp_path, monkeypatch):
     assert "sync_gbif" not in call_order
     assert "build_tree" not in call_order
     assert "enrich_tree" in call_order
+    assert "enrich_temporal" in call_order
     assert "process_tree" in call_order
 
 

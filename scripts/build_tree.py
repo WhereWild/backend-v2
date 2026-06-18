@@ -754,6 +754,11 @@ def update_name_index(payload: dict) -> int:
     added = 0
     for taxon_key, taxon in catalog.items():
         candidates: list[str] = []
+        # Scientific name must always be searchable, including for non-leaf taxa
+        # (genera, families, etc.) that build_catalog never adds to the index.
+        sci = str(taxon.get("scientific_name") or "").replace("_", " ").strip()
+        if sci:
+            candidates.append(sci)
         for field in ("common_name", "inat_preferred_common_name"):
             raw = str(taxon.get(field) or "").strip()
             if raw:
@@ -958,6 +963,68 @@ def run_gbif_backup(catalog: dict) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Image propagation
+# ---------------------------------------------------------------------------
+
+def propagate_images(catalog: dict) -> int:
+    """Bottom-up pass: give imageless ancestor nodes an image from a direct child.
+
+    Processes deepest nodes first so each parent can inherit from a child that
+    may itself have just inherited from its own children — one row at a time up
+    the tree. Prefers inat_preferred_image over gbif_backup_image.
+    """
+    path_to_key = {taxon["path"]: key for key, taxon in catalog.items()}
+    children: dict[str, list[str]] = defaultdict(list)
+    for key, taxon in catalog.items():
+        path = taxon["path"]
+        if "/" in path:
+            parent_path = path.rsplit("/", 1)[0]
+            parent_key = path_to_key.get(parent_path)
+            if parent_key:
+                children[parent_key].append(key)
+
+    by_depth = sorted(catalog.keys(), key=lambda k: catalog[k]["path"].count("/"), reverse=True)
+
+    _INAT_IMG_FIELDS = (
+        "inat_preferred_image",
+        "inat_preferred_image_license",
+        "inat_preferred_image_creator",
+        "inat_preferred_image_attribution",
+        "inat_preferred_image_references",
+    )
+    _GBIF_IMG_FIELDS = (
+        "gbif_backup_image",
+        "gbif_backup_image_license",
+        "gbif_backup_image_creator",
+        "gbif_backup_image_attribution",
+        "gbif_backup_image_references",
+    )
+
+    updated = 0
+    for key in by_depth:
+        taxon = catalog[key]
+        if _clean(taxon.get("inat_preferred_image")) or _clean(taxon.get("gbif_backup_image")):
+            continue
+        inherited: dict | None = None
+        child_keys = children.get(key, [])
+        for child_key in child_keys:
+            child = catalog[child_key]
+            if _clean(child.get("inat_preferred_image")):
+                inherited = {f: child.get(f, "") for f in _INAT_IMG_FIELDS}
+                break
+        if inherited is None:
+            for child_key in child_keys:
+                child = catalog[child_key]
+                if _clean(child.get("gbif_backup_image")):
+                    inherited = {f: child.get(f, "") for f in _GBIF_IMG_FIELDS}
+                    break
+        if inherited:
+            taxon.update(inherited)
+            updated += 1
+    return updated
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -988,6 +1055,9 @@ def main() -> None:
     # run_gbif_backup also streams occurrence.txt to collect obs IDs for any taxa
     # still lacking inat_id, resolving them via the iNat observations API in the
     # same pass — no extra file scan needed.
+    # Load vernacular name maps now (no inat_id dependency), but defer apply_names
+    # until after run_gbif_backup so that obs-based inat_id resolutions also get
+    # their iNat vernacular names applied.
     print("\nFetching GBIF backbone vernacular names...")
     vernacular_bytes = fetch_backbone_vernacular()
     print("Loading vernacular names...")
@@ -996,16 +1066,21 @@ def main() -> None:
     gbif_map = load_gbif_vernacular(vernacular_bytes)
     print(f"  GBIF: {len(gbif_map):,} English names")
     print(f"  Catalog: {len(catalog):,} taxa")
-    updated = apply_names(catalog, inat_map, gbif_map)
 
     print("\nFetching GBIF backup images from occurrence data...")
     backup_n, obs_resolved = run_gbif_backup(catalog)
     print(f"  Resolved inat_id for {obs_resolved:,} additional taxa via observations.")
 
+    updated = apply_names(catalog, inat_map, gbif_map)
+
     # Now that observation mapping is done, fetch iNat preferred names and images
     # for any newly resolved taxa (plus anything still pending).
     print("\nFetching iNat preferred names and images...")
     names_n, images_n = run_inat_preferred(catalog)
+
+    print("\nPropagating images to imageless ancestor nodes...")
+    inherited_n = propagate_images(catalog)
+    print(f"  Propagated images to {inherited_n:,} ancestor nodes.")
 
     index_added = update_name_index(payload)
     print(f"Added {index_added:,} new entries to name search index.")

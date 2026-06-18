@@ -40,6 +40,7 @@ from util.stats import (
     DENSITY_FILE,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
+    ORDINAL_STATS_FILE,
     _filter_df,
     process_observations_df,
 )
@@ -670,15 +671,15 @@ def _build_temporal_var_meta(df: pd.DataFrame) -> list[dict]:
         units = raw.get("units") or None
         imperial_unit = raw.get("imperial_unit") or None
         value_type = raw.get("value_type") or "interval"
-        domain = "discrete" if value_type == "nominal" else "continuous"
+        domain = "discrete" if value_type in ("nominal", "ordinal") else "continuous"
         # process_chunk_mode hardcodes "mode" in column name regardless of layer.agg
         if layer.sources and layer.id != "vapor_pressure_deficit":
             col_agg = "mode"
         else:
             col_agg = layer.agg
-        # For nominal layers (e.g. weather_code), load legend from the base layer id.
+        # For nominal/ordinal layers (e.g. weather_code), load legend from the base layer id.
         legend_json: str | None = None
-        if value_type == "nominal":
+        if value_type in ("nominal", "ordinal"):
             raw_classes = _load_legend(layer.id)
             if raw_classes:
                 legend_json = json.dumps([
@@ -737,7 +738,7 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
         lookup_rows: list[dict] = []
         for col in df.columns:
             layer = layer_meta.get(col)
-            if not layer or layer.get("value_type") != "nominal":
+            if not layer or layer.get("value_type") not in ("nominal", "ordinal"):
                 continue
             legend_id = layer.get("_legend_key", col)
             classes = _load_legend(legend_id)
@@ -803,6 +804,7 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
             (occ_path,                              "occurrence.parquet"),
             (work_dir / NUMERICAL_STATS_FILE,       NUMERICAL_STATS_FILE),
             (work_dir / NOMINAL_STATS_FILE,         NOMINAL_STATS_FILE),
+            (work_dir / ORDINAL_STATS_FILE,         ORDINAL_STATS_FILE),
             (work_dir / CIRCULAR_STATS_FILE,        CIRCULAR_STATS_FILE),
             (work_dir / DENSITY_FILE,               DENSITY_FILE),
             (lookup_path,                           "categorical_value_lookup.parquet"),

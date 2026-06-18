@@ -220,9 +220,11 @@ def test_main_full_pipeline_completes(tmp_path):
     with check1, check2, \
          patch("scripts.sync_gbif.main"), \
          patch("scripts.sync_gbif.sync_occurrences"), \
+         patch.object(rebuild, "SKIPPABLE_REBUILD_STAGES", frozenset()), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("tree")), \
          patch("scripts.populate_tree.main", side_effect=lambda: call_order.append("populate")), \
+         patch("scripts.carry_forward.main", side_effect=lambda: call_order.append("carry_forward")), \
          patch("scripts.gis.process_gadm.main", side_effect=lambda: call_order.append("process_gadm")), \
          patch("scripts.rebuild._run_download_gis", side_effect=lambda: call_order.append("download_gis")), \
          patch("scripts.gis.build_overviews.main", side_effect=lambda: call_order.append("build_overviews")), \
@@ -235,7 +237,7 @@ def test_main_full_pipeline_completes(tmp_path):
         rebuild.main()
 
     assert call_order == [
-        "wipe", "tree", "populate",
+        "wipe", "tree", "populate", "carry_forward",
         "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal", "process_tree",
     ]
     p = _pipeline(tmp_path)
@@ -243,7 +245,7 @@ def test_main_full_pipeline_completes(tmp_path):
     assert all(
         p["stages"][s]["status"] == "completed"
         for s in [
-            "sync_gbif", "build_tree", "populate_tree",
+            "sync_gbif", "build_tree", "populate_tree", "carry_forward",
             "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal", "process_tree",
         ]
     )
@@ -473,9 +475,11 @@ def test_main_stage_flag_skips_prior_stages(tmp_path, monkeypatch):
 
     with patch("scripts.sync_gbif.main", side_effect=lambda: call_order.append("sync_gbif")), \
          patch("scripts.sync_gbif.sync_occurrences"), \
+         patch.object(rebuild, "SKIPPABLE_REBUILD_STAGES", frozenset()), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("build_tree")), \
          patch("scripts.populate_tree.main", side_effect=lambda: call_order.append("populate_tree")), \
+         patch("scripts.carry_forward.main"), \
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \

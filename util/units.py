@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 # (from_unit, to_unit) → (factor, offset)
@@ -27,9 +28,12 @@ _CONVERSION: dict[tuple[str, str], tuple[float, float]] = {
 # These are never converted and never carry a unit label.
 _DIMENSIONLESS_METRICS = frozenset({
     "count", "unique_samples", "total_samples", "unique_classes",
-    "entropy",
     "rbar", "circular_var", "circular_std", "circular_mean",
 })
+
+# Differential entropy transforms as H(aX+b) = H(X) + log|a| under unit scaling.
+# Handled separately from both dimensionless and linear metrics.
+_ENTROPY_METRICS = frozenset({"entropy"})
 
 # Summary metrics that measure spread rather than position.
 # For these, the conversion offset is never applied even on interval-scale variables
@@ -67,7 +71,7 @@ def display_units(layer: dict, unit_system: str | None, *, metric: str | None = 
 
     Returns None for dimensionless metrics regardless of the layer's declared units.
     """
-    if metric is not None and metric in _DIMENSIONLESS_METRICS:
+    if metric is not None and metric in (_DIMENSIONLESS_METRICS | _ENTROPY_METRICS):
         return None
     if unit_system == "imperial":
         return layer.get("imperial_unit") or layer.get("units") or None
@@ -109,6 +113,9 @@ def convert_value(
     to_unit = layer.get("imperial_unit") or ""
     if not from_unit or not to_unit or from_unit == to_unit:
         return value
+    if metric is not None and metric in _ENTROPY_METRICS:
+        factor, _ = _CONVERSION.get((from_unit, to_unit), (1.0, 0.0))
+        return float(value) + math.log(abs(factor))
     return _convert(float(value), from_unit, to_unit, offset=_apply_offset(layer, metric), metric=metric)
 
 
@@ -124,9 +131,12 @@ def convert_summary(
     if not from_unit or not to_unit or from_unit == to_unit:
         return summary
 
+    factor, _ = _CONVERSION.get((from_unit, to_unit), (1.0, 0.0))
     result: dict[str, Any] = {}
     for key, val in summary.items():
-        if isinstance(val, (int, float)) and key not in _DIMENSIONLESS_METRICS:
+        if key in _ENTROPY_METRICS and isinstance(val, (int, float)):
+            result[key] = float(val) + math.log(abs(factor))
+        elif isinstance(val, (int, float)) and key not in _DIMENSIONLESS_METRICS:
             result[key] = _convert(float(val), from_unit, to_unit, offset=_apply_offset(layer, key), metric=key)
         else:
             result[key] = val

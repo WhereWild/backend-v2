@@ -68,6 +68,7 @@ TAXONOMY_LEVELS = ("kingdom", "phylum", "class", "order", "family", "genus", "sp
 TSV_DELIMITER = "\t"
 
 MAPPING_RANKS = frozenset({"SPECIES", "SUBSPECIES", "VARIETY", "FORM"})
+NAME_MATCH_RANKS = MAPPING_RANKS | frozenset({"GENUS", "FAMILY", "ORDER", "CLASS", "PHYLUM", "KINGDOM"})
 INFRA_RANKS = frozenset({"SUBSPECIES", "VARIETY", "FORM"})
 INFRA_MARKERS = frozenset({"var.", "subsp.", "f.", "nothosubsp.", "nothovar."})
 
@@ -124,8 +125,57 @@ def clean_name(name: str, rank: str) -> str:
     return name.replace(" ", "_")
 
 
+def _collect_genus_synonymy(csv_path: Path) -> dict[str, set[str]]:
+    """Single CSV pass: collect genus-level synonym names only.
+
+    Returns genus_key → {old_genus_names} so that genus catalog nodes can be
+    annotated (e.g. Pelecyphora gets genus_synonym_names=["Escobaria"]).
+    All species/infra-specific synonym handling is now done directly in
+    build_catalog by promoting every GBIF taxon key to its own entry.
+    """
+    genus_synonym_map: dict[str, set[str]] = defaultdict(set)
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f, delimiter=TSV_DELIMITER):
+            if not _csv_row_filters(row):
+                continue
+            if row["taxonRank"] != CONFIG.species_rank:
+                continue
+            sci_parts = row["scientificName"].split()
+            accepted_genus = row["genus"]
+            if sci_parts and sci_parts[0] != accepted_genus and row.get("genusKey"):
+                genus_synonym_map[row["genusKey"]].add(sci_parts[0])
+    return dict(genus_synonym_map)
+
+
+def _csv_row_filters(row: dict) -> bool:
+    """Shared row-filter predicate used by both CSV passes in build_catalog."""
+    if row["taxonRank"] not in CONFIG.leaf_rank_set:
+        return False
+    if row["taxonRank"] == CONFIG.species_rank and len(row["scientificName"].split()) < 2:
+        return False
+    if not row.get("genus") or not row.get("genusKey"):
+        return False
+    if row["taxonRank"] in CONFIG.subspecies_equivalents:
+        if not row.get("species") or not row.get("speciesKey"):
+            return False
+    return True
+
+
 def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]:
-    """Parse species list CSV and return (catalog, combined_name_index)."""
+    """Parse species list CSV and return (catalog, combined_name_index).
+
+    SYNONYM species handling:
+    - Same-epithet across-genus rename (e.g. Escobaria vivipara → Pelecyphora vivipara):
+      collapsed into the accepted entry; synonym taxon key goes into gbif_synonym_keys
+      for occurrence routing, old name into gbif_synonym_names for search.
+    - All other SYNONYM species (within-genus like Opuntia tortispina, or cross-taxon
+      across-genus like Escobaria chlorantha): own catalog entry placed at GENUS level
+      (sibling of the accepted species, not nested under it).
+    Across-genus SYNONYM infra entries keep their own taxon key but are renamed to use
+    the accepted genus so pages display the correct accepted name.
+    """
+    genus_synonym_map = _collect_genus_synonymy(csv_path)
+
     catalog: dict = {}
     scientific_index: dict = {}
     common_index: defaultdict = defaultdict(set)
@@ -133,15 +183,14 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter=TSV_DELIMITER)
         for row in reader:
-            if row["taxonRank"] not in CONFIG.leaf_rank_set:
+            if not _csv_row_filters(row):
                 continue
-            if row["taxonRank"] == CONFIG.species_rank and len(row["scientificName"].split()) < 2:
-                continue
-            if not row.get("genus") or not row.get("genusKey"):
-                continue
-            if row["taxonRank"] in CONFIG.subspecies_equivalents:
-                if not row.get("species") or not row.get("speciesKey"):
-                    continue
+
+            sci_parts = row["scientificName"].split()
+            accepted_genus = row["genus"]
+            is_across_genus_synonym = (
+                sci_parts and sci_parts[0] != accepted_genus
+            )
 
             path_parts = []
             rel_path = ""
@@ -161,47 +210,95 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
                             "rank": level.upper(),
                         }
 
-            cleaned_name = clean_name(row["acceptedScientificName"], row["taxonRank"])
-            taxon_key_to_write = row["taxonKey"]
+            taxon_key = row["taxonKey"]
+            species_key = row.get("speciesKey", "")
+            accepted_species_parts = row.get("species", "").split()
+            old_synonym_name: str = ""  # populated when a name is renamed for display
+            same_epithet = (
+                len(sci_parts) >= 2
+                and len(accepted_species_parts) >= 2
+                and sci_parts[1] == accepted_species_parts[1]
+            )
 
-            if row["taxonRank"] in CONFIG.subspecies_equivalents:
-                cleaned_name = clean_name(row["scientificName"], row["taxonRank"])
-                path_parts.append(f"{cleaned_name}_{row['taxonKey']}")
+            if row["taxonRank"] == CONFIG.species_rank:
+                if taxon_key == species_key:
+                    # ACCEPTED species: path already ends at this node from the loop.
+                    cleaned_name = clean_name(row["scientificName"], row["taxonRank"])
+                elif is_across_genus_synonym and same_epithet:
+                    # Pure genus-rename synonym (e.g. Escobaria vivipara → Pelecyphora vivipara):
+                    # collapse into the accepted entry so there is one page, not two.
+                    old_sci_name = clean_name(row["scientificName"], row["taxonRank"])
+                    accepted_entry = catalog.get(str(species_key))
+                    if accepted_entry is not None:
+                        existing_keys: list = list(accepted_entry.get("gbif_synonym_keys") or [])
+                        if taxon_key not in existing_keys:
+                            existing_keys.append(taxon_key)
+                        accepted_entry["gbif_synonym_keys"] = existing_keys
+                        existing_names: list = list(accepted_entry.get("gbif_synonym_names") or [])
+                        old_name_str = old_sci_name.replace("_", " ")
+                        if old_name_str not in existing_names:
+                            existing_names.append(old_name_str)
+                        accepted_entry["gbif_synonym_names"] = existing_names
+                    continue
+                else:
+                    # All other SYNONYM species: own page at GENUS level (sibling of
+                    # accepted species, not nested under it). This covers within-genus
+                    # synonyms (Opuntia tortispina) and cross-taxon across-genus synonyms
+                    # (Escobaria chlorantha → Pelecyphora dasyacantha subsp. dasyacantha).
+                    # Across-genus: rename to accepted genus; keep old name as searchable synonym.
+                    if is_across_genus_synonym:
+                        accepted_name = row["scientificName"].replace(sci_parts[0], accepted_genus, 1)
+                        old_synonym_name = clean_name(row["scientificName"], row["taxonRank"]).replace("_", " ")
+                    else:
+                        accepted_name = row["scientificName"]
+                    cleaned_name = clean_name(accepted_name, row["taxonRank"])
+                    # path_parts currently ends at the accepted species node; back up to genus.
+                    path_parts = path_parts[:-1]
+                    path_parts.append(f"{cleaned_name}_{taxon_key}")
+                    rel_path = "/".join(path_parts)
+
+            elif row["taxonRank"] in CONFIG.subspecies_equivalents:
+                if is_across_genus_synonym:
+                    # Across-genus SYNONYM infra: keep own taxon key (obs land here)
+                    # but rename to accepted genus so the page displays correctly.
+                    accepted_name = row["scientificName"].replace(sci_parts[0], accepted_genus, 1)
+                    cleaned_name = clean_name(accepted_name, row["taxonRank"])
+                    old_synonym_name = clean_name(row["scientificName"], row["taxonRank"]).replace("_", " ")
+                else:
+                    cleaned_name = clean_name(row["scientificName"], row["taxonRank"])
+                path_parts.append(f"{cleaned_name}_{taxon_key}")
                 rel_path = "/".join(path_parts)
-            elif row["taxonRank"] == CONFIG.species_rank:
-                taxon_key_to_write = row["speciesKey"]
 
             if write_dirs:
                 (TREE_ROOT / Path(*path_parts)).mkdir(parents=True, exist_ok=True)
 
             common_name = row.get("commonName", "")
-            entry_key = str(taxon_key_to_write)
-            catalog[entry_key] = {
+            entry_key = str(taxon_key)
+            entry: dict = {
                 "taxon_key": entry_key,
                 "path": rel_path,
                 "scientific_name": cleaned_name,
                 "common_name": common_name,
                 "rank": row["taxonRank"],
             }
-
-            # When taxonKey differs from the key we write under (synonym / reclassified
-            # species), preserve the original taxonKey as an alternate lookup key.  GBIF
-            # backbone vernacular names and older occurrence records may still be indexed
-            # under the synonym key (e.g. Escobaria vivipara → 3084514 while the accepted
-            # Pelecyphora vivipara → 11498251).
-            row_taxon_key = str(row["taxonKey"])
-            if row_taxon_key != entry_key:
-                alt_keys: list = catalog[entry_key].setdefault("gbif_synonym_keys", [])
-                if row_taxon_key not in alt_keys:
-                    alt_keys.append(row_taxon_key)
+            if old_synonym_name:
+                entry["gbif_synonym_names"] = [old_synonym_name]
+            catalog[entry_key] = entry
 
             scientific_name_key = _normalize_index_key(cleaned_name)
             if scientific_name_key:
-                scientific_index[scientific_name_key] = taxon_key_to_write
+                scientific_index[scientific_name_key] = taxon_key
 
             common_name_key = _normalize_index_key(common_name)
             if common_name_key:
-                common_index[common_name_key].add(taxon_key_to_write)
+                common_index[common_name_key].add(taxon_key)
+
+    # Annotate genus nodes with old genus names (e.g. Pelecyphora ← Escobaria).
+    for genus_key, old_names in genus_synonym_map.items():
+        genus_entry = catalog.get(str(genus_key))
+        if genus_entry:
+            existing: set[str] = set(genus_entry.get("genus_synonym_names") or [])
+            genus_entry["genus_synonym_names"] = sorted(existing | old_names)
 
     common_index_sorted = {k: sorted(v) for k, v in common_index.items()}
     combined_index: dict = {k: {v} for k, v in scientific_index.items()}
@@ -314,7 +411,7 @@ def build_mapping(catalog: dict, dwca_bytes: bytes) -> None:
         reader = csv.DictReader(extract_taxa_csv(dwca_bytes))
         for row in reader:
             rank = (row.get("taxonRank") or "").strip().upper()
-            if rank not in MAPPING_RANKS:
+            if rank not in NAME_MATCH_RANKS:
                 continue
 
             name = normalize_name(row.get("scientificName") or "")
@@ -437,7 +534,46 @@ def infer_species_inat_ids(catalog: dict, dwca_bytes: bytes) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2b: Observation-based iNat ID mapping
+# Phase 2b: Genus synonym iNat ID resolution
+# ---------------------------------------------------------------------------
+
+def resolve_genus_synonym_ids(catalog: dict, dwca_bytes: bytes) -> int:
+    """For genus nodes with genus_synonym_names, find iNat IDs for synonym genera.
+
+    Stored as inat_synonym_ids (not inat_id) so the primary iNat page is always
+    preferred for names/images, with synonym IDs used only to pull additional
+    vernacular names and as fallback preferred data.
+    """
+    inat_genus_ids: dict[str, str] = {}
+    zf = zipfile.ZipFile(io.BytesIO(dwca_bytes))
+    with io.TextIOWrapper(zf.open(INAT_TAXA_FILENAME), encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            if (row.get("taxonRank") or "").strip().upper() != "GENUS":
+                continue
+            name = normalize_name(row.get("scientificName") or "")
+            inat_id = (row.get("id") or "").strip()
+            if name and inat_id:
+                inat_genus_ids[name] = inat_id
+
+    updated = 0
+    for taxon_key, taxon in catalog.items():
+        syn_names = taxon.get("genus_synonym_names") or []
+        if not syn_names:
+            continue
+        primary_inat_id = _clean(taxon.get("inat_id"))
+        existing_syn_ids: set[str] = set(taxon.get("inat_synonym_ids") or [])
+        for syn_name in syn_names:
+            syn_inat_id = inat_genus_ids.get(normalize_name(syn_name))
+            if syn_inat_id and syn_inat_id != primary_inat_id and syn_inat_id not in existing_syn_ids:
+                existing_syn_ids.add(syn_inat_id)
+                updated += 1
+        if existing_syn_ids:
+            taxon["inat_synonym_ids"] = sorted(existing_syn_ids)
+    return updated
+
+
+# ---------------------------------------------------------------------------
+# Phase 2c: Observation-based iNat ID mapping
 # ---------------------------------------------------------------------------
 
 def _extract_observation_id(values: list) -> str | None:
@@ -600,9 +736,15 @@ def apply_names(
     for taxon_key, taxon in catalog.items():
         inat_id = str(taxon.get("inat_id") or "").strip()
         inat_names = (inat_map.get(inat_id) if inat_id else None) or []
+        # Also pull vernacular names from synonym iNat IDs (e.g. Escobaria names
+        # for a genus node whose primary iNat page is Pelecyphora).
+        for syn_inat_id in (taxon.get("inat_synonym_ids") or []):
+            for name in (inat_map.get(syn_inat_id) or []):
+                if name not in inat_names:
+                    inat_names = list(inat_names) + [name]
         # Look up GBIF vernacular under the primary key AND any synonym keys (e.g. a
         # reclassified species still has its old taxon key in the backbone TSV).
-        gbif_keys = [taxon_key] + list(taxon.get("gbif_synonym_keys") or [])
+        gbif_keys = [taxon_key]
         seen_gbif: set[str] = set()
         gbif_names: list[str] = []
         for gk in gbif_keys:
@@ -695,6 +837,7 @@ def apply_inat_preferred(
 
 
 def run_inat_preferred(catalog: dict) -> tuple[int, int]:
+    # Primary pass: taxa with a direct inat_id missing name or image.
     inat_to_taxa: dict[str, list[str]] = {}
     for taxon_key, taxon in catalog.items():
         inat_id = _clean(taxon.get("inat_id"))
@@ -706,15 +849,33 @@ def run_inat_preferred(catalog: dict) -> tuple[int, int]:
             continue
         inat_to_taxa.setdefault(inat_id, []).append(taxon_key)
 
-    inat_ids = list(inat_to_taxa.keys())
-    total_batches = (len(inat_ids) + INAT_BATCH_SIZE - 1) // INAT_BATCH_SIZE
+    # Synonym fallback pass: taxa with inat_synonym_ids still missing name or image
+    # after the primary pass (e.g. Pelecyphora genus has an image from its own iNat
+    # page but no preferred name — fall back to Escobaria's iNat page).
+    inat_synonym_to_taxa: dict[str, list[str]] = {}
+    for taxon_key, taxon in catalog.items():
+        syn_ids = taxon.get("inat_synonym_ids") or []
+        if not syn_ids:
+            continue
+        has_name = bool(_clean(taxon.get("inat_preferred_common_name")))
+        has_image = bool(_clean(taxon.get("inat_preferred_image")))
+        if has_name and has_image:
+            continue
+        for syn_id in syn_ids:
+            inat_synonym_to_taxa.setdefault(syn_id, []).append(taxon_key)
+
+    all_ids = list(dict.fromkeys(list(inat_to_taxa.keys()) + list(inat_synonym_to_taxa.keys())))
+    combined_map = {**inat_synonym_to_taxa, **inat_to_taxa}  # primary takes precedence
+
+    total_batches = (len(all_ids) + INAT_BATCH_SIZE - 1) // INAT_BATCH_SIZE
     eta_min = total_batches / INAT_RATE_LIMIT / 60
     print(
-        f"  Taxa needing iNat preferred metadata: {len(inat_ids):,} "
+        f"  Taxa needing iNat preferred metadata: {len(inat_to_taxa):,} primary + "
+        f"{len(inat_synonym_to_taxa):,} synonym fallback "
         f"({total_batches} batches, ~{eta_min:.0f} min)",
         flush=True,
     )
-    if not inat_ids:
+    if not all_ids:
         print("  Nothing to do.")
         return 0, 0
 
@@ -722,8 +883,8 @@ def run_inat_preferred(catalog: dict) -> tuple[int, int]:
     images_updated = 0
     errors = 0
 
-    for i in range(0, len(inat_ids), INAT_BATCH_SIZE):
-        batch = inat_ids[i : i + INAT_BATCH_SIZE]
+    for i in range(0, len(all_ids), INAT_BATCH_SIZE):
+        batch = all_ids[i : i + INAT_BATCH_SIZE]
         try:
             results = fetch_taxa_batch(batch)
         except Exception as exc:
@@ -731,7 +892,7 @@ def run_inat_preferred(catalog: dict) -> tuple[int, int]:
             errors += 1
             time.sleep(1.0 / INAT_RATE_LIMIT)
             continue
-        n, im = apply_inat_preferred(catalog, inat_to_taxa, results)
+        n, im = apply_inat_preferred(catalog, combined_map, results)
         names_updated += n
         images_updated += im
         request_num = i // INAT_BATCH_SIZE + 1
@@ -754,12 +915,22 @@ def update_name_index(payload: dict) -> int:
     added = 0
     for taxon_key, taxon in catalog.items():
         candidates: list[str] = []
+        # Scientific name must always be searchable, including for non-leaf taxa
+        # (genera, families, etc.) that build_catalog never adds to the index.
+        sci = str(taxon.get("scientific_name") or "").replace("_", " ").strip()
+        if sci:
+            candidates.append(sci)
         for field in ("common_name", "inat_preferred_common_name"):
             raw = str(taxon.get(field) or "").strip()
             if raw:
                 candidates.append(raw)
         for name in taxon.get("vernacular_names") or []:
             raw = str(name).strip()
+            if raw:
+                candidates.append(raw)
+        # Old names must be searchable (genus synonyms and collapsed species/infra synonyms).
+        for name in (taxon.get("genus_synonym_names") or []) + (taxon.get("gbif_synonym_names") or []):
+            raw = str(name).replace("_", " ").strip()
             if raw:
                 candidates.append(raw)
         for raw in candidates:
@@ -826,20 +997,24 @@ def _image_quality(license_str: str, vitality: str, evidence: str, rcs: str) -> 
 
 
 def _build_gbif_to_taxon(
-    catalog_keys: set[str],
-    synonym_to_catalog: dict[str, str] | None = None,
+    catalog: dict,
     unmatched_inat_keys: set[str] | None = None,
     obs_id_out: dict[str, str] | None = None,
 ) -> dict[str, tuple]:
     """Stream occurrence.txt → gbifID: (taxon_key, vitality, evidence, rcs).
 
-    synonym_to_catalog maps old synonym taxon keys to their current accepted catalog
-    key so that occurrence records submitted under the old name are still matched.
+    Direct taxonKey lookup against catalog, with synonym key fallback for
+    across-genus synonyms stored in gbif_synonym_keys.
 
     If unmatched_inat_keys and obs_id_out are provided, also collects the first
-    iNat catalogNumber per unmatched taxon in the same pass (used by
-    run_observation_mapping so the file is only streamed once).
+    iNat catalogNumber per unmatched taxon in the same pass.
     """
+    catalog_keys = set(catalog.keys())
+    synonym_to_key: dict[str, str] = {}
+    for taxon_key, taxon in catalog.items():
+        for syn_key in (taxon.get("gbif_synonym_keys") or []):
+            synonym_to_key[str(syn_key)] = taxon_key
+
     mapping: dict[str, tuple] = {}
     rows = 0
     with open(OCCURRENCE_PATH, encoding="utf-8") as f:
@@ -850,15 +1025,11 @@ def _build_gbif_to_taxon(
             gbif_id = (row.get("gbifID") or "").strip()
             if not gbif_id:
                 continue
-            rank = (row.get("taxonRank") or "").upper()
-            taxon_key = (row.get("taxonKey") or "").strip()
-            species_key = (row.get("speciesKey") or "").strip()
-            key = taxon_key if rank in _SUBSPECIES_RANKS else (species_key or taxon_key)
-            if not key:
+            raw_key = (row.get("taxonKey") or "").strip()
+            if not raw_key:
                 continue
-            if key not in catalog_keys and synonym_to_catalog:
-                key = synonym_to_catalog.get(key, key)
-            if not key or key not in catalog_keys:
+            key = raw_key if raw_key in catalog_keys else synonym_to_key.get(raw_key, "")
+            if not key:
                 continue
             # Opportunistically collect an obs ID for iNat ID resolution.
             if unmatched_inat_keys and obs_id_out is not None and key in unmatched_inat_keys and key not in obs_id_out:
@@ -929,11 +1100,6 @@ def run_gbif_backup(catalog: dict) -> tuple[int, int]:
     if not OCCURRENCE_PATH.exists() or not MULTIMEDIA_PATH.exists():
         print("  Occurrence data not yet downloaded, skipping.", flush=True)
         return 0, 0
-    synonym_to_catalog: dict[str, str] = {
-        syn_key: catalog_key
-        for catalog_key, taxon in catalog.items()
-        for syn_key in (taxon.get("gbif_synonym_keys") or [])
-    }
     # Taxa that still need an inat_id resolved via an observation lookup.
     unmatched_inat_keys: set[str] = {
         key for key, taxon in catalog.items()
@@ -942,7 +1108,7 @@ def run_gbif_backup(catalog: dict) -> tuple[int, int]:
     }
     obs_id_out: dict[str, str] = {}
     gbif_to_taxon = _build_gbif_to_taxon(
-        set(catalog.keys()), synonym_to_catalog,
+        catalog,
         unmatched_inat_keys, obs_id_out,
     )
     print(f"  Collected obs IDs for {len(obs_id_out):,} unmatched taxa", flush=True)
@@ -955,6 +1121,68 @@ def run_gbif_backup(catalog: dict) -> tuple[int, int]:
             entry.update(fields)
             updated += 1
     return updated, obs_resolved
+
+
+# ---------------------------------------------------------------------------
+# Image propagation
+# ---------------------------------------------------------------------------
+
+def propagate_images(catalog: dict) -> int:
+    """Bottom-up pass: give imageless ancestor nodes an image from a direct child.
+
+    Processes deepest nodes first so each parent can inherit from a child that
+    may itself have just inherited from its own children — one row at a time up
+    the tree. Prefers inat_preferred_image over gbif_backup_image.
+    """
+    path_to_key = {taxon["path"]: key for key, taxon in catalog.items()}
+    children: dict[str, list[str]] = defaultdict(list)
+    for key, taxon in catalog.items():
+        path = taxon["path"]
+        if "/" in path:
+            parent_path = path.rsplit("/", 1)[0]
+            parent_key = path_to_key.get(parent_path)
+            if parent_key:
+                children[parent_key].append(key)
+
+    by_depth = sorted(catalog.keys(), key=lambda k: catalog[k]["path"].count("/"), reverse=True)
+
+    inat_img_fields = (
+        "inat_preferred_image",
+        "inat_preferred_image_license",
+        "inat_preferred_image_creator",
+        "inat_preferred_image_attribution",
+        "inat_preferred_image_references",
+    )
+    gbif_img_fields = (
+        "gbif_backup_image",
+        "gbif_backup_image_license",
+        "gbif_backup_image_creator",
+        "gbif_backup_image_attribution",
+        "gbif_backup_image_references",
+    )
+
+    updated = 0
+    for key in by_depth:
+        taxon = catalog[key]
+        if _clean(taxon.get("inat_preferred_image")) or _clean(taxon.get("gbif_backup_image")):
+            continue
+        inherited: dict | None = None
+        child_keys = children.get(key, [])
+        for child_key in child_keys:
+            child = catalog[child_key]
+            if _clean(child.get("inat_preferred_image")):
+                inherited = {f: child.get(f, "") for f in inat_img_fields}
+                break
+        if inherited is None:
+            for child_key in child_keys:
+                child = catalog[child_key]
+                if _clean(child.get("gbif_backup_image")):
+                    inherited = {f: child.get(f, "") for f in gbif_img_fields}
+                    break
+        if inherited:
+            taxon.update(inherited)
+            updated += 1
+    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -983,11 +1211,16 @@ def main() -> None:
     MAPPING_PATH.unlink(missing_ok=True)
     inferred = infer_species_inat_ids(catalog, dwca_bytes)
     print(f"Inferred inat_id for {inferred:,} additional species from children.")
+    syn_ids_resolved = resolve_genus_synonym_ids(catalog, dwca_bytes)
+    print(f"Resolved {syn_ids_resolved:,} inat_synonym_ids for genus nodes with synonym genera.")
 
     # Phase 3: Common names, preferred images, GBIF backup images.
     # run_gbif_backup also streams occurrence.txt to collect obs IDs for any taxa
     # still lacking inat_id, resolving them via the iNat observations API in the
     # same pass — no extra file scan needed.
+    # Load vernacular name maps now (no inat_id dependency), but defer apply_names
+    # until after run_gbif_backup so that obs-based inat_id resolutions also get
+    # their iNat vernacular names applied.
     print("\nFetching GBIF backbone vernacular names...")
     vernacular_bytes = fetch_backbone_vernacular()
     print("Loading vernacular names...")
@@ -996,16 +1229,21 @@ def main() -> None:
     gbif_map = load_gbif_vernacular(vernacular_bytes)
     print(f"  GBIF: {len(gbif_map):,} English names")
     print(f"  Catalog: {len(catalog):,} taxa")
-    updated = apply_names(catalog, inat_map, gbif_map)
 
     print("\nFetching GBIF backup images from occurrence data...")
     backup_n, obs_resolved = run_gbif_backup(catalog)
     print(f"  Resolved inat_id for {obs_resolved:,} additional taxa via observations.")
 
+    updated = apply_names(catalog, inat_map, gbif_map)
+
     # Now that observation mapping is done, fetch iNat preferred names and images
     # for any newly resolved taxa (plus anything still pending).
     print("\nFetching iNat preferred names and images...")
     names_n, images_n = run_inat_preferred(catalog)
+
+    print("\nPropagating images to imageless ancestor nodes...")
+    inherited_n = propagate_images(catalog)
+    print(f"  Propagated images to {inherited_n:,} ancestor nodes.")
 
     index_added = update_name_index(payload)
     print(f"Added {index_added:,} new entries to name search index.")

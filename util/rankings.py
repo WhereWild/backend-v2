@@ -29,7 +29,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from config.config import METRICS_BY_TYPE, ValueType, load_config
-from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE
+from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE, ORDINAL_STATS_FILE
 from util.storage import ParquetStorageProxy, atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
 
@@ -67,18 +67,18 @@ MIN_RANKING_SAMPLES = 10  # taxa with fewer observations for a variable are excl
 
 
 _POSITION_SCHEMA = pa.schema([
-    pa.field("taxon_key", pa.string()),
-    pa.field("variable", pa.string()),
-    pa.field("metric", pa.string()),
+    pa.field("taxon_key", pa.large_string()),
+    pa.field("variable", pa.large_string()),
+    pa.field("metric", pa.large_string()),
     pa.field("position", pa.int32()),
     pa.field("count", pa.int32()),
     pa.field("sampleCount", pa.int32()),
-    pa.field("contextTaxonId", pa.string()),
-    pa.field("contextLabel", pa.string()),
+    pa.field("contextTaxonId", pa.large_string()),
+    pa.field("contextLabel", pa.large_string()),
 ])
 
 _STRUCT_FIELDS = [
-    pa.field("taxonKey", pa.string()),
+    pa.field("taxonKey", pa.large_string()),
     pa.field("value", pa.float64()),
     pa.field("sampleCount", pa.int64()),
 ]
@@ -118,20 +118,31 @@ def _descendant_rank_targets(ancestor_rank: str) -> list[str]:
 
 
 # Circular metrics that are angular bearings — included in the sort index but
-# excluded from relative_ranks_positions.parquet (no percentile/position display).
-_ANGULAR_METRICS: frozenset[str] = frozenset({"circular_mean", "mode"})
+# excluded from relative_ranks_positions.parquet for circular variables only.
+_CIRCULAR_ANGULAR_METRICS: frozenset[str] = frozenset({"circular_mean", "mode"})
+
+# Metrics excluded from ranking for nominal/ordinal variables.
+# Ordinal percentiles are ordinal-scale class IDs — numeric ordering is meaningful
+# within a variable but not comparable across taxa.  Mode is a class ID too.
+_NOMINAL_SKIP_RANK_METRICS: frozenset[str] = frozenset({"mode"})
+_ORDINAL_SKIP_RANK_METRICS: frozenset[str] = frozenset({
+    "mode",
+    "10th_percentile", "25th_percentile", "median", "75th_percentile", "90th_percentile",
+})
 
 
 def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
     """Return rankable metric names for a value type.
 
-    Returns () for types with no ranking metrics (ORDINAL, AGGREGATE).
+    Returns () for types with no ranking metrics (AGGREGATE, etc.).
     """
     match vtype:
         case ValueType.RATIO | ValueType.INTERVAL:
             return METRICS_BY_TYPE[vtype]
         case ValueType.NOMINAL:
             return METRICS_BY_TYPE[ValueType.NOMINAL]
+        case ValueType.ORDINAL:
+            return METRICS_BY_TYPE[ValueType.ORDINAL]
         case ValueType.CIRCULAR:
             return METRICS_BY_TYPE[ValueType.CIRCULAR]
         case _:
@@ -143,8 +154,10 @@ def _preload_one_taxon(
     ratio_interval_ids: set[str],
     circular_ids: set[str],
     nominal_ids: set[str],
+    ordinal_ids: set[str],
     layer_metrics: dict[str, tuple[str, ...]],
     nominal_metrics: set[str],
+    ordinal_metrics: set[str],
     circ_metrics: tuple[str, ...],
 ) -> tuple[str, dict]:
     taxon_key = num_path.parent.name.rsplit("_", 1)[-1]
@@ -206,6 +219,31 @@ def _preload_one_taxon(
         except Exception:
             pass
 
+    # ordinal stats — tall format: same as nominal_stats
+    ord_path = taxon_dir / ORDINAL_STATS_FILE
+    if ord_path.exists():
+        try:
+            tbl = pq.ParquetFile(ord_path).read()
+            ord_variables = tbl.column("variable").to_pylist()
+            ord_metrics_col = tbl.column("metric").to_pylist()
+            ord_values = tbl.column("value").to_pylist()
+            for variable, metric, val in zip(ord_variables, ord_metrics_col, ord_values):
+                variable = str(variable or "")
+                metric = str(metric or "")
+                if variable not in ordinal_ids:
+                    continue
+                if metric not in ordinal_metrics and not metric.startswith("class_"):
+                    continue
+                if entry["__sample_count__"] == 0 and metric == "total_samples":
+                    try:
+                        entry["__sample_count__"] = int(float(val or 0))
+                    except (TypeError, ValueError):
+                        pass
+                if _safe_finite(val):
+                    entry[f"{variable}::{metric}"] = float(val)
+        except Exception:
+            pass
+
     # circular stats — wide format: one row per variable, metric columns
     circ_path = taxon_dir / CIRCULAR_STATS_FILE
     if circ_path.exists():
@@ -246,7 +284,9 @@ def preload_stats_cache(layers: list[dict]) -> None:
     _stats_cache = {}
     layer_by_id = {lay["id"]: lay for lay in layers}
     nominal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.NOMINAL}
-    nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL])
+    nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL]) - _NOMINAL_SKIP_RANK_METRICS
+    ordinal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.ORDINAL}
+    ordinal_metrics = set(METRICS_BY_TYPE[ValueType.ORDINAL]) - _ORDINAL_SKIP_RANK_METRICS
 
     ratio_interval_ids: set[str] = set()
     circular_ids: set[str] = set()
@@ -268,8 +308,10 @@ def preload_stats_cache(layers: list[dict]) -> None:
         ratio_interval_ids=ratio_interval_ids,
         circular_ids=circular_ids,
         nominal_ids=nominal_ids,
+        ordinal_ids=ordinal_ids,
         layer_metrics=layer_metrics,
         nominal_metrics=nominal_metrics,
+        ordinal_metrics=ordinal_metrics,
         circ_metrics=circ_metrics,
     )
 
@@ -469,7 +511,7 @@ def _collect_entries_from_nominal_stats(
         return {}
 
     nominal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.NOMINAL}
-    nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL])
+    nominal_metrics = set(METRICS_BY_TYPE[ValueType.NOMINAL]) - _NOMINAL_SKIP_RANK_METRICS
     entries: dict[str, dict[str, Any]] = {}
 
     # Build per-variable total_samples lookup for threshold filtering
@@ -486,6 +528,50 @@ def _collect_entries_from_nominal_stats(
         if var_totals.get(variable, 0) < MIN_RANKING_SAMPLES:
             continue
         if metric not in nominal_metrics and not metric.startswith("class_"):
+            continue
+        val = record.get("value")
+        if not _safe_finite(val):
+            continue
+        entries[f"{variable}::{metric}"] = {
+            "taxon_key": taxon_key,
+            "value": float(val),
+            "sample_count": sample_count,
+        }
+    return entries
+
+
+def _collect_entries_from_ordinal_stats(
+    taxon_key: str,
+    taxon_dir: Path,
+    sample_count: int,
+    layers: list[dict],
+) -> dict[str, dict[str, Any]]:
+    """Read ordinal_stats.parquet → {variable::metric: entry dict}."""
+    stats_path = taxon_dir / ORDINAL_STATS_FILE
+    if not stats_path.exists():
+        return {}
+    try:
+        df = pq.read_table(stats_path).to_pandas()
+    except Exception:
+        return {}
+
+    ordinal_ids = {lay["id"] for lay in layers if lay.get("value_type") == ValueType.ORDINAL}
+    ordinal_metrics = set(METRICS_BY_TYPE[ValueType.ORDINAL]) - _ORDINAL_SKIP_RANK_METRICS
+    entries: dict[str, dict[str, Any]] = {}
+
+    var_totals: dict[str, int] = {}
+    for record in df.to_dict("records"):
+        if str(record.get("metric") or "") == "total_samples":
+            var_totals[str(record.get("variable") or "")] = int(float(record.get("value") or 0))
+
+    for record in df.to_dict("records"):
+        variable = str(record.get("variable") or "")
+        metric = str(record.get("metric") or "")
+        if variable not in ordinal_ids:
+            continue
+        if var_totals.get(variable, 0) < MIN_RANKING_SAMPLES:
+            continue
+        if metric not in ordinal_metrics and not metric.startswith("class_"):
             continue
         val = record.get("value")
         if not _safe_finite(val):
@@ -562,6 +648,7 @@ def _collect_all_entries(
         }
     entries = _collect_entries_from_numerical_stats(taxon_key, taxon_dir, sample_count, layers)
     entries.update(_collect_entries_from_nominal_stats(taxon_key, taxon_dir, sample_count, layers))
+    entries.update(_collect_entries_from_ordinal_stats(taxon_key, taxon_dir, sample_count, layers))
     entries.update(_collect_entries_from_circular_stats(taxon_key, taxon_dir, sample_count, layers))
     return entries
 
@@ -571,8 +658,10 @@ def _build_rank_index(
     rank: str,
     index_path: Path,
     layers: list[dict],
+    circular_ids: frozenset[str] | None = None,
 ) -> None:
     """Collect per-taxon metrics for all descendants of rank and write sorted struct array index."""
+    _circular_ids: frozenset[str] = circular_ids if circular_ids is not None else frozenset()
     descendants = _descendants_for_rank(ancestor, rank)
     if not descendants:
         index_path.unlink(missing_ok=True)
@@ -684,7 +773,7 @@ def _build_rank_index(
             max_len = max(max_len, n)
             arrays[col_key] = pa.StructArray.from_arrays(
                 [
-                    pa.array(sorted_tks, type=pa.string()),
+                    pa.array(sorted_tks, type=pa.large_string()),
                     pa.array(val_np[order], type=pa.float64()),
                     pa.array(sorted_scs, type=pa.int64()),
                 ],
@@ -693,7 +782,8 @@ def _build_rank_index(
 
             # Collect positions inline — data is already sorted, no re-read needed.
             variable, metric = col_key.split("::", 1)
-            if metric not in _ANGULAR_METRICS and n > 0:
+            is_angular = variable in _circular_ids and metric in _CIRCULAR_ANGULAR_METRICS
+            if not is_angular and n > 0:
                 sorted_vals = val_np[order]
                 # Vectorised min_rank_pos: tied values share the first position in their group.
                 is_new = np.empty(n, dtype=bool)
@@ -724,7 +814,7 @@ def _build_rank_index(
             max_len = max(max_len, n)
             arrays[col_key] = pa.StructArray.from_arrays(
                 [
-                    pa.array([e[0] for e in entries], type=pa.string()),
+                    pa.array([e[0] for e in entries], type=pa.large_string()),
                     pa.array([e[1] for e in entries], type=pa.float64()),
                     pa.array([e[2] for e in entries], type=pa.int64()),
                 ],
@@ -754,14 +844,14 @@ def _build_rank_index(
         del pos_pos_chunks, pos_cnt_chunks, pos_sc_chunks
         n_pos = len(pos_tks)
         pos_table = pa.table({
-            "taxon_key":     pa.array(pos_tks,  type=pa.string()),
-            "variable":      pa.array(pos_vars, type=pa.string()),
-            "metric":        pa.array(pos_mets, type=pa.string()),
+            "taxon_key":     pa.array(pos_tks,  type=pa.large_string()),
+            "variable":      pa.array(pos_vars, type=pa.large_string()),
+            "metric":        pa.array(pos_mets, type=pa.large_string()),
             "position":      pa.array(all_pos),
             "count":         pa.array(all_cnt),
             "sampleCount":   pa.array(all_sc),
-            "contextTaxonId": pa.array([context_taxon_id] * n_pos, type=pa.string()),
-            "contextLabel":   pa.array([context_label]    * n_pos, type=pa.string()),
+            "contextTaxonId": pa.array([context_taxon_id] * n_pos, type=pa.large_string()),
+            "contextLabel":   pa.array([context_label]    * n_pos, type=pa.large_string()),
         }, schema=_POSITION_SCHEMA)
         del pos_tks, pos_vars, pos_mets, all_pos, all_cnt, all_sc
         # Sort by taxon_key so consolidation can merge-sort efficiently.
@@ -777,10 +867,14 @@ def build_rank_indexes(ancestor: TaxonRecord, layers: list[dict]) -> None:
     if not targets:
         return
 
+    circular_ids: frozenset[str] = frozenset(
+        lay["id"] for lay in layers
+        if lay.get("value_type") == ValueType.CIRCULAR and lay.get("id")
+    )
     ancestor_dir = TREE_ROOT / ancestor["path"]
     for rank in targets:
         index_path = ancestor_dir / f"{rank.lower()}_index.parquet"
-        _build_rank_index(ancestor, rank, index_path, layers)
+        _build_rank_index(ancestor, rank, index_path, layers, circular_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -980,7 +1074,7 @@ def _query_ranked_scoped(
 
     accepted_ranks = _accepted_ranks(descendant_rank, include_species_like)
 
-    is_circular_bearing = sort_metric in _ANGULAR_METRICS and reference_value is not None
+    is_circular_bearing = sort_metric in _CIRCULAR_ANGULAR_METRICS and reference_value is not None
 
     # For circular sorts, optionally load rbar values for min_rbar filtering
     rbar_map: dict[str, float] = {}
@@ -1029,7 +1123,7 @@ def _query_ranked_scoped(
         taxon = get_taxon_by_id(tk)
         if taxon is None:
             continue
-        percentile = ((local_rank - 1) / total * 100) if total > 0 else None
+        percentile = round(raw_pos / col_len * 100, 3) if col_len > 0 else None
         results.append({
             "taxon": taxon,
             "match_score": match_scores.get(tk),
@@ -1037,7 +1131,7 @@ def _query_ranked_scoped(
             "sample_count": loc_counts.get(tk) or sc or None,
             "sort_value": val,
             "location_count": loc_counts.get(tk) or None,
-            "position": local_rank,
+            "position": raw_pos + 1,
             "percentile": percentile,
         })
 
@@ -1069,7 +1163,7 @@ def _query_ranked_text(
     if not candidates:
         return _empty_result("no_text_matches")
 
-    is_circular_bearing = sort_metric in _ANGULAR_METRICS and reference_value is not None
+    is_circular_bearing = sort_metric in _CIRCULAR_ANGULAR_METRICS and reference_value is not None
 
     enriched: list[tuple[TaxonRecord, float, float, int, str]] = []  # taxon, score, sort_val, sc, match_name
     for taxon, score, match_name in candidates:

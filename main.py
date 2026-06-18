@@ -34,6 +34,7 @@ from util.stats import (
     GLOBAL_STATS_DIR,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
+    ORDINAL_STATS_FILE,
     TREE_ROOT,
     apply_phenology_filter,
     apply_timestamp_filter,
@@ -206,7 +207,7 @@ def _image_fields(taxon: dict) -> dict:
     }
 
 
-_VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "categorical"}
+_VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "categorical", "ordinal": "ordinal"}
 
 
 @app.get("/")
@@ -409,7 +410,7 @@ def list_variables(unit_system: str | None = Query(None)):
     for layer, category in tiles.load_layers_with_category():
         value_type = _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous")
         legend_classes = None
-        if value_type == "categorical":
+        if value_type in ("categorical", "ordinal"):
             raw = _load_legend(layer["id"])
             if raw:
                 legend_classes = [
@@ -434,6 +435,7 @@ def list_variables(unit_system: str | None = Query(None)):
             "render_max": units.convert_value(rmax, layer, unit_system),
             "group": layer.get("group") or None,
             "group_label": layer.get("group_label") or None,
+            "agg": layer.get("agg") or None,
         })
     return result
 
@@ -494,7 +496,7 @@ async def gis_point_value(
 
     class_name: str | None = None
     class_color: str | None = None
-    if value is not None and layer.get("value_type") == "nominal":
+    if value is not None and layer.get("value_type") in ("nominal", "ordinal"):
         legend = _load_legend(variable)
         int_val = int(value) if value == int(value) else None
         for entry in legend:
@@ -556,7 +558,7 @@ async def layer_tile(
     is_temporal = layer.get("window_hours") is not None
     cache_max_age = 300 if is_temporal else 604800
     headers: dict[str, str] = {"Cache-Control": f"public, max-age={cache_max_age}"}
-    if str(layer.get("value_type") or "").lower() == "nominal":
+    if str(layer.get("value_type") or "").lower() in ("nominal", "ordinal"):
         class_counts = await run_in_threadpool(tiles.nominal_tile_range_classes, layer_id, z, x, y, x, y)
         if class_counts:
             ordered = sorted(class_counts.items(), key=lambda kv: kv[1], reverse=True)
@@ -649,13 +651,30 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
     for var in nominal_classes:
         nominal_classes[var].sort(key=lambda e: -e["fraction"])
 
+    ordinal_stats: dict[str, dict] = {}
+    ordinal_classes: dict[str, list] = {}
+    for row in _storage.read_table(GLOBAL_STATS_DIR / ORDINAL_STATS_FILE, filters=_tk).to_pylist():
+        row.pop("taxon_key", None)
+        var, metric, value = row["variable"], row["metric"], row["value"]
+        if metric.startswith("class_"):
+            if not value:
+                continue
+            class_id = int(metric[6:])
+            ordinal_classes.setdefault(var, []).append({"class_id": class_id, "fraction": value})
+        else:
+            ordinal_stats.setdefault(var, {})[metric] = value
+    for var in ordinal_classes:
+        ordinal_classes[var].sort(key=lambda e: e["class_id"])
+
     density_by_var: dict[str, dict] = {}
     for row in _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk).to_pylist():
         row.pop("taxon_key", None)
         var = row.pop("variable")
         density_by_var[var] = row
 
-    all_var_ids = list(dict.fromkeys(list(numerical_stats) + list(circular_stats) + list(nominal_stats)))
+    all_var_ids = list(dict.fromkeys(
+        list(numerical_stats) + list(circular_stats) + list(nominal_stats) + list(ordinal_stats)
+    ))
     variables = []
     for var_id in all_var_ids:
         layer = layer_index.get(var_id, {})
@@ -674,6 +693,10 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
             entry["stats"] = circular_stats[var_id]
             entry["density"] = density_by_var.get(var_id)
             entry["classes"] = None
+        elif var_id in ordinal_stats:
+            entry["stats"] = ordinal_stats[var_id]
+            entry["density"] = None
+            entry["classes"] = ordinal_classes.get(var_id, [])
         else:
             entry["stats"] = nominal_stats[var_id]
             entry["density"] = None
@@ -914,6 +937,7 @@ def get_species_environment(
                         "q90": stats.get("90th_percentile"),
                         "iqr": stats.get("iqr"),
                         "10_90_range": stats.get("10_90_range"),
+                        "entropy": stats.get("entropy"),
                     }
                     return {
                         "species_id": taxon.get("taxon_key"),
@@ -938,6 +962,7 @@ def get_species_environment(
                             "rbar": stats.get("rbar"),
                             "circular_std": stats.get("circular_std"),
                             "circular_var": stats.get("circular_var"),
+                            "entropy": stats.get("entropy"),
                             "mode": stats.get("mode"),
                         },
                         "density_curve": result["density_curve"],
@@ -976,9 +1001,10 @@ def get_species_environment(
                     "relative_ranks": [],
                 }
 
-    if value_type == "nominal":
+    if value_type in ("nominal", "ordinal"):
+        stats_file = ORDINAL_STATS_FILE if value_type == "ordinal" else NOMINAL_STATS_FILE
         rows = _storage.read_table(
-            GLOBAL_STATS_DIR / NOMINAL_STATS_FILE,
+            GLOBAL_STATS_DIR / stats_file,
             filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)],
         ).to_pylist()
         if not rows:
@@ -1004,21 +1030,28 @@ def get_species_environment(
                 "count": round(total_samples * fraction),
                 "fraction": fraction,
             })
-        categorical_distribution.sort(key=lambda x: -x["fraction"])
+        if value_type == "ordinal":
+            categorical_distribution.sort(key=lambda x: x["value"])
+        else:
+            categorical_distribution.sort(key=lambda x: -x["fraction"])
+        summary: dict = {
+            "count": total_samples,
+            "unique_classes": int(metrics["unique_classes"]) if "unique_classes" in metrics else None,
+            "entropy": float(metrics["entropy"]) if "entropy" in metrics else None,
+            "mode": int(metrics["mode"]) if "mode" in metrics else None,
+        }
+        if value_type == "ordinal":
+            for key in ("10th_percentile", "25th_percentile", "median", "75th_percentile", "90th_percentile"):
+                if key in metrics:
+                    summary[key] = float(metrics[key])
+        else:
+            summary.update({"min": None, "mean": None, "max": None})
         return {
             "species_id": taxon.get("taxon_key"),
             "variable": variable_id,
             "variable_metadata": variable_metadata,
             "observation_count": total_samples,
-            "summary": {
-                "count": total_samples,
-                "min": None,
-                "mean": None,
-                "max": None,
-                "unique_classes": int(metrics["unique_classes"]) if "unique_classes" in metrics else None,
-                "entropy": float(metrics["entropy"]) if "entropy" in metrics else None,
-                "mode": int(metrics["mode"]) if "mode" in metrics else None,
-            },
+            "summary": summary,
             "density_curve": None,
             "categorical_distribution": categorical_distribution,
             "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id),
@@ -1037,6 +1070,7 @@ def get_species_environment(
             "rbar": row.get("rbar"),
             "circular_std": row.get("circular_std"),
             "circular_var": row.get("circular_var"),
+            "entropy": row.get("entropy"),
             "mode": row.get("mode"),
         }
         den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
@@ -1077,6 +1111,7 @@ def get_species_environment(
         "q90": row.get("90th_percentile"),
         "iqr": row.get("iqr"),
         "10_90_range": row.get("10_90_range"),
+        "entropy": row.get("entropy"),
     }
 
     den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
@@ -1454,7 +1489,7 @@ def get_species_environment_class_samples(
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
         raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
-    if layer.get("value_type") != "nominal":
+    if layer.get("value_type") not in ("nominal", "ordinal"):
         raise HTTPException(status_code=400, detail="Numerical variables must use the slice endpoint")
     try:
         parsed: float | int = float(class_value)
@@ -1545,6 +1580,8 @@ def list_taxa_ranking_options(
             continue
         if metric.startswith("class_"):
             label = _class_label(variable, metric)
+            if label == metric:
+                continue
         else:
             label = _METRIC_LABELS.get(metric, metric.replace("_", " ").capitalize())
         options.append({

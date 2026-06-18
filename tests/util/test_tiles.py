@@ -52,9 +52,9 @@ FAKE_CATALOG = {
                     "render_max": None,
                 },
                 {
-                    "id": "kg0",
+                    "id": "kg2",
                     "display_name": "Köppen-Geiger Classification",
-                    "filename": "kg0.tif",
+                    "filename": "kg2.tif",
                     "source": "chelsa_v2_1",
                     "units": "",
                     "value_type": "nominal",
@@ -90,7 +90,7 @@ def test_load_layers_returns_all():
     layers = tiles.load_layers()
     assert len(layers) == 3
     assert layers[0]["id"] == "bio1"
-    assert layers[-1]["id"] == "kg0"
+    assert layers[-1]["id"] == "kg2"
 
 
 def test_load_layers_with_category():
@@ -312,7 +312,7 @@ def test_render_tile_nominal_nearest():
     raw = np.arange(1, 17, dtype=np.uint16).reshape(4, 4)
     mock_ds = _make_mock_ds(raw, nodata=65535.0, scales=(1.0,), offsets=(0.0,))
     with patch("rasterio.open", return_value=mock_ds):
-        result = tiles.render_layer_tile_bytes("kg0", z=2, x=2, y=1, tile_size=64)
+        result = tiles.render_layer_tile_bytes("kg2", z=2, x=2, y=1, tile_size=64)
     assert result[:4] == b"\x89PNG"
 
 

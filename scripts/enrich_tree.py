@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 from collections import defaultdict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -86,6 +87,21 @@ _BASE_COLS = frozenset([
     "gbifRegion", "level0Gid", "level1Gid", "level2Gid", "dp", "vitality", "rcs",
 ])
 _REQUIRED_COLS = ("decimalLatitude", "decimalLongitude", "catalogNumber", "hilbertIdx")
+
+_LEGENDS_DIR = Path("config/gis/legends")
+
+@functools.cache
+def _valid_class_ids(layer_id: str) -> frozenset[int] | None:
+    """Return valid class IDs from the legend file, or None if no legend exists."""
+    base_id = re.sub(r'_(avg|sum|mode|mean|min|max)_\d+h$', '', layer_id)
+    legend_path = _LEGENDS_DIR / f"{base_id}_legend.json"
+    if not legend_path.exists():
+        return None
+    try:
+        classes = json.loads(legend_path.read_text()).get("classes", [])
+        return frozenset(int(c["id"]) for c in classes if "id" in c)
+    except Exception:
+        return None
 
 
 def _load_layers() -> list[dict]:
@@ -346,9 +362,16 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
             if not cog_path.exists():
                 print(f"[warn] {cog_path.name} not found; skipping {layer_id}")
                 return layer_id, np.full(len(lats), np.nan)
-            scale = layer["scale_factor"] if layer["scale_factor"] is not None else 1.0
-            offset = layer["add_offset"] if layer["add_offset"] is not None else 0.0
+            scale = layer.get("scale_factor") or 1.0
+            offset = layer.get("add_offset") or 0.0
             vals = _sample_cog_batch(cog_path, layer_id, lats[arr], lons[arr], scale, offset)
+            vtype = layer.get("value_type", "")
+            if vtype in ("nominal", "ordinal"):
+                valid = _valid_class_ids(layer_id)
+                if valid is not None:
+                    finite = np.isfinite(vals)
+                    int_vals = np.where(finite, np.rint(vals).astype(np.int64), 0)
+                    vals[finite & ~np.isin(int_vals, np.array(sorted(valid), dtype=np.int64))] = np.nan
 
         full = np.full(len(lats), np.nan, dtype=np.float64)
         full[arr] = vals
@@ -378,8 +401,8 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
             if lid == elev_layer_id:
                 meta = layer_meta.get(lid)
                 if meta and meta.get("filename"):
-                    scale = meta["scale_factor"] if meta["scale_factor"] is not None else 1.0
-                    offset = meta["add_offset"] if meta["add_offset"] is not None else 0.0
+                    scale = meta.get("scale_factor") or 1.0
+                    offset = meta.get("add_offset") or 0.0
                     vals = vals * scale + offset
             full[common_arr] = vals
             out.append((lid, full))

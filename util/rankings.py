@@ -1123,7 +1123,7 @@ def _query_ranked_scoped(
         taxon = get_taxon_by_id(tk)
         if taxon is None:
             continue
-        percentile = ((local_rank - 1) / total * 100) if total > 0 else None
+        percentile = round(raw_pos / col_len * 100, 3) if col_len > 0 else None
         results.append({
             "taxon": taxon,
             "match_score": match_scores.get(tk),
@@ -1131,7 +1131,7 @@ def _query_ranked_scoped(
             "sample_count": loc_counts.get(tk) or sc or None,
             "sort_value": val,
             "location_count": loc_counts.get(tk) or None,
-            "position": local_rank,
+            "position": raw_pos + 1,
             "percentile": percentile,
         })
 

@@ -122,6 +122,11 @@ def _flush(buffers: dict, taxon_path: str) -> None:
 
 def main() -> None:
     catalog = load_catalog()
+    # Reverse map: across-genus synonym taxon key → accepted catalog entry.
+    synonym_to_taxon: dict[str, dict] = {}
+    for taxon in catalog.values():
+        for syn_key in (taxon.get("gbif_synonym_keys") or []):
+            synonym_to_taxon[str(syn_key)] = taxon
     buffers: dict[str, list] = defaultdict(list)
     rows_read = 0
     rows_written = 0
@@ -150,12 +155,10 @@ def main() -> None:
                 continue
 
             taxon_key = (row.get("taxonKey") or "").strip()
-            species_key = (row.get("speciesKey") or "").strip()
-            lookup_key = taxon_key if rank in CONFIG.subspecies_equivalents else (species_key or taxon_key)
-            if not lookup_key:
+            if not taxon_key:
                 continue
 
-            taxon = catalog.get(lookup_key)
+            taxon = catalog.get(taxon_key) or synonym_to_taxon.get(taxon_key)
             if taxon is None:
                 continue
 

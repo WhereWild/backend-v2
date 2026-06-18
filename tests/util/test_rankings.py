@@ -176,8 +176,14 @@ def test_metrics_for_vtype_circular_returns_full_tuple():
     assert "count" in metrics
 
 
-def test_metrics_for_vtype_ordinal_empty():
-    assert rk._metrics_for_vtype(_ORDINAL_LAYER, ValueType.ORDINAL) == ()
+def test_metrics_for_vtype_ordinal():
+    metrics = rk._metrics_for_vtype(_ORDINAL_LAYER, ValueType.ORDINAL)
+    assert "median" in metrics
+    assert "entropy" in metrics
+    assert "unique_classes" in metrics
+    assert "mean" not in metrics
+    assert "min" not in metrics
+    assert "max" not in metrics
 
 
 # ---------------------------------------------------------------------------

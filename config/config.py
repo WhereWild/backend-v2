@@ -31,8 +31,7 @@ _NOMINAL_METRICS: tuple[str, ...] = (
 
 _ORDINAL_METRICS: tuple[str, ...] = (
     "count", "unique_samples", "total_samples", "unique_classes", "entropy", "mode",
-    "min", "10th_percentile", "25th_percentile", "median",
-    "75th_percentile", "90th_percentile", "max",
+    "10th_percentile", "25th_percentile", "median", "75th_percentile", "90th_percentile",
 )
 
 METRICS_BY_TYPE: dict[ValueType, tuple[str, ...]] = {

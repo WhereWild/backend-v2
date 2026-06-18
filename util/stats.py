@@ -821,7 +821,10 @@ def _ordinal_stats(counts: Counter, unique_samples: int) -> dict:
     probs = np.array([counts[k] / total for k in sorted(counts)], dtype=float)
     entropy = float(_scipy_entropy(probs))
     mode_cls = counts.most_common(1)[0][0]
-    q = lambda p: _ordinal_quantile(counts, p)
+
+    def q(p: float) -> float:
+        return _ordinal_quantile(counts, p)
+
     return {
         "count": total,
         "unique_samples": unique_samples,

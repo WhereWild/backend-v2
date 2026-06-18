@@ -52,6 +52,9 @@ SYNC_STATE_PATH = Path("data/sync_state.json")
 OLD_TREE_STAGE = Path("data/tmp/old_tree")
 NOTIFY_URL = os.environ.get("WHEREWILD_NOTIFY_URL", "")
 STATUS_PUSH_URL = os.environ.get("WHEREWILD_STATUS_PUSH_URL", "")
+SKIPPABLE_REBUILD_STAGES: frozenset[str] = frozenset(
+    s.strip() for s in os.environ.get("SKIPPABLE_REBUILD_STAGES", "").split(",") if s.strip()
+)
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +385,9 @@ def main() -> None:
                 continue
             if stage_id in force_skip_stages:
                 print(f"\n--- Skipping {label} (--re-enrich) ---")
+                continue
+            if stage_id in SKIPPABLE_REBUILD_STAGES:
+                print(f"\n--- Skipping {label} (SKIPPABLE_REBUILD_STAGES) ---")
                 continue
             print(f"\n--- {label} ---")
             _set_stage(stage_id, "in_progress")

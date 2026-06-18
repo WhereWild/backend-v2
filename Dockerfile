@@ -19,6 +19,7 @@ RUN apt-get update \
     build-essential \
     fuse \
     psmisc \
+    python3-venv \
     rclone \
  && rm -rf /var/lib/apt/lists/*
 
@@ -29,12 +30,17 @@ RUN mkdir -p /opt/venvs && chmod 777 /opt/venvs
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/venvs/venv
 ENV UV_LINK_MODE=copy
+# Store uv-managed Python under /opt so it's in the image layer and not in the
+# root-home volume (/root/.local), which non-root container users can't traverse.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 
 WORKDIR /workspace
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project \
- && chmod -R a+w /opt/venvs
+RUN mkdir -p /opt/uv-python \
+ && uv sync --frozen --no-install-project \
+ && chmod -R a+rx /opt/uv-python \
+ && chmod -R a+rwx /opt/venvs
 
 COPY . .
 

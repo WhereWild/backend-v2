@@ -363,7 +363,8 @@
           "add_offset": 0.0,
           "render_min": 8.51,
           "render_max": 95.57,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "cltmean",
@@ -379,7 +380,8 @@
           "add_offset": 0.0,
           "render_min": 5.99,
           "render_max": 91.559998,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "cltmin",
@@ -395,7 +397,8 @@
           "add_offset": 0.0,
           "render_min": 0.13,
           "render_max": 88.909996,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "cltrange",
@@ -411,7 +414,8 @@
           "add_offset": 0.0,
           "render_min": 1.71,
           "render_max": 86.029999,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "rsdsmax",
@@ -427,7 +431,8 @@
           "add_offset": 0.0,
           "render_min": 97.0,
           "render_max": 401.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "rsdsmean",
@@ -443,7 +448,8 @@
           "add_offset": 0.0,
           "render_min": 42.0,
           "render_max": 290.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "rsdsmin",
@@ -459,7 +465,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 257.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "rsdsrange",
@@ -475,7 +482,8 @@
           "add_offset": 0.0,
           "render_min": 6.0,
           "render_max": 401.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "vpdmax",
@@ -491,7 +499,8 @@
           "add_offset": 0.0,
           "render_min": 2.9,
           "render_max": 5354.899902,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "vpdmean",
@@ -507,7 +516,8 @@
           "add_offset": 0.0,
           "render_min": 0.4,
           "render_max": 3166.800049,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "vpdmin",
@@ -523,7 +533,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 2382.800049,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "vpdrange",
@@ -539,7 +550,8 @@
           "add_offset": 0.0,
           "render_min": 2.9,
           "render_max": 4451.899902,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "hursmax",
@@ -555,7 +567,8 @@
           "add_offset": 0.0,
           "render_min": 32.719997,
           "render_max": 100.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "hursmean",
@@ -571,7 +584,8 @@
           "add_offset": 0.0,
           "render_min": 27.129999,
           "render_max": 97.049995,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "hursmin",
@@ -587,7 +601,8 @@
           "add_offset": 0.0,
           "render_min": 20.539999,
           "render_max": 90.709999,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "hursrange",
@@ -603,7 +618,8 @@
           "add_offset": 0.0,
           "render_min": 0.31,
           "render_max": 50.799999,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "petmax",
@@ -620,7 +636,8 @@
           "render_min": 24.119999,
           "render_max": 544.099976,
           "domain": "continuous",
-          "imperial_unit": "in"
+          "imperial_unit": "in",
+          "agg": "max"
         },
         {
           "id": "petmean",
@@ -637,7 +654,8 @@
           "render_min": 9.099999,
           "render_max": 348.589996,
           "domain": "continuous",
-          "imperial_unit": "in"
+          "imperial_unit": "in",
+          "agg": "mean"
         },
         {
           "id": "petmin",
@@ -654,7 +672,8 @@
           "render_min": 0.0,
           "render_max": 326.47998,
           "domain": "continuous",
-          "imperial_unit": "in"
+          "imperial_unit": "in",
+          "agg": "min"
         },
         {
           "id": "petrange",
@@ -671,7 +690,8 @@
           "render_min": 6.63,
           "render_max": 452.949982,
           "domain": "continuous",
-          "imperial_unit": "in"
+          "imperial_unit": "in",
+          "agg": "range"
         },
         {
           "id": "cmimax",
@@ -687,7 +707,8 @@
           "add_offset": 0.0,
           "render_min": -281.800018,
           "render_max": 2502.300049,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "cmimean",
@@ -703,7 +724,8 @@
           "add_offset": 0.0,
           "render_min": -334.899994,
           "render_max": 1739.300049,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "cmimin",
@@ -719,7 +741,8 @@
           "add_offset": 0.0,
           "render_min": -544.100037,
           "render_max": 1293.700073,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "cmirange",
@@ -735,7 +758,8 @@
           "add_offset": 0.0,
           "render_min": 13.2,
           "render_max": 2561.699951,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "npp",
@@ -766,7 +790,8 @@
           "render_min": 0.16,
           "render_max": 52.539997,
           "domain": "continuous",
-          "imperial_unit": "mph"
+          "imperial_unit": "mph",
+          "agg": "max"
         },
         {
           "id": "sfcWindmean",
@@ -783,7 +808,8 @@
           "render_min": 0.15,
           "render_max": 48.27,
           "domain": "continuous",
-          "imperial_unit": "mph"
+          "imperial_unit": "mph",
+          "agg": "mean"
         },
         {
           "id": "sfcWindmin",
@@ -800,7 +826,8 @@
           "render_min": 0.12,
           "render_max": 44.23,
           "domain": "continuous",
-          "imperial_unit": "mph"
+          "imperial_unit": "mph",
+          "agg": "min"
         },
         {
           "id": "sfcWindrange",
@@ -817,7 +844,8 @@
           "render_min": 0.01,
           "render_max": 19.76,
           "domain": "continuous",
-          "imperial_unit": "mph"
+          "imperial_unit": "mph",
+          "agg": "range"
         },
         {
           "id": "gsl",

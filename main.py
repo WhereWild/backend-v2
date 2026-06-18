@@ -435,6 +435,7 @@ def list_variables(unit_system: str | None = Query(None)):
             "render_max": units.convert_value(rmax, layer, unit_system),
             "group": layer.get("group") or None,
             "group_label": layer.get("group_label") or None,
+            "agg": layer.get("agg") or None,
         })
     return result
 

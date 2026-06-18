@@ -936,6 +936,7 @@ def get_species_environment(
                         "q90": stats.get("90th_percentile"),
                         "iqr": stats.get("iqr"),
                         "10_90_range": stats.get("10_90_range"),
+                        "entropy": stats.get("entropy"),
                     }
                     return {
                         "species_id": taxon.get("taxon_key"),
@@ -960,6 +961,7 @@ def get_species_environment(
                             "rbar": stats.get("rbar"),
                             "circular_std": stats.get("circular_std"),
                             "circular_var": stats.get("circular_var"),
+                            "entropy": stats.get("entropy"),
                             "mode": stats.get("mode"),
                         },
                         "density_curve": result["density_curve"],
@@ -1067,6 +1069,7 @@ def get_species_environment(
             "rbar": row.get("rbar"),
             "circular_std": row.get("circular_std"),
             "circular_var": row.get("circular_var"),
+            "entropy": row.get("entropy"),
             "mode": row.get("mode"),
         }
         den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()
@@ -1107,6 +1110,7 @@ def get_species_environment(
         "q90": row.get("90th_percentile"),
         "iqr": row.get("iqr"),
         "10_90_range": row.get("10_90_range"),
+        "entropy": row.get("entropy"),
     }
 
     den_rows = _storage.read_table(GLOBAL_STATS_DIR / DENSITY_FILE, filters=_tk_var).to_pylist()

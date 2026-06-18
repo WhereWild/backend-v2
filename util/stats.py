@@ -33,6 +33,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from fastdigest import TDigest
 from KDEpy import FFTKDE
+from scipy.optimize import brentq as _brentq
+from scipy.special import ive as _bessel_ive
 from scipy.stats import circmean, circstd, circvar
 from scipy.stats import entropy as _scipy_entropy
 
@@ -487,6 +489,10 @@ def _write_stats_from_acc(taxon_dir: Path, acc: dict, layer_meta: dict[str, dict
             stats = _continuous_stats_streaming(digest, a["unique"], None)
             stats["mode"] = mode_val
             if counts:
+                total_c = sum(counts.values())
+                probs_c = np.array([c / total_c for c in counts.values()], dtype=float)
+                stats["entropy"] = float(_scipy_entropy(probs_c))
+            if counts:
                 total = sum(counts.values())
                 min_val, max_val = min(counts), max(counts)
                 all_bins = [(k, counts.get(k, 0)) for k in range(min_val, max_val + 1)]
@@ -504,6 +510,13 @@ def _write_stats_from_acc(taxon_dir: Path, acc: dict, layer_meta: dict[str, dict
         else:
             kde = build_density_curve(reservoir, vtype) if vtype is not None and reservoir.size >= 2 else None
             stats = _continuous_stats_streaming(digest, a["unique"], kde)
+            if kde is not None:
+                xs = np.array(kde["points"])
+                dens = np.array(kde["density"])
+                mask = dens > 0
+                v = float(-np.trapezoid(dens[mask] * np.log(dens[mask]), xs[mask]))
+                if math.isfinite(v):
+                    stats["entropy"] = v
             if kde:
                 density_rows.append({
                     "variable": col,
@@ -714,6 +727,22 @@ def _circ_stats_exact(series: pd.Series, unique_samples: int, kde: dict | None) 
     }
 
 
+def _circular_entropy(rbar: float) -> float:
+    """Von Mises differential entropy on [0, 2π] from mean resultant length rbar.
+
+    Uses exponentially scaled Bessel functions (ive) so the ratio and entropy
+    formula stay numerically stable for arbitrarily large kappa.
+    """
+    if rbar <= 0.0:
+        return math.log(2 * math.pi)   # uniform: maximum entropy
+    if rbar >= 1.0:
+        return float("-inf")            # perfectly concentrated: entropy → -∞
+    # ive(1,k)/ive(0,k) = I1(k)/I0(k) (exp(-k) cancels) — no overflow at large k
+    kappa = _brentq(lambda k: _bessel_ive(1, k) / _bessel_ive(0, k) - rbar, 0.0, 1e6)
+    # log(2π·I0(κ)) - κ·rbar  =  log(2π) + log(ive(0,κ)) + κ·(1 - rbar)
+    return float(math.log(2 * math.pi) + math.log(_bessel_ive(0, kappa)) + kappa * (1.0 - rbar))
+
+
 def _circ_stats_streaming(
     cos_sum: float, sin_sum: float, n: int, unique_samples: int, kde: dict | None
 ) -> dict:
@@ -730,6 +759,7 @@ def _circ_stats_streaming(
         "rbar": rbar,
         "circular_var": var_,
         "circular_std": std_deg,
+        "entropy": _circular_entropy(rbar),
         "mode": kde["mode"] if kde else None,
     }
 
@@ -738,13 +768,29 @@ def _circ_stats_streaming(
 # Stats computation — exact (leaf taxa)
 # ---------------------------------------------------------------------------
 
-def _continuous_stats_exact(values: np.ndarray, unique_samples: int, kde: dict | None) -> dict:
+def _continuous_stats_exact(
+    values: np.ndarray, unique_samples: int, kde: dict | None, *, discrete: bool = False
+) -> dict:
     """Exact continuous stats via numpy (faster than pd.describe for small arrays)."""
     q10, q25, q50, q75, q90 = np.percentile(values, [10, 25, 50, 75, 90])
     mean = float(np.mean(values))
     std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
     if not math.isfinite(std):
         std = 0.0
+    if discrete:
+        counts = Counter(int(v) for v in values)
+        total = sum(counts.values())
+        probs = np.array([c / total for c in counts.values()], dtype=float)
+        entropy_val: float | None = float(_scipy_entropy(probs)) if total > 0 else None
+    elif kde is not None:
+        xs = np.array(kde["points"])
+        dens = np.array(kde["density"])
+        mask = dens > 0
+        entropy_val = float(-np.trapezoid(dens[mask] * np.log(dens[mask]), xs[mask]))
+        if not math.isfinite(entropy_val):
+            entropy_val = None
+    else:
+        entropy_val = None
     return {
         "count": len(values),
         "unique_samples": unique_samples,
@@ -761,6 +807,7 @@ def _continuous_stats_exact(values: np.ndarray, unique_samples: int, kde: dict |
         "iqr": float(q75 - q25),
         "10_90_range": float(q90 - q10),
         "range": float(values.max() - values.min()),
+        "entropy": entropy_val,
         "mode": kde["mode"] if kde else None,
     }
 
@@ -997,8 +1044,8 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
                     continue
                 unique = _col_unique(col)
                 if _is_discrete(layer):
-                    stats = _continuous_stats_exact(values, unique, None)
                     counts_c = Counter(int(v) for v in values)
+                    stats = _continuous_stats_exact(values, unique, None, discrete=True)
                     stats["mode"] = counts_c.most_common(1)[0][0]
                     min_val, max_val = int(values.min()), int(values.max())
                     total = len(values)
@@ -1241,7 +1288,7 @@ def compute_location_filtered_stats(
         if values.size == 0:
             return None
         if _is_discrete(layer):
-            stats = _continuous_stats_exact(series[np.isfinite(series)], unique, None)
+            stats = _continuous_stats_exact(series[np.isfinite(series)], unique, None, discrete=True)
             stats["mode"] = int(series.value_counts().idxmax())
             bin_counts = series.value_counts().sort_index()
             min_val, max_val = int(values.min()), int(values.max())

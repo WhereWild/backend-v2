@@ -118,8 +118,8 @@ def _descendant_rank_targets(ancestor_rank: str) -> list[str]:
 
 
 # Circular metrics that are angular bearings — included in the sort index but
-# excluded from relative_ranks_positions.parquet (no percentile/position display).
-_ANGULAR_METRICS: frozenset[str] = frozenset({"circular_mean", "mode"})
+# excluded from relative_ranks_positions.parquet for circular variables only.
+_CIRCULAR_CIRCULAR_ANGULAR_METRICS: frozenset[str] = frozenset({"circular_mean", "mode"})
 
 
 def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
@@ -771,7 +771,8 @@ def _build_rank_index(
 
             # Collect positions inline — data is already sorted, no re-read needed.
             variable, metric = col_key.split("::", 1)
-            if metric not in _ANGULAR_METRICS and n > 0:
+            is_angular = variable in circular_ids and metric in _CIRCULAR_ANGULAR_METRICS
+            if not is_angular and n > 0:
                 sorted_vals = val_np[order]
                 # Vectorised min_rank_pos: tied values share the first position in their group.
                 is_new = np.empty(n, dtype=bool)
@@ -1058,7 +1059,7 @@ def _query_ranked_scoped(
 
     accepted_ranks = _accepted_ranks(descendant_rank, include_species_like)
 
-    is_circular_bearing = sort_metric in _ANGULAR_METRICS and reference_value is not None
+    is_circular_bearing = sort_metric in _CIRCULAR_ANGULAR_METRICS and reference_value is not None
 
     # For circular sorts, optionally load rbar values for min_rbar filtering
     rbar_map: dict[str, float] = {}
@@ -1147,7 +1148,7 @@ def _query_ranked_text(
     if not candidates:
         return _empty_result("no_text_matches")
 
-    is_circular_bearing = sort_metric in _ANGULAR_METRICS and reference_value is not None
+    is_circular_bearing = sort_metric in _CIRCULAR_ANGULAR_METRICS and reference_value is not None
 
     enriched: list[tuple[TaxonRecord, float, float, int, str]] = []  # taxon, score, sort_val, sc, match_name
     for taxon, score, match_name in candidates:

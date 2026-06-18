@@ -208,7 +208,7 @@ def test_build_catalog_subspecies_path_includes_subspecies_dir(tmp_path):
     catalog, _ = build_tree.build_catalog(csv_path)
     path = catalog["9999001"]["path"]
     assert "9999001" in path
-    assert path.endswith("Echinocereus_triglochidiatus_mojavensis_9999001")
+    assert path.endswith("Opuntia_triglochidiatus_mojavensis_9999001")
 
 
 def test_build_catalog_skips_non_leaf_rank(tmp_path):
@@ -274,6 +274,8 @@ def test_main_writes_pickle(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "run_inat_preferred", lambda catalog: (0, 0))
     monkeypatch.setattr(build_tree, "run_gbif_backup", lambda catalog: (0, 0))
     monkeypatch.setattr(build_tree, "infer_species_inat_ids", lambda catalog, b: 0)
+    monkeypatch.setattr(build_tree, "resolve_genus_synonym_ids", lambda catalog, b: 0)
+    monkeypatch.setattr(build_tree, "propagate_images", lambda catalog: 0)
     monkeypatch.setattr(build_tree, "update_name_index", lambda payload: 0)
     _make_csv([SPECIES_ROW], tmp_path)
 
@@ -1137,7 +1139,7 @@ def test_build_gbif_to_taxon_species(tmp_path, monkeypatch):
         {"gbifID": "g1", "taxonKey": "123", "speciesKey": "123", "taxonRank": "SPECIES"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"123"})
+    result = build_tree._build_gbif_to_taxon({"123": {}})
     assert "g1" in result
     assert result["g1"][0] == "123"
 
@@ -1148,7 +1150,7 @@ def test_build_gbif_to_taxon_subspecies_uses_taxon_key(tmp_path, monkeypatch):
         {"gbifID": "g2", "taxonKey": "456", "speciesKey": "123", "taxonRank": "SUBSPECIES"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"456"})
+    result = build_tree._build_gbif_to_taxon({"456": {}})
     assert result["g2"][0] == "456"
 
 
@@ -1158,7 +1160,7 @@ def test_build_gbif_to_taxon_skips_uncatalogued(tmp_path, monkeypatch):
         {"gbifID": "g3", "taxonKey": "999", "speciesKey": "999", "taxonRank": "SPECIES"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    assert "g3" not in build_tree._build_gbif_to_taxon({"123"})
+    assert "g3" not in build_tree._build_gbif_to_taxon({"123": {}})
 
 
 def test_build_gbif_to_taxon_skips_empty_gbifid(tmp_path, monkeypatch):
@@ -1167,7 +1169,7 @@ def test_build_gbif_to_taxon_skips_empty_gbifid(tmp_path, monkeypatch):
         {"gbifID": "", "taxonKey": "123", "speciesKey": "123", "taxonRank": "SPECIES"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    assert len(build_tree._build_gbif_to_taxon({"123"})) == 0
+    assert len(build_tree._build_gbif_to_taxon({"123": {}})) == 0
 
 
 def test_build_gbif_to_taxon_parses_dynamic_properties(tmp_path, monkeypatch):
@@ -1178,7 +1180,7 @@ def test_build_gbif_to_taxon_parses_dynamic_properties(tmp_path, monkeypatch):
          "taxonRank": "SPECIES", "dynamicProperties": dp},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"123"})
+    result = build_tree._build_gbif_to_taxon({"123": {}})
     assert result["g1"][2] == "organism"
 
 
@@ -1190,7 +1192,7 @@ def test_build_gbif_to_taxon_parses_evidence_list(tmp_path, monkeypatch):
          "taxonRank": "SPECIES", "dynamicProperties": dp},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"123"})
+    result = build_tree._build_gbif_to_taxon({"123": {}})
     assert "organism" in result["g1"][2]
 
 
@@ -1327,7 +1329,7 @@ def test_build_gbif_to_taxon_invalid_dynamic_properties(tmp_path, monkeypatch):
          "taxonRank": "SPECIES", "dynamicProperties": "not-json"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"123"})
+    result = build_tree._build_gbif_to_taxon({"123": {}})
     assert result["g1"][2] == ""  # evidence remains empty on parse error
 
 

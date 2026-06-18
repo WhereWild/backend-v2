@@ -14,6 +14,11 @@ if [[ -f "$template" && ! -f "$target" ]]; then
   echo "Created $target from template; fill in keys locally."
 fi
 
+_venv="${UV_PROJECT_ENVIRONMENT:-/opt/venvs/venv}"
+uv sync --frozen --quiet
+chmod -R a+rx "${UV_PYTHON_INSTALL_DIR:-/opt/uv-python}" 2>/dev/null || true
+chmod -R a+rwx "$_venv" 2>/dev/null || true
+
 MODE="${WHEREWILD_MODE:-dev}"
 
 if [[ "$MODE" == "api" ]]; then

@@ -22,19 +22,24 @@ _CONTINUOUS_METRICS: tuple[str, ...] = (
     "count", "unique_samples", "min",
     "10th_percentile", "25th_percentile", "median",
     "75th_percentile", "90th_percentile", "max",
-    "mean", "std", "variance", "iqr", "10_90_range", "range", "mode",
+    "mean", "std", "variance", "iqr", "10_90_range", "range", "entropy", "mode",
 )
 
 _NOMINAL_METRICS: tuple[str, ...] = (
     "unique_samples", "total_samples", "unique_classes", "entropy", "mode",
 )
 
+_ORDINAL_METRICS: tuple[str, ...] = (
+    "count", "unique_samples", "total_samples", "unique_classes", "entropy", "mode",
+    "10th_percentile", "25th_percentile", "median", "75th_percentile", "90th_percentile",
+)
+
 METRICS_BY_TYPE: dict[ValueType, tuple[str, ...]] = {
     ValueType.RATIO:     _CONTINUOUS_METRICS,
     ValueType.INTERVAL:  _CONTINUOUS_METRICS,
     ValueType.NOMINAL:   _NOMINAL_METRICS,
-    ValueType.ORDINAL:   (),
-    ValueType.CIRCULAR:  ("count", "unique_samples", "circular_mean", "rbar", "circular_var", "circular_std", "mode"),
+    ValueType.ORDINAL:   _ORDINAL_METRICS,
+    ValueType.CIRCULAR:  ("count", "unique_samples", "circular_mean", "rbar", "circular_var", "circular_std", "entropy", "mode"),
     ValueType.AGGREGATE: (),
 }
 

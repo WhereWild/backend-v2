@@ -168,12 +168,40 @@ def search_taxa_by_name(
             continue
         for key in name_index.get(name, []):
             taxon = get_taxon_by_id(key)
+            if taxon is None:
+                continue
             existing = best_by_taxon.get(key)
             if existing is None or adjusted > existing[1]:
-                best_by_taxon[key] = (taxon, adjusted, name)
+                best_by_taxon[key] = (taxon, adjusted, _display_name_for_match(taxon, name))
 
     results = sorted(best_by_taxon.values(), key=lambda x: x[1], reverse=True)
     return results[:limit]
+
+
+def _display_name_for_match(taxon: TaxonRecord, matched_key: str) -> str:
+    """Return the display name for a search match.
+
+    If the matched index key is a vernacular name, return it (the frontend
+    formats casing). If it's a scientific or synonym name, return the taxon's
+    preferred common name instead so synonym searches don't show the old name.
+    """
+    vernacular_keys: set[str] = set()
+    for field in ("common_name", "inat_preferred_common_name"):
+        v = normalize_name(str(taxon.get(field) or ""))
+        if v:
+            vernacular_keys.add(v)
+    for vn in (taxon.get("vernacular_names") or []):
+        k = normalize_name(str(vn))
+        if k:
+            vernacular_keys.add(k)
+    if matched_key in vernacular_keys:
+        return matched_key
+    # Scientific or synonym name — substitute preferred common name
+    preferred = (
+        normalize_name(str(taxon.get("inat_preferred_common_name") or ""))
+        or normalize_name(str(taxon.get("common_name") or ""))
+    )
+    return preferred if preferred else matched_key
 
 
 def _adjust_score(

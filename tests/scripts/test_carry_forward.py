@@ -15,6 +15,7 @@ import pytest
 
 import scripts.carry_forward as cf
 
+_STATIC_IDS   = frozenset(["elevation", "bio1", "kg2"])
 _TEMPORAL_IDS = frozenset(["temperature_2m", "precipitation"])
 
 _BASE_ROW = {
@@ -59,7 +60,7 @@ def test_carry_one_unchanged_copies_all(tmp_path):
     _make_parquet(old_path, [old_row])
     _make_parquet(new_path, [new_row])
 
-    n_carried, n_changed, n_new_obs, n_total = cf._carry_one(new_path, old_path, _TEMPORAL_IDS)
+    n_carried, n_changed, n_new_obs, n_total = cf._carry_one(new_path, old_path, _STATIC_IDS, _TEMPORAL_IDS)
 
     assert n_carried == 1
     assert n_changed == 0
@@ -80,7 +81,7 @@ def test_carry_one_coords_changed_copies_nothing(tmp_path):
     _make_parquet(old_path, [old_row])
     _make_parquet(new_path, [new_row])
 
-    n_carried, n_changed, n_new_obs, _ = cf._carry_one(new_path, old_path, _TEMPORAL_IDS)
+    n_carried, n_changed, n_new_obs, _ = cf._carry_one(new_path, old_path, _STATIC_IDS, _TEMPORAL_IDS)
 
     assert n_carried == 0
     assert n_changed == 1
@@ -100,7 +101,7 @@ def test_carry_one_timestamp_changed_copies_tree_only(tmp_path):
     _make_parquet(old_path, [old_row])
     _make_parquet(new_path, [new_row])
 
-    n_carried, n_changed, _, _ = cf._carry_one(new_path, old_path, _TEMPORAL_IDS)
+    n_carried, n_changed, _, _ = cf._carry_one(new_path, old_path, _STATIC_IDS, _TEMPORAL_IDS)
 
     assert n_carried == 1
     assert n_changed == 0
@@ -119,7 +120,7 @@ def test_carry_one_new_observation_not_copied(tmp_path):
     _make_parquet(old_path, [old_row])
     _make_parquet(new_path, [new_row])
 
-    n_carried, n_changed, n_new_obs, n_total = cf._carry_one(new_path, old_path, _TEMPORAL_IDS)
+    n_carried, n_changed, n_new_obs, n_total = cf._carry_one(new_path, old_path, _STATIC_IDS, _TEMPORAL_IDS)
 
     assert n_carried == 0
     assert n_changed == 0
@@ -133,7 +134,7 @@ def test_carry_one_no_enrichment_in_old(tmp_path):
     _make_parquet(tmp_path / "new.parquet", [_BASE_ROW])
 
     n_carried, n_changed, n_new_obs, _ = cf._carry_one(
-        tmp_path / "new.parquet", tmp_path / "old.parquet", _TEMPORAL_IDS
+        tmp_path / "new.parquet", tmp_path / "old.parquet", _STATIC_IDS, _TEMPORAL_IDS
     )
     assert n_carried == 0
     assert n_new_obs == 1  # old has no enrich cols → early return treats all as new
@@ -146,7 +147,7 @@ def test_carry_one_empty_parquets(tmp_path):
                                   "decimalLatitude": pa.array([], pa.float64())}), tmp_path / fname)
 
     n_carried, n_changed, n_new_obs, n_total = cf._carry_one(
-        tmp_path / "new.parquet", tmp_path / "old.parquet", _TEMPORAL_IDS
+        tmp_path / "new.parquet", tmp_path / "old.parquet", _STATIC_IDS, _TEMPORAL_IDS
     )
     assert n_carried == 0
     assert n_total == 0
@@ -169,7 +170,7 @@ def test_carry_one_mixed_rows(tmp_path):
     _make_parquet(old_path, old_rows)
     _make_parquet(new_path, new_rows)
 
-    n_carried, n_changed, n_new_obs, n_total = cf._carry_one(new_path, old_path, _TEMPORAL_IDS)
+    n_carried, n_changed, n_new_obs, n_total = cf._carry_one(new_path, old_path, _STATIC_IDS, _TEMPORAL_IDS)
 
     assert n_total == 3
     assert n_carried == 1   # cat001: unchanged
@@ -211,7 +212,7 @@ def test_main_carries_forward(tmp_path):
     with (
         patch.object(cf, "OLD_TREE_PATH", old_tree),
         patch.object(cf, "TREE_ROOT", new_tree),
-        patch.object(cf, "_load_temporal_ids", return_value=_TEMPORAL_IDS),
+        patch.object(cf, "_load_catalog_ids", return_value=(_STATIC_IDS, _TEMPORAL_IDS)),
     ):
         cf.main()
 
@@ -233,9 +234,77 @@ def test_main_skips_taxa_not_in_old_tree(tmp_path):
     with (
         patch.object(cf, "OLD_TREE_PATH", old_tree),
         patch.object(cf, "TREE_ROOT", new_tree),
-        patch.object(cf, "_load_temporal_ids", return_value=_TEMPORAL_IDS),
+        patch.object(cf, "_load_catalog_ids", return_value=(_STATIC_IDS, _TEMPORAL_IDS)),
     ):
         cf.main()
 
     result = pq.read_table(new_tree / rel).to_pandas()
     assert "elevation" not in result.columns  # nothing added
+
+
+# ---------------------------------------------------------------------------
+# Catalog-awareness: removed static variables are dropped, temporal preserved
+# ---------------------------------------------------------------------------
+
+def test_carry_one_removed_static_not_carried(tmp_path):
+    """Static col absent from catalog (static_ids) is silently dropped."""
+    old_row = {**_BASE_ROW, "elevation": 1500.0, "old_removed_var": 42.0}
+    new_row = {k: v for k, v in _BASE_ROW.items()}
+
+    old_path = tmp_path / "old.parquet"
+    new_path = tmp_path / "new.parquet"
+    _make_parquet(old_path, [old_row])
+    _make_parquet(new_path, [new_row])
+
+    # "old_removed_var" is NOT in _STATIC_IDS
+    cf._carry_one(new_path, old_path, _STATIC_IDS, _TEMPORAL_IDS)
+
+    result = pq.read_table(new_path).to_pandas()
+    assert result.at[0, "elevation"] == pytest.approx(1500.0)  # in catalog → carried
+    assert "old_removed_var" not in result.columns              # removed → dropped
+
+
+def test_carry_one_temporal_cols_all_carried(tmp_path):
+    """All temporal cols whose base ID is in catalog are carried, even many windows."""
+    old_row = {
+        **_BASE_ROW,
+        "temperature_2m_avg_24h": 10.0,
+        "temperature_2m_max_168h": 25.0,
+        "precipitation_sum_24h": 3.5,
+    }
+    new_row = {k: v for k, v in _BASE_ROW.items()}
+
+    old_path = tmp_path / "old.parquet"
+    new_path = tmp_path / "new.parquet"
+    _make_parquet(old_path, [old_row])
+    _make_parquet(new_path, [new_row])
+
+    cf._carry_one(new_path, old_path, _STATIC_IDS, _TEMPORAL_IDS)
+
+    result = pq.read_table(new_path).to_pandas()
+    assert result.at[0, "temperature_2m_avg_24h"]  == pytest.approx(10.0)
+    assert result.at[0, "temperature_2m_max_168h"] == pytest.approx(25.0)
+    assert result.at[0, "precipitation_sum_24h"]   == pytest.approx(3.5)
+
+
+def test_carry_one_removed_temporal_not_carried(tmp_path):
+    """Temporal col whose base ID was removed from catalog is not carried forward."""
+    old_row = {
+        **_BASE_ROW,
+        "temperature_2m_avg_24h": 10.0,   # still in catalog
+        "wind_speed_avg_24h": 5.0,         # removed temporal variable
+    }
+    new_row = {k: v for k, v in _BASE_ROW.items()}
+
+    old_path = tmp_path / "old.parquet"
+    new_path = tmp_path / "new.parquet"
+    _make_parquet(old_path, [old_row])
+    _make_parquet(new_path, [new_row])
+
+    # "wind_speed" is NOT in _TEMPORAL_IDS, so its columns are treated as static,
+    # then filtered out because "wind_speed_avg_24h" is also not in _STATIC_IDS.
+    cf._carry_one(new_path, old_path, _STATIC_IDS, _TEMPORAL_IDS)
+
+    result = pq.read_table(new_path).to_pandas()
+    assert result.at[0, "temperature_2m_avg_24h"] == pytest.approx(10.0)
+    assert "wind_speed_avg_24h" not in result.columns

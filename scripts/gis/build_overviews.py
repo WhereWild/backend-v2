@@ -42,10 +42,11 @@ def _load_layer_meta() -> dict[str, dict]:
     }
 
 
-def _is_nominal(layer: dict | None) -> bool:
+def _is_class_based(layer: dict | None) -> bool:
+    """True for discrete-class layers (nominal/ordinal) that must use mode resampling."""
     if not layer:
         return False
-    return str(layer.get("value_type") or "").lower() == "nominal"
+    return str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
 
 
 def _target_dst_res_degrees() -> float:
@@ -142,7 +143,7 @@ def main() -> None:
     for path in sorted(LAYERS_DIR.glob("*.tif")):
         total += 1
         layer = layer_meta.get(path.name)
-        nominal = _is_nominal(layer)
+        nominal = _is_class_based(layer)
 
         try:
             with rasterio.open(path) as ds:

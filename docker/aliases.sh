@@ -927,7 +927,7 @@ pdb() {
     return 1
   fi
 
-  PYTHONUNBUFFERED=1 setsid uv run --env-file /workspace/.env python -u -m "$module_dotted" "$@" > "$log_file" 2>&1 &
+  PYTHONUNBUFFERED=1 setsid --wait uv run --env-file /workspace/.env python -u -m "$module_dotted" "$@" > "$log_file" 2>&1 &
   echo "$!" > "$pid_file"
   echo "pdb started: $log_file"
 }
@@ -951,7 +951,7 @@ pdbs() {
     local pid
     pid="$(cat "$pid_file")"
     if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid"
+      kill -- -"$pid"
       echo "pdbs stopped: $log_name"
     else
       local fallback_pids

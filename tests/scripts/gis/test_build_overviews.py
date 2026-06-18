@@ -38,22 +38,26 @@ def test_load_layer_meta_keys(tmp_path):
     assert set(meta) == {"bio1.tif", "koppen.tif"}
 
 
-# --- _is_nominal ---
+# --- _is_class_based ---
 
-def test_is_nominal_interval():
-    assert bo._is_nominal({"value_type": "interval"}) is False
-
-
-def test_is_nominal_nominal():
-    assert bo._is_nominal({"value_type": "nominal"}) is True
+def test_is_class_based_interval():
+    assert bo._is_class_based({"value_type": "interval"}) is False
 
 
-def test_is_nominal_none():
-    assert bo._is_nominal(None) is False
+def test_is_class_based_nominal():
+    assert bo._is_class_based({"value_type": "nominal"}) is True
 
 
-def test_is_nominal_missing_key():
-    assert bo._is_nominal({}) is False
+def test_is_class_based_ordinal():
+    assert bo._is_class_based({"value_type": "ordinal"}) is True
+
+
+def test_is_class_based_none():
+    assert bo._is_class_based(None) is False
+
+
+def test_is_class_based_missing_key():
+    assert bo._is_class_based({}) is False
 
 
 # --- _next_power_of_two ---

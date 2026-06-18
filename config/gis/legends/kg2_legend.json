@@ -1,6 +1,6 @@
 {
-  "layer_id": "kg0",
-  "source": "Karger et al. 2021 / CHELSA v2.1 \u2014 kg0 variant (As/Aw distinction)",
+  "layer_id": "kg2",
+  "source": "Karger et al. 2021 / CHELSA v2.1 \u2014 kg2 variant (Peel et al. 2007, 0\u00b0C C/D boundary)",
   "classes": [
     {
       "id": 1,

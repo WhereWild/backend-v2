@@ -37,8 +37,8 @@ FAKE_CATALOG_JSON = {
                     "add_offset": 0.0,
                 },
                 {
-                    "id": "kg0",
-                    "filename": "kg0.tif",
+                    "id": "kg2",
+                    "filename": "kg2.tif",
                     "value_type": "nominal",
                     "scale_factor": None,
                     "add_offset": None,
@@ -123,7 +123,7 @@ def test_load_layers_returns_all(tmp_path):
         layers = et._load_layers()
     assert len(layers) == 3
     assert layers[0]["id"] == "bio1"
-    assert layers[2]["id"] == "kg0"
+    assert layers[2]["id"] == "kg2"
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +369,7 @@ def test_sample_cog_no_nodata():
     lats = np.array([40.0])
     lons = np.array([-105.0])
     with patch("rasterio.open", return_value=mock_ds):
-        result = et._sample_cog(Path("kg0.tif"), "kg0", lats, lons, 1.0, 0.0)
+        result = et._sample_cog(Path("kg2.tif"), "kg2", lats, lons, 1.0, 0.0)
     assert result == [5.0]
 
 
@@ -378,7 +378,7 @@ def test_sample_cog_nominal_no_transform():
     lats = np.array([40.0])
     lons = np.array([-105.0])
     with patch("rasterio.open", return_value=mock_ds):
-        result = et._sample_cog(Path("kg0.tif"), "kg0", lats, lons, 1.0, 0.0)
+        result = et._sample_cog(Path("kg2.tif"), "kg2", lats, lons, 1.0, 0.0)
     assert result == [15.0]
 
 
@@ -509,17 +509,17 @@ def test_process_batch_none_scale_offset(tmp_path):
     # nominal layer: scale_factor=None, add_offset=None → defaults to 1.0, 0.0
     path = tmp_path / "occ.parquet"
     _make_occurrence_parquet(path)
-    worklist = _make_worklist("tk1", str(path), ["kg0"])
-    layers = [{"id": "kg0", "filename": "kg0.tif", "scale_factor": None, "add_offset": None}]
+    worklist = _make_worklist("tk1", str(path), ["kg2"])
+    layers = [{"id": "kg2", "filename": "kg2.tif", "scale_factor": None, "add_offset": None}]
     layers_dir = tmp_path / "layers"
     layers_dir.mkdir()
-    (layers_dir / "kg0.tif").touch()
+    (layers_dir / "kg2.tif").touch()
     mock_ds = _mock_rasterio_open([15.0, 3.0], nodata=65535.0)
     with patch.object(et, "LAYERS_DIR", layers_dir), \
          patch("rasterio.open", return_value=mock_ds):
         et._process_batch(worklist, layers)
     df = pq.read_table(path).to_pandas()
-    assert pytest.approx(df.loc[df["catalogNumber"] == "obs1", "kg0"].iloc[0]) == 15.0
+    assert pytest.approx(df.loc[df["catalogNumber"] == "obs1", "kg2"].iloc[0]) == 15.0
 def test_main_nothing_to_do(tmp_path, capsys):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
@@ -713,4 +713,4 @@ def test_main_vars_to_enrich_none_uses_all_layers(tmp_path, capsys):
          patch.object(et, "_iter_worklist_batches", side_effect=fake_iter_batches):
         et.main()
 
-    assert set(captured_layer_ids) == {"bio1", "swe", "kg0"}
+    assert set(captured_layer_ids) == {"bio1", "swe", "kg2"}

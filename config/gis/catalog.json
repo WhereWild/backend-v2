@@ -233,7 +233,7 @@
           "id": "bio4",
           "source": "chelsa_v2_1",
           "display_name": "Temperature Seasonality",
-          "units": "°C",
+          "units": "",
           "value_type": "ratio",
           "download_url": "https://os.zhdk.cloud.switch.ch/chelsav2/GLOBAL/climatologies/1981-2010/bio/CHELSA_bio4_1981-2010_V.2.1.tif",
           "filename": "bio4.tif",
@@ -295,13 +295,13 @@
       "description": "Extended climate variables from CHELSA v2.1 (1981–2010): growing season thermal indices, snow and frost dynamics, atmospheric drivers (cloud cover, humidity, radiation, wind, vapor pressure deficit, evapotranspiration, moisture index, net primary production), and Köppen-Geiger classification.",
       "layers": [
         {
-          "id": "kg0",
+          "id": "kg2",
           "source": "chelsa_v2_1",
           "display_name": "Köppen-Geiger Climate Classification",
           "units": "",
           "value_type": "nominal",
-          "download_url": "https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/kg0/1981-2010/CHELSA_kg0_1981-2010_V.2.1.tif",
-          "filename": "kg0.tif",
+          "download_url": "https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/kg2/1981-2010/CHELSA_kg2_1981-2010_V.2.1.tif",
+          "filename": "kg2.tif",
           "scale_factor": null,
           "add_offset": null,
           "render_min": 1.0,
@@ -363,7 +363,8 @@
           "add_offset": 0.0,
           "render_min": 8.51,
           "render_max": 95.57,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "cltmean",
@@ -379,7 +380,8 @@
           "add_offset": 0.0,
           "render_min": 5.99,
           "render_max": 91.559998,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "cltmin",
@@ -395,7 +397,8 @@
           "add_offset": 0.0,
           "render_min": 0.13,
           "render_max": 88.909996,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "cltrange",
@@ -411,7 +414,8 @@
           "add_offset": 0.0,
           "render_min": 1.71,
           "render_max": 86.029999,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "rsdsmax",
@@ -427,7 +431,8 @@
           "add_offset": 0.0,
           "render_min": 97.0,
           "render_max": 401.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "rsdsmean",
@@ -443,7 +448,8 @@
           "add_offset": 0.0,
           "render_min": 42.0,
           "render_max": 290.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "rsdsmin",
@@ -459,7 +465,8 @@
           "add_offset": 0.0,
           "render_min": 0.0,
           "render_max": 257.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "rsdsrange",
@@ -475,71 +482,76 @@
           "add_offset": 0.0,
           "render_min": 6.0,
           "render_max": 401.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "vpdmax",
           "source": "chelsa_v2_1",
           "display_name": "Maximum Vapor Pressure Deficit",
-          "units": "Pa",
+          "units": "kPa",
           "value_type": "ratio",
           "group": "vpd",
           "group_label": "Vapor Pressure Deficit",
           "download_url": "https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/vpdmax/1981-2010/CHELSA_vpdmax_1981-2010_V.2.1.tif",
           "filename": "vpdmax.tif",
-          "scale_factor": 0.1,
+          "scale_factor": 0.0001,
           "add_offset": 0.0,
-          "render_min": 2.9,
-          "render_max": 5354.899902,
-          "domain": "continuous"
+          "render_min": 0.003,
+          "render_max": 5.355,
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "vpdmean",
           "source": "chelsa_v2_1",
           "display_name": "Mean Vapor Pressure Deficit",
-          "units": "Pa",
+          "units": "kPa",
           "value_type": "ratio",
           "group": "vpd",
           "group_label": "Vapor Pressure Deficit",
           "download_url": "https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/vpdmean/1981-2010/CHELSA_vpdmean_1981-2010_V.2.1.tif",
           "filename": "vpdmean.tif",
-          "scale_factor": 0.1,
+          "scale_factor": 0.0001,
           "add_offset": 0.0,
-          "render_min": 0.4,
-          "render_max": 3166.800049,
-          "domain": "continuous"
+          "render_min": 0.0004,
+          "render_max": 3.167,
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "vpdmin",
           "source": "chelsa_v2_1",
           "display_name": "Minimum Vapor Pressure Deficit",
-          "units": "Pa",
+          "units": "kPa",
           "value_type": "ratio",
           "group": "vpd",
           "group_label": "Vapor Pressure Deficit",
           "download_url": "https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/vpdmin/1981-2010/CHELSA_vpdmin_1981-2010_V.2.1.tif",
           "filename": "vpdmin.tif",
-          "scale_factor": 0.1,
+          "scale_factor": 0.0001,
           "add_offset": 0.0,
           "render_min": 0.0,
-          "render_max": 2382.800049,
-          "domain": "continuous"
+          "render_max": 2.383,
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "vpdrange",
           "source": "chelsa_v2_1",
           "display_name": "Vapor Pressure Deficit Range",
-          "units": "Pa",
+          "units": "kPa",
           "value_type": "ratio",
           "group": "vpd",
           "group_label": "Vapor Pressure Deficit",
           "download_url": "https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/vpdrange/1981-2010/CHELSA_vpdrange_1981-2010_V.2.1.tif",
           "filename": "vpdrange.tif",
-          "scale_factor": 0.1,
+          "scale_factor": 0.0001,
           "add_offset": 0.0,
-          "render_min": 2.9,
-          "render_max": 4451.899902,
-          "domain": "continuous"
+          "render_min": 0.003,
+          "render_max": 4.452,
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "hursmax",
@@ -555,7 +567,8 @@
           "add_offset": 0.0,
           "render_min": 32.719997,
           "render_max": 100.0,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "hursmean",
@@ -571,7 +584,8 @@
           "add_offset": 0.0,
           "render_min": 27.129999,
           "render_max": 97.049995,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "hursmin",
@@ -587,7 +601,8 @@
           "add_offset": 0.0,
           "render_min": 20.539999,
           "render_max": 90.709999,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "hursrange",
@@ -603,7 +618,8 @@
           "add_offset": 0.0,
           "render_min": 0.31,
           "render_max": 50.799999,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "petmax",
@@ -620,7 +636,8 @@
           "render_min": 24.119999,
           "render_max": 544.099976,
           "domain": "continuous",
-          "imperial_unit": "in"
+          "imperial_unit": "in",
+          "agg": "max"
         },
         {
           "id": "petmean",
@@ -637,7 +654,8 @@
           "render_min": 9.099999,
           "render_max": 348.589996,
           "domain": "continuous",
-          "imperial_unit": "in"
+          "imperial_unit": "in",
+          "agg": "mean"
         },
         {
           "id": "petmin",
@@ -654,7 +672,8 @@
           "render_min": 0.0,
           "render_max": 326.47998,
           "domain": "continuous",
-          "imperial_unit": "in"
+          "imperial_unit": "in",
+          "agg": "min"
         },
         {
           "id": "petrange",
@@ -671,7 +690,8 @@
           "render_min": 6.63,
           "render_max": 452.949982,
           "domain": "continuous",
-          "imperial_unit": "in"
+          "imperial_unit": "in",
+          "agg": "range"
         },
         {
           "id": "cmimax",
@@ -687,7 +707,8 @@
           "add_offset": 0.0,
           "render_min": -281.800018,
           "render_max": 2502.300049,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "max"
         },
         {
           "id": "cmimean",
@@ -703,7 +724,8 @@
           "add_offset": 0.0,
           "render_min": -334.899994,
           "render_max": 1739.300049,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "mean"
         },
         {
           "id": "cmimin",
@@ -719,7 +741,8 @@
           "add_offset": 0.0,
           "render_min": -544.100037,
           "render_max": 1293.700073,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "min"
         },
         {
           "id": "cmirange",
@@ -735,7 +758,8 @@
           "add_offset": 0.0,
           "render_min": 13.2,
           "render_max": 2561.699951,
-          "domain": "continuous"
+          "domain": "continuous",
+          "agg": "range"
         },
         {
           "id": "npp",
@@ -766,7 +790,8 @@
           "render_min": 0.16,
           "render_max": 52.539997,
           "domain": "continuous",
-          "imperial_unit": "mph"
+          "imperial_unit": "mph",
+          "agg": "max"
         },
         {
           "id": "sfcWindmean",
@@ -783,7 +808,8 @@
           "render_min": 0.15,
           "render_max": 48.27,
           "domain": "continuous",
-          "imperial_unit": "mph"
+          "imperial_unit": "mph",
+          "agg": "mean"
         },
         {
           "id": "sfcWindmin",
@@ -800,7 +826,8 @@
           "render_min": 0.12,
           "render_max": 44.23,
           "domain": "continuous",
-          "imperial_unit": "mph"
+          "imperial_unit": "mph",
+          "agg": "min"
         },
         {
           "id": "sfcWindrange",
@@ -817,7 +844,8 @@
           "render_min": 0.01,
           "render_max": 19.76,
           "domain": "continuous",
-          "imperial_unit": "mph"
+          "imperial_unit": "mph",
+          "agg": "range"
         },
         {
           "id": "gsl",
@@ -1093,7 +1121,10 @@
           "domain": "continuous",
           "agg": "avg",
           "derived": false,
-          "sources": ["temperature_2m", "dew_point_2m"],
+          "sources": [
+            "temperature_2m",
+            "dew_point_2m"
+          ],
           "filename": null,
           "download_url": null,
           "scale_factor": null,
@@ -1305,8 +1336,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 65.0,
+          "render_min": 2.3,
+          "render_max": 63.3,
           "domain": "continuous"
         },
         {
@@ -1320,8 +1351,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 100.0,
+          "render_min": 0.9,
+          "render_max": 94.5,
           "domain": "continuous"
         },
         {
@@ -1335,8 +1366,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 80.0,
+          "render_min": 2.9,
+          "render_max": 73.5,
           "domain": "continuous"
         },
         {
@@ -1351,7 +1382,7 @@
           "add_offset": 0.0,
           "resampling": "bilinear",
           "render_min": 0.0,
-          "render_max": 60.0,
+          "render_max": 50.9,
           "domain": "continuous"
         },
         {
@@ -1365,8 +1396,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 1.8,
+          "render_min": 0.25,
+          "render_max": 1.7,
           "domain": "continuous"
         },
         {
@@ -1380,8 +1411,8 @@
           "scale_factor": 0.01,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 10.0,
+          "render_min": 0.23,
+          "render_max": 23.5,
           "domain": "continuous"
         },
         {
@@ -1395,8 +1426,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 3.5,
-          "render_max": 10.0,
+          "render_min": 3.8,
+          "render_max": 9.3,
           "domain": "continuous"
         },
         {
@@ -1410,8 +1441,8 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 60.0,
+          "render_min": 3.2,
+          "render_max": 85.2,
           "domain": "continuous"
         },
         {
@@ -1425,9 +1456,20 @@
           "scale_factor": 0.1,
           "add_offset": 0.0,
           "resampling": "bilinear",
-          "render_min": 0.0,
-          "render_max": 200.0,
+          "render_min": 1.3,
+          "render_max": 398.8,
           "domain": "continuous"
+        },
+        {
+          "id": "salinity",
+          "source": "isric_salinity",
+          "display_name": "Soil Salinity",
+          "units": "",
+          "value_type": "ordinal",
+          "vrt_url": "https://files.isric.org/public/global_soil_salinity/salmap2016.vrt",
+          "filename": "salinity.tif",
+          "render_min": 0,
+          "render_max": 4
         },
         {
           "id": "wrb",

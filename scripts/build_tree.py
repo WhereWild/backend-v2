@@ -68,6 +68,7 @@ TAXONOMY_LEVELS = ("kingdom", "phylum", "class", "order", "family", "genus", "sp
 TSV_DELIMITER = "\t"
 
 MAPPING_RANKS = frozenset({"SPECIES", "SUBSPECIES", "VARIETY", "FORM"})
+NAME_MATCH_RANKS = MAPPING_RANKS | frozenset({"GENUS", "FAMILY", "ORDER", "CLASS", "PHYLUM", "KINGDOM"})
 INFRA_RANKS = frozenset({"SUBSPECIES", "VARIETY", "FORM"})
 INFRA_MARKERS = frozenset({"var.", "subsp.", "f.", "nothosubsp.", "nothovar."})
 
@@ -314,7 +315,7 @@ def build_mapping(catalog: dict, dwca_bytes: bytes) -> None:
         reader = csv.DictReader(extract_taxa_csv(dwca_bytes))
         for row in reader:
             rank = (row.get("taxonRank") or "").strip().upper()
-            if rank not in MAPPING_RANKS:
+            if rank not in NAME_MATCH_RANKS:
                 continue
 
             name = normalize_name(row.get("scientificName") or "")

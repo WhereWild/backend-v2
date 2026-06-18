@@ -252,18 +252,18 @@ def test_load_legend_missing_file_returns_empty(tmp_path):
 
 def test_load_legend_returns_classes(tmp_path):
     legend = {"classes": [{"id": 1, "name": "Tropical"}, {"id": 2, "name": "Arid"}]}
-    (tmp_path / "kg0_legend.json").write_text(json.dumps(legend))
+    (tmp_path / "kg2_legend.json").write_text(json.dumps(legend))
     with patch("util.upload._LEGEND_DIR", tmp_path):
-        result = up._load_legend("kg0")
+        result = up._load_legend("kg2")
     assert len(result) == 2
     assert result[0]["name"] == "Tropical"
 
 
 def test_load_legend_missing_classes_key_returns_empty(tmp_path):
     legend = {"source": "CHELSA"}
-    (tmp_path / "kg0_legend.json").write_text(json.dumps(legend))
+    (tmp_path / "kg2_legend.json").write_text(json.dumps(legend))
     with patch("util.upload._LEGEND_DIR", tmp_path):
-        result = up._load_legend("kg0")
+        result = up._load_legend("kg2")
     assert result == []
 
 
@@ -412,10 +412,10 @@ def test_build_archive_generates_categorical_value_lookup():
         "catalogNumber": ["OBS1"],
         "decimalLatitude": [45.0],
         "decimalLongitude": [-120.0],
-        "kg0": [15.0],
+        "kg2": [15.0],
     })
     fake_meta = {
-        "kg0": {"id": "kg0", "display_name": "Köppen-Geiger", "value_type": "nominal",
+        "kg2": {"id": "kg2", "display_name": "Köppen-Geiger", "value_type": "nominal",
                 "category_display_name": "Bioclimatic", "source": "chelsa_v2_1"},
     }
     fake_legend = [{"id": 15, "name": "Temperate, humid subtropical",

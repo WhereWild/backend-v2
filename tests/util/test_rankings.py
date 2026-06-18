@@ -22,7 +22,7 @@ from config.config import ValueType
 # ---------------------------------------------------------------------------
 
 _RATIO_LAYER = {"id": "bio1", "value_type": "ratio"}
-_NOMINAL_LAYER = {"id": "kg0", "value_type": "nominal"}
+_NOMINAL_LAYER = {"id": "kg2", "value_type": "nominal"}
 _CIRCULAR_LAYER = {"id": "aspect_deg", "value_type": "circular"}
 _ORDINAL_LAYER = {"id": "foo", "value_type": "ordinal"}
 _ALL_LAYERS = [_RATIO_LAYER, _NOMINAL_LAYER]
@@ -214,7 +214,7 @@ def test_infer_sample_count_from_numerical_stats(tmp_path):
 
 
 def test_infer_sample_count_from_nominal_stats(tmp_path):
-    _write_nominal_stats(tmp_path, "kg0", [("total_samples", 17.0), ("entropy", 1.5)])
+    _write_nominal_stats(tmp_path, "kg2", [("total_samples", 17.0), ("entropy", 1.5)])
     assert rk._infer_sample_count(tmp_path) == 17
 def test_infer_sample_count_no_files(tmp_path):
     assert rk._infer_sample_count(tmp_path) == 0
@@ -275,7 +275,7 @@ def test_collect_entries_numerical_stats_no_file(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_collect_entries_nominal_stats(tmp_path):
-    _write_nominal_stats(tmp_path, "kg0", [
+    _write_nominal_stats(tmp_path, "kg2", [
         ("entropy", 1.5),
         ("unique_classes", 3.0),
         ("total_samples", 20.0),
@@ -283,14 +283,14 @@ def test_collect_entries_nominal_stats(tmp_path):
         ("unique_samples", 18.0),
     ])
     entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 20, [_NOMINAL_LAYER])
-    assert "kg0::entropy" in entries
-    assert entries["kg0::entropy"]["value"] == pytest.approx(1.5)
-    assert entries["kg0::entropy"]["taxon_key"] == "50"
-    assert "kg0::total_samples" in entries
+    assert "kg2::entropy" in entries
+    assert entries["kg2::entropy"]["value"] == pytest.approx(1.5)
+    assert entries["kg2::entropy"]["taxon_key"] == "50"
+    assert "kg2::total_samples" in entries
 
 
 def test_collect_entries_nominal_stats_skips_non_nominal_layers(tmp_path):
-    _write_nominal_stats(tmp_path, "kg0", [("entropy", 1.5)])
+    _write_nominal_stats(tmp_path, "kg2", [("entropy", 1.5)])
     entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 10, [_RATIO_LAYER])
     assert len(entries) == 0
 
@@ -450,7 +450,7 @@ def test_collect_entries_nominal_stats_corrupt_file(tmp_path):
 # _collect_entries_from_nominal_stats — non-castable value (lines 287-288)
 def test_collect_entries_nominal_stats_bad_value(tmp_path):
     pq.write_table(
-        pa.table({"variable": ["kg0"], "metric": ["entropy"], "value": ["bad"]}),
+        pa.table({"variable": ["kg2"], "metric": ["entropy"], "value": ["bad"]}),
         tmp_path / rk.NOMINAL_STATS_FILE,
     )
     entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
@@ -460,11 +460,11 @@ def test_collect_entries_nominal_stats_bad_value(tmp_path):
 # _collect_entries_from_nominal_stats — non-finite value (line 290)
 def test_collect_entries_nominal_stats_nonfinite_value(tmp_path):
     pq.write_table(
-        pa.table({"variable": ["kg0"], "metric": ["entropy"], "value": [float("inf")]}),
+        pa.table({"variable": ["kg2"], "metric": ["entropy"], "value": [float("inf")]}),
         tmp_path / rk.NOMINAL_STATS_FILE,
     )
     entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
-    assert "kg0::entropy" not in entries
+    assert "kg2::entropy" not in entries
 
 
 
@@ -580,8 +580,8 @@ def test_taxon_metric_value_from_numerical(tmp_path):
 
 
 def test_taxon_metric_value_from_nominal(tmp_path):
-    _write_nominal_stats(tmp_path, "kg0", [("total_samples", 50.0), ("unique_classes", 3.0)])
-    result = rk._taxon_metric_value(tmp_path, "kg0", "total_samples")
+    _write_nominal_stats(tmp_path, "kg2", [("total_samples", 50.0), ("unique_classes", 3.0)])
+    result = rk._taxon_metric_value(tmp_path, "kg2", "total_samples")
     assert result == pytest.approx(50.0)
 
 
@@ -820,8 +820,8 @@ def test_taxon_metric_value_corrupt_numerical_stats(tmp_path):
     """Corrupt numerical stats parquet falls through to nominal stats check."""
     from util.stats import NUMERICAL_STATS_FILE
     (tmp_path / NUMERICAL_STATS_FILE).write_bytes(b"garbage")
-    _write_nominal_stats(tmp_path, "kg0", [("total_samples", 25.0)])
-    result = rk._taxon_metric_value(tmp_path, "kg0", "total_samples")
+    _write_nominal_stats(tmp_path, "kg2", [("total_samples", 25.0)])
+    result = rk._taxon_metric_value(tmp_path, "kg2", "total_samples")
     assert result == pytest.approx(25.0)
 
 
@@ -829,7 +829,7 @@ def test_taxon_metric_value_corrupt_nominal_stats(tmp_path):
     """Corrupt nominal stats parquet returns None."""
     from util.stats import NOMINAL_STATS_FILE
     (tmp_path / NOMINAL_STATS_FILE).write_bytes(b"garbage")
-    assert rk._taxon_metric_value(tmp_path, "kg0", "total_samples") is None
+    assert rk._taxon_metric_value(tmp_path, "kg2", "total_samples") is None
 
 
 def test_query_ranked_scoped_all_null_entries(tmp_path, monkeypatch):

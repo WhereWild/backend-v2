@@ -46,16 +46,17 @@ _BASE_COLS = frozenset([
 ])
 
 
-def _load_temporal_ids() -> frozenset[str]:
-    """Return temporal layer IDs from catalog (used to classify enrichment cols)."""
+def _load_catalog_ids() -> tuple[frozenset[str], frozenset[str]]:
+    """Return (static_layer_ids, temporal_layer_ids) from catalog."""
     with open(CATALOG_PATH) as f:
         cat = json.load(f)
-    ids: set[str] = set()
+    static_ids: set[str] = set()
+    temporal_ids: set[str] = set()
     for category in cat["categories"]:
-        if category.get("id") == "temporal":
-            for layer in category["layers"]:
-                ids.add(layer["id"])
-    return frozenset(ids)
+        is_temporal = category.get("id") == "temporal"
+        for layer in category["layers"]:
+            (temporal_ids if is_temporal else static_ids).add(layer["id"])
+    return frozenset(static_ids), frozenset(temporal_ids)
 
 
 def _is_temporal_col(col: str, temporal_ids: frozenset[str]) -> bool:
@@ -70,6 +71,7 @@ def _atomic_write(path: Path, table: pa.Table) -> None:
 def _carry_one(
     new_path: Path,
     old_path: Path,
+    static_ids: frozenset[str],
     temporal_ids: frozenset[str],
 ) -> tuple[int, int, int, int]:
     """Carry enrichment columns from old_path into new_path for matching rows.
@@ -93,7 +95,7 @@ def _carry_one(
     if not enrich_cols:
         return 0, 0, n_total, n_total
 
-    tree_cols = [c for c in enrich_cols if not _is_temporal_col(c, temporal_ids)]
+    tree_cols = [c for c in enrich_cols if not _is_temporal_col(c, temporal_ids) and c in static_ids]
     temp_cols = [c for c in enrich_cols if _is_temporal_col(c, temporal_ids)]
 
     new_df = new_table.to_pandas()
@@ -163,7 +165,7 @@ def main() -> None:
         print("[carry_forward] no old tree at data/tmp/old_tree/ — first run, skipping")
         return
 
-    temporal_ids = _load_temporal_ids()
+    static_ids, temporal_ids = _load_catalog_ids()
     t0 = time.monotonic()
     total_rows = 0
     total_carried = 0
@@ -179,7 +181,7 @@ def main() -> None:
             total_rows += n
             total_new_obs += n
         else:
-            carried, changed, new_obs, n_total = _carry_one(new_path, old_path, temporal_ids)
+            carried, changed, new_obs, n_total = _carry_one(new_path, old_path, static_ids, temporal_ids)
             total_rows += n_total
             total_carried += carried
             total_changed += changed

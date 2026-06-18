@@ -1,4 +1,23 @@
 {
+  "isric_salinity": {
+    "name": "Global Soil Salinity Map",
+    "url": "https://files.isric.org/public/global_soil_salinity/",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Ivushkin, K., Bartholomeus, H., Bregt, A.K., Pulatov, A., Kempen, B., and de Sousa, L. (2019). Global mapping of soil salinity change. Remote Sensing of Environment, 231, 111260.",
+    "doi": "https://doi.org/10.1016/j.rse.2019.111260",
+    "references": [
+      {
+        "authors": "Ivushkin, K., Bartholomeus, H., Bregt, A.K., Pulatov, A., Kempen, B., and de Sousa, L.",
+        "year": 2019,
+        "title": "Global mapping of soil salinity change",
+        "journal": "Remote Sensing of Environment",
+        "volume_issue": "231",
+        "pages": "111260",
+        "doi": "https://doi.org/10.1016/j.rse.2019.111260"
+      }
+    ]
+  },
   "soilgrids_2_0": {
     "name": "SoilGrids 2.0",
     "url": "https://soilgrids.org/",

@@ -209,12 +209,12 @@ def _write_occ_index(taxon_dir: Path, rows=None) -> None:
     """Write a struct-format occurrence_index.parquet to taxon_dir."""
     if rows is None:
         rows = [
-            {"catalogNumber": "OCC001", "decimalLatitude": 40.5, "decimalLongitude": -75.0, "bio1": 10.0, "kg0": 1.0},
-            {"catalogNumber": "OCC002", "decimalLatitude": 41.0, "decimalLongitude": -74.5, "bio1": 20.0, "kg0": 2.0},
-            {"catalogNumber": "OCC003", "decimalLatitude": 42.0, "decimalLongitude": -73.0, "bio1": 30.0, "kg0": 1.0},
+            {"catalogNumber": "OCC001", "decimalLatitude": 40.5, "decimalLongitude": -75.0, "bio1": 10.0, "kg2": 1.0},
+            {"catalogNumber": "OCC002", "decimalLatitude": 41.0, "decimalLongitude": -74.5, "bio1": 20.0, "kg2": 2.0},
+            {"catalogNumber": "OCC003", "decimalLatitude": 42.0, "decimalLongitude": -73.0, "bio1": 30.0, "kg2": 1.0},
         ]
     df = pd.DataFrame(rows)
-    layer_meta = {c: {"id": c, "value_type": "nominal" if c == "kg0" else "interval"}
+    layer_meta = {c: {"id": c, "value_type": "nominal" if c == "kg2" else "interval"}
                   for c in df.columns if c not in ("catalogNumber", "decimalLatitude", "decimalLongitude")}
     taxon_dir.mkdir(parents=True, exist_ok=True)
     build_leaf_index(taxon_dir, df, layer_meta, "test")
@@ -538,7 +538,7 @@ def test_variable_tile_compat():
 # ---------------------------------------------------------------------------
 
 FAKE_NOM_LAYER = {
-    "id": "kg0",
+    "id": "kg2",
     "display_name": "Koppen-Geiger Climate",
     "units": None,
     "value_type": "nominal",
@@ -572,7 +572,7 @@ _NUM_STATS_TABLE = pa.table({
 })
 
 _NOM_STATS_TABLE = pa.table({
-    "variable": ["kg0", "kg0", "kg0"],
+    "variable": ["kg2", "kg2", "kg2"],
     "metric": ["total_samples", "class_1", "class_2"],
     "value": [100.0, 0.6, 0.4],
 })
@@ -684,9 +684,9 @@ def test_get_taxon_env_stats_all_files():
     bio1 = next(v for v in body["variables"] if v["id"] == "bio1")
     assert bio1["stats"]["count"] == 100
     assert bio1["density"] is not None
-    kg0 = next(v for v in body["variables"] if v["id"] == "kg0")
-    assert kg0["density"] is None
-    assert kg0["classes"] is not None
+    kg2 = next(v for v in body["variables"] if v["id"] == "kg2")
+    assert kg2["density"] is None
+    assert kg2["classes"] is not None
 
 
 def test_get_taxon_env_stats_no_files():
@@ -715,7 +715,7 @@ def test_get_species_environment_nominal_no_file():
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
          patch.object(pq, "read_table", return_value=pa.table({})):
-        r = client.get("/species/2923970/environment/kg0")
+        r = client.get("/species/2923970/environment/kg2")
     assert r.status_code == 404
 
 
@@ -731,7 +731,7 @@ def test_get_species_environment_nominal_no_rows():
          patch("pathlib.Path.exists", return_value=True), \
          patch.object(pq, "read_table", return_value=empty), \
          patch("main._load_legend", return_value=[]):
-        r = client.get("/species/2923970/environment/kg0")
+        r = client.get("/species/2923970/environment/kg2")
     assert r.status_code == 404
 
 
@@ -746,10 +746,10 @@ def test_get_species_environment_nominal_success():
          patch("pathlib.Path.exists", return_value=True), \
          patch.object(pq, "read_table", return_value=_NOM_STATS_TABLE), \
          patch("main._load_legend", return_value=legend):
-        r = client.get("/species/2923970/environment/kg0")
+        r = client.get("/species/2923970/environment/kg2")
     assert r.status_code == 200
     body = r.json()
-    assert body["variable"] == "kg0"
+    assert body["variable"] == "kg2"
     assert body["density_curve"] is None
     dist = body["categorical_distribution"]
     assert len(dist) == 2
@@ -1219,7 +1219,7 @@ def test_get_species_environment_with_location_continuous(tmp_path, monkeypatch)
 def test_get_species_environment_with_location_nominal(tmp_path, monkeypatch):
     monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
     monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "kg0",
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "kg2",
                        [1.0] * 15 + [2.0] * 5)
     _patch_hierarchy(monkeypatch, {"USA": _USA})
     legend = [{"id": 1, "name": "Tropical", "description": None, "traits": None},
@@ -1227,7 +1227,7 @@ def test_get_species_environment_with_location_nominal(tmp_path, monkeypatch):
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
          patch("main._load_legend", return_value=legend):
-        r = client.get("/species/2923970/environment/kg0?location=USA")
+        r = client.get("/species/2923970/environment/kg2?location=USA")
     assert r.status_code == 200
     body = r.json()
     assert body["observation_count"] == 20
@@ -1281,7 +1281,7 @@ _INDEX_TABLE = pa.table({
     "decimalLatitude": [40.5, 41.0, 42.0],
     "decimalLongitude": [-75.0, -74.5, -73.0],
     "bio1": [10.0, 20.0, 30.0],
-    "kg0": [1.0, 2.0, 1.0],
+    "kg2": [1.0, 2.0, 1.0],
 })
 
 _INDEX_SCHEMA = MagicMock()
@@ -1309,7 +1309,7 @@ def test_slice_nominal_rejected():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
-        r = client.get("/species/2923970/environment/kg0/slice?min=0&max=30")
+        r = client.get("/species/2923970/environment/kg2/slice?min=0&max=30")
     assert r.status_code == 400
 
 
@@ -1317,7 +1317,7 @@ def test_class_samples_layer_not_found():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[]):
-        r = client.get("/species/2923970/environment/kg0/class/1/samples")
+        r = client.get("/species/2923970/environment/kg2/class/1/samples")
     assert r.status_code == 404
 
 
@@ -1333,7 +1333,7 @@ def test_class_samples_invalid_class():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
-        r = client.get("/species/2923970/environment/kg0/class/notanumber/samples")
+        r = client.get("/species/2923970/environment/kg2/class/notanumber/samples")
     assert r.status_code == 400
 
 
@@ -1413,12 +1413,12 @@ def test_slice_with_location_limit(tmp_path, monkeypatch):
 def test_class_samples_with_location_success(tmp_path, monkeypatch):
     monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
     monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "kg0",
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "kg2",
                        [1.0] * 10 + [2.0] * 10)
     _patch_hierarchy(monkeypatch, {"USA": _USA})
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
-        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=USA")
+        r = client.get("/species/2923970/environment/kg2/class/1/samples?location=USA")
     assert r.status_code == 200
     body = r.json()
     assert body["class_value"] == 1
@@ -1434,7 +1434,7 @@ def test_class_samples_with_location_no_data(tmp_path, monkeypatch):
     _patch_hierarchy(monkeypatch, {"USA": _USA})
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
-        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=USA")
+        r = client.get("/species/2923970/environment/kg2/class/1/samples?location=USA")
     assert r.status_code == 200
     assert r.json()["count"] == 0
 
@@ -1444,21 +1444,21 @@ def test_class_samples_with_location_empty_after_gid_filter(tmp_path, monkeypatc
     monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
     monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
     # Occurrence file has CAN rows, not USA
-    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "CAN", "kg0", [1.0] * 10)
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "CAN", "kg2", [1.0] * 10)
     _patch_hierarchy(monkeypatch, {"USA": _USA})
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
-        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=USA")
+        r = client.get("/species/2923970/environment/kg2/class/1/samples?location=USA")
     assert r.status_code == 200
     assert r.json()["count"] == 0
 def test_class_samples_with_location_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
     monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "kg0", [1.0] * 20)
+    _make_occ_with_loc(tmp_path, TAXON["path"], "level0Gid", "USA", "kg2", [1.0] * 20)
     _patch_hierarchy(monkeypatch, {"USA": _USA})
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
-        r = client.get("/species/2923970/environment/kg0/class/1/samples?location=USA&limit=3")
+        r = client.get("/species/2923970/environment/kg2/class/1/samples?location=USA&limit=3")
     assert r.status_code == 200
     assert r.json()["count"] == 3
 
@@ -1637,7 +1637,8 @@ def test_ranking_options_returns_options(tmp_path, monkeypatch):
          patch.object(tiles, "load_layers", return_value=[
              {"id": "bio1", "display_name": "Temperature"},
              {"id": "bio12", "display_name": "Precipitation"},
-         ]):
+         ]), \
+         patch.object(main_module, "_load_legend", return_value=[{"id": 0, "name": "Dry"}]):
         r = client.get("/api/taxa/ranking-options?within_taxon=2923970&descendant_rank=SPECIES")
     assert r.status_code == 200
     body = r.json()
@@ -1717,8 +1718,8 @@ _STATIC_LAYER = {
 }
 
 _NOMINAL_LAYER = {
-    "id": "kg0",
-    "filename": "kg0.tif",
+    "id": "kg2",
+    "filename": "kg2.tif",
     "scale_factor": None,
     "add_offset": None,
     "units": "",
@@ -1795,7 +1796,7 @@ def test_gis_point_nominal_resolves_class_name():
     with patch.object(tiles, "get_layer", return_value=_NOMINAL_LAYER), \
          patch.object(gis_module, "sample_point", return_value=9.0), \
          patch.object(main_module, "_load_legend", return_value=fake_legend):
-        r = client.get("/gis/point?lat=40&lon=-105&variable=kg0")
+        r = client.get("/gis/point?lat=40&lon=-105&variable=kg2")
     assert r.status_code == 200
     body = r.json()
     assert body["value"] == pytest.approx(9.0)

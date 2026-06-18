@@ -36,7 +36,7 @@ def _make_occ_parquet(path: Path, extra_cols: dict | None = None) -> None:
 
 
 _CONTINUOUS_LAYER = {"id": "bio1", "value_type": "ratio", "scale_factor": 0.1, "add_offset": -273.15}
-_NOMINAL_LAYER    = {"id": "kg0",  "value_type": "nominal", "scale_factor": None, "add_offset": None}
+_NOMINAL_LAYER    = {"id": "kg2",  "value_type": "nominal", "scale_factor": None, "add_offset": None}
 _DISCRETE_LAYER   = {"id": "gsl",  "value_type": "ratio",   "scale_factor": None, "add_offset": None, "domain": "discrete"}
 
 
@@ -238,8 +238,8 @@ def test_nominal_stats_uniform_max_entropy():
 def test_nominal_cat_entries_structure():
     counts = Counter({1: 80, 2: 20})
     summary = {"unique_samples": 50, "total_samples": 100, "unique_classes": 2, "entropy": 0.5, "mode": 1}
-    layer = {"id": "kg0", "display_name": "Köppen-Geiger", "source": "chelsa_v2_1"}
-    entries = st._nominal_cat_entries("kg0", layer, counts, summary)
+    layer = {"id": "kg2", "display_name": "Köppen-Geiger", "source": "chelsa_v2_1"}
+    entries = st._nominal_cat_entries("kg2", layer, counts, summary)
     metrics = {e["metric"] for e in entries}
     assert "unique_samples" in metrics
     assert "total_samples" in metrics
@@ -289,8 +289,8 @@ def test_write_stats_frame_empty(tmp_path):
 
 def test_write_read_nominal_stats(tmp_path):
     entries = [
-        {"variable": "kg0", "metric": "total_samples", "value": 100.0},
-        {"variable": "kg0", "metric": "class_1", "value": 0.6},
+        {"variable": "kg2", "metric": "total_samples", "value": 100.0},
+        {"variable": "kg2", "metric": "class_1", "value": 0.6},
     ]
     st._write_nominal_stats(tmp_path, entries)
     df = pd.read_parquet(tmp_path / st.NOMINAL_STATS_FILE)
@@ -356,8 +356,8 @@ def test_process_leaf_discrete(tmp_path, monkeypatch):
 def test_process_leaf_nominal(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
     taxon_dir = tmp_path / "taxon"
-    _make_occ_parquet(taxon_dir / st.OCCURRENCE_FILE, extra_cols={"kg0": [1.0] * 15 + [2.0] * 5})
-    st._process_leaf(taxon_dir, {"kg0": _NOMINAL_LAYER})
+    _make_occ_parquet(taxon_dir / st.OCCURRENCE_FILE, extra_cols={"kg2": [1.0] * 15 + [2.0] * 5})
+    st._process_leaf(taxon_dir, {"kg2": _NOMINAL_LAYER})
     assert (taxon_dir / st.NOMINAL_STATS_FILE).exists()
     df = pd.read_parquet(taxon_dir / st.NOMINAL_STATS_FILE)
     metrics = dict(zip(df["metric"], df["value"]))
@@ -644,8 +644,8 @@ def test_process_leaf_all_nan_after_isfinite(tmp_path):
 def test_process_leaf_nominal_series_empty_after_dropna(tmp_path):
     """Nominal series empty after dropna (line 325)."""
     taxon_dir = tmp_path / "nominal_null"
-    _make_occ_parquet(taxon_dir / st.OCCURRENCE_FILE, extra_cols={"kg0": [None] * 20})
-    st._process_leaf(taxon_dir, {"kg0": _NOMINAL_LAYER})
+    _make_occ_parquet(taxon_dir / st.OCCURRENCE_FILE, extra_cols={"kg2": [None] * 20})
+    st._process_leaf(taxon_dir, {"kg2": _NOMINAL_LAYER})
     assert not (taxon_dir / st.NOMINAL_STATS_FILE).exists()
 
 

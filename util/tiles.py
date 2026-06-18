@@ -405,7 +405,7 @@ def render_temporal_tile_bytes(
     var_id = layer["var_id"]
     window_label = layer["window_label"]
     model = layer.get("model", "copernicus_era5")
-    nominal = str(layer.get("value_type") or "").lower() == "nominal"
+    nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
 
     npy_path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{forecast_suffix}.npy"
     arr = _load_temporal_npy(npy_path)
@@ -528,7 +528,7 @@ def nominal_tile_range_classes(
     Keys are class IDs; values are total pixel counts across all tiles in the range.
     """
     layer = get_layer(layer_id)
-    if str(layer.get("value_type") or "").lower() != "nominal":
+    if str(layer.get("value_type") or "").lower() not in ("nominal", "ordinal"):
         return {}
 
     if layer.get("window_hours") is not None:
@@ -697,7 +697,7 @@ def render_layer_tile_bytes(
     path    = LAYERS_DIR / layer["filename"]
     scale   = layer.get("scale_factor") or 1.0
     offset  = layer.get("add_offset")   or 0.0
-    nominal = str(layer.get("value_type") or "").lower() == "nominal"
+    nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
     vmin    = layer.get("render_min")
     vmax    = layer.get("render_max")
 

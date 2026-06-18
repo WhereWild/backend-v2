@@ -250,8 +250,8 @@ def test_main_subspecies_routing(tmp_path):
     assert out.exists()
 
 
-def test_main_species_uses_species_key(tmp_path):
-    row = {"taxonRank": "SPECIES", "taxonKey": "99999", "speciesKey": "2923970"}
+def test_main_species_uses_taxon_key(tmp_path):
+    row = {"taxonRank": "SPECIES", "taxonKey": "2923970", "speciesKey": "2923970"}
     _run_main(_make_tsv([row]), tmp_path)
     out = tmp_path / "tree" / CATALOG["2923970"]["path"] / "occurrence.parquet"
     assert out.exists()

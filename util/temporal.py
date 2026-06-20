@@ -529,7 +529,7 @@ class _CachedOmReader:
     """
     __slots__ = ("_reader", "_ww_key", "shape")
 
-    def __init__(self, reader: "OmFileReader", key: str) -> None:
+    def __init__(self, reader: OmFileReader, key: str) -> None:
         self._reader = reader
         self._ww_key = key
         self.shape = reader.shape
@@ -556,7 +556,7 @@ _RA_CACHE_MX = threading.Lock()
 _RA_CACHE_MAXSIZE = 60  # ~60 × 33 MB ≈ 2 GB worst-case ceiling
 
 
-def _read_array_cached(reader: "OmFileReader", ny: int, nx: int, t0: int, t1: int) -> np.ndarray:
+def _read_array_cached(reader: OmFileReader, ny: int, nx: int, t0: int, t1: int) -> np.ndarray:
     key = (getattr(reader, "_ww_key", None), t0, t1)
     if key[0] is None:
         return np.asarray(

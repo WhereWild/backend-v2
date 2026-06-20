@@ -548,7 +548,10 @@ _DOWNLOAD_CHUNK_LOCKS_MX = threading.Lock()
 # LRU cache for read_array results (keyed by local file path + slice bounds).
 # In steady-state incremental runs every window shares the same "add" step, so
 # 6 of 7 per-window reads become instant cache hits instead of ~1s disk reads.
+# _RA_PENDING coalesces concurrent misses: only the first thread reads; others
+# wait on the Event instead of all decompressing the same data simultaneously.
 _RA_CACHE: OrderedDict[tuple, np.ndarray] = OrderedDict()
+_RA_PENDING: dict[tuple, threading.Event] = {}
 _RA_CACHE_MX = threading.Lock()
 _RA_CACHE_MAXSIZE = 60  # ~60 × 33 MB ≈ 2 GB worst-case ceiling
 
@@ -560,21 +563,38 @@ def _read_array_cached(reader: "OmFileReader", ny: int, nx: int, t0: int, t1: in
             reader.read_array((slice(0, ny), slice(0, nx), slice(t0, t1))),
             dtype=np.float64,
         )
-    with _RA_CACHE_MX:
-        if key in _RA_CACHE:
-            _RA_CACHE.move_to_end(key)
-            return _RA_CACHE[key]
-    data = np.asarray(
-        reader.read_array((slice(0, ny), slice(0, nx), slice(t0, t1))),
-        dtype=np.float64,
-    )
-    with _RA_CACHE_MX:
-        if key not in _RA_CACHE:
+
+    while True:
+        with _RA_CACHE_MX:
+            if key in _RA_CACHE:
+                _RA_CACHE.move_to_end(key)
+                return _RA_CACHE[key]
+            if key in _RA_PENDING:
+                event = _RA_PENDING[key]
+            else:
+                event = threading.Event()
+                _RA_PENDING[key] = event
+                break  # this thread is the designated reader
+        event.wait()  # another thread is reading — wait then re-check cache
+
+    try:
+        data = np.asarray(
+            reader.read_array((slice(0, ny), slice(0, nx), slice(t0, t1))),
+            dtype=np.float64,
+        )
+        with _RA_CACHE_MX:
             _RA_CACHE[key] = data
             _RA_CACHE.move_to_end(key)
             while len(_RA_CACHE) > _RA_CACHE_MAXSIZE:
                 _RA_CACHE.popitem(last=False)
-    return data
+            del _RA_PENDING[key]
+        event.set()
+        return data
+    except Exception:
+        with _RA_CACHE_MX:
+            _RA_PENDING.pop(key, None)
+        event.set()
+        raise
 
 
 def set_raster_chunk_cache(path: str) -> None:

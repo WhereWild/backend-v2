@@ -26,6 +26,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -757,7 +758,7 @@ def _build_forecast_aggregates(
             }
             save_raster_state(out_dir, vid, wl, agg, sums, fc_meta, suffix=suffix)
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(_process, vid, cfg, wh, wl): (vid, wl) for vid, cfg, wh, wl in combos}
             for fut in as_completed(futures):
                 if exc := fut.exception():
@@ -1057,6 +1058,8 @@ def main() -> None:
         )
 
         # ── Main window loop ───────────────────────────────────────────────────
+        _state_lock = threading.Lock()
+
         def _process_var(var_id: str, vcfg: dict, window_h: int, wl: str) -> None:
             var_key = f"{var_id}_{wl}"
             if var_key in resume_completed:
@@ -1075,17 +1078,19 @@ def main() -> None:
                 print(f"  [{wl}] {var_id} incremental ({stale_h:.1f}h stale) …", flush=True)
                 _incremental_update(var_id, vcfg, window_h, wl, existing_sums, existing_meta,
                                     now_ts, era5_end, gfs_end_ts, era5_cidx, gfs_cidx, out_dir)
-            completed_vars.append(var_key)
-            _write_state("running")
+            with _state_lock:
+                completed_vars.append(var_key)
+                _write_state("running")
 
         t_windows = time.perf_counter()
-        for window_h, wl in windows:
-            print(f"\n=== window {wl} ===")
-            for vid, vcfg in var_configs.items():
-                try:
-                    _process_var(vid, vcfg, window_h, wl)
-                except Exception as exc:
-                    print(f"  ERROR {vid}: {exc}", flush=True)
+        all_combos = [(vid, vcfg, wh, wl) for wh, wl in windows for vid, vcfg in var_configs.items()]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_process_var, vid, vcfg, wh, wl): (vid, wl)
+                       for vid, vcfg, wh, wl in all_combos}
+            for fut in as_completed(futures):
+                if exc := fut.exception():
+                    vid, wl = futures[fut]
+                    print(f"  ERROR [{wl}] {vid}: {exc}", flush=True)
         print(f"\n=== windows done in {time.perf_counter() - t_windows:.1f}s ===")
 
         # ── Forecast aggregates ────────────────────────────────────────────────

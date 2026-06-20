@@ -18,6 +18,7 @@ Layers are processed in parallel threads.
 from __future__ import annotations
 
 import functools
+import gc
 import json
 import os
 import re
@@ -60,22 +61,17 @@ _LAYER_WORKERS = int(os.environ.get("ENRICH_LAYER_WORKERS", "1"))
 # Raising workers above 1 requires lowering this threshold proportionally.
 _MEMORY_MB_THRESHOLD = int(os.environ.get("ENRICH_MEMORY_MB_THRESHOLD", "24000"))
 
-# GDAL block cache for the ds.sample() large-raster path (elevation, landcover).
-# In-memory rasters bypass GDAL entirely so this doesn't affect them.
-# Default: total RAM − 16 GB OS floor − in-memory raster budget − 4 GB working data,
-# capped at 48 GB. Overridable via GDAL_CACHEMAX in the environment (MB).
-def _default_gdal_cachemax_mb() -> int:
-    try:
-        total_mb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // (1024 * 1024)
-    except (AttributeError, ValueError):
-        total_mb = 16 * 1024  # fallback: assume 16 GB, cache gets 512 MB minimum
-    floor_mb = 16 * 1024
-    raster_budget_mb = _LAYER_WORKERS * _MEMORY_MB_THRESHOLD
-    working_mb = 4 * 1024
-    safe_mb = max(512, total_mb - floor_mb - raster_budget_mb - working_mb)
-    return min(safe_mb, 48 * 1024)
 
-os.environ.setdefault("GDAL_CACHEMAX", str(_default_gdal_cachemax_mb()))
+def _rss_mb() -> float:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
 
 _raw_vars = os.environ.get("VARS_TO_ENRICH", "")
 VARS_TO_ENRICH: list[str] | None = [v.strip() for v in _raw_vars.split(",") if v.strip()] or None
@@ -158,13 +154,39 @@ def _missing_rows_for_taxon(taxon: TaxonRecord, layer_ids: list[str]) -> pa.Tabl
     data_path = TREE_ROOT / taxon["path"] / OCCURRENCE_FILE
     if not data_path.exists():
         return None
-    table = pq.read_table(data_path)
+
+    # Read schema only (no data) to decide which columns are needed and whether
+    # stale GIS columns exist. Avoids loading temporal columns (~200+) into RAM
+    # on every taxon scan when only GIS columns + coordinates are needed here.
+    try:
+        schema = pq.read_schema(data_path)
+    except Exception:
+        return None
+    schema_names = set(schema.names)
+    if any(col not in schema_names for col in _REQUIRED_COLS):
+        return None
+
+    allowed = _BASE_COLS | set(layer_ids)
+    temporal_ids = _temporal_layer_ids()
+    stale = [
+        col for col in schema_names
+        if col not in allowed
+        and not any(col.startswith(tid + "_") for tid in temporal_ids)
+    ]
+
+    if stale:
+        # Rare: need full read to detect and rewrite without stale columns.
+        table = pq.read_table(data_path)
+        df = table.to_pandas()
+        _drop_stale_gis_columns(df, layer_ids, data_path)
+        table = pa.Table.from_pandas(df, preserve_index=False)
+    else:
+        # Common path: read only the GIS layer columns + coordinates we actually need.
+        needed = list((set(_REQUIRED_COLS) | set(layer_ids)) & schema_names)
+        table = pq.read_table(data_path, columns=needed)
+
     if table.num_rows == 0:
         return None
-    df = table.to_pandas()
-    if any(col not in df.columns for col in _REQUIRED_COLS):
-        return None
-    _drop_stale_gis_columns(df, layer_ids, data_path)
 
     # Use pc.is_null on the Arrow table (not pandas isna) so that no-coverage
     # sentinels (NaN for continuous, -1 for nominal) are not re-queued.
@@ -182,7 +204,8 @@ def _missing_rows_for_taxon(taxon: TaxonRecord, layer_ids: list[str]) -> pa.Tabl
     if not has_missing.any():
         return None  # all rows already fully enriched
 
-    df_f = df[has_missing].reset_index(drop=True)
+    df_f = table.to_pandas() if not stale else df
+    df_f = df_f[has_missing].reset_index(drop=True)
     null_f = null_matrix[has_missing]
     layer_arr = np.array(layer_ids)
     missing_layers = [layer_arr[row].tolist() for row in null_f]
@@ -230,6 +253,8 @@ def _iter_worklist_batches(
         batch_rows += chunk.num_rows
         if idx % 1000 == 0:
             print(f"[worklist] scanned {idx} taxa, captured {total_rows} rows")
+            gc.collect()
+            pa.default_memory_pool().release_unused()
         if batch_rows >= row_limit:
             print(f"[worklist] concatenating {len(chunks)} chunks ({batch_rows} rows)")
             worklist = pa.concat_tables(chunks).combine_chunks().sort_by([("hilbertIdx", "ascending")])
@@ -302,6 +327,7 @@ def _sample_cog_batch(
 
 def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
     """Sample all layers for every row in the worklist and flush results."""
+    print(f"[process] batch start  rss={_rss_mb():.0f}MB  rows={worklist.num_rows}")
     df = worklist.to_pandas()
     if df.empty:
         return
@@ -473,9 +499,23 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
                 layer_id, full_values = result
                 layer_results[layer_id] = full_values
                 completed += 1
-                print(f"[process] layer {completed}/{total}: {layer_id}")
+                print(f"[process] layer {completed}/{total}: {layer_id}  rss={_rss_mb():.0f}MB")
+
+    rss_after_sample = _rss_mb()
+    print(f"[process] sampling done — rss={rss_after_sample:.0f}MB  taxa={len(taxon_to_rows)}")
+
+    # Precompute a boolean mask per layer (size = worklist rows) so the flush
+    # loop can filter relevant rows with a cheap mask[row_indices] slice instead
+    # of np.intersect1d (which is O(n+m) and called taxa×layers times).
+    n_worklist = len(lats)
+    layer_mask: dict[str, np.ndarray] = {}
+    for lid, arr in layer_rows.items():
+        m = np.zeros(n_worklist, dtype=bool)
+        m[arr] = True
+        layer_mask[lid] = m
 
     # Flush per taxon — read parquet once, assign all layers at once
+    flush_n = 0
     for taxon_key, row_indices in taxon_to_rows.items():
         data_path = taxon_paths.get(taxon_key)
         if not data_path:
@@ -484,13 +524,19 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
         if not data_file.exists():
             continue
 
-        # Include ALL sampled rows (even NaN = no-coverage) so we can stamp the
-        # no-coverage sentinel and avoid re-processing them on future rebuilds.
-        taxon_updates: dict[str, np.ndarray] = {}
+        # Only write values for rows that were actually missing each layer.
+        # full_values arrays default to NaN outside layer_rows[layer_id], so using
+        # the full row_indices would overwrite existing valid values with NaN for any
+        # taxon rows that already had that layer enriched (carry-forward case).
+        taxon_updates: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for layer_id, full_values in layer_results.items():
-            t_vals = full_values[row_indices]
-            if t_vals.size > 0:
-                taxon_updates[layer_id] = t_vals
+            mask = layer_mask.get(layer_id)
+            if mask is None:
+                continue
+            relevant = row_indices[mask[row_indices]]
+            if relevant.size == 0:
+                continue
+            taxon_updates[layer_id] = (relevant, full_values[relevant])
 
         if not taxon_updates:
             continue
@@ -503,11 +549,11 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
         catalog_arr = df_taxon["catalogNumber"].astype(str).to_numpy()
         catalog_index = {v: i for i, v in enumerate(catalog_arr)}
 
-        for layer_id, t_vals in taxon_updates.items():
+        for layer_id, (relevant, t_vals) in taxon_updates.items():
             if layer_id not in df_taxon.columns:
                 df_taxon[layer_id] = np.nan
             col = df_taxon[layer_id].to_numpy(dtype=np.float64, copy=True)
-            df_indices = np.array([catalog_index.get(c, -1) for c in catalogs[row_indices]])
+            df_indices = np.array([catalog_index.get(c, -1) for c in catalogs[relevant]])
             valid = df_indices >= 0
             col[df_indices[valid]] = t_vals[valid]
             df_taxon[layer_id] = col
@@ -530,6 +576,16 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
                 arrow_table = arrow_table.set_column(idx, col_name, new_col)
 
         _atomic_write(data_file, arrow_table)
+        flush_n += 1
+        if flush_n % 500 == 0:
+            gc.collect()
+            pa.default_memory_pool().release_unused()
+            print(f"[flush] {flush_n}/{len(taxon_to_rows)}  rss={_rss_mb():.0f}MB")
+
+    # Return Arrow allocator memory to the OS so it doesn't accumulate across batches.
+    gc.collect()
+    pa.default_memory_pool().release_unused()
+    print(f"[flush] done  rss={_rss_mb():.0f}MB")
 
 
 def _sample_cog(

@@ -23,7 +23,9 @@ path), the correction is a no-op: obs_elev is NaN → offset is 0.
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -519,8 +521,60 @@ def _chunk_filename(chunk_entry: ChunkRange) -> str:
     return f"chunk_{chunk_entry.chunk_num}.om"
 
 
+class _CachedOmReader:
+    """Thin wrapper around OmFileReader that carries a cache key.
+
+    OmFileReader is a C extension and doesn't support arbitrary attribute
+    assignment, so we wrap it to attach the local file path for _read_array_cached.
+    """
+    __slots__ = ("_reader", "_ww_key", "shape")
+
+    def __init__(self, reader: "OmFileReader", key: str) -> None:
+        self._reader = reader
+        self._ww_key = key
+        self.shape = reader.shape
+
+    def read_array(self, idx: tuple) -> object:
+        return self._reader.read_array(idx)
+
+
 # When set, accumulate_raster downloads chunks here before reading (faster for large grids).
 _RASTER_CHUNK_CACHE_DIR: str | None = None
+
+# Per-file locks so concurrent workers don't race to download the same chunk.
+_DOWNLOAD_CHUNK_LOCKS: dict[str, threading.Lock] = {}
+_DOWNLOAD_CHUNK_LOCKS_MX = threading.Lock()
+
+# LRU cache for read_array results (keyed by local file path + slice bounds).
+# In steady-state incremental runs every window shares the same "add" step, so
+# 6 of 7 per-window reads become instant cache hits instead of ~1s disk reads.
+_RA_CACHE: OrderedDict[tuple, np.ndarray] = OrderedDict()
+_RA_CACHE_MX = threading.Lock()
+_RA_CACHE_MAXSIZE = 60  # ~60 × 33 MB ≈ 2 GB worst-case ceiling
+
+
+def _read_array_cached(reader: "OmFileReader", ny: int, nx: int, t0: int, t1: int) -> np.ndarray:
+    key = (getattr(reader, "_ww_key", None), t0, t1)
+    if key[0] is None:
+        return np.asarray(
+            reader.read_array((slice(0, ny), slice(0, nx), slice(t0, t1))),
+            dtype=np.float64,
+        )
+    with _RA_CACHE_MX:
+        if key in _RA_CACHE:
+            _RA_CACHE.move_to_end(key)
+            return _RA_CACHE[key]
+    data = np.asarray(
+        reader.read_array((slice(0, ny), slice(0, nx), slice(t0, t1))),
+        dtype=np.float64,
+    )
+    with _RA_CACHE_MX:
+        if key not in _RA_CACHE:
+            _RA_CACHE[key] = data
+            _RA_CACHE.move_to_end(key)
+            while len(_RA_CACHE) > _RA_CACHE_MAXSIZE:
+                _RA_CACHE.popitem(last=False)
+    return data
 
 
 def set_raster_chunk_cache(path: str) -> None:
@@ -529,15 +583,20 @@ def set_raster_chunk_cache(path: str) -> None:
     _RASTER_CHUNK_CACHE_DIR = path
 
 
-def _open_chunk(entry: ChunkRange, model: str, variable: str) -> OmFileReader:
-    """Return an OmFileReader for the chunk.
+def _open_chunk(entry: ChunkRange, model: str, variable: str, n_steps: int = -1) -> OmFileReader:
+    """Return an OmFileReader for the chunk, attaching _ww_key for the read-array cache.
 
     If _RASTER_CHUNK_CACHE_DIR is set, downloads to disk first (fast local reads).
-    Otherwise streams directly from S3 via from_fsspec.
+    Already-cached files are reused without re-downloading.
+    Falls back to HTTP range requests when no cache dir is set.
     """
     if _RASTER_CHUNK_CACHE_DIR is not None:
-        local = _download_chunk(entry, model, variable, _RASTER_CHUNK_CACHE_DIR)
-        return OmFileReader(str(local))
+        filename = _chunk_filename(entry)
+        target = Path(_RASTER_CHUNK_CACHE_DIR) / "chunks" / f"{model}_{variable}_{filename}"
+        if not target.exists():
+            _download_chunk(entry, model, variable, _RASTER_CHUNK_CACHE_DIR)
+        return _CachedOmReader(OmFileReader(str(target)), str(target))
+
     filename = _chunk_filename(entry)
     path = f"openmeteo/data/{model}/{variable}/{filename}"
     fs = fsspec.filesystem("s3", anon=True)
@@ -558,7 +617,11 @@ def _download_chunk(
     variable: str,
     cache_dir: str,
 ) -> Path:
-    """Download a single .om chunk to local disk via fsspec and return the path."""
+    """Download a single .om chunk to local disk via fsspec and return the path.
+
+    Uses per-file locking so concurrent workers don't race to download the same
+    file, and writes via a .tmp rename so readers never see a partial file.
+    """
     filename = _chunk_filename(chunk_entry)
     uri = f"s3://openmeteo/data/{model}/{variable}/{filename}"
 
@@ -569,8 +632,20 @@ def _download_chunk(
     if target.exists():
         return target
 
-    fs = fsspec.filesystem("s3", anon=True)
-    fs.get(uri, str(target))
+    key = str(target)
+    with _DOWNLOAD_CHUNK_LOCKS_MX:
+        if key not in _DOWNLOAD_CHUNK_LOCKS:
+            _DOWNLOAD_CHUNK_LOCKS[key] = threading.Lock()
+        lock = _DOWNLOAD_CHUNK_LOCKS[key]
+
+    with lock:
+        if target.exists():
+            return target
+        tmp = target.with_suffix(".tmp")
+        fs = fsspec.filesystem("s3", anon=True)
+        fs.get(uri, str(tmp))
+        tmp.rename(target)
+
     return target
 
 
@@ -733,8 +808,14 @@ def build_chunk_index(
 
 def _chunk_entry_for_time(idx: ChunkIndex, ts: float) -> tuple[ChunkRange | None, int]:
     """Return the ChunkRange containing ts and the file-position index within it."""
-    for entry in idx.ranges:
-        if entry.start <= ts <= entry.end:
+    starts: np.ndarray | None = idx.__dict__.get("_starts_cache")
+    if starts is None:
+        starts = np.array([r.start for r in idx.ranges], dtype=np.float64)
+        idx.__dict__["_starts_cache"] = starts
+    i = int(np.searchsorted(starts, ts, side="right")) - 1
+    if i >= 0:
+        entry = idx.ranges[i]
+        if ts <= entry.end:
             return entry, int(round((ts - entry.start) / idx.resolution)) + entry.file_offset
     return None, -1
 
@@ -1843,7 +1924,7 @@ def accumulate_raster(
         if t1 <= t0:
             continue
 
-        reader = _open_chunk(entry, model, variable)
+        reader = _open_chunk(entry, model, variable, n_steps=t1 - t0)
         ny, nx, _ = reader.shape
 
         if total_sum is None:
@@ -1852,10 +1933,7 @@ def accumulate_raster(
         sub = 24
         for ts in range(t0, t1, sub):
             te = min(ts + sub, t1)
-            chunk_data = np.asarray(
-                reader.read_array((slice(0, ny), slice(0, nx), slice(ts, te))),
-                dtype=np.float64,
-            )
+            chunk_data = _read_array_cached(reader, ny, nx, ts, te)
             total_sum += np.nansum(chunk_data, axis=2)
 
         n_steps += t1 - t0
@@ -1903,7 +1981,7 @@ def accumulate_vpd_raster(
         if t1 <= t0:
             continue
 
-        t_reader = _open_chunk(t_entry, model, "temperature_2m")
+        t_reader = _open_chunk(t_entry, model, "temperature_2m", n_steps=t1 - t0)
         ny, nx, _ = t_reader.shape
 
         if total_sum is None:
@@ -1914,20 +1992,14 @@ def accumulate_vpd_raster(
             te = min(ts + sub, t1)
             step_ts = t_entry.start + (ts - t_entry.file_offset) * resolution
 
-            t_data = np.asarray(
-                t_reader.read_array((slice(0, ny), slice(0, nx), slice(ts, te))),
-                dtype=np.float64,
-            )
+            t_data = _read_array_cached(t_reader, ny, nx, ts, te)
 
             td_entry, td_t0 = _chunk_entry_for_time(td_cidx, step_ts)
             if td_entry is None:
                 continue
-            td_reader = _open_chunk(td_entry, model, "dew_point_2m")
+            td_reader = _open_chunk(td_entry, model, "dew_point_2m", n_steps=t1 - t0)
             batch_len = te - ts
-            td_data = np.asarray(
-                td_reader.read_array((slice(0, ny), slice(0, nx), slice(td_t0, td_t0 + batch_len))),
-                dtype=np.float64,
-            )
+            td_data = _read_array_cached(td_reader, ny, nx, td_t0, td_t0 + batch_len)
             if td_data.shape[2] < batch_len:
                 t_data = t_data[:, :, :td_data.shape[2]]
 
@@ -1988,7 +2060,7 @@ def accumulate_vpd_raster_gfs(
         if t1 <= t0:
             continue
 
-        t_reader = _open_chunk(t_entry, gfs_model, "temperature_2m")
+        t_reader = _open_chunk(t_entry, gfs_model, "temperature_2m", n_steps=t1 - t0)
         ny, nx, _ = t_reader.shape
 
         if total_sum_gfs is None:
@@ -1999,27 +2071,20 @@ def accumulate_vpd_raster_gfs(
             te = min(ts + sub, t1)
             step_ts = t_entry.start + (ts - t_entry.file_offset) * resolution
 
-            t_data = np.asarray(
-                t_reader.read_array((slice(0, ny), slice(0, nx), slice(ts, te))),
-                dtype=np.float64,
-            )
+            t_data = _read_array_cached(t_reader, ny, nx, ts, te)
 
             rh_entry, rh_t0 = _chunk_entry_for_time(rh_cidx, step_ts)
             if rh_entry is None:
                 continue
-            rh_reader = _open_chunk(rh_entry, gfs_model, "relative_humidity_2m")
+            rh_reader = _open_chunk(rh_entry, gfs_model, "relative_humidity_2m", n_steps=t1 - t0)
             batch_len = te - ts
-            rh_data = np.asarray(
-                rh_reader.read_array((slice(0, ny), slice(0, nx), slice(rh_t0, rh_t0 + batch_len))),
-                dtype=np.float64,
-            )
+            rh_data = _read_array_cached(rh_reader, ny, nx, rh_t0, rh_t0 + batch_len)
             if rh_data.shape[2] < batch_len:
                 t_data = t_data[:, :, :rh_data.shape[2]]
 
-            for i in range(t_data.shape[2]):
-                td_slice = _rh_to_dew_point(t_data[:, :, i], rh_data[:, :, i])
-                vpd_slice = vpd_kpa(t_data[:, :, i], td_slice)
-                total_sum_gfs += np.where(np.isfinite(vpd_slice), vpd_slice, 0.0)
+            td_batch = _rh_to_dew_point(t_data, rh_data)
+            vpd_batch = vpd_kpa(t_data, td_batch)
+            total_sum_gfs += np.nansum(vpd_batch, axis=2)
 
         n_steps += t1 - t0
 
@@ -2082,7 +2147,7 @@ def accumulate_raster_mode(
 
         # Open cc reader once for the whole chunk but read one step at a time to
         # avoid materialising a (ny, nx, n_steps) float64 array for large windows.
-        cc_reader = _open_chunk(cc_entry, model, "cloud_cover")
+        cc_reader = _open_chunk(cc_entry, model, "cloud_cover", n_steps=t1 - t0)
         rny, rnx, _ = cc_reader.shape
         ny, nx = rny, rnx
 
@@ -2097,33 +2162,24 @@ def accumulate_raster_mode(
         for i in range(t1 - t0):
             step_ts = cc_entry.start + (t0 + i - cc_entry.file_offset) * resolution
 
-            cc_slice = np.asarray(
-                cc_reader.read_array((slice(0, ny), slice(0, nx), slice(t0 + i, t0 + i + 1))),
-                dtype=np.float64,
-            )[:, :, 0]
+            cc_slice = _read_array_cached(cc_reader, ny, nx, t0 + i, t0 + i + 1)[:, :, 0]
 
             pr_slice = np.zeros((ny, nx), dtype=np.float64)
             pr_entry, pr_idx = _chunk_entry_for_time(precip_index, step_ts)
             if pr_entry is not None:
                 if pr_entry.chunk_num not in _pr_readers:
-                    _pr_readers[pr_entry.chunk_num] = _open_chunk(pr_entry, model, "precipitation")
-                pr_slice = np.asarray(
-                    _pr_readers[pr_entry.chunk_num].read_array(
-                        (slice(0, ny), slice(0, nx), slice(pr_idx, pr_idx + 1))
-                    ),
-                    dtype=np.float64,
+                    _pr_readers[pr_entry.chunk_num] = _open_chunk(pr_entry, model, "precipitation", n_steps=t1 - t0)
+                pr_slice = _read_array_cached(
+                    _pr_readers[pr_entry.chunk_num], ny, nx, pr_idx, pr_idx + 1
                 )[:, :, 0]
 
             sw_slice = np.zeros((ny, nx), dtype=np.float64)
             sw_entry, sw_idx = _chunk_entry_for_time(swe_index, step_ts)
             if sw_entry is not None:
                 if sw_entry.chunk_num not in _sw_readers:
-                    _sw_readers[sw_entry.chunk_num] = _open_chunk(sw_entry, model, "snowfall_water_equivalent")
-                sw_slice = np.asarray(
-                    _sw_readers[sw_entry.chunk_num].read_array(
-                        (slice(0, ny), slice(0, nx), slice(sw_idx, sw_idx + 1))
-                    ),
-                    dtype=np.float64,
+                    _sw_readers[sw_entry.chunk_num] = _open_chunk(sw_entry, model, "snowfall_water_equivalent", n_steps=t1 - t0)
+                sw_slice = _read_array_cached(
+                    _sw_readers[sw_entry.chunk_num], ny, nx, sw_idx, sw_idx + 1
                 )[:, :, 0]
 
             codes = weather_code_array(

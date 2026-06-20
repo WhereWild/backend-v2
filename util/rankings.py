@@ -16,6 +16,7 @@ nominal_stats.parquet). Called from scripts/process_tree.py.
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import math
 import os
@@ -858,6 +859,9 @@ def _build_rank_index(
         pos_table = pos_table.sort_by([("taxon_key", "ascending")])
         ctx_pos_path = index_path.parent / f"{rank.lower()}_positions.parquet"
         _atomic_write(ctx_pos_path, pos_table)
+
+    gc.collect()
+    pa.default_memory_pool().release_unused()
 
 
 def build_rank_indexes(ancestor: TaxonRecord, layers: list[dict]) -> None:

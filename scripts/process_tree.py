@@ -295,6 +295,8 @@ def run_consolidation() -> None:
                     chunk = pa.concat_tables(batch, promote_options="default")
                     if writer is None:
                         writer = pq.ParquetWriter(tmp_path, chunk.schema)
+                    elif chunk.schema.names != writer.schema.names:
+                        chunk = chunk.select(writer.schema.names)
                     writer.write_table(chunk, row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
                     total_rows += len(chunk)
                     batch.clear()
@@ -307,6 +309,8 @@ def run_consolidation() -> None:
                 chunk = pa.concat_tables(batch, promote_options="default")
                 if writer is None:
                     writer = pq.ParquetWriter(tmp_path, chunk.schema)
+                elif chunk.schema.names != writer.schema.names:
+                    chunk = chunk.select(writer.schema.names)
                 writer.write_table(chunk, row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
                 total_rows += len(chunk)
                 batch.clear()

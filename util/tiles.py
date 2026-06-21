@@ -369,8 +369,8 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEF
 # ---------------------------------------------------------------------------
 
 @lru_cache(maxsize=128)
-def _load_temporal_meta(var_id: str, window_label: str) -> dict:
-    path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}.meta.json"
+def _load_temporal_meta(var_id: str, window_label: str, suffix: str = "") -> dict:
+    path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{suffix}.meta.json"
     try:
         with _storage.open_input_file(path) as f:
             return json.loads(f.read())
@@ -378,12 +378,12 @@ def _load_temporal_meta(var_id: str, window_label: str) -> dict:
         return {}
 
 
-def get_layer_render_range(layer: dict) -> tuple[float | None, float | None]:
+def get_layer_render_range(layer: dict, forecast_suffix: str = "") -> tuple[float | None, float | None]:
     """Return (render_min, render_max) for a layer, falling back to meta.json for temporal layers."""
     rmin = layer.get("render_min")
     rmax = layer.get("render_max")
     if (rmin is None or rmax is None) and layer.get("window_hours") is not None:
-        meta = _load_temporal_meta(layer["var_id"], layer["window_label"])
+        meta = _load_temporal_meta(layer["var_id"], layer["window_label"], forecast_suffix)
         if rmin is None:
             rmin = meta.get("render_min")
         if rmax is None:
@@ -417,7 +417,7 @@ def render_temporal_tile_bytes(
     if arr is not None:
         # Load pre-computed render range from meta.json if catalog doesn't have it
         if not nominal and (vmin is None or vmax is None):
-            meta = _load_temporal_meta(var_id, window_label)
+            meta = _load_temporal_meta(var_id, window_label, forecast_suffix)
             if vmin is None:
                 vmin = meta.get("render_min")
             if vmax is None:

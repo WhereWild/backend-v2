@@ -617,15 +617,18 @@ def _build_forecast_aggregates(
 
         def _process(vid: str, cfg: dict, wh: int, wl: str) -> None:
             agg = cfg["agg"]
-            # Try the existing forecast state first (incremental update path).
-            # Fall back to base state only if no forecast state exists yet.
             now_sums, now_meta = load_raster_state(out_dir, vid, wl, suffix=suffix)
             if now_sums is None:
-                now_sums, now_meta = load_raster_state(out_dir, vid, wl)
-            if now_sums is None:
-                _full_build(vid, cfg, wh, wl, future_ts, era5_end_ts, gfs_end_for_fc,
-                            era5_cidx_by_var.get(vid, {}), gfs_cidx, out_dir, suffix=suffix)
-                return
+                if wh >= forecast_h:
+                    # Window is large enough that the new window start doesn't overshoot
+                    # old_gfs_end — safe to slide from the base window state.
+                    now_sums, now_meta = load_raster_state(out_dir, vid, wl)
+                if now_sums is None:
+                    # window_h < forecast_h: sliding would add the entire forecast period
+                    # instead of just the window slice at the horizon, so full-build instead.
+                    _full_build(vid, cfg, wh, wl, future_ts, era5_end_ts, gfs_end_for_fc,
+                                era5_cidx_by_var.get(vid, {}), gfs_cidx, out_dir, suffix=suffix)
+                    return
             if float(now_meta.get("gfs_end_ts", 0)) >= gfs_end_for_fc:
                 return  # forecast state already up to date
 

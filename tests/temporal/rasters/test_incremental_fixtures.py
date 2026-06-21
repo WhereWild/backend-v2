@@ -66,7 +66,7 @@ def _patch_open_chunk(monkeypatch, series: np.ndarray) -> None:
     """Patch _open_chunk so every model/variable/cell returns the fixture series."""
     monkeypatch.setattr(
         "util.temporal._open_chunk",
-        lambda entry, model, variable, cache_dir=None: FakeRasterReader(series, model),
+        lambda entry, model, variable, n_steps=-1: FakeRasterReader(series, model),
     )
 
 

@@ -177,7 +177,7 @@ class TestAccumulateRaster:
         )
         call_count = [0]
 
-        def _fake_open(entry, model, var) -> _FakeRasterReader:
+        def _fake_open(entry, model, var, n_steps=-1) -> _FakeRasterReader:
             call_count[0] += 1
             return _FakeRasterReader(chunk_a, 2, 2)
 
@@ -228,7 +228,7 @@ class TestAccumulateRaster:
 
         call_count = [0]
 
-        def _fake_open(entry, model, var):
+        def _fake_open(entry, model, var, n_steps=-1):
             r = _FakeRasterReader(chunk_a if call_count[0] == 0 else chunk_b, 2, 2)
             call_count[0] += 1
             return r
@@ -261,7 +261,7 @@ class TestAccumulateRasterMode:
                 "snowfall_water_equivalent": np.zeros((ny, nx, n)),
             }
 
-        def _fake_open(entry, model, var):
+        def _fake_open(entry, model, var, n_steps=-1):
             return _FakeRasterReader3D(data_by_var[var])
 
         return data_by_var, _fake_open

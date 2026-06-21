@@ -117,7 +117,8 @@ def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
     if "obscured" in df.columns:
         df = df[df["obscured"] == "No"]
     if "coordinateUncertaintyInMeters" in df.columns:
-        df = df[df["coordinateUncertaintyInMeters"] <= 500]
+        col = df["coordinateUncertaintyInMeters"]
+        df = df[col.isna() | (col <= 500)]
     return df
 
 # ---------------------------------------------------------------------------
@@ -1372,7 +1373,8 @@ def get_observation_variable_values(
             if "obscured" in tbl.columns:
                 tbl = tbl[tbl["obscured"] == "No"]
             if "coordinateUncertaintyInMeters" in tbl.columns:
-                tbl = tbl[tbl["coordinateUncertaintyInMeters"] <= 500]
+                col = tbl["coordinateUncertaintyInMeters"]
+                tbl = tbl[col.isna() | (col <= 500)]
             for cat, val in zip(tbl["catalogNumber"].tolist(), tbl[variable_id].tolist()):
                 if cat not in collected and val is not None and not (isinstance(val, float) and math.isnan(val)):
                     converted = units.convert_value(float(val), layer, unit_system)

@@ -20,6 +20,7 @@ Usage:
 """
 from __future__ import annotations
 
+import gc
 import os
 import signal
 import threading
@@ -28,6 +29,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pyarrow as pa
 import pyarrow.compute as pc
 
 from config.config import load_config
@@ -35,6 +37,7 @@ from util.temporal import (
     _PREFETCH_WORKERS,
     TailBuffer,
     TemporalLayer,
+    _chunk_entry_for_time,
     _download_layer_chunk,
     build_chunk_index,
     build_occ_index,
@@ -190,11 +193,33 @@ def _run_layer(
             f"{sum(batch_chunk_worklists[e.chunk_num].num_rows for e in chunks_this_batch if e.chunk_num in sparse_set)} sparse obs)"
         )
 
-        # Prefetch primary source for dense chunks only.
+        # Prefetch primary + secondary sources for dense chunks in parallel.
+        # Secondary vars (e.g. cloud_cover for weather_code_simple) have different
+        # chunk boundaries, so we compute their correct chunk entries here using the
+        # same _chunk_entry_for_time logic process_chunk_mode uses — not the primary
+        # chunk entry, which would download the wrong file.
         if dense_chunks:
             t_dl = time.monotonic()
+            prefetch_tasks: list[tuple[object, str]] = []
+            for e in dense_chunks:
+                prefetch_tasks.append((e, primary_var))
+                if secondary_indices:
+                    pfs_ts = e.start - e.file_offset * chunk_index.resolution
+                    for var in layer.sources[1:]:
+                        if var in secondary_indices:
+                            sec_entry, _ = _chunk_entry_for_time(secondary_indices[var], pfs_ts)
+                            if sec_entry is not None:
+                                prefetch_tasks.append((sec_entry, var))
+            seen: set[tuple[int, str]] = set()
+            unique_tasks = []
+            for e, v in prefetch_tasks:
+                key = (e.chunk_num, v)
+                if key not in seen:
+                    seen.add(key)
+                    unique_tasks.append((e, v))
             with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as dl_pool:
-                for fut in [dl_pool.submit(_download_layer_chunk, e, layer.model, [primary_var], cfg.temporal_cache_dir) for e in dense_chunks]:
+                futs = [dl_pool.submit(_download_layer_chunk, e, layer.model, [v], cfg.temporal_cache_dir) for e, v in unique_tasks]
+                for fut in futs:
                     fut.result()
             print(f"[prefetch] {layer.id} batch={batch_num}: downloads done ({time.monotonic() - t_dl:.1f}s)")
 
@@ -257,6 +282,9 @@ def _run_layer(
 
         if batch_updates and not stop.is_set():
             write_back(batch_updates)
+
+        gc.collect()
+        pa.default_memory_pool().release_unused()
 
         if stopped:
             break

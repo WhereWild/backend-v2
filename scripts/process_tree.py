@@ -22,6 +22,7 @@ Pass 2 — Rankings (top-down, shallowest first):
 from __future__ import annotations
 
 import argparse
+import gc
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -297,6 +298,8 @@ def run_consolidation() -> None:
                     writer.write_table(chunk, row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
                     total_rows += len(chunk)
                     batch.clear()
+                    gc.collect()
+                    pa.default_memory_pool().release_unused()
                 if n % 10_000 == 0:
                     print(f"[consolidate] {label}: {n}/{len(paths)}  [{time.monotonic()-t0:.1f}s]")
 

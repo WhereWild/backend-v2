@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -39,6 +40,8 @@ from util.temporal import (
     RASTER_GRIDS,
     RASTER_WC_CODES,
     ChunkIndex,
+    _chunk_entry_for_time,
+    _download_chunk,
     accumulate_raster,
     accumulate_raster_mode,
     accumulate_vpd_raster,
@@ -754,7 +757,7 @@ def _build_forecast_aggregates(
             }
             save_raster_state(out_dir, vid, wl, agg, sums, fc_meta, suffix=suffix)
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(_process, vid, cfg, wh, wl): (vid, wl) for vid, cfg, wh, wl in combos}
             for fut in as_completed(futures):
                 if exc := fut.exception():
@@ -794,6 +797,87 @@ def _push_rasters(out_dir: str) -> None:
         print(f"  rclone sync exited {result.returncode}")
     else:
         print("  upload complete")
+
+
+def _prefetch_chunks(
+    gfs_cidx: dict[str, ChunkIndex],
+    era5_cidx_flat: dict[tuple[str, str], ChunkIndex],  # (era5_model, raw_var) → ChunkIndex
+    gfs_end_ts: float,
+    era5_end_ts: float,
+    old_era5_end_ts: float,
+    window_hours: list[int],
+    cache_dir: str,
+) -> set[str]:
+    """Download all chunk files needed for this run in parallel before processing.
+
+    Covers:
+    - GFS: add position (gfs_end_ts) + all window drop positions
+    - ERA5: quality-swap zone ([old_era5_end, era5_end_ts]) when ERA5 has advanced
+
+    Multiple timestamps that resolve to the same file are deduplicated.
+    Returns the set of local filenames that are needed (used by cleanup).
+    """
+    # needed maps local_filename → (entry, model, raw_var)
+    needed: dict[str, tuple[object, str, str]] = {}
+
+    # GFS: add step + all window drop steps
+    for gv, cidx in gfs_cidx.items():
+        timestamps = [gfs_end_ts] + [gfs_end_ts - wh * 3600 for wh in window_hours]
+        for ts in timestamps:
+            entry, _ = _chunk_entry_for_time(cidx, ts)
+            if entry is not None and entry.source != "year":
+                key = f"ncep_gfs013_{gv}_chunk_{entry.chunk_num}.om"
+                needed[key] = (entry, "ncep_gfs013", gv)
+
+    # ERA5: quality-swap zone — when ERA5 has advanced since last run we need
+    # both the ERA5 data to add and the ERA5 chunk files covering that period.
+    if era5_end_ts > old_era5_end_ts:
+        for (era5_model, rv), cidx in era5_cidx_flat.items():
+            for ts in (old_era5_end_ts + cidx.resolution, era5_end_ts):
+                entry, _ = _chunk_entry_for_time(cidx, ts)
+                if entry is not None and entry.source != "year":
+                    key = f"{era5_model}_{rv}_chunk_{entry.chunk_num}.om"
+                    needed[key] = (entry, era5_model, rv)
+
+    if not needed:
+        return set()
+
+    print(f"  pre-fetching {len(needed)} chunk(s) in parallel …", flush=True)
+    t0 = time.perf_counter()
+
+    def _fetch(entry: object, model: str, rv: str) -> None:
+        _download_chunk(entry, model, rv, cache_dir)
+
+    with ThreadPoolExecutor(max_workers=len(needed)) as pool:
+        futures = [pool.submit(_fetch, e, m, v) for e, m, v in needed.values()]
+        for f in futures:
+            f.result()
+
+    print(f"  pre-fetch done in {time.perf_counter() - t0:.1f}s", flush=True)
+    return set(needed.keys())
+
+
+def _cleanup_chunk_cache(cache_dir: Path, needed_filenames: set[str]) -> None:
+    """Remove chunk_*.om files that aren't needed for this run or the next.
+
+    Any chunk not in needed_filenames is stale — either too old to fall within
+    any aggregation window or superseded by a newer chunk.  year_*.om files are
+    never touched (they're immutable and kept forever).
+    """
+    if not cache_dir.exists():
+        return
+
+    removed = 0
+    for p in cache_dir.rglob("chunk_*.om"):
+        if p.name not in needed_filenames:
+            try:
+                p.unlink()
+                removed += 1
+            except Exception as exc:
+                print(f"  [cleanup] could not remove {p}: {exc}")
+
+    if removed:
+        print(f"  [cleanup] removed {removed} stale chunk_*.om file(s) from {cache_dir}")
 
 
 def main() -> None:
@@ -953,7 +1037,28 @@ def main() -> None:
                     print(f"  ERA5 {var_id}/{rv}: {e}")
             era5_cidx_by_var[var_id] = era5_cidx
 
+        # Flatten ERA5 indices to (model, raw_var) → ChunkIndex for the prefetch.
+        era5_cidx_flat: dict[tuple[str, str], ChunkIndex] = {}
+        for var_id, vcfg in var_configs.items():
+            era5_model = vcfg["era5_model"]
+            for rv, cidx in era5_cidx_by_var.get(var_id, {}).items():
+                if not rv.startswith("_"):
+                    era5_cidx_flat[(era5_model, rv)] = cidx
+
+        old_era5_end_ts = float(prior_state.get("era5_end_ts") or 0)
+
+        # ── Pre-fetch all needed chunks in parallel ────────────────────────────
+        chunk_cache_dir = Path(out_dir).parent / "chunks"
+        _needed_chunks = _prefetch_chunks(
+            gfs_cidx, era5_cidx_flat,
+            gfs_end_ts, era5_end_ts, old_era5_end_ts,
+            [h for h, _ in windows],
+            str(chunk_cache_dir),
+        )
+
         # ── Main window loop ───────────────────────────────────────────────────
+        _state_lock = threading.Lock()
+
         def _process_var(var_id: str, vcfg: dict, window_h: int, wl: str) -> None:
             var_key = f"{var_id}_{wl}"
             if var_key in resume_completed:
@@ -972,17 +1077,19 @@ def main() -> None:
                 print(f"  [{wl}] {var_id} incremental ({stale_h:.1f}h stale) …", flush=True)
                 _incremental_update(var_id, vcfg, window_h, wl, existing_sums, existing_meta,
                                     now_ts, era5_end, gfs_end_ts, era5_cidx, gfs_cidx, out_dir)
-            completed_vars.append(var_key)
-            _write_state("running")
+            with _state_lock:
+                completed_vars.append(var_key)
+                _write_state("running")
 
         t_windows = time.perf_counter()
-        for window_h, wl in windows:
-            print(f"\n=== window {wl} ===")
-            for vid, vcfg in var_configs.items():
-                try:
-                    _process_var(vid, vcfg, window_h, wl)
-                except Exception as exc:
-                    print(f"  ERROR {vid}: {exc}", flush=True)
+        all_combos = [(vid, vcfg, wh, wl) for wh, wl in windows for vid, vcfg in var_configs.items()]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_process_var, vid, vcfg, wh, wl): (vid, wl)
+                       for vid, vcfg, wh, wl in all_combos}
+            for fut in as_completed(futures):
+                if exc := fut.exception():
+                    vid, wl = futures[fut]
+                    print(f"  ERROR [{wl}] {vid}: {exc}", flush=True)
         print(f"\n=== windows done in {time.perf_counter() - t_windows:.1f}s ===")
 
         # ── Forecast aggregates ────────────────────────────────────────────────
@@ -999,19 +1106,8 @@ def main() -> None:
         print(f"\n=== total {time.perf_counter() - t_main:.1f}s ===")
 
         # ── Clean up raster chunk cache ────────────────────────────────────────
-        # Delete chunk_*.om files (may update each run); keep year_*.om (immutable).
-        chunk_cache_dir = Path(out_dir).parent / "chunks"
-        if chunk_cache_dir.exists():
-            removed = 0
-            for p in chunk_cache_dir.rglob("*.om"):
-                if p.name.startswith("chunk_"):
-                    try:
-                        p.unlink()
-                        removed += 1
-                    except Exception as exc:
-                        print(f"  [cleanup] could not remove {p}: {exc}")
-            if removed:
-                print(f"  [cleanup] removed {removed} chunk_*.om file(s) from {chunk_cache_dir}")
+        # Keep the latest chunk per variable (reused next run); delete older ones.
+        _cleanup_chunk_cache(chunk_cache_dir, _needed_chunks)
 
         # ── Push rasters to B2 ────────────────────────────────────────────────
         if os.environ.get("TEMPORAL_RASTER_NO_PUSH", "0") != "1":

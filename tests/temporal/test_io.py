@@ -210,14 +210,17 @@ class TestChunkHelpers:
         assert captured["path"] == "openmeteo/data/copernicus_era5/precipitation/year_2023.om"
 
     def test_open_chunk_uses_cache_dir(self, monkeypatch, tmp_path):
-        fake_local = tmp_path / "copernicus_era5_precipitation_year_2023.om"
+        chunks_dir = tmp_path / "chunks"
+        chunks_dir.mkdir()
+        fake_local = chunks_dir / "copernicus_era5_precipitation_year_2023.om"
         fake_local.write_bytes(b"")
         monkeypatch.setattr("util.temporal._RASTER_CHUNK_CACHE_DIR", str(tmp_path))
         monkeypatch.setattr("util.temporal._download_chunk", lambda e, m, v, d: fake_local)
-        monkeypatch.setattr("util.temporal.OmFileReader", lambda path: path)
+        fake_reader = MagicMock()
+        monkeypatch.setattr("util.temporal.OmFileReader", lambda path: fake_reader)
         entry = util.temporal.ChunkRange(chunk_num=2023, start=0, end=0, time_len=1, source="year")
         result = util.temporal._open_chunk(entry, "copernicus_era5", "precipitation")
-        assert result == str(fake_local)
+        assert result._ww_key == str(fake_local)
 
     def test_download_chunk_returns_cached(self, tmp_path):
         entry = util.temporal.ChunkRange(chunk_num=2019, start=0, end=0, time_len=1, source="chunk")

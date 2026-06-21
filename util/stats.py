@@ -205,7 +205,8 @@ def _filter_df(df: pd.DataFrame) -> pd.DataFrame:
     if "obscured" in df.columns:
         df = df[df["obscured"] == "No"]
     if "coordinateUncertaintyInMeters" in df.columns:
-        df = df[df["coordinateUncertaintyInMeters"] <= 500]
+        col = df["coordinateUncertaintyInMeters"]
+        df = df[col.isna() | (col <= 500)]
     return df
 
 

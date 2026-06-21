@@ -406,7 +406,8 @@ def data_sources():
 
 
 @app.get("/variables")
-def list_variables(unit_system: str | None = Query(None)):
+def list_variables(unit_system: str | None = Query(None), forecast_h: int = Query(0, ge=0)):
+    forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h in _VALID_FORECAST_HOURS and forecast_h > 0 else ""
     result = []
     for layer, category in tiles.load_layers_with_category():
         value_type = _VALUE_TYPE_MAP.get(layer.get("value_type", ""), "continuous")
@@ -422,7 +423,7 @@ def list_variables(unit_system: str | None = Query(None)):
                     }
                     for cls in raw
                 ]
-        rmin, rmax = tiles.get_layer_render_range(layer)
+        rmin, rmax = tiles.get_layer_render_range(layer, forecast_suffix)
         result.append({
             "id": layer["id"],
             "name": layer.get("display_name"),

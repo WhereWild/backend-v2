@@ -279,6 +279,7 @@ def run_consolidation() -> None:
 
         # Stream-write in batches to avoid holding all frames in memory at once.
         writer: pq.ParquetWriter | None = None
+        canonical_names: list[str] | None = None
         batch: list[pa.Table] = []
         total_rows = 0
         batch_size = 100_000
@@ -294,7 +295,10 @@ def run_consolidation() -> None:
                 if len(batch) >= batch_size:
                     chunk = pa.concat_tables(batch, promote_options="default")
                     if writer is None:
+                        canonical_names = chunk.schema.names
                         writer = pq.ParquetWriter(tmp_path, chunk.schema)
+                    elif chunk.schema.names != canonical_names:
+                        chunk = chunk.select(canonical_names)
                     writer.write_table(chunk, row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
                     total_rows += len(chunk)
                     batch.clear()
@@ -306,7 +310,10 @@ def run_consolidation() -> None:
             if batch:
                 chunk = pa.concat_tables(batch, promote_options="default")
                 if writer is None:
+                    canonical_names = chunk.schema.names
                     writer = pq.ParquetWriter(tmp_path, chunk.schema)
+                elif chunk.schema.names != canonical_names:
+                    chunk = chunk.select(canonical_names)
                 writer.write_table(chunk, row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
                 total_rows += len(chunk)
                 batch.clear()

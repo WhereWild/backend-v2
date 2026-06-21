@@ -796,8 +796,8 @@ def _circ_stats_streaming(
         "rbar": rbar,
         "circular_var": var_,
         "circular_std": std_deg,
-        "entropy": _circular_entropy(rbar),
         "mode": kde["mode"] if kde else None,
+        "entropy": _circular_entropy(rbar),
     }
 
 
@@ -844,8 +844,8 @@ def _continuous_stats_exact(
         "iqr": float(q75 - q25),
         "10_90_range": float(q90 - q10),
         "range": float(values.max() - values.min()),
-        "entropy": entropy_val,
         "mode": kde["mode"] if kde else None,
+        "entropy": entropy_val,
     }
 
 

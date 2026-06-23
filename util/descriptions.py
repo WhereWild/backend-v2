@@ -366,7 +366,7 @@ def _usda_texture_class(sand: float, silt: float, clay: float) -> str:
     if (silt + 1.5 * clay) >= 15 and (silt + 2 * clay) < 30:
         return "loamy sand"
     if (7 <= clay < 20 and sand > 52 and (silt + 2 * clay) >= 30) or \
-       (clay < 7 and silt < 50 and (silt + 2 * clay) >= 30):
+       (clay < 7 and (silt + 2 * clay) >= 30):
         return "sandy loam"
     return "sandy loam"
 

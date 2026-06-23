@@ -50,7 +50,8 @@ def test_health():
 
 def test_get_taxon_by_id():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(main_module._storage, "read_table", return_value=pa.table({})):
         response = client.get("/api/taxon/2923970")
     assert response.status_code == 200
     assert response.json()["taxon_key"] == "2923970"
@@ -58,7 +59,8 @@ def test_get_taxon_by_id():
 
 def test_get_taxon_by_slug():
     with patch.object(taxa, "get_taxon_by_id", return_value=None), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=TAXON):
+         patch.object(taxa, "get_taxon_by_slug", return_value=TAXON), \
+         patch.object(main_module._storage, "read_table", return_value=pa.table({})):
         response = client.get("/api/taxon/opuntia-humifusa")
     assert response.status_code == 200
     assert response.json()["scientific_name"] == "Opuntia humifusa"
@@ -648,7 +650,8 @@ def test_filter_occ_df_passthrough():
 
 def test_get_species_obscured_found():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]):
         r = client.get("/api/species/2923970/obscured")
     assert r.status_code == 200
     assert not r.json()["allObscured"]
@@ -1244,7 +1247,8 @@ def test_get_species_environment_with_location_no_data_falls_through(monkeypatch
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
          patch("pathlib.Path.exists", return_value=True), \
-         patch.object(pq, "read_table", side_effect=_env_stats_read):
+         patch.object(pq, "read_table", side_effect=_env_stats_read), \
+         patch("main.iter_descendants", return_value=[TAXON]):
         r = client.get("/species/2923970/environment/bio1?location=USA")
     assert r.status_code == 404
 

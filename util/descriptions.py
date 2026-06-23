@@ -187,7 +187,7 @@ def build_terrain_lines(
     numerical_stats: dict[str, dict],
     circular_stats: dict[str, dict],
     *,
-    unit_system: Optional[str] = None,
+    unit_system: str | None = None,
 ) -> list[dict]:
     lines: list[dict] = []
 
@@ -278,36 +278,58 @@ def _join_labels(labels: list[str]) -> str:
 
 
 def _summer_heat_label(celsius: float) -> str:
-    if celsius > 34: return "scorching"
-    if celsius > 31: return "very hot"
-    if celsius > 29: return "hot"
-    if celsius > 27.5: return "warm"
-    if celsius > 25: return "temperate"
-    if celsius > 10: return "cool"
+    if celsius > 34:
+        return "scorching"
+    if celsius > 31:
+        return "very hot"
+    if celsius > 29:
+        return "hot"
+    if celsius > 27.5:
+        return "warm"
+    if celsius > 25:
+        return "temperate"
+    if celsius > 10:
+        return "cool"
     return "cold"
 
 
 def _winter_cold_label(celsius: float) -> str:
-    if celsius < -15: return "extremely cold"
-    if celsius < -10: return "incredibly cold"
-    if celsius < -5: return "very cold"
-    if celsius < 0: return "cold"
-    if celsius < 5: return "cool"
-    if celsius < 10: return "temperate"
-    if celsius < 25: return "warm"
+    if celsius < -15:
+        return "extremely cold"
+    if celsius < -10:
+        return "incredibly cold"
+    if celsius < -5:
+        return "very cold"
+    if celsius < 0:
+        return "cold"
+    if celsius < 5:
+        return "cool"
+    if celsius < 10:
+        return "temperate"
+    if celsius < 25:
+        return "warm"
     return "hot"
 
 
 def _precip_label(mm: float) -> str:
-    if mm < 150: return "extremely xeric"
-    if mm < 300: return "xeric"
-    if mm < 450: return "arid"
-    if mm < 600: return "semi-arid"
-    if mm < 800: return "subhumid"
-    if mm < 1100: return "moderately wet"
-    if mm < 1500: return "wet"
-    if mm < 2200: return "very wet"
-    if mm < 3000: return "extremely wet"
+    if mm < 150:
+        return "extremely xeric"
+    if mm < 300:
+        return "xeric"
+    if mm < 450:
+        return "arid"
+    if mm < 600:
+        return "semi-arid"
+    if mm < 800:
+        return "subhumid"
+    if mm < 1100:
+        return "moderately wet"
+    if mm < 1500:
+        return "wet"
+    if mm < 2200:
+        return "very wet"
+    if mm < 3000:
+        return "extremely wet"
     return "torrential"
 
 
@@ -318,14 +340,18 @@ def _seasonal_precip_label(mm_quarter: float) -> str:
 def _usda_texture_class(sand: float, silt: float, clay: float) -> str:
     # Conditions taken directly from NRCS Soil Texture Calculator (MultiPointTriangle_100pt_508.xlsx, Calc1 sheet)
     if clay >= 40:
-        if silt >= 40: return "silty clay"
-        if sand <= 45: return "clay"
+        if silt >= 40:
+            return "silty clay"
+        if sand <= 45:
+            return "clay"
         return "sandy clay"
     if clay >= 35 and sand > 45:
         return "sandy clay"
     if clay >= 27:
-        if sand <= 20: return "silty clay loam"
-        if sand <= 45: return "clay loam"
+        if sand <= 20:
+            return "silty clay loam"
+        if sand <= 45:
+            return "clay loam"
         return "sandy clay loam"
     if clay >= 20 and sand > 45 and silt < 28:
         return "sandy clay loam"
@@ -346,25 +372,40 @@ def _usda_texture_class(sand: float, silt: float, clay: float) -> str:
 
 
 def _ph_label(ph: float) -> str:
-    if ph < 3.5: return "ultra acidic"
-    if ph < 4.5: return "extremely acidic"
-    if ph < 5.1: return "very strongly acidic"
-    if ph < 5.6: return "strongly acidic"
-    if ph < 6.1: return "moderately acidic"
-    if ph < 6.6: return "slightly acidic"
-    if ph < 7.4: return "neutral"
-    if ph < 7.9: return "slightly alkaline"
-    if ph < 8.5: return "moderately alkaline"
-    if ph <= 9.0: return "strongly alkaline"
+    if ph < 3.5:
+        return "ultra acidic"
+    if ph < 4.5:
+        return "extremely acidic"
+    if ph < 5.1:
+        return "very strongly acidic"
+    if ph < 5.6:
+        return "strongly acidic"
+    if ph < 6.1:
+        return "moderately acidic"
+    if ph < 6.6:
+        return "slightly acidic"
+    if ph < 7.4:
+        return "neutral"
+    if ph < 7.9:
+        return "slightly alkaline"
+    if ph < 8.5:
+        return "moderately alkaline"
+    if ph <= 9.0:
+        return "strongly alkaline"
     return "very strongly alkaline"
 
 
 def _swe_tier(swe_mm: float) -> str:
-    if swe_mm < 5: return "snow-free"
-    if swe_mm < 50: return "slightly snowy"
-    if swe_mm < 100: return "moderately snowy"
-    if swe_mm < 200: return "snowy"
-    if swe_mm < 300: return "very snowy"
+    if swe_mm < 5:
+        return "snow-free"
+    if swe_mm < 50:
+        return "slightly snowy"
+    if swe_mm < 100:
+        return "moderately snowy"
+    if swe_mm < 200:
+        return "snowy"
+    if swe_mm < 300:
+        return "very snowy"
     return "incredibly snowy"
 
 
@@ -498,10 +539,14 @@ def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
     cfvo = _get("cfvo", "mean")
     coarse_part: str | None = None
     if cfvo is not None:
-        if cfvo < 2: coarse_part = "very fine"
-        elif cfvo < 5: coarse_part = "fine"
-        elif cfvo >= 25: coarse_part = "very coarse"
-        elif cfvo >= 15: coarse_part = "coarse"
+        if cfvo < 2:
+            coarse_part = "very fine"
+        elif cfvo < 5:
+            coarse_part = "fine"
+        elif cfvo >= 25:
+            coarse_part = "very coarse"
+        elif cfvo >= 15:
+            coarse_part = "coarse"
 
     _texture_display = {
         "loam": "loamy", "sand": "sandy", "silt": "silty", "clay": "clay-rich",
@@ -523,10 +568,14 @@ def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
     if phh2o_raw is not None:
         ph_phrase = _ph_label(phh2o_raw)
     if nitrogen is not None:
-        if nitrogen < 1.5: nutrient_phrase = "very nutrient poor"
-        elif nitrogen < 2: nutrient_phrase = "nutrient poor"
-        elif nitrogen >= 10: nutrient_phrase = "very nutrient rich"
-        elif nitrogen >= 7: nutrient_phrase = "nutrient rich"
+        if nitrogen < 1.5:
+            nutrient_phrase = "very nutrient poor"
+        elif nitrogen < 2:
+            nutrient_phrase = "nutrient poor"
+        elif nitrogen >= 10:
+            nutrient_phrase = "very nutrient rich"
+        elif nitrogen >= 7:
+            nutrient_phrase = "nutrient rich"
 
     if ph_phrase and nutrient_phrase:
         lines.append({"body": f"Usually {nutrient_phrase} and {ph_phrase} soil"})

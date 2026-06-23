@@ -651,7 +651,7 @@ def test_get_species_obscured_found():
          patch.object(taxa, "get_taxon_by_slug", return_value=None):
         r = client.get("/api/species/2923970/obscured")
     assert r.status_code == 200
-    assert r.json()["allObscured"] == False
+    assert not r.json()["allObscured"]
 
 
 def test_get_species_obscured_not_found():

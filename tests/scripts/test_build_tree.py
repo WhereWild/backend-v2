@@ -881,12 +881,12 @@ def test_extract_preferred_image_metadata_full():
     }}
     result = build_tree.extract_preferred_image_metadata(payload)
     assert result["inat_preferred_image"] == "https://example.com/photo.jpg"
-    assert result["inat_preferred_image_license"] == "cc-by"
+    assert result["inat_preferred_image_license"] == "https://creativecommons.org/licenses/by/4.0/"
     assert "12345" in result["inat_preferred_image_references"]
 
 
 def test_extract_preferred_image_metadata_fallback_url():
-    payload = {"default_photo": {"id": "99", "large_url": "https://example.com/large.jpg"}}
+    payload = {"default_photo": {"id": "99", "large_url": "https://example.com/large.jpg", "license_code": "cc0"}}
     result = build_tree.extract_preferred_image_metadata(payload)
     assert result["inat_preferred_image"] == "https://example.com/large.jpg"
 
@@ -896,7 +896,7 @@ def test_extract_preferred_image_metadata_no_url():
 
 
 def test_extract_preferred_image_metadata_no_photo_id():
-    payload = {"default_photo": {"original_url": "https://example.com/img.jpg"}}
+    payload = {"default_photo": {"original_url": "https://example.com/img.jpg", "license_code": "cc0"}}
     result = build_tree.extract_preferred_image_metadata(payload)
     assert result["inat_preferred_image_references"] == ""
 

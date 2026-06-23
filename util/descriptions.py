@@ -167,9 +167,7 @@ def build_location_text(
 
 
 def _frequency_verb(frac: float) -> str | None:
-    if frac >= 1.0:
-        return "always"
-    if frac > 0.80:
+    if frac >= 1.00:
         return "almost always"
     if frac > 0.50:
         return "primarily"
@@ -222,30 +220,19 @@ def build_climate_lines(
     if not agg:
         return []
 
-    # Count how many distinct attr keys exist per group (for the "drop all" check)
     group_key_count: dict[str, int] = {}
-    for key in agg:
-        group_key_count[key[0]] = group_key_count.get(key[0], 0) + 1
+    for k in agg:
+        group_key_count[k[0]] = group_key_count.get(k[0], 0) + 1
 
     ranked = sorted(agg.values(), key=lambda e: e["fraction"], reverse=True)
-    used: set[tuple] = set()
-    lines: list[dict] = []
 
-    for _ in range(2):
-        remaining = [e for e in ranked if (e["group"], tuple(e["attrs"])) not in used]
-        if not remaining:
-            break
-        top_verb = _frequency_verb(remaining[0]["fraction"])
-        if top_verb is None:
-            break
+    def _entry_key(e: dict) -> tuple:
+        return (e["group"], tuple(e["attrs"]))
 
-        band = [e for e in remaining if _frequency_verb(e["fraction"]) == top_verb]
-
-        # Within each group in the band, merge attribute labels ordered by fraction
+    def _build_from_band(band: list) -> tuple[str, str]:
         by_group: dict[str, list] = {}
         for e in band:
             by_group.setdefault(e["group"], []).append(e)
-
         group_order = sorted(
             by_group.keys(),
             key=lambda g: sum(e["fraction"] for e in by_group[g]),
@@ -256,22 +243,40 @@ def build_climate_lines(
             g_entries = sorted(by_group[g], key=lambda e: e["fraction"], reverse=True)
             group_label = g_entries[0]["group_label"]
             all_attrs = [a for e in g_entries for a in e["attrs"]]
-            # Drop attributes if all variants for this group are represented in the band
             all_variants_present = len(g_entries) == group_key_count[g] and len(g_entries) > 1
             if all_attrs and not all_variants_present:
                 stems.append(f"{_join_labels(all_attrs)} {group_label}")
             else:
                 stems.append(group_label)
-
         combined_frac = sum(e["fraction"] for e in band)
-        verb = _frequency_verb(combined_frac) or top_verb
-        body = _join_labels(stems) + " climates"
-        lines.append({"prefix": f"{verb.capitalize()} in", "body": body})
+        verb = _frequency_verb(combined_frac) or _frequency_verb(ranked[0]["fraction"]) or "rarely"
+        return verb, _join_labels(stems) + " climates"
 
+    result: list[dict] = []  # {"verb": str, "body": str, "band": list}
+    used: set[tuple] = set()
+
+    while len(result) < 2:
+        remaining = [e for e in ranked if _entry_key(e) not in used]
+        if not remaining:
+            break
+        top_verb = _frequency_verb(remaining[0]["fraction"])
+        if top_verb is None:
+            break
+
+        band = [e for e in remaining if _frequency_verb(e["fraction"]) == top_verb]
         for e in band:
-            used.add((e["group"], tuple(e["attrs"])))
+            used.add(_entry_key(e))
 
-    return lines
+        verb, body = _build_from_band(band)
+
+        if result and result[-1]["verb"] == verb:
+            merged_band = result[-1]["band"] + band
+            verb, body = _build_from_band(merged_band)
+            result[-1] = {"verb": verb, "body": body, "band": merged_band}
+        else:
+            result.append({"verb": verb, "body": body, "band": band})
+
+    return [{"prefix": f"{r['verb'].capitalize()} in", "body": r["body"]} for r in result]
 
 
 # ---------------------------------------------------------------------------

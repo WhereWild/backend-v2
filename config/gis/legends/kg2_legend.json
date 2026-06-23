@@ -1,6 +1,6 @@
 {
   "layer_id": "kg2",
-  "source": "Karger et al. 2021 / CHELSA v2.1 — kg2 variant (Peel et al. 2007, 0°C C/D boundary)",
+  "source": "Karger et al. 2021 / CHELSA v2.1 \u2014 kg2 variant (Peel et al. 2007, 0\u00b0C C/D boundary)",
   "classes": [
     {
       "id": 1,
@@ -47,9 +47,10 @@
       "name": "Arid, cold desert",
       "group": "desert",
       "group_label": "Desert",
-      "attributes": ["cold"],
+      "attributes": [
+        "cold"
+      ],
       "traits": {
-        "thermal": "cold",
         "code": "BWK",
         "color": "#FF9696"
       }
@@ -59,9 +60,10 @@
       "name": "Arid, hot desert",
       "group": "desert",
       "group_label": "Desert",
-      "attributes": ["hot"],
+      "attributes": [
+        "hot"
+      ],
       "traits": {
-        "thermal": "hot",
         "code": "BWH",
         "color": "#FF0000"
       }
@@ -71,9 +73,10 @@
       "name": "Arid, cold steppe",
       "group": "steppe",
       "group_label": "Steppe",
-      "attributes": ["cold"],
+      "attributes": [
+        "cold"
+      ],
       "traits": {
-        "thermal": "cold",
         "code": "BSK",
         "color": "#FFDC64"
       }
@@ -83,9 +86,10 @@
       "name": "Arid, hot steppe",
       "group": "steppe",
       "group_label": "Steppe",
-      "attributes": ["hot"],
+      "attributes": [
+        "hot"
+      ],
       "traits": {
-        "thermal": "hot",
         "code": "BSH",
         "color": "#F5A500"
       }
@@ -96,7 +100,6 @@
       "group": "oceanic",
       "group_label": "Oceanic",
       "traits": {
-        "thermal": "hot",
         "code": "CFA",
         "color": "#C8FF50"
       }
@@ -107,7 +110,6 @@
       "group": "oceanic",
       "group_label": "Oceanic",
       "traits": {
-        "thermal": "warm",
         "code": "CFB",
         "color": "#64FF50"
       }
@@ -118,7 +120,6 @@
       "group": "oceanic",
       "group_label": "Oceanic",
       "traits": {
-        "thermal": "cool",
         "code": "CFC",
         "color": "#32C800"
       }
@@ -129,7 +130,6 @@
       "group": "mediterranean",
       "group_label": "Mediterranean",
       "traits": {
-        "thermal": "hot",
         "code": "CSA",
         "color": "#FFFF00"
       }
@@ -140,7 +140,6 @@
       "group": "mediterranean",
       "group_label": "Mediterranean",
       "traits": {
-        "thermal": "warm",
         "code": "CSB",
         "color": "#C8C800"
       }
@@ -151,7 +150,6 @@
       "group": "mediterranean",
       "group_label": "Mediterranean",
       "traits": {
-        "thermal": "cool",
         "code": "CSC",
         "color": "#969600"
       }
@@ -162,7 +160,6 @@
       "group": "highland",
       "group_label": "Highland",
       "traits": {
-        "thermal": "hot",
         "code": "CWA",
         "color": "#96FF96"
       }
@@ -173,7 +170,6 @@
       "group": "highland",
       "group_label": "Highland",
       "traits": {
-        "thermal": "warm",
         "code": "CWB",
         "color": "#64C864"
       }
@@ -184,7 +180,6 @@
       "group": "highland",
       "group_label": "Highland",
       "traits": {
-        "thermal": "cool",
         "code": "CWC",
         "color": "#329632"
       }
@@ -194,9 +189,10 @@
       "name": "Continental, humid hot summer",
       "group": "continental",
       "group_label": "Continental",
-      "attributes": ["hot"],
+      "attributes": [
+        "hot"
+      ],
       "traits": {
-        "thermal": "hot",
         "code": "DFA",
         "color": "#C8C8FF"
       }
@@ -206,9 +202,7 @@
       "name": "Continental, humid warm summer",
       "group": "continental",
       "group_label": "Continental",
-      "attributes": ["warm"],
       "traits": {
-        "thermal": "warm",
         "code": "DFB",
         "color": "#9696FF"
       }
@@ -219,7 +213,6 @@
       "group": "subarctic",
       "group_label": "Subarctic",
       "traits": {
-        "thermal": "cool",
         "code": "DFC",
         "color": "#6464FF"
       }
@@ -229,9 +222,10 @@
       "name": "Continental, subarctic severe winter",
       "group": "subarctic",
       "group_label": "Subarctic",
-      "attributes": ["severe-winter"],
+      "attributes": [
+        "severe-winter"
+      ],
       "traits": {
-        "thermal": "severe-winter",
         "code": "DFD",
         "color": "#3232C8"
       }
@@ -241,9 +235,10 @@
       "name": "Continental, dry summer hot",
       "group": "continental",
       "group_label": "Continental",
-      "attributes": ["hot"],
+      "attributes": [
+        "hot"
+      ],
       "traits": {
-        "thermal": "hot",
         "code": "DSA",
         "color": "#FF00FF"
       }
@@ -253,9 +248,7 @@
       "name": "Continental, dry summer warm",
       "group": "continental",
       "group_label": "Continental",
-      "attributes": ["warm"],
       "traits": {
-        "thermal": "warm",
         "code": "DSB",
         "color": "#C800C8"
       }
@@ -266,7 +259,6 @@
       "group": "subarctic",
       "group_label": "Subarctic",
       "traits": {
-        "thermal": "cool",
         "code": "DSC",
         "color": "#963296"
       }
@@ -276,9 +268,10 @@
       "name": "Continental, dry summer severe winter",
       "group": "subarctic",
       "group_label": "Subarctic",
-      "attributes": ["severe-winter"],
+      "attributes": [
+        "severe-winter"
+      ],
       "traits": {
-        "thermal": "severe-winter",
         "code": "DSD",
         "color": "#966496"
       }
@@ -288,9 +281,10 @@
       "name": "Continental, dry winter hot summer",
       "group": "continental",
       "group_label": "Continental",
-      "attributes": ["hot"],
+      "attributes": [
+        "hot"
+      ],
       "traits": {
-        "thermal": "hot",
         "code": "DWA",
         "color": "#ABABFF"
       }
@@ -300,9 +294,7 @@
       "name": "Continental, dry winter warm summer",
       "group": "continental",
       "group_label": "Continental",
-      "attributes": ["warm"],
       "traits": {
-        "thermal": "warm",
         "code": "DWB",
         "color": "#8282FF"
       }
@@ -313,7 +305,6 @@
       "group": "subarctic",
       "group_label": "Subarctic",
       "traits": {
-        "thermal": "cool",
         "code": "DWC",
         "color": "#5959FF"
       }
@@ -323,9 +314,10 @@
       "name": "Continental, dry winter severe",
       "group": "subarctic",
       "group_label": "Subarctic",
-      "attributes": ["severe-winter"],
+      "attributes": [
+        "severe-winter"
+      ],
       "traits": {
-        "thermal": "severe-winter",
         "code": "DWD",
         "color": "#2F2FFF"
       }
@@ -336,7 +328,6 @@
       "group": "polar",
       "group_label": "Polar",
       "traits": {
-        "thermal": "cold",
         "code": "ET",
         "color": "#B2B2B2"
       }
@@ -347,7 +338,6 @@
       "group": "polar",
       "group_label": "Polar",
       "traits": {
-        "thermal": "severe-winter",
         "code": "EF",
         "color": "#646464"
       }

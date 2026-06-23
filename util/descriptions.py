@@ -162,6 +162,119 @@ def build_location_text(
 
 
 # ---------------------------------------------------------------------------
+# Climate text
+# ---------------------------------------------------------------------------
+
+
+def _frequency_verb(frac: float) -> str | None:
+    if frac >= 1.0:
+        return "always"
+    if frac > 0.80:
+        return "almost always"
+    if frac > 0.50:
+        return "primarily"
+    if frac > 0.30:
+        return "often"
+    if frac > 0.20:
+        return "sometimes"
+    if frac > 0.10:
+        return "rarely"
+    return None
+
+
+def _join_labels(labels: list[str]) -> str:
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) == 2:
+        return f"{labels[0]} and {labels[1]}"
+    return ", ".join(labels[:-1]) + f", and {labels[-1]}"
+
+
+def build_climate_lines(
+    class_fractions: dict[int, float],
+    legend_classes: list[dict],
+) -> list[dict]:
+    """Return up to 2 styled line dicts for the climate section.
+
+    Each line is {"prefix": "Primarily in", "body": "temperate climates"}.
+    Aggregates by (group, attributes), merges same-verb entries within a group
+    into e.g. "hot and cold desert", then joins across groups into one line.
+    """
+    # Aggregate fractions by (group, sorted_attrs_tuple)
+    agg: dict[tuple, dict] = {}
+    for cls in legend_classes:
+        cid = cls.get("id")
+        if cid is None:
+            continue
+        frac = float(class_fractions.get(cid, 0.0))
+        if frac <= 0:
+            continue
+        group = str(cls.get("group") or "").strip().lower()
+        if not group:
+            continue
+        group_label = str(cls.get("group_label") or group).strip().lower()
+        attrs = sorted(str(a).strip().lower() for a in (cls.get("attributes") or []) if str(a).strip())
+        key = (group, tuple(attrs))
+        if key not in agg:
+            agg[key] = {"group": group, "group_label": group_label, "attrs": attrs, "fraction": 0.0}
+        agg[key]["fraction"] += frac
+
+    if not agg:
+        return []
+
+    # Count how many distinct attr keys exist per group (for the "drop all" check)
+    group_key_count: dict[str, int] = {}
+    for key in agg:
+        group_key_count[key[0]] = group_key_count.get(key[0], 0) + 1
+
+    ranked = sorted(agg.values(), key=lambda e: e["fraction"], reverse=True)
+    used: set[tuple] = set()
+    lines: list[dict] = []
+
+    for _ in range(2):
+        remaining = [e for e in ranked if (e["group"], tuple(e["attrs"])) not in used]
+        if not remaining:
+            break
+        top_verb = _frequency_verb(remaining[0]["fraction"])
+        if top_verb is None:
+            break
+
+        band = [e for e in remaining if _frequency_verb(e["fraction"]) == top_verb]
+
+        # Within each group in the band, merge attribute labels ordered by fraction
+        by_group: dict[str, list] = {}
+        for e in band:
+            by_group.setdefault(e["group"], []).append(e)
+
+        group_order = sorted(
+            by_group.keys(),
+            key=lambda g: sum(e["fraction"] for e in by_group[g]),
+            reverse=True,
+        )
+        stems: list[str] = []
+        for g in group_order:
+            g_entries = sorted(by_group[g], key=lambda e: e["fraction"], reverse=True)
+            group_label = g_entries[0]["group_label"]
+            all_attrs = [a for e in g_entries for a in e["attrs"]]
+            # Drop attributes if all variants for this group are represented in the band
+            all_variants_present = len(g_entries) == group_key_count[g] and len(g_entries) > 1
+            if all_attrs and not all_variants_present:
+                stems.append(f"{_join_labels(all_attrs)} {group_label}")
+            else:
+                stems.append(group_label)
+
+        combined_frac = sum(e["fraction"] for e in band)
+        verb = _frequency_verb(combined_frac) or top_verb
+        body = _join_labels(stems) + " climates"
+        lines.append({"prefix": f"{verb.capitalize()} in", "body": body})
+
+        for e in band:
+            used.add((e["group"], tuple(e["attrs"])))
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Profile assembly
 # ---------------------------------------------------------------------------
 
@@ -174,6 +287,8 @@ def build_description_profile(
     loc_taxa_path: Path,
     scope_by_level: dict[int, str],
     location_gid: Optional[str] = None,
+    kg2_class_fractions: Optional[dict[int, float]] = None,
+    kg2_legend_classes: Optional[list[dict]] = None,
 ) -> dict:
     """Return a description_profile dict with structured sections for the frontend."""
     location_text = build_location_text(
@@ -187,6 +302,16 @@ def build_description_profile(
     location_text = _capitalize_leading_the(location_text) if location_text else ""
 
     sections = []
+
+    if kg2_class_fractions and kg2_legend_classes:
+        climate_lines = build_climate_lines(kg2_class_fractions, kg2_legend_classes)
+        if climate_lines:
+            sections.append({
+                "id": "climate",
+                "title": "Climates",
+                "lines": climate_lines,
+            })
+
     if location_text:
         sections.append({
             "id": "locations",

@@ -597,12 +597,23 @@ def get_taxon(taxon_id: str):
     sci = taxon.get("scientific_name", "")
     preferred_raw = taxon.get("inat_preferred_common_name") or ""
     common_raw = taxon.get("common_name") or ""
+    kg2_rows = _storage.read_table(
+        GLOBAL_STATS_DIR / NOMINAL_STATS_FILE,
+        filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", "kg2")],
+    ).to_pylist()
+    kg2_class_fractions = {
+        int(r["metric"][6:]): float(r["value"])
+        for r in kg2_rows
+        if r["metric"].startswith("class_") and r["metric"][6:].isdigit() and float(r["value"] or 0) > 0
+    }
     description_profile = descriptions.build_description_profile(
         taxon["taxon_key"],
         hierarchy=_load_hierarchy(),
         storage=_storage,
         loc_taxa_path=_LOC_TAXA_PATH,
         scope_by_level=_CONFIG.location_scope_by_level,
+        kg2_class_fractions=kg2_class_fractions or None,
+        kg2_legend_classes=_load_legend("kg2") or None,
     )
     description = next(
         (line["body"] for section in description_profile["sections"] for line in section["lines"]),

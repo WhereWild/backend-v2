@@ -97,6 +97,16 @@ def _load_legend(layer_id: str) -> list:
     return json.loads(Path(path).read_text()).get("classes", [])
 
 
+def _load_legend_full(layer_id: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9_]+", layer_id):
+        return {}
+    legend_root = os.path.realpath(_LEGEND_DIR)
+    path = os.path.realpath(_LEGEND_DIR / f"{layer_id}_legend.json")
+    if not path.startswith(legend_root + os.sep) or not os.path.exists(path):
+        return {}
+    return json.loads(Path(path).read_text())
+
+
 def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
     """Read an env value for a known observation directly from occurrence.parquet."""
     occ_path = TREE_ROOT / taxon["path"] / "occurrence.parquet"
@@ -597,15 +607,23 @@ def get_taxon(taxon_id: str):
     sci = taxon.get("scientific_name", "")
     preferred_raw = taxon.get("inat_preferred_common_name") or ""
     common_raw = taxon.get("common_name") or ""
-    kg2_rows = _storage.read_table(
+    nominal_rows = _storage.read_table(
         GLOBAL_STATS_DIR / NOMINAL_STATS_FILE,
-        filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", "kg2")],
+        filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
     ).to_pylist()
-    kg2_class_fractions = {
-        int(r["metric"][6:]): float(r["value"])
-        for r in kg2_rows
-        if r["metric"].startswith("class_") and r["metric"][6:].isdigit() and float(r["value"] or 0) > 0
-    }
+
+    def _class_fractions(variable: str) -> dict[int, float]:
+        return {
+            int(r["metric"][6:]): float(r["value"])
+            for r in nominal_rows
+            if r["variable"] == variable
+            and r["metric"].startswith("class_")
+            and r["metric"][6:].isdigit()
+            and float(r["value"] or 0) > 0
+        }
+
+    kg2_class_fractions = _class_fractions("kg2")
+    lc_class_fractions = _class_fractions("landcover")
     description_profile = descriptions.build_description_profile(
         taxon["taxon_key"],
         hierarchy=_load_hierarchy(),
@@ -614,6 +632,8 @@ def get_taxon(taxon_id: str):
         scope_by_level=_CONFIG.location_scope_by_level,
         kg2_class_fractions=kg2_class_fractions or None,
         kg2_legend_classes=_load_legend("kg2") or None,
+        lc_class_fractions=lc_class_fractions or None,
+        lc_legend=_load_legend_full("landcover") or None,
     )
     description = next(
         (line["body"] for section in description_profile["sections"] for line in section["lines"]),

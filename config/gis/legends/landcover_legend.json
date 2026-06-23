@@ -6,7 +6,7 @@
       "id": 10,
       "name": "Rainfed cropland",
       "group": "cropland",
-      "group_label": "Cropland",
+      "group_label": "Croplands",
       "traits": {
         "color": "#FFFF64"
       }
@@ -15,7 +15,7 @@
       "id": 11,
       "name": "Herbaceous cover cropland",
       "group": "cropland",
-      "group_label": "Cropland",
+      "group_label": "Croplands",
       "traits": {
         "color": "#FFFF64"
       }
@@ -24,7 +24,7 @@
       "id": 12,
       "name": "Tree or shrub cover cropland (orchard)",
       "group": "cropland",
-      "group_label": "Cropland",
+      "group_label": "Croplands",
       "traits": {
         "color": "#FFFF00"
       }
@@ -33,7 +33,7 @@
       "id": 20,
       "name": "Irrigated cropland",
       "group": "cropland",
-      "group_label": "Cropland",
+      "group_label": "Croplands",
       "traits": {
         "color": "#AAF0F0"
       }
@@ -42,11 +42,13 @@
       "id": 51,
       "name": "Open evergreen broadleaved forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "sparse",
+        "evergreen",
+        "broadleaved"
+      ],
       "traits": {
-        "openness": "open",
-        "phenology": "evergreen",
-        "leaf": "broadleaved",
         "color": "#4C7300"
       }
     },
@@ -54,11 +56,13 @@
       "id": 52,
       "name": "Closed evergreen broadleaved forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "dense",
+        "evergreen",
+        "broadleaved"
+      ],
       "traits": {
-        "openness": "closed",
-        "phenology": "evergreen",
-        "leaf": "broadleaved",
         "color": "#006400"
       }
     },
@@ -66,11 +70,13 @@
       "id": 61,
       "name": "Open deciduous broadleaved forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "sparse",
+        "deciduous",
+        "broadleaved"
+      ],
       "traits": {
-        "openness": "open",
-        "phenology": "deciduous",
-        "leaf": "broadleaved",
         "color": "#AAC800"
       }
     },
@@ -78,11 +84,13 @@
       "id": 62,
       "name": "Closed deciduous broadleaved forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "dense",
+        "deciduous",
+        "broadleaved"
+      ],
       "traits": {
-        "openness": "closed",
-        "phenology": "deciduous",
-        "leaf": "broadleaved",
         "color": "#00A000"
       }
     },
@@ -90,11 +98,13 @@
       "id": 71,
       "name": "Open evergreen needle-leaved forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "sparse",
+        "evergreen",
+        "needleleaved"
+      ],
       "traits": {
-        "openness": "open",
-        "phenology": "evergreen",
-        "leaf": "needle-leaved",
         "color": "#005000"
       }
     },
@@ -102,11 +112,13 @@
       "id": 72,
       "name": "Closed evergreen needle-leaved forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "dense",
+        "evergreen",
+        "needleleaved"
+      ],
       "traits": {
-        "openness": "closed",
-        "phenology": "evergreen",
-        "leaf": "needle-leaved",
         "color": "#003C00"
       }
     },
@@ -114,11 +126,13 @@
       "id": 81,
       "name": "Open deciduous needle-leaved forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "sparse",
+        "deciduous",
+        "needleleaved"
+      ],
       "traits": {
-        "openness": "open",
-        "phenology": "deciduous",
-        "leaf": "needle-leaved",
         "color": "#286400"
       }
     },
@@ -126,11 +140,13 @@
       "id": 82,
       "name": "Closed deciduous needle-leaved forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "dense",
+        "deciduous",
+        "needleleaved"
+      ],
       "traits": {
-        "openness": "closed",
-        "phenology": "deciduous",
-        "leaf": "needle-leaved",
         "color": "#285000"
       }
     },
@@ -138,11 +154,11 @@
       "id": 91,
       "name": "Open mixed leaf forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "sparse"
+      ],
       "traits": {
-        "openness": "open",
-        "phenology": "mixed",
-        "leaf": "mixed",
         "color": "#A0B432"
       }
     },
@@ -150,11 +166,11 @@
       "id": 92,
       "name": "Closed mixed leaf forest",
       "group": "forest",
-      "group_label": "Forest",
+      "group_label": "Forests",
+      "attributes": [
+        "dense"
+      ],
       "traits": {
-        "openness": "closed",
-        "phenology": "mixed",
-        "leaf": "mixed",
         "color": "#788200"
       }
     },
@@ -162,7 +178,7 @@
       "id": 120,
       "name": "Shrubland",
       "group": "shrubland",
-      "group_label": "Shrubland",
+      "group_label": "Shrublands",
       "traits": {
         "color": "#966400"
       }
@@ -171,7 +187,7 @@
       "id": 121,
       "name": "Evergreen shrubland",
       "group": "shrubland",
-      "group_label": "Shrubland",
+      "group_label": "Shrublands",
       "traits": {
         "phenology": "evergreen",
         "color": "#964B00"
@@ -181,7 +197,7 @@
       "id": 122,
       "name": "Deciduous shrubland",
       "group": "shrubland",
-      "group_label": "Shrubland",
+      "group_label": "Shrublands",
       "traits": {
         "phenology": "deciduous",
         "color": "#966400"
@@ -191,7 +207,7 @@
       "id": 130,
       "name": "Grassland",
       "group": "grassland",
-      "group_label": "Grassland",
+      "group_label": "Grasslands",
       "traits": {
         "color": "#FFB432"
       }
@@ -200,7 +216,7 @@
       "id": 140,
       "name": "Lichens and mosses",
       "group": "sparse_vegetation",
-      "group_label": "Lichens/Mosses",
+      "group_label": "Sparse Vegetation",
       "traits": {
         "color": "#FFDCD2"
       }
@@ -299,7 +315,7 @@
       "id": 190,
       "name": "Urban / Impervious surfaces",
       "group": "urban",
-      "group_label": "Urban",
+      "group_label": "Urban Areas",
       "traits": {
         "color": "#C31400"
       }
@@ -335,7 +351,7 @@
       "id": 210,
       "name": "Water body",
       "group": "water",
-      "group_label": "Water",
+      "group_label": "Water Bodies",
       "traits": {
         "color": "#0046C8"
       }
@@ -349,5 +365,30 @@
         "color": "#FFFFFF"
       }
     }
-  ]
+  ],
+  "attribute_axes": {
+    "forest": [
+      {
+        "name": "openness",
+        "values": [
+          "sparse",
+          "dense"
+        ]
+      },
+      {
+        "name": "phenology",
+        "values": [
+          "evergreen",
+          "deciduous"
+        ]
+      },
+      {
+        "name": "leaf",
+        "values": [
+          "broadleaved",
+          "needleleaved"
+        ]
+      }
+    ]
+  }
 }

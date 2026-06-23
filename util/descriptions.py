@@ -7,8 +7,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Text helpers
@@ -57,7 +55,7 @@ def build_location_text(
     storage,
     loc_taxa_path: Path,
     scope_by_level: dict[int, str],
-    location_gid: Optional[str] = None,
+    location_gid: str | None = None,
     limit: int = 3,
 ) -> str:
     """Return a natural language location string for a taxon.
@@ -87,7 +85,7 @@ def build_location_text(
     scope1 = scope_by_level.get(1, "gadm_level1")
     scope2 = scope_by_level.get(2, "gadm_level2")
 
-    def _entries_for_scope(scope: str, parent_gid: Optional[str] = None) -> list[tuple[str, str, int]]:
+    def _entries_for_scope(scope: str, parent_gid: str | None = None) -> list[tuple[str, str, int]]:
         result = []
         for gid, count in by_scope.get(scope, []):
             rec = hierarchy.get(gid)
@@ -99,7 +97,7 @@ def build_location_text(
         result.sort(key=lambda r: r[2], reverse=True)
         return result
 
-    def _top_names(scope: str, parent_gid: Optional[str] = None) -> tuple[list[tuple[str, str, int]], bool]:
+    def _top_names(scope: str, parent_gid: str | None = None) -> tuple[list[tuple[str, str, int]], bool]:
         entries = _entries_for_scope(scope, parent_gid)
         seen: set[str] = set()
         deduped = []
@@ -169,14 +167,18 @@ def build_location_text(
 def _frequency_verb(frac: float) -> str | None:
     if frac >= 1.00:
         return "almost always"
-    if frac > 0.50:
+    if frac > 0.80:
         return "primarily"
-    if frac > 0.30:
+    if frac > 0.60:
+        return "commonly"
+    if frac > 0.4:
         return "often"
     if frac > 0.20:
         return "sometimes"
     if frac > 0.10:
-        return "rarely"
+        return "uncommonly"
+    if frac > 0.05:
+        return "rarely"        
     return None
 
 
@@ -188,17 +190,13 @@ def _join_labels(labels: list[str]) -> str:
     return ", ".join(labels[:-1]) + f", and {labels[-1]}"
 
 
-def build_climate_lines(
+def _build_nominal_lines(
     class_fractions: dict[int, float],
     legend_classes: list[dict],
+    *,
+    attribute_axes: dict[str, list[dict]] | None = None,
+    body_suffix: str = "",
 ) -> list[dict]:
-    """Return up to 2 styled line dicts for the climate section.
-
-    Each line is {"prefix": "Primarily in", "body": "temperate climates"}.
-    Aggregates by (group, attributes), merges same-verb entries within a group
-    into e.g. "hot and cold desert", then joins across groups into one line.
-    """
-    # Aggregate fractions by (group, sorted_attrs_tuple)
     agg: dict[tuple, dict] = {}
     for cls in legend_classes:
         cid = cls.get("id")
@@ -229,6 +227,26 @@ def build_climate_lines(
     def _entry_key(e: dict) -> tuple:
         return (e["group"], tuple(e["attrs"]))
 
+    def _make_stem(g: str, g_entries: list, group_label: str) -> str:
+        axes = (attribute_axes or {}).get(g)
+        if axes:
+            kept: list[str] = []
+            for axis in axes:
+                axis_vals = set(axis["values"])
+                per_entry = [next((a for a in e["attrs"] if a in axis_vals), None) for e in g_entries]
+                distinct = set(per_entry)
+                if len(distinct) == 1:
+                    val = next(iter(distinct))
+                    if val is not None:
+                        kept.append(val)
+            return f"{' '.join(kept)} {group_label}" if kept else group_label
+        else:
+            all_attrs = [a for e in g_entries for a in e["attrs"]]
+            all_variants_present = len(g_entries) == group_key_count[g] and len(g_entries) > 1
+            if all_attrs and not all_variants_present:
+                return f"{_join_labels(all_attrs)} {group_label}"
+            return group_label
+
     def _build_from_band(band: list) -> tuple[str, str]:
         by_group: dict[str, list] = {}
         for e in band:
@@ -238,21 +256,15 @@ def build_climate_lines(
             key=lambda g: sum(e["fraction"] for e in by_group[g]),
             reverse=True,
         )
-        stems: list[str] = []
-        for g in group_order:
-            g_entries = sorted(by_group[g], key=lambda e: e["fraction"], reverse=True)
-            group_label = g_entries[0]["group_label"]
-            all_attrs = [a for e in g_entries for a in e["attrs"]]
-            all_variants_present = len(g_entries) == group_key_count[g] and len(g_entries) > 1
-            if all_attrs and not all_variants_present:
-                stems.append(f"{_join_labels(all_attrs)} {group_label}")
-            else:
-                stems.append(group_label)
+        stems = [
+            _make_stem(g, sorted(by_group[g], key=lambda e: e["fraction"], reverse=True), by_group[g][0]["group_label"])
+            for g in group_order
+        ]
         combined_frac = sum(e["fraction"] for e in band)
-        verb = _frequency_verb(combined_frac) or _frequency_verb(ranked[0]["fraction"]) or "rarely"
-        return verb, _join_labels(stems) + " climates"
+        verb = _frequency_verb(combined_frac) or top_verb
+        return verb, _join_labels(stems) + body_suffix
 
-    result: list[dict] = []  # {"verb": str, "body": str, "band": list}
+    result: list[dict] = []
     used: set[tuple] = set()
 
     while len(result) < 2:
@@ -279,6 +291,21 @@ def build_climate_lines(
     return [{"prefix": f"{r['verb'].capitalize()} in", "body": r["body"]} for r in result]
 
 
+def build_climate_lines(
+    class_fractions: dict[int, float],
+    legend_classes: list[dict],
+) -> list[dict]:
+    return _build_nominal_lines(class_fractions, legend_classes, body_suffix=" climates")
+
+
+def build_habitat_lines(
+    class_fractions: dict[int, float],
+    legend_classes: list[dict],
+    attribute_axes: dict[str, list[dict]] | None = None,
+) -> list[dict]:
+    return _build_nominal_lines(class_fractions, legend_classes, attribute_axes=attribute_axes)
+
+
 # ---------------------------------------------------------------------------
 # Profile assembly
 # ---------------------------------------------------------------------------
@@ -291,9 +318,11 @@ def build_description_profile(
     storage,
     loc_taxa_path: Path,
     scope_by_level: dict[int, str],
-    location_gid: Optional[str] = None,
-    kg2_class_fractions: Optional[dict[int, float]] = None,
-    kg2_legend_classes: Optional[list[dict]] = None,
+    location_gid: str | None = None,
+    kg2_class_fractions: dict[int, float] | None = None,
+    kg2_legend_classes: list[dict] | None = None,
+    lc_class_fractions: dict[int, float] | None = None,
+    lc_legend: dict | None = None,
 ) -> dict:
     """Return a description_profile dict with structured sections for the frontend."""
     location_text = build_location_text(
@@ -308,20 +337,19 @@ def build_description_profile(
 
     sections = []
 
+    if location_text:
+        sections.append({"id": "locations", "title": "Locations", "lines": [{"body": location_text}]})
+
     if kg2_class_fractions and kg2_legend_classes:
         climate_lines = build_climate_lines(kg2_class_fractions, kg2_legend_classes)
         if climate_lines:
-            sections.append({
-                "id": "climate",
-                "title": "Climates",
-                "lines": climate_lines,
-            })
+            sections.append({"id": "climate", "title": "Climates", "lines": climate_lines})
 
-    if location_text:
-        sections.append({
-            "id": "locations",
-            "title": "Locations",
-            "lines": [{"body": location_text}],
-        })
+    if lc_class_fractions and lc_legend:
+        lc_classes = lc_legend.get("classes") or []
+        lc_axes = lc_legend.get("attribute_axes") or {}
+        habitat_lines = build_habitat_lines(lc_class_fractions, lc_classes, attribute_axes=lc_axes)
+        if habitat_lines:
+            sections.append({"id": "habitat", "title": "Habitat", "lines": habitat_lines})
 
     return {"sections": sections}

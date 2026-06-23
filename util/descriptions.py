@@ -168,11 +168,11 @@ def _slope_band(grade: float) -> str:
         return "flat"
     if grade < 8:
         return "gentle"
-    if grade < 15:
+    if grade < 12:
         return "moderate"
-    if grade < 25:
+    if grade < 18:
         return "moderately steep"
-    if grade < 45:
+    if grade < 28:
         return "steep"
     return "very steep"
 
@@ -247,21 +247,25 @@ def build_terrain_lines(
 # ---------------------------------------------------------------------------
 
 
+# Ordered highest → lowest. _VERB_RANK and _frequency_verb both derive from this.
+_FREQ_THRESHOLDS: list[tuple[float, str]] = [
+    (1.00, "almost always"),
+    (0.80, "primarily"),
+    (0.60, "commonly"),
+    (0.40, "often"),
+    (0.20, "sometimes"),
+    (0.10, "uncommonly"),
+    (0.05, "rarely"),
+]
+_VERB_RANK: dict[str, int] = {
+    verb: len(_FREQ_THRESHOLDS) - i for i, (_, verb) in enumerate(_FREQ_THRESHOLDS)
+}
+
+
 def _frequency_verb(frac: float) -> str | None:
-    if frac >= 1.00:
-        return "almost always"
-    if frac > 0.80:
-        return "primarily"
-    if frac > 0.60:
-        return "commonly"
-    if frac > 0.4:
-        return "often"
-    if frac > 0.20:
-        return "sometimes"
-    if frac > 0.10:
-        return "uncommonly"
-    if frac > 0.05:
-        return "rarely"        
+    for threshold, verb in _FREQ_THRESHOLDS:
+        if frac >= threshold:
+            return verb
     return None
 
 
@@ -364,7 +368,7 @@ def _build_nominal_lines(
 
         verb, body = _build_from_band(band)
 
-        if result and result[-1]["verb"] == verb:
+        if result and _VERB_RANK.get(verb, 0) >= _VERB_RANK.get(result[-1]["verb"], 0):
             merged_band = result[-1]["band"] + band
             verb, body = _build_from_band(merged_band)
             result[-1] = {"verb": verb, "body": body, "band": merged_band}

@@ -788,9 +788,40 @@ def _clean(value: object) -> str:
     return "" if text.lower() in {"none", "null"} else text
 
 
+_INAT_LICENSE_URLS: dict[str, str] = {
+    "cc0":          "https://creativecommons.org/publicdomain/zero/1.0/",
+    "pd":           "https://creativecommons.org/publicdomain/zero/1.0/",
+    "cc-by":        "https://creativecommons.org/licenses/by/4.0/",
+    "cc-by-sa":     "https://creativecommons.org/licenses/by-sa/4.0/",
+    "cc-by-nd":     "https://creativecommons.org/licenses/by-nd/4.0/",
+    "cc-by-nc":     "https://creativecommons.org/licenses/by-nc/4.0/",
+    "cc-by-nc-sa":  "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+    "cc-by-nc-nd":  "https://creativecommons.org/licenses/by-nc-nd/4.0/",
+}
+
+
+def _normalize_license_url(raw: str) -> str:
+    """Normalize a license code or URL to a canonical https CC URL.
+
+    iNat short codes (e.g. "cc-by-nc") are mapped to their canonical URL.
+    Existing URLs are normalized from http to https.
+    Returns empty string if the input is empty.
+    """
+    if not raw:
+        return ""
+    canonical = _INAT_LICENSE_URLS.get(raw.strip().lower())
+    if canonical:
+        return canonical
+    # Already a URL — normalize http → https
+    return raw.strip().replace("http://", "https://", 1)
+
+
 def extract_preferred_image_metadata(taxon_payload: dict) -> dict[str, str]:
     default_photo = taxon_payload.get("default_photo")
     if not isinstance(default_photo, dict):
+        return {}
+    license_code = _clean(default_photo.get("license_code"))
+    if not _is_usable_license(license_code):
         return {}
     image_url = ""
     for field in ("original_url", "large_url", "medium_url", "url", "square_url"):
@@ -803,7 +834,7 @@ def extract_preferred_image_metadata(taxon_payload: dict) -> dict[str, str]:
     photo_id = _clean(default_photo.get("id"))
     return {
         "inat_preferred_image": image_url,
-        "inat_preferred_image_license": _clean(default_photo.get("license_code")),
+        "inat_preferred_image_license": _normalize_license_url(license_code),
         "inat_preferred_image_creator": _clean(default_photo.get("attribution_name")),
         "inat_preferred_image_attribution": _clean(default_photo.get("attribution")),
         "inat_preferred_image_references": f"{INAT_PHOTO_BASE_URL}/{photo_id}" if photo_id else "",
@@ -957,7 +988,7 @@ _LICENSE_PRIORITY = [
     ("/by-nc-sa/", 4), ("cc by-nc-sa", 4),
 ]
 _USABLE_LICENSES = {
-    "cc0", "cc by", "cc-by", "/by/", "/by-sa/", "/by-nc/", "/by-nc-sa/",
+    "cc0", "cc by", "cc-by", "/by/", "/by-nd/", "/by-sa/", "/by-nc/", "/by-nc-sa/", "/by-nc-nd/",
     "publicdomain", "public domain",
 }
 _BAD_EVIDENCE = {"track", "scat", "feather", "bone", "molt", "hair"}
@@ -975,7 +1006,9 @@ def _license_score(s: str) -> int:
 
 def _is_usable_license(s: str) -> bool:
     n = s.strip().lower()
-    return any(p in n for p in _USABLE_LICENSES)
+    # "pd" is iNat's code for public domain; check exact match before substring scan
+    # to avoid false-positive on e.g. "updated".
+    return n == "pd" or any(p in n for p in _USABLE_LICENSES)
 
 
 def _image_quality(license_str: str, vitality: str, evidence: str, rcs: str) -> tuple:
@@ -1082,7 +1115,7 @@ def _build_gbif_images(gbif_to_taxon: dict[str, tuple]) -> dict[str, dict]:
                 continue
             best[taxon_key] = (score, {
                 "gbif_backup_image": url,
-                "gbif_backup_image_license": license_str,
+                "gbif_backup_image_license": _normalize_license_url(license_str),
                 "gbif_backup_image_creator": _clean(row.get("creator")),
                 "gbif_backup_image_attribution": _clean(row.get("rightsHolder")),
                 "gbif_backup_image_references": _clean(row.get("references")),
@@ -1170,7 +1203,9 @@ def propagate_images(catalog: dict) -> int:
         child_keys = children.get(key, [])
         for child_key in child_keys:
             child = catalog[child_key]
-            if _clean(child.get("inat_preferred_image")):
+            if _clean(child.get("inat_preferred_image")) and _is_usable_license(
+                _clean(child.get("inat_preferred_image_license"))
+            ):
                 inherited = {f: child.get(f, "") for f in inat_img_fields}
                 break
         if inherited is None:

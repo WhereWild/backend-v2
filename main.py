@@ -206,12 +206,32 @@ app = FastAPI(lifespan=_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"], expose_headers=["X-Nominal-Classes"])
 
 
+def _license_label(url: str | None) -> str | None:
+    """Derive a short display label from a canonical CC license URL.
+
+    The catalog always stores canonical https CC URLs (normalized at build time),
+    so this only needs to handle URL→label, not short codes.
+    """
+    if not url:
+        return None
+    m = re.search(r"/publicdomain/zero/([^/]+)/", url)
+    if m:
+        return f"CC0 {m.group(1)}"
+    m = re.search(r"/licenses/([^/]+)/([^/]+)/", url)
+    if m:
+        parts = m.group(1).split("-")
+        return "CC " + "-".join(p.upper() for p in parts) + " " + m.group(2)
+    return url  # fallback: show whatever is stored
+
+
 def _image_fields(taxon: dict) -> dict:
     """Return unified image_* fields, preferring iNat over GBIF backup."""
     prefix = "inat_preferred" if taxon.get("inat_preferred_image") else "gbif_backup"
+    license_url = taxon.get(f"{prefix}_image_license") or None
     return {
         "image_url": taxon.get(f"{prefix}_image") or None,
-        "image_license": taxon.get(f"{prefix}_image_license") or None,
+        "image_license": _license_label(license_url),
+        "image_license_url": license_url,
         "image_creator": taxon.get(f"{prefix}_image_creator") or None,
         "image_rights_holder": taxon.get(f"{prefix}_image_attribution") or None,
         "image_references": taxon.get(f"{prefix}_image_references") or None,

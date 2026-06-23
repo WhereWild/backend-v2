@@ -160,6 +160,89 @@ def build_location_text(
 
 
 # ---------------------------------------------------------------------------
+# Terrain text
+# ---------------------------------------------------------------------------
+
+def _slope_band(grade: float) -> str:
+    if grade < 3:
+        return "flat"
+    if grade < 8:
+        return "gentle"
+    if grade < 15:
+        return "moderate"
+    if grade < 25:
+        return "moderately steep"
+    if grade < 45:
+        return "steep"
+    return "very steep"
+
+
+def _compass_direction(degrees: float) -> str:
+    d = degrees % 360
+    idx = int((d + 22.5) / 45) % 8
+    return ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"][idx]
+
+
+def build_terrain_lines(
+    numerical_stats: dict[str, dict],
+    circular_stats: dict[str, dict],
+    *,
+    unit_system: Optional[str] = None,
+) -> list[dict]:
+    lines: list[dict] = []
+
+    elev = numerical_stats.get("elevation") or {}
+    p10 = elev.get("min")
+    p90 = elev.get("max")
+    if p10 is not None and p90 is not None:
+        if unit_system == "imperial":
+            p10 = p10 / 0.3048
+            p90 = p90 / 0.3048
+            unit_label = "ft"
+        else:
+            unit_label = "m"
+        elev_text: str | None = None
+        for step in (100, 10, 1):
+            lo = round(p10 / step) * step
+            hi = round(p90 / step) * step
+            if lo != hi:
+                elev_text = f"Found from {lo:,} to {hi:,} {unit_label} elevation"
+                break
+        if elev_text is None:
+            elev_text = f"Found at {round(p10):,} {unit_label} elevation"
+        lines.append({"body": elev_text})
+
+    slope = numerical_stats.get("slope") or {}
+    slope_mean = slope.get("mean")
+    slope_p10 = slope.get("10th_percentile")
+    if slope_mean is not None:
+        mean_band = _slope_band(slope_mean)
+        if slope_p10 is not None:
+            p10_band = _slope_band(slope_p10)
+        else:
+            p10_band = mean_band
+        if p10_band == mean_band:
+            band_text = "flat areas" if mean_band == "flat" else f"{mean_band} slopes"
+        elif p10_band == "flat":
+            band_text = f"flat areas to {mean_band} slopes"
+        else:
+            band_text = f"{p10_band} to {mean_band} slopes"
+        lines.append({"body": f"Often on {band_text}"})
+
+    aspect = circular_stats.get("aspect") or {}
+    rbar = aspect.get("rbar")
+    mean_dir = aspect.get("circular_mean")
+    count = aspect.get("count") or 0
+    median_slope = (numerical_stats.get("slope") or {}).get("median") or 0
+    if rbar is not None and mean_dir is not None and count > 100 and rbar > 0.15 and median_slope > 5:
+        direction = _compass_direction(mean_dir)
+        qualifier = "Strongly prefers" if rbar > 0.35 else "Prefers"
+        lines.append({"body": f"{qualifier} {direction}-facing slopes"})
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Climate text
 # ---------------------------------------------------------------------------
 
@@ -323,6 +406,9 @@ def build_description_profile(
     kg2_legend_classes: list[dict] | None = None,
     lc_class_fractions: dict[int, float] | None = None,
     lc_legend: dict | None = None,
+    numerical_stats: dict[str, dict] | None = None,
+    circular_stats: dict[str, dict] | None = None,
+    unit_system: str | None = None,
 ) -> dict:
     """Return a description_profile dict with structured sections for the frontend."""
     location_text = build_location_text(
@@ -351,5 +437,10 @@ def build_description_profile(
         habitat_lines = build_habitat_lines(lc_class_fractions, lc_classes, attribute_axes=lc_axes)
         if habitat_lines:
             sections.append({"id": "habitat", "title": "Habitat", "lines": habitat_lines})
+
+    if numerical_stats or circular_stats:
+        terrain_lines = build_terrain_lines(numerical_stats or {}, circular_stats or {}, unit_system=unit_system)
+        if terrain_lines:
+            sections.append({"id": "terrain", "title": "Terrain", "lines": terrain_lines})
 
     return {"sections": sections}

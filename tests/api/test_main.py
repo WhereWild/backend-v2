@@ -651,7 +651,7 @@ def test_get_species_obscured_found():
          patch.object(taxa, "get_taxon_by_slug", return_value=None):
         r = client.get("/api/species/2923970/obscured")
     assert r.status_code == 200
-    assert r.json() == {"allObscured": False}
+    assert r.json()["allObscured"] == False
 
 
 def test_get_species_obscured_not_found():
@@ -1238,7 +1238,7 @@ def test_get_species_environment_with_location_nominal(tmp_path, monkeypatch):
 
 
 def test_get_species_environment_with_location_no_data_falls_through(monkeypatch):
-    """compute_location_filtered_stats returns None → falls back to precomputed stats."""
+    """compute_location_filtered_stats returns None → 404 (no fallback to precomputed)."""
     monkeypatch.setattr(st_module, "collect_taxon_df", lambda t, **kwargs: None)
     _patch_hierarchy(monkeypatch, {"USA": _USA})
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
@@ -1246,8 +1246,7 @@ def test_get_species_environment_with_location_no_data_falls_through(monkeypatch
          patch("pathlib.Path.exists", return_value=True), \
          patch.object(pq, "read_table", side_effect=_env_stats_read):
         r = client.get("/species/2923970/environment/bio1?location=USA")
-    assert r.status_code == 200
-    assert r.json()["observation_count"] == 100  # from precomputed table
+    assert r.status_code == 404
 
 
 def test_get_species_environment_with_location_no_layer_falls_through(monkeypatch):

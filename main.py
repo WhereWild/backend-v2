@@ -600,7 +600,7 @@ async def layer_tile_range_classes(
 
 @app.get("/api/taxon/{taxon_id}")
 @app.get("/api/species/{taxon_id}")
-def get_taxon(taxon_id: str):
+def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -624,6 +624,19 @@ def get_taxon(taxon_id: str):
 
     kg2_class_fractions = _class_fractions("kg2")
     lc_class_fractions = _class_fractions("landcover")
+
+    numerical_rows = _storage.read_table(
+        GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
+        filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+    ).to_pylist()
+    numerical_stats = {r["variable"]: r for r in numerical_rows}
+
+    circular_rows = _storage.read_table(
+        GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE,
+        filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+    ).to_pylist()
+    circular_stats = {r["variable"]: r for r in circular_rows}
+
     description_profile = descriptions.build_description_profile(
         taxon["taxon_key"],
         hierarchy=_load_hierarchy(),
@@ -634,6 +647,9 @@ def get_taxon(taxon_id: str):
         kg2_legend_classes=_load_legend("kg2") or None,
         lc_class_fractions=lc_class_fractions or None,
         lc_legend=_load_legend_full("landcover") or None,
+        numerical_stats=numerical_stats or None,
+        circular_stats=circular_stats or None,
+        unit_system=unit_system or None,
     )
     description = next(
         (line["body"] for section in description_profile["sections"] for line in section["lines"]),

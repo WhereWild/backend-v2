@@ -277,6 +277,53 @@ def _join_labels(labels: list[str]) -> str:
     return ", ".join(labels[:-1]) + f", and {labels[-1]}"
 
 
+def _summer_heat_label(celsius: float) -> str:
+    if celsius > 34: return "scorching"
+    if celsius > 31: return "very hot"
+    if celsius > 29: return "hot"
+    if celsius > 27.5: return "warm"
+    if celsius > 25: return "temperate"
+    if celsius > 10: return "cool"
+    return "cold"
+
+
+def _winter_cold_label(celsius: float) -> str:
+    if celsius < -15: return "extremely cold"
+    if celsius < -10: return "incredibly cold"
+    if celsius < -5: return "very cold"
+    if celsius < 0: return "cold"
+    if celsius < 5: return "cool"
+    if celsius < 10: return "temperate"
+    if celsius < 25: return "warm"
+    return "hot"
+
+
+def _precip_label(mm: float) -> str:
+    if mm < 150: return "extremely xeric"
+    if mm < 300: return "xeric"
+    if mm < 450: return "arid"
+    if mm < 600: return "semi-arid"
+    if mm < 800: return "subhumid"
+    if mm < 1100: return "moderately wet"
+    if mm < 1500: return "wet"
+    if mm < 2200: return "very wet"
+    if mm < 3000: return "extremely wet"
+    return "torrential"
+
+
+def _seasonal_precip_label(mm_quarter: float) -> str:
+    return _precip_label(mm_quarter * 4)
+
+
+def _swe_tier(swe_mm: float) -> str:
+    if swe_mm < 5: return "snow-free"
+    if swe_mm < 50: return "slightly snowy"
+    if swe_mm < 100: return "moderately snowy"
+    if swe_mm < 200: return "snowy"
+    if swe_mm < 300: return "very snowy"
+    return "incredibly snowy"
+
+
 def _build_nominal_lines(
     class_fractions: dict[int, float],
     legend_classes: list[dict],
@@ -393,6 +440,49 @@ def build_habitat_lines(
     return _build_nominal_lines(class_fractions, legend_classes, attribute_axes=attribute_axes)
 
 
+def build_weather_lines(numerical_stats: dict[str, dict]) -> list[dict]:
+    lines: list[dict] = []
+
+    def _get(var: str, metric: str) -> float | None:
+        v = (numerical_stats.get(var) or {}).get(metric)
+        return float(v) if v is not None else None
+
+    hottest = _get("bio5", "mean")
+    coldest = _get("bio6", "mean")
+    summer_precip = _get("bio18", "mean")
+    swe_median = _get("swe", "median")
+    winter_precip = _get("bio19", "median")
+
+    summer_parts: list[str] = []
+    if hottest is not None:
+        summer_parts.append(_summer_heat_label(hottest))
+    if summer_precip is not None:
+        summer_parts.append(_seasonal_precip_label(summer_precip))
+
+    winter_parts: list[str] = []
+    if coldest is not None:
+        winter_parts.append(_winter_cold_label(coldest))
+    snow_tier = _swe_tier(swe_median) if swe_median is not None else None
+    if snow_tier and snow_tier != "snow-free":
+        winter_parts.append(snow_tier)
+    elif winter_precip is not None:
+        winter_parts.append(_seasonal_precip_label(winter_precip))
+
+    if summer_parts or winter_parts:
+        season_parts = []
+        if summer_parts:
+            season_parts.append(f"{', '.join(summer_parts)} summers")
+        if winter_parts:
+            season_parts.append(f"{', '.join(winter_parts)} winters")
+        lines.append({"body": f"Prefers {' and '.join(season_parts)}."})
+
+    avg_precip = _get("bio12", "median")
+    if avg_precip is not None:
+        lines.append({"body": f"Typically {_precip_label(avg_precip)} locations overall"})
+
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Profile assembly
 # ---------------------------------------------------------------------------
@@ -446,5 +536,10 @@ def build_description_profile(
         terrain_lines = build_terrain_lines(numerical_stats or {}, circular_stats or {}, unit_system=unit_system)
         if terrain_lines:
             sections.append({"id": "terrain", "title": "Terrain", "lines": terrain_lines})
+
+    if numerical_stats:
+        weather_lines = build_weather_lines(numerical_stats)
+        if weather_lines:
+            sections.append({"id": "weather", "title": "Weather", "lines": weather_lines})
 
     return {"sections": sections}

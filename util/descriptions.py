@@ -38,6 +38,8 @@ def _join_names(names: list[str], *, use_and: bool = True) -> str:
         return ""
     if len(names) == 1:
         return names[0]
+    if len(names) == 2 and use_and:
+        return f"{names[0]} and {names[1]}"
     if use_and:
         return ", ".join(names[:-1]) + f", and {names[-1]}"
     return ", ".join(names)
@@ -123,6 +125,13 @@ def build_location_text(
         name = rec.get("name", location_gid)
         if level == 0:
             entries, has_more = _top_names(scope1, parent_gid=location_gid)
+            if len(entries) == 1 and not has_more:
+                state_gid, state_name, _ = entries[0]
+                county_entries, has_more_counties = _top_names(scope2, parent_gid=state_gid)
+                county_names = [e[1] for e in county_entries]
+                if county_names:
+                    return _format(county_names, parent=state_name, has_more=has_more_counties, more_label="counties")
+                return state_name
             state_names = [e[1] for e in entries]
             if state_names:
                 return _format(state_names, parent=_with_definite_article(name), has_more=has_more, more_label="regions")
@@ -147,6 +156,13 @@ def build_location_text(
     if len(country_entries) == 1 and not has_more:
         country_gid, country_name, _ = country_entries[0]
         state_entries, has_more_states = _top_names(scope1, parent_gid=country_gid)
+        if len(state_entries) == 1 and not has_more_states:
+            state_gid, state_name, _ = state_entries[0]
+            county_entries, has_more_counties = _top_names(scope2, parent_gid=state_gid)
+            county_names = [e[1] for e in county_entries]
+            if county_names:
+                return _format(county_names, parent=state_name, has_more=has_more_counties, more_label="counties")
+            return f"{state_name} in {_with_definite_article(country_name)}"
         state_names = [e[1] for e in state_entries]
         if state_names:
             return _format(state_names, parent=_with_definite_article(country_name), has_more=has_more_states, more_label="regions")
@@ -306,9 +322,7 @@ def _winter_cold_label(celsius: float) -> str:
         return "cool"
     if celsius < 10:
         return "temperate"
-    if celsius < 25:
-        return "warm"
-    return "hot"
+    return "warm"
 
 
 def _precip_label(mm: float) -> str:
@@ -556,7 +570,7 @@ def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
         _raw = _usda_texture_class(sand, silt, clay)
         texture = _texture_display.get(_raw, _raw)
         if coarse_part:
-            lines.append({"body": f"Prefers {texture}, {coarse_part} soil"})
+            lines.append({"body": f"Prefers {coarse_part}, {texture} soil"})
         else:
             lines.append({"body": f"Prefers {texture} soil"})
 

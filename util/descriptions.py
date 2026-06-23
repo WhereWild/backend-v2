@@ -315,6 +315,50 @@ def _seasonal_precip_label(mm_quarter: float) -> str:
     return _precip_label(mm_quarter * 4)
 
 
+def _usda_texture_class(sand: float, silt: float, clay: float) -> str:
+    # Conditions taken directly from NRCS Soil Texture Calculator (MultiPointTriangle_100pt_508.xlsx, Calc1 sheet)
+    if clay >= 40:
+        if silt >= 40: return "silty clay"
+        if sand <= 45: return "clay"
+        return "sandy clay"
+    if clay >= 35 and sand > 45:
+        return "sandy clay"
+    if clay >= 27:
+        if sand <= 20: return "silty clay loam"
+        if sand <= 45: return "clay loam"
+        return "sandy clay loam"
+    if clay >= 20 and sand > 45 and silt < 28:
+        return "sandy clay loam"
+    if silt >= 80 and clay < 12:
+        return "silt"
+    if silt >= 50:
+        return "silt loam"
+    if clay >= 7 and silt >= 28 and sand <= 52:
+        return "loam"
+    if (silt + 1.5 * clay) < 15:
+        return "sand"
+    if (silt + 1.5 * clay) >= 15 and (silt + 2 * clay) < 30:
+        return "loamy sand"
+    if (7 <= clay < 20 and sand > 52 and (silt + 2 * clay) >= 30) or \
+       (clay < 7 and silt < 50 and (silt + 2 * clay) >= 30):
+        return "sandy loam"
+    return "sandy loam"
+
+
+def _ph_label(ph: float) -> str:
+    if ph < 3.5: return "ultra acidic"
+    if ph < 4.5: return "extremely acidic"
+    if ph < 5.1: return "very strongly acidic"
+    if ph < 5.6: return "strongly acidic"
+    if ph < 6.1: return "moderately acidic"
+    if ph < 6.6: return "slightly acidic"
+    if ph < 7.4: return "neutral"
+    if ph < 7.9: return "slightly alkaline"
+    if ph < 8.5: return "moderately alkaline"
+    if ph <= 9.0: return "strongly alkaline"
+    return "very strongly alkaline"
+
+
 def _swe_tier(swe_mm: float) -> str:
     if swe_mm < 5: return "snow-free"
     if swe_mm < 50: return "slightly snowy"
@@ -440,6 +484,60 @@ def build_habitat_lines(
     return _build_nominal_lines(class_fractions, legend_classes, attribute_axes=attribute_axes)
 
 
+def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
+    lines: list[dict] = []
+
+    def _get(var: str, metric: str) -> float | None:
+        v = (numerical_stats.get(var) or {}).get(metric)
+        return float(v) if v is not None else None
+
+    sand = _get("sand", "median")
+    silt = _get("silt", "median")
+    clay = _get("clay", "median")
+
+    cfvo = _get("cfvo", "mean")
+    coarse_part: str | None = None
+    if cfvo is not None:
+        if cfvo < 2: coarse_part = "very fine"
+        elif cfvo < 5: coarse_part = "fine"
+        elif cfvo >= 25: coarse_part = "very coarse"
+        elif cfvo >= 15: coarse_part = "coarse"
+
+    _texture_display = {
+        "loam": "loamy", "sand": "sandy", "silt": "silty", "clay": "clay-rich",
+    }
+
+    if sand is not None and silt is not None and clay is not None:
+        _raw = _usda_texture_class(sand, silt, clay)
+        texture = _texture_display.get(_raw, _raw)
+        if coarse_part:
+            lines.append({"body": f"Prefers {texture}, {coarse_part} soil"})
+        else:
+            lines.append({"body": f"Prefers {texture} soil"})
+
+    # pH — SoilGrids stores phh2o as pH × 10
+    phh2o_raw = _get("phh2o", "mean")
+    nitrogen = _get("nitrogen", "mean")
+    ph_phrase: str | None = None
+    nutrient_phrase: str | None = None
+    if phh2o_raw is not None:
+        ph_phrase = _ph_label(phh2o_raw)
+    if nitrogen is not None:
+        if nitrogen < 1.5: nutrient_phrase = "very nutrient poor"
+        elif nitrogen < 2: nutrient_phrase = "nutrient poor"
+        elif nitrogen >= 10: nutrient_phrase = "very nutrient rich"
+        elif nitrogen >= 7: nutrient_phrase = "nutrient rich"
+
+    if ph_phrase and nutrient_phrase:
+        lines.append({"body": f"Usually {nutrient_phrase} and {ph_phrase} soil"})
+    elif ph_phrase:
+        lines.append({"body": f"Usually {ph_phrase} soil"})
+    elif nutrient_phrase:
+        lines.append({"body": f"Usually {nutrient_phrase} soil"})
+
+    return lines
+
+
 def build_weather_lines(numerical_stats: dict[str, dict]) -> list[dict]:
     lines: list[dict] = []
 
@@ -474,7 +572,7 @@ def build_weather_lines(numerical_stats: dict[str, dict]) -> list[dict]:
             season_parts.append(f"{', '.join(summer_parts)} summers")
         if winter_parts:
             season_parts.append(f"{', '.join(winter_parts)} winters")
-        lines.append({"body": f"Prefers {' and '.join(season_parts)}."})
+        lines.append({"body": f"Prefers {' and '.join(season_parts)}"})
 
     avg_precip = _get("bio12", "median")
     if avg_precip is not None:
@@ -541,5 +639,10 @@ def build_description_profile(
         weather_lines = build_weather_lines(numerical_stats)
         if weather_lines:
             sections.append({"id": "weather", "title": "Weather", "lines": weather_lines})
+
+    if numerical_stats:
+        soil_lines = build_soil_lines(numerical_stats)
+        if soil_lines:
+            sections.append({"id": "soil", "title": "Soil", "lines": soil_lines})
 
     return {"sections": sections}

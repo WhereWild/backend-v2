@@ -26,7 +26,7 @@ from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
 from config.config import load_config
-from util import citations, gis, taxa, tiles, units, upload
+from util import citations, descriptions, gis, taxa, tiles, units, upload
 from util.rankings import TREE_ROOT as RANKINGS_TREE_ROOT
 from util.stats import (
     CIRCULAR_STATS_FILE,
@@ -95,6 +95,16 @@ def _load_legend(layer_id: str) -> list:
     if not os.path.exists(path):
         return []
     return json.loads(Path(path).read_text()).get("classes", [])
+
+
+def _load_legend_full(layer_id: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9_]+", layer_id):
+        return {}
+    legend_root = os.path.realpath(_LEGEND_DIR)
+    path = os.path.realpath(_LEGEND_DIR / f"{layer_id}_legend.json")
+    if not path.startswith(legend_root + os.sep) or not os.path.exists(path):
+        return {}
+    return json.loads(Path(path).read_text())
 
 
 def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
@@ -590,30 +600,132 @@ async def layer_tile_range_classes(
 
 @app.get("/api/taxon/{taxon_id}")
 @app.get("/api/species/{taxon_id}")
-def get_taxon(taxon_id: str):
+def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
     sci = taxon.get("scientific_name", "")
-    vnames = [format_common_name(n) for n in taxon.get("vernacular_names") or []]
     preferred_raw = taxon.get("inat_preferred_common_name") or ""
     common_raw = taxon.get("common_name") or ""
+    nominal_rows = _storage.read_table(
+        GLOBAL_STATS_DIR / NOMINAL_STATS_FILE,
+        filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+    ).to_pylist()
+
+    def _class_fractions(variable: str) -> dict[int, float]:
+        return {
+            int(r["metric"][6:]): float(r["value"])
+            for r in nominal_rows
+            if r["variable"] == variable
+            and r["metric"].startswith("class_")
+            and r["metric"][6:].isdigit()
+            and float(r["value"] or 0) > 0
+        }
+
+    kg2_class_fractions = _class_fractions("kg2")
+    lc_class_fractions = _class_fractions("landcover")
+
+    numerical_rows = _storage.read_table(
+        GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
+        filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+    ).to_pylist()
+    numerical_stats = {r["variable"]: r for r in numerical_rows}
+
+    circular_rows = _storage.read_table(
+        GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE,
+        filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+    ).to_pylist()
+    circular_stats = {r["variable"]: r for r in circular_rows}
+
+    description_profile = descriptions.build_description_profile(
+        taxon["taxon_key"],
+        hierarchy=_load_hierarchy(),
+        storage=_storage,
+        loc_taxa_path=_LOC_TAXA_PATH,
+        scope_by_level=_CONFIG.location_scope_by_level,
+        kg2_class_fractions=kg2_class_fractions or None,
+        kg2_legend_classes=_load_legend("kg2") or None,
+        lc_class_fractions=lc_class_fractions or None,
+        lc_legend=_load_legend_full("landcover") or None,
+        numerical_stats=numerical_stats or None,
+        circular_stats=circular_stats or None,
+        unit_system=unit_system or None,
+    )
+    description = next(
+        (line["body"] for section in description_profile["sections"] for line in section["lines"]),
+        "",
+    )
     return {
         **taxon,
         "scientific_name": sci.replace("_", " "),
-        "vernacular_names": vnames,
         "inat_preferred_common_name": format_common_name(preferred_raw) or None,
         "common_name": format_common_name(preferred_raw or common_raw) or None,
         **_image_fields(taxon),
+        "description": description,
+        "description_profile": description_profile,
     }
 
 
+def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
+    """Return True when every observation in scope has obscured coordinates."""
+    filter_col = _location_filter_col(location_gid) if location_gid else None
+    has_any = False
+    has_non_obscured = False
+
+    def _scan(path: Path) -> None:
+        nonlocal has_any, has_non_obscured
+        if has_non_obscured:
+            return
+        try:
+            needed = ["obscured"]
+            if filter_col:
+                needed.append(filter_col)
+            schema_names = set(_storage.read_schema(path).names)
+            cols = [c for c in needed if c in schema_names]
+            if "obscured" not in cols:
+                has_non_obscured = True
+                return
+            tbl = _storage.read_table(path, columns=cols)
+            df = tbl.to_pandas()
+            if filter_col and filter_col in df.columns:
+                df = df[df[filter_col].astype(str) == str(location_gid)]
+            if df.empty:
+                return
+            has_any = True
+            if (df["obscured"] == "No").any():
+                has_non_obscured = True
+        except Exception:
+            return
+
+    is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
+    if taxon["rank"] == _CONFIG.species_rank:
+        for desc in iter_descendants(taxon, include_self=True):
+            _scan(TREE_ROOT / desc["path"] / _OCC_FILE)
+    elif is_leaf:
+        _scan(TREE_ROOT / taxon["path"] / _OCC_FILE)
+    else:
+        for desc in iter_descendants(taxon, include_self=False):
+            _scan(TREE_ROOT / desc["path"] / _OCC_FILE)
+
+    return has_any and not has_non_obscured
+
+
 @app.get("/api/species/{taxon_id}/obscured")
-def get_species_obscured(taxon_id: str):
+def get_species_obscured(
+    taxon_id: str,
+    location: str | None = Query(None, description="Optional location GID to scope the obscured check"),
+):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    return {"allObscured": False}
+    location_gid = location.strip() if location else None
+    all_obscured = _check_all_obscured(taxon, location_gid)
+    return {
+        "taxon_id": taxon_id,
+        "all_obscured": all_obscured,
+        "allObscured": all_obscured,
+        "location_filtered": location_gid is not None,
+    }
 
 
 @app.get("/api/taxon/{taxon_id}/env-stats")
@@ -1002,6 +1114,17 @@ def get_species_environment(
                     "categorical_distribution": categorical_distribution,
                     "relative_ranks": [],
                 }
+            else:
+                if _check_all_obscured(taxon, location):
+                    return {
+                        "all_obscured": True,
+                        "species_id": taxon.get("taxon_key"),
+                        "variable": variable_id,
+                    }
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}' with the active filters.",
+                )
 
     if value_type in ("nominal", "ordinal"):
         stats_file = ORDINAL_STATS_FILE if value_type == "ordinal" else NOMINAL_STATS_FILE

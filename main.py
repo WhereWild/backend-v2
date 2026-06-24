@@ -238,7 +238,7 @@ def _image_fields(taxon: dict) -> dict:
     }
 
 
-_VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "categorical", "ordinal": "ordinal"}
+_VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "categorical", "ordinal": "ordinal", "circular": "circular"}
 
 
 @app.get("/")

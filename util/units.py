@@ -24,11 +24,13 @@ _CONVERSION: dict[tuple[str, str], tuple[float, float]] = {
     ("mph", "m s⁻¹"):     (1 / 2.2369362921, 0.0),
 }
 
-# Metrics whose values are dimensionless (counts, fractions, angular stats).
+# Metrics whose values are dimensionless (counts, fractions, unitless ratios).
 # These are never converted and never carry a unit label.
+# Note: circular_mean and circular_std are in degrees and are NOT here — they
+# inherit their units from the layer (e.g. "°" for aspect).
 _DIMENSIONLESS_METRICS = frozenset({
     "count", "unique_samples", "total_samples", "unique_classes",
-    "rbar", "circular_var", "circular_std", "circular_mean",
+    "rbar", "circular_var",
 })
 
 # Differential entropy transforms as H(aX+b) = H(X) + log|a| under unit scaling.

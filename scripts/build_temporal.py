@@ -820,39 +820,53 @@ def _prefetch_chunks(
     Multiple timestamps that resolve to the same file are deduplicated.
     Returns the set of local filenames that are needed (used by cleanup).
     """
-    # needed maps local_filename → (entry, model, raw_var)
-    needed: dict[str, tuple[object, str, str]] = {}
+    # needed maps local_filename → (entry, model, raw_var, is_frontier)
+    # is_frontier=True triggers an S3 freshness check on the cached file so that
+    # new GFS model cycles (which rewrite the rolling frontier chunk in-place on
+    # S3) are picked up without waiting for the chunk to age out of the cache.
+    needed: dict[str, tuple[object, str, str, bool]] = {}
 
     # GFS: add step + all window drop steps
     for gv, cidx in gfs_cidx.items():
+        # The chunk containing gfs_end_ts is the live frontier — Open-Meteo
+        # rewrites it on every GFS cycle run, so we must check S3 freshness.
+        frontier_entry, _ = _chunk_entry_for_time(cidx, gfs_end_ts)
+        frontier_chunk_num = frontier_entry.chunk_num if frontier_entry is not None else None
+
         timestamps = [gfs_end_ts] + [gfs_end_ts - wh * 3600 for wh in window_hours]
         for ts in timestamps:
             entry, _ = _chunk_entry_for_time(cidx, ts)
             if entry is not None and entry.source != "year":
                 key = f"ncep_gfs013_{gv}_chunk_{entry.chunk_num}.om"
-                needed[key] = (entry, "ncep_gfs013", gv)
+                is_frontier = entry.chunk_num == frontier_chunk_num
+                # Preserve is_frontier=True if already set by an earlier timestamp
+                if key not in needed or is_frontier:
+                    needed[key] = (entry, "ncep_gfs013", gv, is_frontier)
 
     # ERA5: quality-swap zone — when ERA5 has advanced since last run we need
     # both the ERA5 data to add and the ERA5 chunk files covering that period.
+    # ERA5 chunks are sealed/immutable once written; no freshness check needed.
     if era5_end_ts > old_era5_end_ts:
         for (era5_model, rv), cidx in era5_cidx_flat.items():
             for ts in (old_era5_end_ts + cidx.resolution, era5_end_ts):
                 entry, _ = _chunk_entry_for_time(cidx, ts)
                 if entry is not None and entry.source != "year":
                     key = f"{era5_model}_{rv}_chunk_{entry.chunk_num}.om"
-                    needed[key] = (entry, era5_model, rv)
+                    if key not in needed:
+                        needed[key] = (entry, era5_model, rv, False)
 
     if not needed:
         return set()
 
-    print(f"  pre-fetching {len(needed)} chunk(s) in parallel …", flush=True)
+    frontier_count = sum(1 for _, _, _, f in needed.values() if f)
+    print(f"  pre-fetching {len(needed)} chunk(s) ({frontier_count} frontier) in parallel …", flush=True)
     t0 = time.perf_counter()
 
-    def _fetch(entry: object, model: str, rv: str) -> None:
-        _download_chunk(entry, model, rv, cache_dir)
+    def _fetch(entry: object, model: str, rv: str, is_frontier: bool) -> None:
+        _download_chunk(entry, model, rv, cache_dir, check_freshness=is_frontier)
 
     with ThreadPoolExecutor(max_workers=len(needed)) as pool:
-        futures = [pool.submit(_fetch, e, m, v) for e, m, v in needed.values()]
+        futures = [pool.submit(_fetch, e, m, v, f) for e, m, v, f in needed.values()]
         for f in futures:
             f.result()
 

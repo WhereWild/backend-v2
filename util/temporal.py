@@ -636,11 +636,18 @@ def _download_chunk(
     model: str,
     variable: str,
     cache_dir: str,
+    *,
+    check_freshness: bool = False,
 ) -> Path:
     """Download a single .om chunk to local disk via fsspec and return the path.
 
     Uses per-file locking so concurrent workers don't race to download the same
     file, and writes via a .tmp rename so readers never see a partial file.
+
+    When check_freshness=True and the file is already cached, a cheap S3 HEAD
+    request compares LastModified against the local mtime. If S3 is newer the
+    local copy is deleted so the file is re-downloaded. Use this for frontier
+    chunks (the rolling chunk that Open-Meteo rewrites on each GFS cycle).
     """
     filename = _chunk_filename(chunk_entry)
     uri = f"s3://openmeteo/data/{model}/{variable}/{filename}"
@@ -650,7 +657,22 @@ def _download_chunk(
     target = dest_dir / f"{model}_{variable}_{filename}"
 
     if target.exists():
-        return target
+        if check_freshness:
+            try:
+                fs = fsspec.filesystem("s3", anon=True)
+                s3_mtime = fs.info(uri).get("LastModified")
+                if s3_mtime is not None:
+                    local_mtime = datetime.fromtimestamp(target.stat().st_mtime, tz=UTC)
+                    if s3_mtime > local_mtime:
+                        target.unlink(missing_ok=True)
+                    else:
+                        return target
+                else:
+                    return target
+            except Exception:
+                return target  # HEAD failed — use cached copy
+        else:
+            return target
 
     key = str(target)
     with _DOWNLOAD_CHUNK_LOCKS_MX:

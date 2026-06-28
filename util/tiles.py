@@ -126,6 +126,7 @@ _MODEL_GRID_PARAMS: dict[str, dict] = {
 }
 
 _npy_cache: dict[Path, tuple[float, np.ndarray]] = {}
+_meta_cache: dict[Path, tuple[float, dict]] = {}
 
 
 def _load_temporal_npy(path: Path) -> np.ndarray | None:
@@ -368,14 +369,29 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEF
 # Tile renderer
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=128)
 def _load_temporal_meta(var_id: str, window_label: str, suffix: str = "") -> dict:
     path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{suffix}.meta.json"
+    storage = _storage.current()
+    cached = _meta_cache.get(path)
+    if cached is not None:
+        if not storage.is_remote and path.exists() and cached[0] != path.stat().st_mtime:
+            pass  # local file changed — fall through to reload
+        else:
+            return cached[1]
     try:
-        with _storage.open_input_file(path) as f:
-            return json.loads(f.read())
+        if path.exists():
+            meta = json.loads(path.read_text())
+            mtime = path.stat().st_mtime
+        elif storage.is_remote:
+            with _storage.open_input_file(path) as f:
+                meta = json.loads(f.read())
+            mtime = 0.0
+        else:
+            return {}
     except Exception:
         return {}
+    _meta_cache[path] = (mtime, meta)
+    return meta
 
 
 def get_layer_render_range(layer: dict, forecast_suffix: str = "") -> tuple[float | None, float | None]:

@@ -187,7 +187,7 @@ def _full_build(
 ) -> None:
     era5_model = cfg["era5_model"]
     agg = cfg["agg"]
-    w_start = now_ts - max(window_h - 1, 1) * 3600
+    w_start = now_ts - (window_h - 1) * 3600
 
     sums: dict[str, np.ndarray] = {}
     n_era5, n_gfs = 0, 0
@@ -431,13 +431,16 @@ def _incremental_update(
                         sums[c] = np.maximum(0, sums[c] - sub[c])
                 n_gfs -= int(round((gfs_drop_end - gfs_drop_start) / resolution)) + 1
 
-        # Add newest GFS hours — start at old_gfs_end + 1h to avoid double-counting
+        # Add newest GFS hours — start at old_gfs_end + 1h to avoid double-counting.
+        # Cap at new_w_start so a stale build doesn't add hours before the window.
         if gfs_end_ts > old_gfs_end:
-            add = _mode_accumulate(old_gfs_end + resolution, gfs_end_ts, use_gfs=True)
-            if add:
-                for c in RASTER_WC_CODES:
-                    sums[c] = sums[c] + add[c]
-            n_gfs += int(round((gfs_end_ts - old_gfs_end) / cc_cidx.resolution))
+            add_start = max(old_gfs_end + resolution, new_w_start)
+            if gfs_end_ts >= add_start:
+                add = _mode_accumulate(add_start, gfs_end_ts, use_gfs=True)
+                if add:
+                    for c in RASTER_WC_CODES:
+                        sums[c] = sums[c] + add[c]
+                n_gfs += int(round((gfs_end_ts - add_start) / cc_cidx.resolution)) + 1
 
     elif var_id == "vapor_pressure_deficit":
         # VPD incremental: accumulate per-timestep VPD directly (not T/Td separately)
@@ -493,11 +496,13 @@ def _incremental_update(
                 n_gfs -= drop_n
 
         if gfs_end_ts > old_gfs_end:
-            add_n = int(round((gfs_end_ts - old_gfs_end) / resolution))
-            added = _vpd_gfs(old_gfs_end + resolution, gfs_end_ts)
-            if added is not None:
-                sums["gfs_vpd"] = sums.get("gfs_vpd", np.zeros_like(added)) + added
-            n_gfs += add_n
+            add_start = max(old_gfs_end + resolution, new_w_start)
+            if gfs_end_ts >= add_start:
+                add_n = int(round((gfs_end_ts - add_start) / resolution)) + 1
+                added = _vpd_gfs(add_start, gfs_end_ts)
+                if added is not None:
+                    sums["gfs_vpd"] = sums.get("gfs_vpd", np.zeros_like(added)) + added
+                n_gfs += add_n
 
     else:
         # Scalar incremental
@@ -569,13 +574,15 @@ def _incremental_update(
                 n_gfs -= drop_n
 
         if gfs_end_ts > old_gfs_end:
-            add_n = int(round((gfs_end_ts - old_gfs_end) / resolution))
-            for gv in _gfs_raw_vars(cfg):
-                added = _accum_gfs_reproj(gv, old_gfs_end + resolution, gfs_end_ts)
-                if added is not None:
-                    key = f"gfs_{gv}"
-                    sums[key] = sums.get(key, np.zeros_like(added)) + added
-            n_gfs += add_n
+            add_start = max(old_gfs_end + resolution, new_w_start)
+            if gfs_end_ts >= add_start:
+                add_n = int(round((gfs_end_ts - add_start) / resolution)) + 1
+                for gv in _gfs_raw_vars(cfg):
+                    added = _accum_gfs_reproj(gv, add_start, gfs_end_ts)
+                    if added is not None:
+                        key = f"gfs_{gv}"
+                        sums[key] = sums.get(key, np.zeros_like(added)) + added
+                n_gfs += add_n
 
     n_era5 = max(n_era5, 0)
     n_gfs = max(n_gfs, 0)

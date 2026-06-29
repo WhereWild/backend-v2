@@ -37,11 +37,15 @@ import httpx
 import numpy as np
 import pytest
 
+import scripts.build_temporal as bt
 from util.temporal import (
     RASTER_GRIDS,
     accumulate_raster,
     build_chunk_index,
     grid_indices,
+    load_raster_state,
+    save_raster_state,
+    set_raster_chunk_cache,
 )
 
 pytestmark = pytest.mark.live
@@ -114,6 +118,14 @@ _CASE_TEMPLATES: list[dict[str, Any]] = [
 def _live_gate(request: pytest.FixtureRequest) -> None:
     if not request.config.getoption("--live"):
         pytest.skip("live S3 raster tests skipped — use: pt --temporal")
+
+
+@pytest.fixture(scope="session")
+def live_chunk_cache(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Session-scoped local chunk cache so S3 chunks are downloaded once per session."""
+    cache = str(tmp_path_factory.mktemp("chunk_cache"))
+    set_raster_chunk_cache(cache)
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +249,171 @@ def _pipeline_value(case: dict[str, Any], obs_ts: int) -> float:
     cell_sum = float(sum_grid[lat_idx, lon_idx])
     raw = cell_sum if agg == "sum" else cell_sum / n_steps
     return round(raw, api_decimals)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Incremental correctness: 1h cloud_cover with real S3 GFS data
+# ---------------------------------------------------------------------------
+
+def test_cloud_cover_24h_incremental_bounds(
+    live_raster_expected: dict[str, Any],
+    live_chunk_cache: str,
+    tmp_path: Path,
+) -> None:
+    """Seed 24h cloud_cover state from real ERA5 data, slide the window twice, assert bounds.
+
+    Uses the same frozen obs_ts as the API-matching tests (60 days before ERA5 end)
+    so the year file chunk is already warm and the S3 reads are fast.
+    Validates that drop-oldest / add-newest keeps n_total constant and output
+    stays within 0–100 % across two 1h advances.
+    """
+    obs_ts_raw = live_raster_expected.get("obs_ts")
+    if obs_ts_raw is None:
+        pytest.skip("obs_ts missing — regenerate with --regenerate-live")
+
+    # obs_ts is ~60 days before era5_end; use obs_ts-26h as "now" so there's
+    # room to advance 2 more hours fully inside ERA5 territory.
+    obs_ts = float(int(obs_ts_raw) // 3600 * 3600) - 26 * 3600
+    era5_end = int(_model_end_ts(_ERA5_MODEL)) // 3600 * 3600
+    # Pretend ERA5 ends 2h after obs_ts so each slide adds exactly 1 ERA5 hour.
+    fake_era5_end = obs_ts + 2 * 3600
+
+    era5_cidx_obj = build_chunk_index("copernicus_era5", "cloud_cover")
+    era5_cidx = {"cloud_cover": era5_cidx_obj}
+    gfs_cidx_obj = build_chunk_index("ncep_gfs013", "cloud_cover")
+    gfs_cidx = {"cloud_cover": gfs_cidx_obj}
+    cfg = bt.VAR_CONFIGS["cloud_cover"]
+    out_dir = str(tmp_path)
+
+    # Seed: accumulate 24h ERA5 window ending at obs_ts
+    w_start = obs_ts - 23 * 3600
+    era5_sum, n_era5 = accumulate_raster("copernicus_era5", "cloud_cover",
+                                          w_start, obs_ts, era5_cidx_obj)
+    sums: dict[str, Any] = {
+        "era5_cloud_cover": era5_sum,
+        "gfs_cloud_cover": np.zeros_like(era5_sum),
+    }
+    meta: dict[str, Any] = {
+        "var_id": "cloud_cover",
+        "window_h": 24,
+        "window_label": "24h",
+        "era5_window_start_ts": w_start,
+        "era5_end_ts": fake_era5_end,
+        "gfs_start_ts": fake_era5_end + 3600,
+        "gfs_end_ts": obs_ts,   # gfs_end < gfs_start → 0 GFS steps in seed
+        "n_era5": n_era5,
+        "n_gfs": 0,
+        "built_at": datetime.fromtimestamp(obs_ts, UTC).isoformat(),
+    }
+    save_raster_state(out_dir, "cloud_cover", "24h", "avg", sums, meta)
+
+    for step in range(2):
+        now_ts = obs_ts + (step + 1) * 3600
+        loaded_sums, loaded_meta = load_raster_state(out_dir, "cloud_cover", "24h")
+        bt._incremental_update(
+            "cloud_cover", cfg, 24, "24h",
+            sums={k: v.copy() for k, v in loaded_sums.items()},
+            old_meta=loaded_meta,
+            now_ts=now_ts,
+            era5_end_ts=fake_era5_end,
+            gfs_end_ts=obs_ts,   # frozen — drops oldest ERA5, adds no GFS
+            era5_cidx=era5_cidx,
+            gfs_cidx=gfs_cidx,
+            out_dir=out_dir,
+        )
+
+        result = np.load(tmp_path / "cloud_cover_24h.npy")
+        lo_bad = int((result < -1.0).sum())
+        hi_bad = int((result > 101.0).sum())
+        assert lo_bad == 0, f"step {step+1}: {lo_bad} pixels below -1 % (min={result.min():.2f})"
+        assert hi_bad == 0, f"step {step+1}: {hi_bad} pixels above 101 % (max={result.max():.2f})"
+
+
+# ---------------------------------------------------------------------------
+# Incremental correctness: 1h cloud_cover, stale build (11h gap)
+# ---------------------------------------------------------------------------
+
+def test_cloud_cover_1h_stale_incremental(
+    live_raster_expected: dict[str, Any],
+    live_chunk_cache: str,
+    tmp_path: Path,
+) -> None:
+    """Seed a 1h cloud_cover window then advance 11h in one stale build.
+
+    This is the exact scenario that caused persistent bad n_gfs counts in
+    production: the build falls behind by many hours (restart, sleep, etc.)
+    and the catch-up incremental adds all hours since old_gfs_end instead of
+    only the hours inside the new window.
+
+    Key assertion: after the stale advance, meta["n_gfs"] == 1 (not 11).
+    A 1h window should always hold exactly 1 GFS step.
+    """
+    obs_ts_raw = live_raster_expected.get("obs_ts")
+    if obs_ts_raw is None:
+        pytest.skip("obs_ts missing — regenerate with --regenerate-live")
+
+    obs_ts = float(int(obs_ts_raw) // 3600 * 3600)
+    era5_cidx_obj = build_chunk_index("copernicus_era5", "cloud_cover")
+    era5_cidx = {"cloud_cover": era5_cidx_obj}
+    gfs_cidx_obj = build_chunk_index("ncep_gfs013", "cloud_cover")
+    gfs_cidx = {"cloud_cover": gfs_cidx_obj}
+    cfg = bt.VAR_CONFIGS["cloud_cover"]
+    out_dir = str(tmp_path)
+
+    # Seed: 1h window fully inside ERA5 territory, 0 GFS steps.
+    # old_gfs_end = obs_ts; gfs_start > gfs_end means no GFS in window.
+    era5_sum, n_era5 = accumulate_raster(
+        "copernicus_era5", "cloud_cover", obs_ts, obs_ts, era5_cidx_obj
+    )
+    sums: dict[str, Any] = {
+        "era5_cloud_cover": era5_sum,
+        "gfs_cloud_cover": np.zeros_like(era5_sum),
+    }
+    meta: dict[str, Any] = {
+        "var_id": "cloud_cover",
+        "window_h": 1,
+        "window_label": "1h",
+        "era5_window_start_ts": obs_ts,
+        "era5_end_ts": obs_ts,
+        "gfs_start_ts": obs_ts + 3600,   # no GFS in seed
+        "gfs_end_ts": obs_ts,
+        "n_era5": n_era5,
+        "n_gfs": 0,
+        "built_at": datetime.fromtimestamp(obs_ts, UTC).isoformat(),
+    }
+    save_raster_state(out_dir, "cloud_cover", "1h", "avg", sums, meta)
+
+    # Stale build: advance 11h in one shot.
+    # new_w_start = obs_ts + 11h (1h window), so only obs_ts+11h should be added.
+    now_ts = obs_ts + 11 * 3600
+    gfs_end_ts = obs_ts + 11 * 3600
+    loaded_sums, loaded_meta = load_raster_state(out_dir, "cloud_cover", "1h")
+    bt._incremental_update(
+        "cloud_cover", cfg, 1, "1h",
+        sums={k: v.copy() for k, v in loaded_sums.items()},
+        old_meta=loaded_meta,
+        now_ts=now_ts,
+        era5_end_ts=obs_ts,       # ERA5 hasn't advanced
+        gfs_end_ts=gfs_end_ts,
+        era5_cidx=era5_cidx,
+        gfs_cidx=gfs_cidx,
+        out_dir=out_dir,
+    )
+
+    _, out_meta = load_raster_state(out_dir, "cloud_cover", "1h")
+    n_gfs_actual = int(out_meta["n_gfs"])
+    assert n_gfs_actual == 1, (
+        f"Expected n_gfs=1 after 11h-stale 1h-window build, got {n_gfs_actual}. "
+        f"The stale add step is accumulating hours outside the window."
+    )
+
+    result = np.load(tmp_path / "cloud_cover_1h.npy")
+    lo_bad = int((result < -1.0).sum())
+    hi_bad = int((result > 101.0).sum())
+    assert lo_bad == 0, f"stale 1h build: {lo_bad} pixels below -1 % (min={result.min():.2f})"
+    assert hi_bad == 0, f"stale 1h build: {hi_bad} pixels above 101 % (max={result.max():.2f})"
 
 
 # ---------------------------------------------------------------------------

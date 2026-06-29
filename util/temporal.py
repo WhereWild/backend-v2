@@ -2253,12 +2253,19 @@ def reproject_to_grid(
     dst_lat_max: float,
     dst_lon_min: float,
     dst_lon_max: float,
+    resampling: str = "bilinear",
 ) -> np.ndarray:
-    """Bilinear reproject src (lat-ascending float array) onto a new WGS84 grid.
+    """Reproject src (lat-ascending float array) onto a new WGS84 grid.
 
     Both grids must be in geographic coordinates (degrees).  src must already
     be lat-ascending (flipud applied before calling).
+
+    resampling: "bilinear" (default, for continuous data) or "average"
+        (for count/integer data going fine→coarse — averages all source pixels
+        that overlap each destination pixel, avoiding the nearest-center-sample
+        artifact of bilinear on discrete grids).
     """
+    _resamp = _Resampling.average if resampling == "average" else _Resampling.bilinear
     src_f = np.asarray(src, dtype=np.float32)
     src_ny, src_nx = src_f.shape
 
@@ -2270,7 +2277,7 @@ def reproject_to_grid(
         source=src_f, destination=dst,
         src_transform=src_transform, src_crs=_WGS84,
         dst_transform=dst_transform, dst_crs=_WGS84,
-        resampling=_Resampling.bilinear,
+        resampling=_resamp,
         src_nodata=np.nan, dst_nodata=np.nan,
     )
     return dst

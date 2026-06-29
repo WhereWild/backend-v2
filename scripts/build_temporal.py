@@ -229,7 +229,7 @@ def _full_build(
         gfs_pr = gfs_cidx.get("precipitation")
         gfs_sw = gfs_cidx.get("snowfall_water_equivalent")
         gfs_mode_start = gfs_start
-        if gfs_cc and gfs_pr and gfs_sw and gfs_mode_start < gfs_end_ts:
+        if gfs_cc and gfs_pr and gfs_sw and gfs_mode_start <= gfs_end_ts:
             gfs_counts = accumulate_raster_mode(
                 "ncep_gfs013", gfs_mode_start, gfs_end_ts,
                 gfs_cc, gfs_pr, gfs_sw,
@@ -243,6 +243,7 @@ def _full_build(
                     era5_grid["ny"], era5_grid["nx"],
                     era5_grid["lat_min"], era5_grid["lat_max"],
                     era5_grid["lon_min"], era5_grid["lon_max"],
+                    resampling="average",
                 )
                 sums[c] = sums[c] + np.round(gfs_reproj).astype(np.int32)
             n_gfs = max(0, int(round((gfs_end_ts - gfs_mode_start) / gfs_cc.resolution)))
@@ -261,7 +262,7 @@ def _full_build(
         # GFS gap fill: per-timestep VPD from T + RH
         t_cidx_gfs = gfs_cidx.get("temperature_2m")
         rh_cidx_gfs = gfs_cidx.get("relative_humidity_2m")
-        if t_cidx_gfs and rh_cidx_gfs and gfs_start < gfs_end_ts:
+        if t_cidx_gfs and rh_cidx_gfs and gfs_start <= gfs_end_ts:
             vpd_gfs_sum, n_gfs = accumulate_vpd_raster_gfs(
                 gfs_start, gfs_end_ts, t_cidx_gfs, rh_cidx_gfs, era5_model
             )
@@ -293,7 +294,7 @@ def _full_build(
             # Derive GFS dew point from T + RH
             t_cidx = gfs_cidx.get("temperature_2m")
             rh_cidx = gfs_cidx.get("relative_humidity_2m")
-            if t_cidx and rh_cidx and gfs_start < gfs_end_ts:
+            if t_cidx and rh_cidx and gfs_start <= gfs_end_ts:
                 t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", gfs_start, gfs_end_ts, t_cidx)
                 rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", gfs_start, gfs_end_ts, rh_cidx)
                 n = min(t_n, rh_n)
@@ -313,7 +314,7 @@ def _full_build(
         else:
             for gv in _gfs_raw_vars(cfg):
                 cidx = gfs_cidx.get(gv)
-                if not cidx or gfs_start >= gfs_end_ts:
+                if not cidx or gfs_start > gfs_end_ts:
                     continue
                 acc, n = accumulate_raster("ncep_gfs013", gv, gfs_start, gfs_end_ts, cidx)
                 reproj = reproject_to_grid(
@@ -394,6 +395,7 @@ def _incremental_update(
                         gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
                         era5_g["ny"], era5_g["nx"],
                         era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
+                        resampling="average",
                     )).astype(np.int32)
             return delta
 
@@ -596,6 +598,200 @@ def _incremental_update(
         "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
     }
     save_raster_state(out_dir, var_id, window_label, agg, sums, meta)
+
+
+# ---------------------------------------------------------------------------
+# GFS cycle re-derive: rebuild only the GFS portion when frontier chunk changes
+# ---------------------------------------------------------------------------
+
+def _gfs_rederive(
+    var_id: str,
+    cfg: dict,
+    window_h: int,
+    window_label: str,
+    existing_sums: dict,
+    existing_meta: dict,
+    now_ts: float,
+    era5_end_ts: float,
+    gfs_end_ts: float,
+    era5_cidx: dict,
+    gfs_cidx: dict,
+    out_dir: str,
+) -> None:
+    """Re-accumulate GFS sums after a GFS cycle replaces the frontier chunk.
+
+    A new GFS cycle revises recent short-range forecast hours (the 3-6 h ahead
+    values from the previous cycle's initialization). The incremental drop reads
+    from the current chunk; the stored sums were built from the older chunk.
+    When those values differ the drop over-subtracts, leaving negative residuals.
+
+    ERA5 sums are preserved — ERA5 is immutable. GFS sums are zeroed and rebuilt
+    from the current frontier chunk for the full GFS window (max 7 days).
+    For mode vars the sums interleave ERA5+GFS irretrievably; fall back to _full_build.
+    """
+    agg = cfg["agg"]
+
+    if agg == "mode":
+        _full_build(var_id, cfg, window_h, window_label, now_ts, era5_end_ts, gfs_end_ts,
+                    era5_cidx, gfs_cidx, out_dir)
+        return
+
+    era5_model = cfg["era5_model"]
+    resolution = 3600.0
+    dst_g = RASTER_GRIDS[era5_model]
+    gfs_g = RASTER_GRIDS["ncep_gfs013"]
+
+    new_w_start = now_ts - (window_h - 1) * 3600
+    new_gfs_start = max(era5_end_ts + resolution, new_w_start)
+
+    old_w_start = float(existing_meta["era5_window_start_ts"])
+    old_era5_end = float(existing_meta["era5_end_ts"])
+    old_gfs_end = float(existing_meta["gfs_end_ts"])
+
+    # Deep-copy ERA5 sums; zero all GFS sums.
+    sums: dict = {}
+    for k, v in existing_sums.items():
+        sums[k] = np.zeros_like(v) if str(k).startswith("gfs_") else v.copy()
+
+    n_gfs = 0
+
+    if var_id == "vapor_pressure_deficit":
+        t_cidx = era5_cidx.get("temperature_2m")
+        td_cidx = era5_cidx.get("dew_point_2m")
+        t_cidx_gfs = gfs_cidx.get("temperature_2m")
+        rh_cidx_gfs = gfs_cidx.get("relative_humidity_2m")
+
+        def _vpd_era5_acc(start: float, end: float) -> np.ndarray | None:
+            if not t_cidx or not td_cidx or end < start:
+                return None
+            acc, _ = accumulate_vpd_raster(era5_model, start, end, t_cidx, td_cidx)
+            return acc.astype(np.float32)
+
+        if era5_end_ts > old_era5_end:
+            swap_start = max(old_era5_end + resolution, old_w_start)
+            swap_end = min(era5_end_ts, old_gfs_end)
+            if swap_end >= swap_start:
+                added = _vpd_era5_acc(swap_start, swap_end)
+                if added is not None:
+                    sums["era5_vpd"] = sums.get("era5_vpd", np.zeros_like(added)) + added
+
+        if new_w_start > old_w_start:
+            era5_drop_end = min(new_w_start - resolution, era5_end_ts)
+            if era5_drop_end >= old_w_start:
+                dropped = _vpd_era5_acc(old_w_start, era5_drop_end)
+                if dropped is not None and "era5_vpd" in sums:
+                    sums["era5_vpd"] = sums["era5_vpd"] - dropped
+
+        if new_gfs_start <= gfs_end_ts and t_cidx_gfs and rh_cidx_gfs:
+            vpd_acc, n_gfs = accumulate_vpd_raster_gfs(
+                new_gfs_start, gfs_end_ts, t_cidx_gfs, rh_cidx_gfs, era5_model
+            )
+            sums["gfs_vpd"] = vpd_acc
+
+    elif var_id == "dew_point_2m":
+        td_era5_cidx = era5_cidx.get("dew_point_2m")
+        t_cidx_gfs = gfs_cidx.get("temperature_2m")
+        rh_cidx_gfs = gfs_cidx.get("relative_humidity_2m")
+
+        if era5_end_ts > old_era5_end:
+            swap_start = max(old_era5_end + resolution, old_w_start)
+            swap_end = min(era5_end_ts, old_gfs_end)
+            if swap_end >= swap_start and td_era5_cidx:
+                added, _ = accumulate_raster(era5_model, "dew_point_2m", swap_start, swap_end, td_era5_cidx)
+                key = "era5_dew_point_2m"
+                sums[key] = sums.get(key, np.zeros_like(added)) + added
+
+        if new_w_start > old_w_start and td_era5_cidx:
+            era5_drop_end = min(new_w_start - resolution, era5_end_ts)
+            if era5_drop_end >= old_w_start:
+                dropped, _ = accumulate_raster(era5_model, "dew_point_2m", old_w_start, era5_drop_end, td_era5_cidx)
+                if "era5_dew_point_2m" in sums:
+                    sums["era5_dew_point_2m"] = sums["era5_dew_point_2m"] - dropped
+
+        if new_gfs_start <= gfs_end_ts and t_cidx_gfs and rh_cidx_gfs:
+            t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", new_gfs_start, gfs_end_ts, t_cidx_gfs)
+            rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", new_gfs_start, gfs_end_ts, rh_cidx_gfs)
+            n_gfs = min(t_n, rh_n)
+            if n_gfs > 0:
+                t_avg = (t_sum / n_gfs).astype(np.float32)
+                rh_avg = (rh_sum / n_gfs).astype(np.float32)
+                td_gfs = _derive_dew_point(t_avg, rh_avg)
+                td_repr = reproject_to_grid(
+                    td_gfs,
+                    gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                    dst_g["ny"], dst_g["nx"],
+                    dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
+                )
+                sums["gfs_dew_point_2m"] = td_repr.astype(np.float64) * n_gfs
+
+    else:
+        # Standard scalar vars with gfs_var
+        def _era5_acc(rv: str, start: float, end: float) -> np.ndarray | None:
+            cidx = era5_cidx.get(rv)
+            if not cidx or end < start:
+                return None
+            acc, _ = accumulate_raster(era5_model, rv, start, end, cidx)
+            return acc.astype(np.float32)
+
+        def _gfs_acc(gv: str, start: float, end: float) -> np.ndarray | None:
+            cidx = gfs_cidx.get(gv)
+            if not cidx or end < start:
+                return None
+            acc, _ = accumulate_raster("ncep_gfs013", gv, start, end, cidx)
+            return reproject_to_grid(
+                acc.astype(np.float32),
+                gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                dst_g["ny"], dst_g["nx"],
+                dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
+            )
+
+        if era5_end_ts > old_era5_end:
+            swap_start = max(old_era5_end + resolution, old_w_start)
+            swap_end = min(era5_end_ts, old_gfs_end)
+            if swap_end >= swap_start:
+                for rv in _era5_raw_vars(cfg):
+                    added = _era5_acc(rv, swap_start, swap_end)
+                    if added is not None:
+                        key = f"era5_{rv}"
+                        sums[key] = sums.get(key, np.zeros_like(added)) + added
+
+        if new_w_start > old_w_start:
+            era5_drop_end = min(new_w_start - resolution, era5_end_ts)
+            if era5_drop_end >= old_w_start:
+                for rv in _era5_raw_vars(cfg):
+                    dropped = _era5_acc(rv, old_w_start, era5_drop_end)
+                    if dropped is not None:
+                        key = f"era5_{rv}"
+                        if key in sums:
+                            sums[key] = sums[key] - dropped
+
+        if new_gfs_start <= gfs_end_ts:
+            for gv in _gfs_raw_vars(cfg):
+                added = _gfs_acc(gv, new_gfs_start, gfs_end_ts)
+                if added is not None:
+                    sums[f"gfs_{gv}"] = added.astype(np.float64)
+                    n_gfs = max(n_gfs, int(round((gfs_end_ts - new_gfs_start) / resolution)) + 1)
+
+    # n_era5 derived from the window range — more reliable than tracking deltas.
+    n_era5 = (
+        int(round((era5_end_ts - new_w_start) / resolution)) + 1
+        if new_w_start <= era5_end_ts else 0
+    )
+    n_era5 = max(n_era5, 0)
+    n_gfs = max(n_gfs, 0)
+
+    meta = {
+        **existing_meta,
+        "era5_end_ts": era5_end_ts,
+        "era5_window_start_ts": new_w_start,
+        "gfs_start_ts": new_gfs_start,
+        "gfs_end_ts": gfs_end_ts,
+        "n_era5": n_era5,
+        "n_gfs": n_gfs,
+        "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
+    }
+    save_raster_state(out_dir, var_id, window_label, agg, sums, meta)
+    print(f"  [{window_label}] {var_id}: GFS re-derived ({n_gfs}h), ERA5 {n_era5}h preserved", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -997,6 +1193,7 @@ def main() -> None:
     forecast_done: list[bool] = [
         same_data and bool(prior_state.get("forecast_completed"))
     ]
+    frontier_chunk_nums: dict = {}  # populated after chunk indices are built
 
     def _write_state(status: str, *, skipped: bool = False, error: str | None = None) -> None:
         state: dict = {
@@ -1008,6 +1205,7 @@ def main() -> None:
             "skipped": skipped,
             "completed_vars": completed_vars,
             "forecast_completed": forecast_done[0],
+            "gfs_frontier_chunks": frontier_chunk_nums,
         }
         if status == "completed":
             state["completed_at"] = datetime.now(UTC).isoformat()
@@ -1040,6 +1238,23 @@ def main() -> None:
                 print(f"  GFS {gv}: {len(gfs_cidx[gv].ranges)} range(s)")
             except Exception as e:
                 print(f"  GFS {gv}: unavailable ({e})")
+
+        # Detect GFS frontier chunk rotation — a new cycle may revise recent
+        # short-range forecast values, making stored GFS sums inconsistent.
+        for gv, cidx in gfs_cidx.items():
+            entry, _ = _chunk_entry_for_time(cidx, gfs_end_ts)
+            if entry is not None:
+                frontier_chunk_nums[gv] = entry.chunk_num
+
+        prev_frontier_nums: dict = prior_state.get("gfs_frontier_chunks", {})
+        gfs_cycle_changed = bool(frontier_chunk_nums) and any(
+            frontier_chunk_nums.get(gv) != prev_frontier_nums.get(gv)
+            for gv in frontier_chunk_nums
+        )
+        if gfs_cycle_changed:
+            changed = [gv for gv in frontier_chunk_nums
+                       if frontier_chunk_nums[gv] != prev_frontier_nums.get(gv)]
+            print(f"  GFS frontier chunk changed ({changed}) → will re-derive GFS sums", flush=True)
 
         era5_cidx_by_var: dict[str, dict[str, ChunkIndex]] = {}
         for var_id, vcfg in var_configs.items():
@@ -1096,6 +1311,10 @@ def main() -> None:
                 print(f"  [{wl}] {var_id} full build …", flush=True)
                 _full_build(var_id, vcfg, window_h, wl, now_ts, era5_end, gfs_end_ts,
                             era5_cidx, gfs_cidx, out_dir)
+            elif gfs_cycle_changed:
+                print(f"  [{wl}] {var_id} GFS cycle re-derive …", flush=True)
+                _gfs_rederive(var_id, vcfg, window_h, wl, existing_sums, existing_meta,
+                              now_ts, era5_end, gfs_end_ts, era5_cidx, gfs_cidx, out_dir)
             else:
                 stale_h = (now_ts - float(existing_meta["gfs_end_ts"])) / 3600
                 print(f"  [{wl}] {var_id} incremental ({stale_h:.1f}h stale) …", flush=True)

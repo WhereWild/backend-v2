@@ -2187,8 +2187,6 @@ def accumulate_raster_mode(
         if t1 <= t0:
             continue
 
-        # Open cc reader once for the whole chunk but read one step at a time to
-        # avoid materialising a (ny, nx, n_steps) float64 array for large windows.
         cc_reader = _open_chunk(cc_entry, model, "cloud_cover", n_steps=t1 - t0)
         rny, rnx, _ = cc_reader.shape
         ny, nx = rny, rnx
@@ -2197,39 +2195,42 @@ def accumulate_raster_mode(
             for c in RASTER_WC_CODES:
                 counts[c] = np.zeros((ny, nx), dtype=np.int32)
 
-        # Cache open readers for pr/sw so we don't reopen the same file every step.
+        # Read in batches of 24 (matching accumulate_raster) so _read_array_cached
+        # LRU entries are shared with concurrent standalone cloud/precip/snow builds.
         _pr_readers: dict[int, object] = {}
         _sw_readers: dict[int, object] = {}
+        _sub = 24
 
-        for i in range(t1 - t0):
-            step_ts = cc_entry.start + (t0 + i - cc_entry.file_offset) * resolution
+        for ts in range(t0, t1, _sub):
+            te = min(ts + _sub, t1)
+            bs = te - ts
+            batch_start_ts = cc_entry.start + (ts - cc_entry.file_offset) * resolution
 
-            cc_slice = _read_array_cached(cc_reader, ny, nx, t0 + i, t0 + i + 1)[:, :, 0]
+            cc_batch = _read_array_cached(cc_reader, ny, nx, ts, te)
 
-            pr_slice = np.zeros((ny, nx), dtype=np.float64)
-            pr_entry, pr_idx = _chunk_entry_for_time(precip_index, step_ts)
+            pr_batch = np.zeros((ny, nx, bs), dtype=np.float64)
+            pr_entry, pr_idx = _chunk_entry_for_time(precip_index, batch_start_ts)
             if pr_entry is not None:
                 if pr_entry.chunk_num not in _pr_readers:
                     _pr_readers[pr_entry.chunk_num] = _open_chunk(pr_entry, model, "precipitation", n_steps=t1 - t0)
-                pr_slice = _read_array_cached(
-                    _pr_readers[pr_entry.chunk_num], ny, nx, pr_idx, pr_idx + 1
-                )[:, :, 0]
+                pr_data = _read_array_cached(_pr_readers[pr_entry.chunk_num], ny, nx, pr_idx, pr_idx + bs)
+                pr_batch[:, :, :pr_data.shape[2]] = pr_data[:, :, :bs]
 
-            sw_slice = np.zeros((ny, nx), dtype=np.float64)
-            sw_entry, sw_idx = _chunk_entry_for_time(swe_index, step_ts)
+            sw_batch = np.zeros((ny, nx, bs), dtype=np.float64)
+            sw_entry, sw_idx = _chunk_entry_for_time(swe_index, batch_start_ts)
             if sw_entry is not None:
                 if sw_entry.chunk_num not in _sw_readers:
                     _sw_readers[sw_entry.chunk_num] = _open_chunk(sw_entry, model, "snowfall_water_equivalent", n_steps=t1 - t0)
-                sw_slice = _read_array_cached(
-                    _sw_readers[sw_entry.chunk_num], ny, nx, sw_idx, sw_idx + 1
-                )[:, :, 0]
+                sw_data = _read_array_cached(_sw_readers[sw_entry.chunk_num], ny, nx, sw_idx, sw_idx + bs)
+                sw_batch[:, :, :sw_data.shape[2]] = sw_data[:, :, :bs]
 
-            codes = weather_code_array(
-                cc_slice, pr_slice, sw_slice,
-                resolution, temp=temp_grid_025,
-            )
-            for c in RASTER_WC_CODES:
-                counts[c] += (np.round(codes) == c).astype(np.int32)
+            for j in range(bs):
+                codes = weather_code_array(
+                    cc_batch[:, :, j], pr_batch[:, :, j], sw_batch[:, :, j],
+                    resolution, temp=temp_grid_025,
+                )
+                for c in RASTER_WC_CODES:
+                    counts[c] += (np.round(codes) == c).astype(np.int32)
 
     # Initialise to zero arrays if no data was found
     g = RASTER_GRIDS[model]

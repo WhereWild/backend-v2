@@ -874,6 +874,7 @@ def _build_forecast_aggregates(
                         gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
                         era5_g["ny"], era5_g["nx"],
                         era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
+                        resampling="average",
                     )).astype(np.int32) for c in RASTER_WC_CODES}
 
                 era5_drop_end = min(new_w_start, era5_end_ts)

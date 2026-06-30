@@ -219,6 +219,29 @@ def _reproject_gfs_to(src: np.ndarray, dst_model: str) -> np.ndarray:
     )
 
 
+def _accum_gfs_mode_reproj(
+    start: float, end: float,
+    gfs_cc, gfs_pr, gfs_sw,
+    dst_model: str,
+) -> dict | None:
+    """Accumulate GFS mode count arrays and reproject to dst_model grid."""
+    if end < start or not (gfs_cc and gfs_pr and gfs_sw):
+        return None
+    counts = accumulate_raster_mode("ncep_gfs013", start, end, gfs_cc, gfs_pr, gfs_sw)
+    gfs_g = RASTER_GRIDS["ncep_gfs013"]
+    dst_g = RASTER_GRIDS[dst_model]
+    result = {}
+    for c in RASTER_WC_CODES:
+        result[c] = np.round(reproject_to_grid(
+            counts[c].astype(np.float32),
+            gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+            dst_g["ny"], dst_g["nx"],
+            dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
+            resampling="nearest",
+        )).astype(np.int32)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Full build for one var + window
 # ---------------------------------------------------------------------------
@@ -278,32 +301,30 @@ def _full_build(
             temp_grid_025=temp_grid_025,
         )
         for c in RASTER_WC_CODES:
-            sums[c] = era5_counts[c]
+            sums[f"era5_wc_{c}"] = era5_counts[c]
         n_era5 = max(0, int(round((era5_end_ts - w_start) / cc_cidx.resolution)) + 1)
 
-        # GFS gap fill for mode (no stable/forecast split for mode counts)
         gfs_cc = gfs_cidx.get("cloud_cover")
         gfs_pr = gfs_cidx.get("precipitation")
         gfs_sw = gfs_cidx.get("snowfall_water_equivalent")
-        gfs_mode_start = gfs_start
-        if gfs_cc and gfs_pr and gfs_sw and gfs_mode_start <= gfs_end_ts:
-            gfs_counts = accumulate_raster_mode(
-                "ncep_gfs013", gfs_mode_start, gfs_end_ts,
-                gfs_cc, gfs_pr, gfs_sw,
-            )
-            era5_grid = RASTER_GRIDS["copernicus_era5"]
-            for c in RASTER_WC_CODES:
-                gfs_reproj = reproject_to_grid(
-                    gfs_counts[c].astype(np.float32),
-                    RASTER_GRIDS["ncep_gfs013"]["lat_min"], RASTER_GRIDS["ncep_gfs013"]["lat_max"],
-                    RASTER_GRIDS["ncep_gfs013"]["lon_min"], RASTER_GRIDS["ncep_gfs013"]["lon_max"],
-                    era5_grid["ny"], era5_grid["nx"],
-                    era5_grid["lat_min"], era5_grid["lat_max"],
-                    era5_grid["lon_min"], era5_grid["lon_max"],
-                    resampling="nearest",
-                )
-                sums[c] = sums[c] + np.round(gfs_reproj).astype(np.int32)
-            n_gfs_forecast = max(0, int(round((gfs_end_ts - gfs_mode_start) / gfs_cc.resolution)) + 1)
+        if gfs_cc and gfs_pr and gfs_sw:
+            # GFS stable: [gfs_start, cycle_init_ts)
+            if cycle_init_ts > 0:
+                gfs_stable_end = cycle_init_ts - gfs_cc.resolution
+                if gfs_stable_end >= gfs_start:
+                    stable = _accum_gfs_mode_reproj(gfs_start, gfs_stable_end, gfs_cc, gfs_pr, gfs_sw, era5_model)
+                    if stable:
+                        for c in RASTER_WC_CODES:
+                            sums[f"gfs_stable_wc_{c}"] = stable[c]
+                        n_gfs_stable = max(0, int(round((gfs_stable_end - gfs_start) / gfs_cc.resolution)) + 1)
+            # GFS forecast: [cycle_init_ts or gfs_start, gfs_end_ts]
+            gfs_fc_start = max(cycle_init_ts, gfs_start) if cycle_init_ts > 0 else gfs_start
+            if gfs_fc_start <= gfs_end_ts:
+                fc = _accum_gfs_mode_reproj(gfs_fc_start, gfs_end_ts, gfs_cc, gfs_pr, gfs_sw, era5_model)
+                if fc:
+                    for c in RASTER_WC_CODES:
+                        sums[f"gfs_forecast_wc_{c}"] = fc[c]
+                    n_gfs_forecast = max(0, int(round((gfs_end_ts - gfs_fc_start) / gfs_cc.resolution)) + 1)
 
     elif var_id == "vapor_pressure_deficit":
         t_cidx = era5_cidx.get("temperature_2m")
@@ -453,82 +474,83 @@ def _incremental_update(
     cycle_init_ts = float(old_meta.get("gfs_cycle_init_ts", 0.0))
 
     if agg == "mode":
-        # Mode incremental: sums contains {wc_code: count_grid}
         cc_cidx = era5_cidx.get("cloud_cover")
         pr_cidx = era5_cidx.get("precipitation")
         sw_cidx = era5_cidx.get("snowfall_water_equivalent")
+        gfs_cc = gfs_cidx.get("cloud_cover")
+        gfs_pr = gfs_cidx.get("precipitation")
+        gfs_sw = gfs_cidx.get("snowfall_water_equivalent")
         if not cc_cidx:
             return
 
         resolution = cc_cidx.resolution
-        gfs_g = RASTER_GRIDS["ncep_gfs013"]
+        zero = np.zeros_like(next(iter(sums.values())))
 
-        def _mode_accumulate(start: float, end: float, use_gfs: bool) -> dict[int, np.ndarray] | None:
-            if end < start:
+        def _era5_mode_delta(start: float, end: float) -> dict | None:
+            if end < start or not (cc_cidx and pr_cidx and sw_cidx):
                 return None
-            model = "ncep_gfs013" if use_gfs else era5_model
-            _cc = gfs_cidx.get("cloud_cover") if use_gfs else cc_cidx
-            _pr = gfs_cidx.get("precipitation") if use_gfs else pr_cidx
-            _sw = gfs_cidx.get("snowfall_water_equivalent") if use_gfs else sw_cidx
-            if not _cc or not _pr or not _sw:
-                return None
-            delta = accumulate_raster_mode(model, start, end, _cc, _pr, _sw)
-            if use_gfs:
-                era5_g = RASTER_GRIDS["copernicus_era5"]
-                for c in RASTER_WC_CODES:
-                    delta[c] = np.round(reproject_to_grid(
-                        delta[c].astype(np.float32),
-                        gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                        era5_g["ny"], era5_g["nx"],
-                        era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
-                        resampling="nearest",
-                    )).astype(np.int32)
-            return delta
+            return accumulate_raster_mode(era5_model, start, end, cc_cidx, pr_cidx, sw_cidx)  # type: ignore[arg-type]
 
-        # ERA5 quality swap: replace GFS with ERA5 for [old_era5_end+1h, new_era5_end]
+        # ERA5 quality swap: add ERA5 to era5_wc_*, subtract GFS from gfs_stable_wc_*
+        # (swap range is always ≤ era5_end_ts < cycle_init_ts → entirely in stable bucket)
         if era5_end_ts > old_era5_end:
             swap_start = max(old_era5_end + resolution, old_w_start)
             swap_end = min(era5_end_ts, old_gfs_end)
             if swap_end >= swap_start:
-                add = _mode_accumulate(swap_start, swap_end, use_gfs=False)
-                sub = _mode_accumulate(swap_start, swap_end, use_gfs=True)
+                era5_add = _era5_mode_delta(swap_start, swap_end)
+                gfs_sub = _accum_gfs_mode_reproj(swap_start, swap_end, gfs_cc, gfs_pr, gfs_sw, era5_model)
                 swap_n = int(round((swap_end - swap_start) / resolution)) + 1
-                if add and sub:
-                    for c in RASTER_WC_CODES:
-                        sums[c] = np.maximum(0, sums[c] + add[c] - sub[c])
+                for c in RASTER_WC_CODES:
+                    if era5_add:
+                        sums[f"era5_wc_{c}"] = sums.get(f"era5_wc_{c}", zero) + era5_add[c]
+                    if gfs_sub:
+                        sums[f"gfs_stable_wc_{c}"] = np.maximum(0, sums.get(f"gfs_stable_wc_{c}", zero) - gfs_sub[c])
                 n_era5 += swap_n
-                n_gfs -= swap_n
+                n_gfs_stable -= swap_n
                 old_gfs_start = era5_end_ts + resolution
 
-        # Drop oldest hours — new_w_start is the first point of the new window, so drop up to new_w_start - 1h
         if new_w_start > old_w_start:
+            # ERA5 window drop
             era5_drop_end = min(new_w_start - resolution, era5_end_ts)
             if era5_drop_end >= old_w_start:
-                sub = _mode_accumulate(old_w_start, era5_drop_end, use_gfs=False)
+                sub = _era5_mode_delta(old_w_start, era5_drop_end)
                 if sub:
                     for c in RASTER_WC_CODES:
-                        sums[c] = np.maximum(0, sums[c] - sub[c])
+                        sums[f"era5_wc_{c}"] = np.maximum(0, sums.get(f"era5_wc_{c}", zero) - sub[c])
                 n_era5 -= int(round((era5_drop_end - old_w_start) / resolution)) + 1
 
+            # GFS window drop — split at cycle_init_ts
             gfs_drop_start = max(old_w_start, old_gfs_start)
             gfs_drop_end = min(new_w_start - resolution, old_gfs_end)
             if gfs_drop_end >= gfs_drop_start:
-                sub = _mode_accumulate(gfs_drop_start, gfs_drop_end, use_gfs=True)
-                if sub:
-                    for c in RASTER_WC_CODES:
-                        sums[c] = np.maximum(0, sums[c] - sub[c])
-                n_gfs -= int(round((gfs_drop_end - gfs_drop_start) / resolution)) + 1
+                if cycle_init_ts > 0:
+                    stable_drop_end = min(gfs_drop_end, cycle_init_ts - resolution)
+                    fc_drop_start = max(gfs_drop_start, cycle_init_ts)
+                else:
+                    stable_drop_end = gfs_drop_start - 1
+                    fc_drop_start = gfs_drop_start
+                if stable_drop_end >= gfs_drop_start:
+                    sub = _accum_gfs_mode_reproj(gfs_drop_start, stable_drop_end, gfs_cc, gfs_pr, gfs_sw, era5_model)
+                    if sub:
+                        for c in RASTER_WC_CODES:
+                            sums[f"gfs_stable_wc_{c}"] = np.maximum(0, sums.get(f"gfs_stable_wc_{c}", zero) - sub[c])
+                    n_gfs_stable -= int(round((stable_drop_end - gfs_drop_start) / resolution)) + 1
+                if fc_drop_start <= gfs_drop_end:
+                    sub = _accum_gfs_mode_reproj(fc_drop_start, gfs_drop_end, gfs_cc, gfs_pr, gfs_sw, era5_model)
+                    if sub:
+                        for c in RASTER_WC_CODES:
+                            sums[f"gfs_forecast_wc_{c}"] = np.maximum(0, sums.get(f"gfs_forecast_wc_{c}", zero) - sub[c])
+                    n_gfs_forecast -= int(round((gfs_drop_end - fc_drop_start) / resolution)) + 1
 
-        # Add newest GFS hours — start at old_gfs_end + 1h to avoid double-counting.
-        # Cap at new_w_start so a stale build doesn't add hours before the window.
+        # Add newest GFS hours → always forecast bucket
         if gfs_end_ts > old_gfs_end:
             add_start = max(old_gfs_end + resolution, new_w_start)
             if gfs_end_ts >= add_start:
-                add = _mode_accumulate(add_start, gfs_end_ts, use_gfs=True)
+                add = _accum_gfs_mode_reproj(add_start, gfs_end_ts, gfs_cc, gfs_pr, gfs_sw, era5_model)
                 if add:
                     for c in RASTER_WC_CODES:
-                        sums[c] = sums[c] + add[c]
-                n_gfs += int(round((gfs_end_ts - add_start) / cc_cidx.resolution)) + 1
+                        sums[f"gfs_forecast_wc_{c}"] = sums.get(f"gfs_forecast_wc_{c}", zero) + add[c]
+                n_gfs_forecast += int(round((gfs_end_ts - add_start) / cc_cidx.resolution)) + 1
 
     elif var_id == "vapor_pressure_deficit":
         # VPD incremental: accumulate per-timestep VPD directly (not T/Td separately)
@@ -728,15 +750,9 @@ def _incremental_update(
                 n_gfs_forecast += add_n
 
     n_era5 = max(n_era5, 0)
-    if agg == "mode":
-        # Mode doesn't split stable/forecast; n_gfs was updated directly above.
-        n_gfs = max(n_gfs, 0)
-        n_gfs_stable = n_gfs
-        n_gfs_forecast = 0
-    else:
-        n_gfs_stable = max(n_gfs_stable, 0)
-        n_gfs_forecast = max(n_gfs_forecast, 0)
-        n_gfs = n_gfs_stable + n_gfs_forecast
+    n_gfs_stable = max(n_gfs_stable, 0)
+    n_gfs_forecast = max(n_gfs_forecast, 0)
+    n_gfs = n_gfs_stable + n_gfs_forecast
     meta = {
         **old_meta,
         "era5_end_ts": era5_end_ts,
@@ -782,11 +798,6 @@ def _gfs_rederive(
     """
     agg = cfg["agg"]
 
-    if agg == "mode":
-        _full_build(var_id, cfg, window_h, window_label, now_ts, era5_end_ts, gfs_end_ts,
-                    era5_cidx, gfs_cidx, out_dir, cycle_init_ts=new_cycle_init_ts)
-        return
-
     era5_model = cfg["era5_model"]
     resolution = 3600.0
     dst_g = RASTER_GRIDS[era5_model]
@@ -799,6 +810,93 @@ def _gfs_rederive(
     old_era5_end = float(existing_meta["era5_end_ts"])
     old_gfs_end = float(existing_meta["gfs_end_ts"])
     old_cycle_init_ts = float(existing_meta.get("gfs_cycle_init_ts", 0.0))
+
+    if agg == "mode":
+        cc_cidx = era5_cidx.get("cloud_cover")
+        pr_cidx = era5_cidx.get("precipitation")
+        sw_cidx = era5_cidx.get("snowfall_water_equivalent")
+        gfs_cc = gfs_cidx.get("cloud_cover")
+        gfs_pr = gfs_cidx.get("precipitation")
+        gfs_sw = gfs_cidx.get("snowfall_water_equivalent")
+        if not (cc_cidx and gfs_cc and gfs_pr and gfs_sw):
+            _full_build(var_id, cfg, window_h, window_label, now_ts, era5_end_ts, gfs_end_ts,
+                        era5_cidx, gfs_cidx, out_dir, cycle_init_ts=new_cycle_init_ts)
+            return
+
+        # Preserve ERA5 and stable GFS count arrays; zero forecast bucket.
+        sums: dict = {}
+        for k, v in existing_sums.items():
+            sums[k] = np.zeros_like(v) if "gfs_forecast_wc_" in str(k) else v.copy()
+        zero = np.zeros_like(next(iter(sums.values())))
+
+        n_gfs_stable = int(existing_meta.get("n_gfs_stable", 0))
+        n_gfs_forecast = 0
+
+        # ERA5 quality swap: add ERA5 to era5_wc_*, subtract GFS from gfs_stable_wc_*
+        if era5_end_ts > old_era5_end:
+            swap_start = max(old_era5_end + resolution, old_w_start)
+            swap_end = min(era5_end_ts, old_gfs_end)
+            if swap_end >= swap_start:
+                era5_add = accumulate_raster_mode(era5_model, swap_start, swap_end, cc_cidx, pr_cidx, sw_cidx)  # type: ignore[arg-type]
+                gfs_sub = _accum_gfs_mode_reproj(swap_start, swap_end, gfs_cc, gfs_pr, gfs_sw, era5_model)
+                for c in RASTER_WC_CODES:
+                    sums[f"era5_wc_{c}"] = sums.get(f"era5_wc_{c}", zero) + era5_add[c]
+                    if gfs_sub:
+                        sums[f"gfs_stable_wc_{c}"] = np.maximum(0, sums.get(f"gfs_stable_wc_{c}", zero) - gfs_sub[c])
+
+        # ERA5 window drop
+        if new_w_start > old_w_start:
+            era5_drop_end = min(new_w_start - resolution, era5_end_ts)
+            if era5_drop_end >= old_w_start:
+                sub = accumulate_raster_mode(era5_model, old_w_start, era5_drop_end, cc_cidx, pr_cidx, sw_cidx)  # type: ignore[arg-type]
+                for c in RASTER_WC_CODES:
+                    if f"era5_wc_{c}" in sums:
+                        sums[f"era5_wc_{c}"] = np.maximum(0, sums[f"era5_wc_{c}"] - sub[c])
+
+        # Graduate [old_cycle_init_ts, new_cycle_init_ts) from forecast → stable
+        if old_cycle_init_ts > 0 and new_cycle_init_ts > old_cycle_init_ts:
+            grad_end = new_cycle_init_ts - resolution
+            if grad_end >= old_cycle_init_ts:
+                grad = _accum_gfs_mode_reproj(old_cycle_init_ts, grad_end, gfs_cc, gfs_pr, gfs_sw, era5_model)
+                grad_n = int(round((grad_end - old_cycle_init_ts) / resolution)) + 1
+                if grad:
+                    for c in RASTER_WC_CODES:
+                        sums[f"gfs_stable_wc_{c}"] = sums.get(f"gfs_stable_wc_{c}", zero) + grad[c]
+                    n_gfs_stable += grad_n
+
+        # Rebuild forecast from [new_cycle_init_ts, gfs_end_ts]
+        fc_start = max(new_cycle_init_ts, new_gfs_start) if new_cycle_init_ts > 0 else new_gfs_start
+        if fc_start <= gfs_end_ts:
+            fc = _accum_gfs_mode_reproj(fc_start, gfs_end_ts, gfs_cc, gfs_pr, gfs_sw, era5_model)
+            fc_n = int(round((gfs_end_ts - fc_start) / resolution)) + 1
+            if fc:
+                for c in RASTER_WC_CODES:
+                    sums[f"gfs_forecast_wc_{c}"] = fc[c]
+                n_gfs_forecast = fc_n
+
+        n_era5 = (
+            int(round((era5_end_ts - new_w_start) / resolution)) + 1
+            if new_w_start <= era5_end_ts else 0
+        )
+        n_era5 = max(n_era5, 0)
+        n_gfs_stable = max(n_gfs_stable, 0)
+        n_gfs_forecast = max(n_gfs_forecast, 0)
+        meta = {
+            **existing_meta,
+            "era5_end_ts": era5_end_ts,
+            "era5_window_start_ts": new_w_start,
+            "gfs_start_ts": new_gfs_start,
+            "gfs_end_ts": gfs_end_ts,
+            "gfs_cycle_init_ts": new_cycle_init_ts,
+            "n_era5": n_era5,
+            "n_gfs": n_gfs_stable + n_gfs_forecast,
+            "n_gfs_stable": n_gfs_stable,
+            "n_gfs_forecast": n_gfs_forecast,
+            "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
+        }
+        save_raster_state(out_dir, var_id, window_label, agg, sums, meta)
+        print(f"  [{window_label}] {var_id}: GFS cycle rederive → {n_gfs_stable}h stable + {n_gfs_forecast}h forecast, ERA5 {n_era5}h preserved", flush=True)
+        return
 
     # Preserve ERA5 and stable GFS sums; zero only forecast sums.
     sums: dict = {}
@@ -1070,47 +1168,62 @@ def _build_forecast_aggregates(
                 gfs_cc = gfs_cidx.get("cloud_cover")
                 gfs_pr = gfs_cidx.get("precipitation")
                 gfs_sw = gfs_cidx.get("snowfall_water_equivalent")
-
-                def _mode_delta_era5(start: float, end: float) -> dict | None:
-                    if end < start or not cc_cidx:
-                        return None
-                    return accumulate_raster_mode(era5_model, start, end, cc_cidx, pr_cidx, sw_cidx)
-
-                def _mode_delta_gfs(start: float, end: float) -> dict | None:
-                    if end < start or not (gfs_cc and gfs_pr and gfs_sw):
-                        return None
-                    d = accumulate_raster_mode("ncep_gfs013", start, end, gfs_cc, gfs_pr, gfs_sw)
-                    era5_g = RASTER_GRIDS["copernicus_era5"]
-                    return {c: np.round(reproject_to_grid(
-                        d[c].astype(np.float32),
-                        gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                        era5_g["ny"], era5_g["nx"],
-                        era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
-                        resampling="nearest",
-                    )).astype(np.int32) for c in RASTER_WC_CODES}
+                cycle_init_ts = float(now_meta.get("gfs_cycle_init_ts", 0.0))
+                n_gfs_stable = int(now_meta.get("n_gfs_stable", n_gfs))
+                n_gfs_forecast = int(now_meta.get("n_gfs_forecast", 0))
+                zero = np.zeros_like(next(iter(sums.values())))
 
                 era5_drop_end = min(new_w_start - resolution, era5_end_ts)
                 if era5_drop_end >= old_w_start:
-                    delta = _mode_delta_era5(old_w_start, era5_drop_end)
-                    if delta:
+                    sub = accumulate_raster_mode(era5_model, old_w_start, era5_drop_end, cc_cidx, pr_cidx, sw_cidx) if cc_cidx else None  # type: ignore[arg-type]
+                    if sub:
                         for c in RASTER_WC_CODES:
-                            sums[c] = np.maximum(0, sums[c] - delta[c])
+                            sums[f"era5_wc_{c}"] = np.maximum(0, sums.get(f"era5_wc_{c}", zero) - sub[c])
                     n_era5 -= int(round((era5_drop_end - old_w_start) / resolution)) + 1
 
                 gfs_drop_end = min(new_w_start - resolution, old_gfs_end)
                 if gfs_drop_end >= old_gfs_start:
-                    delta = _mode_delta_gfs(old_gfs_start, gfs_drop_end)
-                    if delta:
-                        for c in RASTER_WC_CODES:
-                            sums[c] = np.maximum(0, sums[c] - delta[c])
-                    n_gfs -= int(round((gfs_drop_end - old_gfs_start) / resolution)) + 1
+                    if cycle_init_ts > 0:
+                        stable_drop_end = min(gfs_drop_end, cycle_init_ts - resolution)
+                        fc_drop_start = max(old_gfs_start, cycle_init_ts)
+                    else:
+                        stable_drop_end = old_gfs_start - 1
+                        fc_drop_start = old_gfs_start
+                    if stable_drop_end >= old_gfs_start:
+                        sub = _accum_gfs_mode_reproj(old_gfs_start, stable_drop_end, gfs_cc, gfs_pr, gfs_sw, era5_model)
+                        if sub:
+                            for c in RASTER_WC_CODES:
+                                sums[f"gfs_stable_wc_{c}"] = np.maximum(0, sums.get(f"gfs_stable_wc_{c}", zero) - sub[c])
+                        n_gfs_stable -= int(round((stable_drop_end - old_gfs_start) / resolution)) + 1
+                    if fc_drop_start <= gfs_drop_end:
+                        sub = _accum_gfs_mode_reproj(fc_drop_start, gfs_drop_end, gfs_cc, gfs_pr, gfs_sw, era5_model)
+                        if sub:
+                            for c in RASTER_WC_CODES:
+                                sums[f"gfs_forecast_wc_{c}"] = np.maximum(0, sums.get(f"gfs_forecast_wc_{c}", zero) - sub[c])
+                        n_gfs_forecast -= int(round((gfs_drop_end - fc_drop_start) / resolution)) + 1
 
                 if gfs_end_for_fc > old_gfs_end:
-                    delta = _mode_delta_gfs(old_gfs_end + resolution, gfs_end_for_fc)
-                    if delta:
+                    add = _accum_gfs_mode_reproj(old_gfs_end + resolution, gfs_end_for_fc, gfs_cc, gfs_pr, gfs_sw, era5_model)
+                    if add:
                         for c in RASTER_WC_CODES:
-                            sums[c] = sums.get(c, np.zeros_like(delta[c])) + delta[c]
-                    n_gfs += int(round((gfs_end_for_fc - old_gfs_end) / resolution))
+                            sums[f"gfs_forecast_wc_{c}"] = sums.get(f"gfs_forecast_wc_{c}", zero) + add[c]
+                    n_gfs_forecast += int(round((gfs_end_for_fc - old_gfs_end) / resolution))
+
+                n_era5 = max(n_era5, 0)
+                n_gfs_stable = max(n_gfs_stable, 0)
+                n_gfs_forecast = max(n_gfs_forecast, 0)
+                n_gfs = n_gfs_stable + n_gfs_forecast
+                fc_meta = {
+                    **now_meta,
+                    "era5_window_start_ts": new_w_start,
+                    "gfs_start_ts": max(era5_end_ts, new_w_start),
+                    "gfs_end_ts": gfs_end_for_fc,
+                    "n_era5": n_era5, "n_gfs": n_gfs,
+                    "n_gfs_stable": n_gfs_stable, "n_gfs_forecast": n_gfs_forecast,
+                    "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
+                }
+                save_raster_state(out_dir, vid, wl, agg, sums, fc_meta, suffix=suffix)
+                return
 
             else:
                 cycle_init_ts = float(now_meta.get("gfs_cycle_init_ts", 0.0))
@@ -1546,10 +1659,14 @@ def main() -> None:
             era5_end = era5_land_end_ts if era5_model == "copernicus_era5_land" else era5_end_ts
             era5_cidx = era5_cidx_by_var.get(var_id, {})
             existing_sums, existing_meta = load_raster_state(out_dir, var_id, wl)
-            # Migration: state missing gfs_cycle_init_ts → treat as stale, force full build
-            needs_migration = (existing_meta is not None
-                               and "gfs_cycle_init_ts" not in existing_meta
-                               and vcfg.get("agg") != "mode")
+            # Migration: scalar/VPD missing gfs_cycle_init_ts, or mode using old blended format
+            needs_migration = (
+                existing_meta is not None and (
+                    ("gfs_cycle_init_ts" not in existing_meta and vcfg.get("agg") != "mode")
+                    or (vcfg.get("agg") == "mode" and existing_sums is not None
+                        and f"era5_wc_{RASTER_WC_CODES[0]}" not in existing_sums)
+                )
+            )
             if force or existing_sums is None or needs_migration:
                 reason = "migration" if needs_migration else ("force" if force else "no state")
                 print(f"  [{wl}] {var_id} full build ({reason}) …", flush=True)

@@ -40,10 +40,13 @@ import pytest
 import scripts.build_temporal as bt
 from util.temporal import (
     RASTER_GRIDS,
+    RASTER_WC_CODES,
     accumulate_raster,
+    accumulate_raster_mode,
     build_chunk_index,
     grid_indices,
     load_raster_state,
+    reproject_to_grid,
     save_raster_state,
     set_raster_chunk_cache,
 )
@@ -554,6 +557,135 @@ def test_gfs_cycle_rederive_discards_stale_forecast(
     hi_bad = int((result > 101.0).sum())
     assert lo_bad == 0, f"rederive output: {lo_bad} pixels below -1 % (min={result.min():.2f})"
     assert hi_bad == 0, f"rederive output: {hi_bad} pixels above 101 % (max={result.max():.2f})"
+
+
+def test_gfs_cycle_rederive_mode_discards_stale_forecast(
+    live_raster_expected: dict[str, Any],
+    live_chunk_cache: str,
+    tmp_path: Path,
+) -> None:
+    """Mode rederive: corrupt gfs_forecast_wc_* cleared, ERA5 and stable preserved.
+
+    Mirrors test_gfs_cycle_rederive_discards_stale_forecast but for weather_code_simple.
+    Validates that _gfs_rederive properly handles the split-key format for mode vars.
+    """
+    obs_ts_raw = live_raster_expected.get("obs_ts")
+    if obs_ts_raw is None:
+        pytest.skip("obs_ts missing — regenerate with --regenerate-live")
+
+    obs_ts = float(int(obs_ts_raw) // 3600 * 3600)
+    old_cycle_init_ts = float((int(obs_ts) // (6 * 3600)) * (6 * 3600))
+    new_cycle_init_ts = old_cycle_init_ts + 6 * 3600
+
+    cc_cidx = build_chunk_index("copernicus_era5", "cloud_cover")
+    pr_cidx = build_chunk_index("copernicus_era5", "precipitation")
+    sw_cidx = build_chunk_index("copernicus_era5", "snowfall_water_equivalent")
+    gfs_cc = build_chunk_index("ncep_gfs013", "cloud_cover")
+    gfs_pr = build_chunk_index("ncep_gfs013", "precipitation")
+    gfs_sw = build_chunk_index("ncep_gfs013", "snowfall_water_equivalent")
+
+    era5_cidx = {"cloud_cover": cc_cidx, "precipitation": pr_cidx,
+                 "snowfall_water_equivalent": sw_cidx}
+    gfs_cidx = {"cloud_cover": gfs_cc, "precipitation": gfs_pr,
+                 "snowfall_water_equivalent": gfs_sw}
+    cfg = bt.VAR_CONFIGS["weather_code_simple"]
+    out_dir = str(tmp_path)
+    window_h = 24
+    w_start = obs_ts - (window_h - 1) * 3600
+
+    gfs_g = RASTER_GRIDS["ncep_gfs013"]
+    era5_g = RASTER_GRIDS["copernicus_era5"]
+
+    # Accumulate real ERA5 counts
+    era5_counts = accumulate_raster_mode("copernicus_era5", w_start, obs_ts, cc_cidx, pr_cidx, sw_cidx)
+
+    # Accumulate real GFS stable counts
+    gfs_start = obs_ts + 3600
+    gfs_end_ts = old_cycle_init_ts + 6 * 3600
+    n_gfs_stable = 0
+    stable_reproj: dict = {}
+    if gfs_start < old_cycle_init_ts:
+        stable_counts = accumulate_raster_mode("ncep_gfs013", gfs_start,
+                                                old_cycle_init_ts - 3600, gfs_cc, gfs_pr, gfs_sw)
+        n_gfs_stable = int(round((old_cycle_init_ts - 3600 - gfs_start) / 3600)) + 1
+        for c in RASTER_WC_CODES:
+            stable_reproj[c] = np.round(reproject_to_grid(
+                stable_counts[c].astype(np.float32),
+                gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                era5_g["ny"], era5_g["nx"],
+                era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
+                resampling="nearest",
+            )).astype(np.int32)
+
+    # Corrupt forecast bucket
+    corrupt = np.full((era5_g["ny"], era5_g["nx"]), fill_value=9999, dtype=np.int32)
+    sums: dict[str, Any] = {}
+    for c in RASTER_WC_CODES:
+        sums[f"era5_wc_{c}"] = era5_counts[c].copy()
+        sums[f"gfs_stable_wc_{c}"] = stable_reproj.get(c, np.zeros((era5_g["ny"], era5_g["nx"]), dtype=np.int32)).copy()
+        sums[f"gfs_forecast_wc_{c}"] = corrupt.copy()
+
+    meta: dict[str, Any] = {
+        "var_id": "weather_code_simple",
+        "window_h": window_h,
+        "window_label": "24h",
+        "era5_window_start_ts": w_start,
+        "era5_end_ts": obs_ts,
+        "gfs_start_ts": gfs_start,
+        "gfs_end_ts": gfs_end_ts,
+        "gfs_cycle_init_ts": old_cycle_init_ts,
+        "n_era5": int(round((obs_ts - w_start) / 3600)) + 1,
+        "n_gfs": n_gfs_stable,
+        "n_gfs_stable": n_gfs_stable,
+        "n_gfs_forecast": 0,
+        "built_at": datetime.fromtimestamp(obs_ts, UTC).isoformat(),
+    }
+    save_raster_state(out_dir, "weather_code_simple", "24h", "mode", sums, meta)
+
+    bt._gfs_rederive(
+        "weather_code_simple", cfg, window_h, "24h",
+        existing_sums=sums,
+        existing_meta=meta,
+        now_ts=obs_ts,
+        era5_end_ts=obs_ts,
+        gfs_end_ts=gfs_end_ts,
+        era5_cidx=era5_cidx,
+        gfs_cidx=gfs_cidx,
+        out_dir=out_dir,
+        new_cycle_init_ts=new_cycle_init_ts,
+    )
+
+    result_sums, result_meta = load_raster_state(out_dir, "weather_code_simple", "24h")
+
+    # Corrupt forecast values must be gone
+    for c in RASTER_WC_CODES:
+        key = f"gfs_forecast_wc_{c}"
+        if key in result_sums:
+            assert int(np.max(result_sums[key])) < 9999, \
+                f"{key} still has corrupt value (max={np.max(result_sums[key])})"
+
+    # ERA5 counts must be preserved exactly
+    for c in RASTER_WC_CODES:
+        np.testing.assert_array_equal(
+            result_sums[f"era5_wc_{c}"], era5_counts[c],
+            err_msg=f"era5_wc_{c} was modified during mode rederive",
+        )
+
+    # Stable counts must be >= original (graduation only adds)
+    if n_gfs_stable > 0:
+        for c in RASTER_WC_CODES:
+            orig = stable_reproj.get(c, np.zeros_like(corrupt))
+            assert np.any(result_sums.get(f"gfs_stable_wc_{c}", orig) >= orig), \
+                f"gfs_stable_wc_{c} should have grown after graduation"
+
+    assert int(result_meta["n_gfs_stable"]) >= n_gfs_stable
+
+    # Output weather codes must all be valid RASTER_WC_CODES values
+    result = np.load(tmp_path / "weather_code_simple_24h.npy")
+    valid_codes = set(float(c) for c in RASTER_WC_CODES)
+    invalid = ~np.isin(result, list(valid_codes))
+    assert int(invalid.sum()) == 0, \
+        f"Mode rederive output contains invalid weather codes: {np.unique(result[invalid])}"
 
 
 # ---------------------------------------------------------------------------

@@ -2304,8 +2304,12 @@ def compute_raster_final(
     n_total = max(n_era5 + n_gfs, 1)
 
     if agg == "mode":
-        stack = np.stack([sums.get(c, np.zeros_like(next(iter(sums.values()))))
-                          for c in RASTER_WC_CODES], axis=0)
+        zero_wc = np.zeros_like(next(iter(sums.values())))
+        if f"era5_wc_{RASTER_WC_CODES[0]}" in sums:
+            combined = {c: sums.get(f"era5_wc_{c}", zero_wc) + sums.get(f"gfs_stable_wc_{c}", zero_wc) + sums.get(f"gfs_forecast_wc_{c}", zero_wc) for c in RASTER_WC_CODES}
+        else:
+            combined = {c: sums.get(c, zero_wc) for c in RASTER_WC_CODES}
+        stack = np.stack([combined[c] for c in RASTER_WC_CODES], axis=0)
         best = np.argmax(stack, axis=0)
         return np.array(RASTER_WC_CODES, dtype=np.float32)[best]
 

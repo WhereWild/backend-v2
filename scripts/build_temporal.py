@@ -279,7 +279,7 @@ def _full_build(
         )
         for c in RASTER_WC_CODES:
             sums[c] = era5_counts[c]
-        n_era5 = max(0, int(round((era5_end_ts - w_start) / cc_cidx.resolution)))
+        n_era5 = max(0, int(round((era5_end_ts - w_start) / cc_cidx.resolution)) + 1)
 
         # GFS gap fill for mode (no stable/forecast split for mode counts)
         gfs_cc = gfs_cidx.get("cloud_cover")
@@ -303,7 +303,7 @@ def _full_build(
                     resampling="nearest",
                 )
                 sums[c] = sums[c] + np.round(gfs_reproj).astype(np.int32)
-            n_gfs_forecast = max(0, int(round((gfs_end_ts - gfs_mode_start) / gfs_cc.resolution)))
+            n_gfs_forecast = max(0, int(round((gfs_end_ts - gfs_mode_start) / gfs_cc.resolution)) + 1)
 
     elif var_id == "vapor_pressure_deficit":
         t_cidx = era5_cidx.get("temperature_2m")
@@ -1089,24 +1089,24 @@ def _build_forecast_aggregates(
                         resampling="nearest",
                     )).astype(np.int32) for c in RASTER_WC_CODES}
 
-                era5_drop_end = min(new_w_start, era5_end_ts)
-                if era5_drop_end > old_w_start:
+                era5_drop_end = min(new_w_start - resolution, era5_end_ts)
+                if era5_drop_end >= old_w_start:
                     delta = _mode_delta_era5(old_w_start, era5_drop_end)
                     if delta:
                         for c in RASTER_WC_CODES:
                             sums[c] = np.maximum(0, sums[c] - delta[c])
-                    n_era5 -= int(round((era5_drop_end - old_w_start) / resolution))
+                    n_era5 -= int(round((era5_drop_end - old_w_start) / resolution)) + 1
 
-                gfs_drop_end = min(new_w_start, old_gfs_end)
-                if gfs_drop_end > old_gfs_start:
+                gfs_drop_end = min(new_w_start - resolution, old_gfs_end)
+                if gfs_drop_end >= old_gfs_start:
                     delta = _mode_delta_gfs(old_gfs_start, gfs_drop_end)
                     if delta:
                         for c in RASTER_WC_CODES:
                             sums[c] = np.maximum(0, sums[c] - delta[c])
-                    n_gfs -= int(round((gfs_drop_end - old_gfs_start) / resolution))
+                    n_gfs -= int(round((gfs_drop_end - old_gfs_start) / resolution)) + 1
 
                 if gfs_end_for_fc > old_gfs_end:
-                    delta = _mode_delta_gfs(old_gfs_end, gfs_end_for_fc)
+                    delta = _mode_delta_gfs(old_gfs_end + resolution, gfs_end_for_fc)
                     if delta:
                         for c in RASTER_WC_CODES:
                             sums[c] = sums.get(c, np.zeros_like(delta[c])) + delta[c]
@@ -1129,10 +1129,10 @@ def _build_forecast_aggregates(
                         dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
                     )
 
-                # Drop oldest forecast_h hours from ERA5 tail
-                era5_drop_end = min(new_w_start, era5_end_ts)
-                if era5_drop_end > old_w_start:
-                    drop_n = int(round((era5_drop_end - old_w_start) / resolution))
+                # Drop oldest hours from ERA5 tail (exclude new_w_start — it stays in window)
+                era5_drop_end = min(new_w_start - resolution, era5_end_ts)
+                if era5_drop_end >= old_w_start:
+                    drop_n = int(round((era5_drop_end - old_w_start) / resolution)) + 1
                     for rv in _era5_raw_vars(cfg):
                         cidx = era5_cidx.get(rv)
                         if not cidx:
@@ -1144,10 +1144,14 @@ def _build_forecast_aggregates(
                     n_era5 -= drop_n
 
                 # GFS drops — split at cycle_init_ts
-                gfs_drop_end = min(new_w_start, old_gfs_end)
-                if gfs_drop_end > old_gfs_start:
-                    stable_drop_end = min(gfs_drop_end, cycle_init_ts - resolution) if cycle_init_ts > 0 else gfs_drop_end
-                    fc_drop_start = max(old_gfs_start, cycle_init_ts) if cycle_init_ts > 0 else gfs_drop_end + 1
+                gfs_drop_end = min(new_w_start - resolution, old_gfs_end)
+                if gfs_drop_end >= old_gfs_start:
+                    if cycle_init_ts > 0:
+                        stable_drop_end = min(gfs_drop_end, cycle_init_ts - resolution)
+                        fc_drop_start = max(old_gfs_start, cycle_init_ts)
+                    else:
+                        stable_drop_end = old_gfs_start - 1  # nothing in stable
+                        fc_drop_start = old_gfs_start         # all in forecast
                     for gv in _gfs_raw_vars(cfg):
                         if stable_drop_end >= old_gfs_start:
                             r = _gfs_reproj_fc(gv, old_gfs_start, stable_drop_end)
@@ -1157,16 +1161,16 @@ def _build_forecast_aggregates(
                             r = _gfs_reproj_fc(gv, fc_drop_start, gfs_drop_end)
                             if r is not None and f"gfs_forecast_{gv}" in sums:
                                 sums[f"gfs_forecast_{gv}"] = np.maximum(0.0, sums[f"gfs_forecast_{gv}"] - r)
-                    sdn = max(0, int(round((stable_drop_end - old_gfs_start) / resolution))) if stable_drop_end >= old_gfs_start else 0
-                    fdn = max(0, int(round((gfs_drop_end - fc_drop_start) / resolution))) if fc_drop_start <= gfs_drop_end else 0
+                    sdn = max(0, int(round((stable_drop_end - old_gfs_start) / resolution)) + 1) if stable_drop_end >= old_gfs_start else 0
+                    fdn = max(0, int(round((gfs_drop_end - fc_drop_start) / resolution)) + 1) if fc_drop_start <= gfs_drop_end else 0
                     n_gfs_stable -= sdn
                     n_gfs_forecast -= fdn
 
-                # Add GFS forecast hours → always to forecast bucket
+                # Add GFS forecast hours → always to forecast bucket (start from old_gfs_end+1 step)
                 if gfs_end_for_fc > old_gfs_end:
                     add_n = int(round((gfs_end_for_fc - old_gfs_end) / resolution))
                     for gv in _gfs_raw_vars(cfg):
-                        r = _gfs_reproj_fc(gv, old_gfs_end, gfs_end_for_fc)
+                        r = _gfs_reproj_fc(gv, old_gfs_end + resolution, gfs_end_for_fc)
                         if r is not None:
                             key = f"gfs_forecast_{gv}"
                             sums[key] = sums.get(key, np.zeros_like(r)) + r

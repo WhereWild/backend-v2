@@ -300,7 +300,7 @@ def _full_build(
                     era5_grid["ny"], era5_grid["nx"],
                     era5_grid["lat_min"], era5_grid["lat_max"],
                     era5_grid["lon_min"], era5_grid["lon_max"],
-                    resampling="average",
+                    resampling="nearest",
                 )
                 sums[c] = sums[c] + np.round(gfs_reproj).astype(np.int32)
             n_gfs_forecast = max(0, int(round((gfs_end_ts - gfs_mode_start) / gfs_cc.resolution)))
@@ -481,7 +481,7 @@ def _incremental_update(
                         gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
                         era5_g["ny"], era5_g["nx"],
                         era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
-                        resampling="average",
+                        resampling="nearest",
                     )).astype(np.int32)
             return delta
 
@@ -1086,7 +1086,7 @@ def _build_forecast_aggregates(
                         gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
                         era5_g["ny"], era5_g["nx"],
                         era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
-                        resampling="average",
+                        resampling="nearest",
                     )).astype(np.int32) for c in RASTER_WC_CODES}
 
                 era5_drop_end = min(new_w_start, era5_end_ts)

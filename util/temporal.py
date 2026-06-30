@@ -2261,12 +2261,16 @@ def reproject_to_grid(
     Both grids must be in geographic coordinates (degrees).  src must already
     be lat-ascending (flipud applied before calling).
 
-    resampling: "bilinear" (default, for continuous data) or "average"
-        (for count/integer data going fine→coarse — averages all source pixels
-        that overlap each destination pixel, avoiding the nearest-center-sample
-        artifact of bilinear on discrete grids).
+    resampling: "bilinear" (default, for continuous data), "average"
+        (for count/integer data going fine→coarse), or "nearest"
+        (for same-resolution grids or classified/discrete data — no interpolation).
     """
-    _resamp = _Resampling.average if resampling == "average" else _Resampling.bilinear
+    if resampling == "average":
+        _resamp = _Resampling.average
+    elif resampling == "nearest":
+        _resamp = _Resampling.nearest
+    else:
+        _resamp = _Resampling.bilinear
     src_f = np.asarray(src, dtype=np.float32)
     src_ny, src_nx = src_f.shape
 

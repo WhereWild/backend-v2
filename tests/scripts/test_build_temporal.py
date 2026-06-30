@@ -1319,8 +1319,11 @@ def test_main_incremental_path(monkeypatch, tmp_path: Path):
         "era5_end_ts": NOW_TS - 10 * 3600,
         "gfs_start_ts": NOW_TS - 10 * 3600,
         "gfs_end_ts": NOW_TS - 2 * 3600,
+        "gfs_cycle_init_ts": NOW_TS - 6 * 3600,
         "n_era5": 38,
         "n_gfs": 8,
+        "n_gfs_stable": 8,
+        "n_gfs_forecast": 0,
     }
     monkeypatch.setattr("scripts.build_temporal.load_raster_state",
                         lambda *a, **kw: (existing_sums, existing_meta))

@@ -56,6 +56,57 @@ from util.temporal import (
 _TEMPORAL_STATUS_PUSH_URL = os.environ.get("WHEREWILD_STATUS_PUSH_URL", "")
 
 
+def _floor_to_6h(last_modified: datetime) -> float:
+    h = (last_modified.hour // 6) * 6
+    return last_modified.replace(hour=h, minute=0, second=0, microsecond=0).timestamp()
+
+
+def _gfs_detect_cycle(
+    gfs_cidx: dict[str, "ChunkIndex"],
+    gfs_end_ts: float,
+    max_window_h: int,
+    fs: "fsspec.AbstractFileSystem",
+    prior_last_modified: dict[str, str],
+) -> tuple[bool, float, dict[str, str]]:
+    """Check S3 LastModified for all GFS chunks that could affect this run.
+
+    Returns (changed, new_cycle_init_ts, new_last_modified_dict).
+    new_cycle_init_ts = floor(max(new LastModified), 6h) across all changed chunks.
+    """
+    unique_chunks: dict[str, tuple[object, str, str]] = {}
+    for gv, cidx in gfs_cidx.items():
+        window_start = gfs_end_ts - max_window_h * 3600
+        for ts in [window_start, gfs_end_ts]:
+            entry, _ = _chunk_entry_for_time(cidx, ts)
+            if entry is not None and entry.source != "year":
+                key = f"{gv}_{entry.chunk_num}"
+                if key not in unique_chunks:
+                    unique_chunks[key] = (entry, "ncep_gfs013", gv)
+
+    new_lm: dict[str, str] = {}
+    max_changed_lm: datetime | None = None
+
+    for key, (entry, model, gv) in unique_chunks.items():
+        fname = f"chunk_{entry.chunk_num}.om"
+        uri = f"s3://openmeteo/data/{model}/{gv}/{fname}"
+        try:
+            info = fs.info(uri)
+            lm = info.get("LastModified")
+            if lm is None:
+                continue
+            lm_str = str(lm)
+            new_lm[key] = lm_str
+            if lm_str != prior_last_modified.get(key):
+                if max_changed_lm is None or lm > max_changed_lm:
+                    max_changed_lm = lm
+        except Exception as e:
+            print(f"  [cycle-detect] HEAD {uri}: {e}")
+
+    changed = max_changed_lm is not None
+    cycle_init_ts = _floor_to_6h(max_changed_lm) if changed else 0.0
+    return changed, cycle_init_ts, new_lm
+
+
 def _push_temporal_state(state: dict) -> None:
     if not _TEMPORAL_STATUS_PUSH_URL:
         return
@@ -184,18 +235,24 @@ def _full_build(
     gfs_cidx: dict[str, ChunkIndex],
     out_dir: str,
     suffix: str = "",
+    cycle_init_ts: float = 0.0,
 ) -> None:
     era5_model = cfg["era5_model"]
     agg = cfg["agg"]
     w_start = now_ts - (window_h - 1) * 3600
 
     sums: dict[str, np.ndarray] = {}
-    n_era5, n_gfs = 0, 0
+    n_era5, n_gfs_stable, n_gfs_forecast = 0, 0, 0
 
     # GFS starts one step AFTER era5_end_ts so the boundary hour is not counted
     # in both ERA5 and GFS sums simultaneously.
     resolution = next((c.resolution for c in list(era5_cidx.values()) + list(gfs_cidx.values()) if c is not None), 3600.0)
     gfs_start = max(era5_end_ts + resolution, w_start)
+
+    # stable = [gfs_start, cycle_init_ts); forecast = [cycle_init_ts, gfs_end_ts]
+    # If cycle_init_ts == 0 (unknown), treat entire GFS window as forecast.
+    gfs_stable_end = (cycle_init_ts - resolution) if cycle_init_ts > gfs_start else (gfs_start - resolution)
+    gfs_fc_start = cycle_init_ts if cycle_init_ts > gfs_start else gfs_start
 
     if agg == "mode":
         cc_cidx = era5_cidx.get("cloud_cover")
@@ -224,7 +281,7 @@ def _full_build(
             sums[c] = era5_counts[c]
         n_era5 = max(0, int(round((era5_end_ts - w_start) / cc_cidx.resolution)))
 
-        # GFS gap fill for mode
+        # GFS gap fill for mode (no stable/forecast split for mode counts)
         gfs_cc = gfs_cidx.get("cloud_cover")
         gfs_pr = gfs_cidx.get("precipitation")
         gfs_sw = gfs_cidx.get("snowfall_water_equivalent")
@@ -246,10 +303,9 @@ def _full_build(
                     resampling="average",
                 )
                 sums[c] = sums[c] + np.round(gfs_reproj).astype(np.int32)
-            n_gfs = max(0, int(round((gfs_end_ts - gfs_mode_start) / gfs_cc.resolution)))
+            n_gfs_forecast = max(0, int(round((gfs_end_ts - gfs_mode_start) / gfs_cc.resolution)))
 
     elif var_id == "vapor_pressure_deficit":
-        # ERA5-land: accumulate per-timestep VPD directly
         t_cidx = era5_cidx.get("temperature_2m")
         td_cidx = era5_cidx.get("dew_point_2m")
         if not t_cidx or not td_cidx:
@@ -259,14 +315,21 @@ def _full_build(
         sums["era5_vpd"] = vpd_sum
         n_era5 = n
 
-        # GFS gap fill: per-timestep VPD from T + RH
         t_cidx_gfs = gfs_cidx.get("temperature_2m")
         rh_cidx_gfs = gfs_cidx.get("relative_humidity_2m")
-        if t_cidx_gfs and rh_cidx_gfs and gfs_start <= gfs_end_ts:
-            vpd_gfs_sum, n_gfs = accumulate_vpd_raster_gfs(
-                gfs_start, gfs_end_ts, t_cidx_gfs, rh_cidx_gfs, era5_model
-            )
-            sums["gfs_vpd"] = vpd_gfs_sum
+        if t_cidx_gfs and rh_cidx_gfs:
+            if gfs_start <= gfs_stable_end:
+                vpd_stable, n_s = accumulate_vpd_raster_gfs(
+                    gfs_start, gfs_stable_end, t_cidx_gfs, rh_cidx_gfs, era5_model
+                )
+                sums["gfs_vpd"] = vpd_stable
+                n_gfs_stable = n_s
+            if gfs_fc_start <= gfs_end_ts:
+                vpd_fc, n_f = accumulate_vpd_raster_gfs(
+                    gfs_fc_start, gfs_end_ts, t_cidx_gfs, rh_cidx_gfs, era5_model
+                )
+                sums["gfs_forecast_vpd"] = vpd_fc
+                n_gfs_forecast = n_f
 
         if not sums:
             print(f"  [{window_label}] {var_id}: no ERA5 data, skipping")
@@ -286,56 +349,76 @@ def _full_build(
             print(f"  [{window_label}] {var_id}: no ERA5 data, skipping")
             return
 
-        # GFS portion: starts one step after era5_end_ts (gfs_start computed above)
         dst_g = RASTER_GRIDS[era5_model]
         gfs_g = RASTER_GRIDS["ncep_gfs013"]
 
+        def _accum_gfs_reproj_full(gv: str, t0: float, t1: float) -> tuple[np.ndarray | None, int]:
+            cidx = gfs_cidx.get(gv)
+            if not cidx or t0 > t1:
+                return None, 0
+            acc, n = accumulate_raster("ncep_gfs013", gv, t0, t1, cidx)
+            reproj = reproject_to_grid(
+                acc.astype(np.float32),
+                gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                dst_g["ny"], dst_g["nx"],
+                dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
+            )
+            return reproj.astype(np.float64), n
+
         if var_id == "dew_point_2m":
-            # Derive GFS dew point from T + RH
             t_cidx = gfs_cidx.get("temperature_2m")
             rh_cidx = gfs_cidx.get("relative_humidity_2m")
-            if t_cidx and rh_cidx and gfs_start <= gfs_end_ts:
-                t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", gfs_start, gfs_end_ts, t_cidx)
-                rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", gfs_start, gfs_end_ts, rh_cidx)
+
+            def _accum_td(t0: float, t1: float) -> tuple[np.ndarray | None, int]:
+                if not t_cidx or not rh_cidx or t0 > t1:
+                    return None, 0
+                t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", t0, t1, t_cidx)
+                rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", t0, t1, rh_cidx)
                 n = min(t_n, rh_n)
-                if n > 0:
-                    t_avg = (t_sum / n).astype(np.float32)
-                    rh_avg = (rh_sum / n).astype(np.float32)
-                    td_gfs = _derive_dew_point(t_avg, rh_avg)
-                    td_repr = reproject_to_grid(
-                        td_gfs,
-                        gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                        dst_g["ny"], dst_g["nx"],
-                        dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
-                    )
-                    sums["gfs_dew_point_2m"] = td_repr.astype(np.float64) * n
-                    n_gfs = n
+                if n == 0:
+                    return None, 0
+                td = _derive_dew_point((t_sum / n).astype(np.float32), (rh_sum / n).astype(np.float32))
+                r = reproject_to_grid(td, gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                                      dst_g["ny"], dst_g["nx"], dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"])
+                return r.astype(np.float64) * n, n
+
+            if gfs_start <= gfs_stable_end:
+                arr, n = _accum_td(gfs_start, gfs_stable_end)
+                if arr is not None:
+                    sums["gfs_dew_point_2m"] = arr
+                    n_gfs_stable = n
+            if gfs_fc_start <= gfs_end_ts:
+                arr, n = _accum_td(gfs_fc_start, gfs_end_ts)
+                if arr is not None:
+                    sums["gfs_forecast_dew_point_2m"] = arr
+                    n_gfs_forecast = n
 
         else:
             for gv in _gfs_raw_vars(cfg):
-                cidx = gfs_cidx.get(gv)
-                if not cidx or gfs_start > gfs_end_ts:
-                    continue
-                acc, n = accumulate_raster("ncep_gfs013", gv, gfs_start, gfs_end_ts, cidx)
-                reproj = reproject_to_grid(
-                    acc.astype(np.float32),
-                    gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                    dst_g["ny"], dst_g["nx"],
-                    dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
-                )
-                sums[f"gfs_{gv}"] = reproj.astype(np.float64)
-                n_gfs = max(n_gfs, n)
+                if gfs_start <= gfs_stable_end:
+                    arr, n = _accum_gfs_reproj_full(gv, gfs_start, gfs_stable_end)
+                    if arr is not None:
+                        sums[f"gfs_{gv}"] = arr
+                        n_gfs_stable = max(n_gfs_stable, n)
+                if gfs_fc_start <= gfs_end_ts:
+                    arr, n = _accum_gfs_reproj_full(gv, gfs_fc_start, gfs_end_ts)
+                    if arr is not None:
+                        sums[f"gfs_forecast_{gv}"] = arr
+                        n_gfs_forecast = max(n_gfs_forecast, n)
 
+    n_gfs = n_gfs_stable + n_gfs_forecast
     meta = {
         "var_id": var_id, "window_h": window_h, "window_label": window_label,
         "era5_window_start_ts": w_start, "era5_end_ts": era5_end_ts,
         "gfs_start_ts": gfs_start,
         "gfs_end_ts": gfs_end_ts,
+        "gfs_cycle_init_ts": cycle_init_ts,
         "n_era5": n_era5, "n_gfs": n_gfs,
+        "n_gfs_stable": n_gfs_stable, "n_gfs_forecast": n_gfs_forecast,
         "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
     }
     save_raster_state(out_dir, var_id, window_label, agg, sums, meta, suffix=suffix)
-    print(f"  [{window_label}] {var_id}: {n_era5}h ERA5 + {n_gfs}h GFS → {out_dir}/{var_id}_{window_label}{suffix}.npy")
+    print(f"  [{window_label}] {var_id}: {n_era5}h ERA5 + {n_gfs_stable}h GFS-stable + {n_gfs_forecast}h GFS-fc → {out_dir}/{var_id}_{window_label}{suffix}.npy")
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +447,10 @@ def _incremental_update(
     old_gfs_start = float(old_meta["gfs_start_ts"])
     old_gfs_end = float(old_meta["gfs_end_ts"])
     n_era5 = int(old_meta["n_era5"])
-    n_gfs = int(old_meta["n_gfs"])
+    n_gfs_stable = int(old_meta.get("n_gfs_stable", old_meta["n_gfs"]))
+    n_gfs_forecast = int(old_meta.get("n_gfs_forecast", 0))
+    n_gfs = n_gfs_stable + n_gfs_forecast
+    cycle_init_ts = float(old_meta.get("gfs_cycle_init_ts", 0.0))
 
     if agg == "mode":
         # Mode incremental: sums contains {wc_code: count_grid}
@@ -472,13 +558,28 @@ def _incremental_update(
                 added = _vpd_era5(swap_start, swap_end)
                 if added is not None:
                     sums["era5_vpd"] = sums.get("era5_vpd", np.zeros_like(added)) + added
-                dropped = _vpd_gfs(swap_start, swap_end)
-                if dropped is not None and "gfs_vpd" in sums:
-                    sums["gfs_vpd"] = sums["gfs_vpd"] - dropped
+                if cycle_init_ts > 0:
+                    stable_swap_end = min(swap_end, cycle_init_ts - resolution)
+                    fc_swap_start = max(swap_start, cycle_init_ts)
+                else:
+                    stable_swap_end = swap_start - 1
+                    fc_swap_start = swap_start
+                stable_swap_n = max(0, int(round((stable_swap_end - swap_start) / resolution)) + 1) if stable_swap_end >= swap_start else 0
+                fc_swap_n = max(0, int(round((swap_end - fc_swap_start) / resolution)) + 1) if fc_swap_start <= swap_end else 0
+                if stable_swap_end >= swap_start:
+                    dropped = _vpd_gfs(swap_start, stable_swap_end)
+                    if dropped is not None and "gfs_vpd" in sums:
+                        sums["gfs_vpd"] = sums["gfs_vpd"] - dropped
+                if fc_swap_start <= swap_end:
+                    dropped = _vpd_gfs(fc_swap_start, swap_end)
+                    if dropped is not None and "gfs_forecast_vpd" in sums:
+                        sums["gfs_forecast_vpd"] = sums["gfs_forecast_vpd"] - dropped
                 n_era5 += swap_n
-                n_gfs -= swap_n
+                n_gfs_stable -= stable_swap_n
+                n_gfs_forecast -= fc_swap_n
                 old_gfs_start = era5_end_ts + resolution
 
+        # Drops: split at cycle_init_ts — stable bucket vs forecast bucket
         if new_w_start > old_w_start:
             era5_drop_end = min(new_w_start - resolution, era5_end_ts)
             if era5_drop_end >= old_w_start:
@@ -491,20 +592,34 @@ def _incremental_update(
             gfs_drop_start = max(old_w_start, old_gfs_start)
             gfs_drop_end = min(new_w_start - resolution, old_gfs_end)
             if gfs_drop_end >= gfs_drop_start:
-                drop_n = int(round((gfs_drop_end - gfs_drop_start) / resolution)) + 1
-                dropped = _vpd_gfs(gfs_drop_start, gfs_drop_end)
-                if dropped is not None and "gfs_vpd" in sums:
-                    sums["gfs_vpd"] = sums["gfs_vpd"] - dropped
-                n_gfs -= drop_n
+                if cycle_init_ts > 0:
+                    stable_drop_end = min(gfs_drop_end, cycle_init_ts - resolution)
+                    fc_drop_start = max(gfs_drop_start, cycle_init_ts)
+                else:
+                    stable_drop_end = gfs_drop_start - 1
+                    fc_drop_start = gfs_drop_start
+                if stable_drop_end >= gfs_drop_start:
+                    dropped = _vpd_gfs(gfs_drop_start, stable_drop_end)
+                    sn = int(round((stable_drop_end - gfs_drop_start) / resolution)) + 1
+                    if dropped is not None and "gfs_vpd" in sums:
+                        sums["gfs_vpd"] = sums["gfs_vpd"] - dropped
+                    n_gfs_stable -= sn
+                if fc_drop_start <= gfs_drop_end:
+                    dropped = _vpd_gfs(fc_drop_start, gfs_drop_end)
+                    fn = int(round((gfs_drop_end - fc_drop_start) / resolution)) + 1
+                    if dropped is not None and "gfs_forecast_vpd" in sums:
+                        sums["gfs_forecast_vpd"] = sums["gfs_forecast_vpd"] - dropped
+                    n_gfs_forecast -= fn
 
+        # Adds always go to forecast bucket
         if gfs_end_ts > old_gfs_end:
             add_start = max(old_gfs_end + resolution, new_w_start)
             if gfs_end_ts >= add_start:
                 add_n = int(round((gfs_end_ts - add_start) / resolution)) + 1
                 added = _vpd_gfs(add_start, gfs_end_ts)
                 if added is not None:
-                    sums["gfs_vpd"] = sums.get("gfs_vpd", np.zeros_like(added)) + added
-                n_gfs += add_n
+                    sums["gfs_forecast_vpd"] = sums.get("gfs_forecast_vpd", np.zeros_like(added)) + added
+                n_gfs_forecast += add_n
 
     else:
         # Scalar incremental
@@ -541,14 +656,28 @@ def _incremental_update(
                     if added is not None:
                         key = f"era5_{rv}"
                         sums[key] = sums.get(key, np.zeros_like(added)) + added
+                # ERA5 quality swap: split GFS drop between stable and forecast buckets.
+                # When cycle_init_ts=0 (unknown), everything is in the forecast bucket.
+                if cycle_init_ts > 0:
+                    stable_swap_end = min(swap_end, cycle_init_ts - resolution)
+                    fc_swap_start = max(swap_start, cycle_init_ts)
+                else:
+                    stable_swap_end = swap_start - 1  # nothing in stable
+                    fc_swap_start = swap_start          # all in forecast
+                stable_swap_n = max(0, int(round((stable_swap_end - swap_start) / resolution)) + 1) if stable_swap_end >= swap_start else 0
+                fc_swap_n = max(0, int(round((swap_end - fc_swap_start) / resolution)) + 1) if fc_swap_start <= swap_end else 0
                 for gv in _gfs_raw_vars(cfg):
-                    dropped = _accum_gfs_reproj(gv, swap_start, swap_end)
-                    if dropped is not None:
-                        key = f"gfs_{gv}"
-                        if key in sums:
-                            sums[key] = sums[key] - dropped
+                    if stable_swap_end >= swap_start:
+                        dropped = _accum_gfs_reproj(gv, swap_start, stable_swap_end)
+                        if dropped is not None and f"gfs_{gv}" in sums:
+                            sums[f"gfs_{gv}"] = sums[f"gfs_{gv}"] - dropped
+                    if fc_swap_start <= swap_end:
+                        dropped = _accum_gfs_reproj(gv, fc_swap_start, swap_end)
+                        if dropped is not None and f"gfs_forecast_{gv}" in sums:
+                            sums[f"gfs_forecast_{gv}"] = sums[f"gfs_forecast_{gv}"] - dropped
                 n_era5 += swap_n
-                n_gfs -= swap_n
+                n_gfs_stable -= stable_swap_n
+                n_gfs_forecast -= fc_swap_n
                 old_gfs_start = era5_end_ts + resolution
 
         if new_w_start > old_w_start:
@@ -566,15 +695,27 @@ def _incremental_update(
             gfs_drop_start = max(old_w_start, old_gfs_start)
             gfs_drop_end = min(new_w_start - resolution, old_gfs_end)
             if gfs_drop_end >= gfs_drop_start:
-                drop_n = int(round((gfs_drop_end - gfs_drop_start) / resolution)) + 1
+                if cycle_init_ts > 0:
+                    stable_drop_end = min(gfs_drop_end, cycle_init_ts - resolution)
+                    fc_drop_start = max(gfs_drop_start, cycle_init_ts)
+                else:
+                    stable_drop_end = gfs_drop_start - 1  # nothing in stable
+                    fc_drop_start = gfs_drop_start          # all in forecast
                 for gv in _gfs_raw_vars(cfg):
-                    dropped = _accum_gfs_reproj(gv, gfs_drop_start, gfs_drop_end)
-                    if dropped is not None:
-                        key = f"gfs_{gv}"
-                        if key in sums:
-                            sums[key] = sums[key] - dropped
-                n_gfs -= drop_n
+                    if stable_drop_end >= gfs_drop_start:
+                        dropped = _accum_gfs_reproj(gv, gfs_drop_start, stable_drop_end)
+                        if dropped is not None and f"gfs_{gv}" in sums:
+                            sums[f"gfs_{gv}"] = sums[f"gfs_{gv}"] - dropped
+                    if fc_drop_start <= gfs_drop_end:
+                        dropped = _accum_gfs_reproj(gv, fc_drop_start, gfs_drop_end)
+                        if dropped is not None and f"gfs_forecast_{gv}" in sums:
+                            sums[f"gfs_forecast_{gv}"] = sums[f"gfs_forecast_{gv}"] - dropped
+                stable_dn = max(0, int(round((stable_drop_end - gfs_drop_start) / resolution)) + 1) if stable_drop_end >= gfs_drop_start else 0
+                fc_dn = max(0, int(round((gfs_drop_end - fc_drop_start) / resolution)) + 1) if fc_drop_start <= gfs_drop_end else 0
+                n_gfs_stable -= stable_dn
+                n_gfs_forecast -= fc_dn
 
+        # Adds always go to forecast bucket (new data >= cycle_init_ts)
         if gfs_end_ts > old_gfs_end:
             add_start = max(old_gfs_end + resolution, new_w_start)
             if gfs_end_ts >= add_start:
@@ -582,19 +723,29 @@ def _incremental_update(
                 for gv in _gfs_raw_vars(cfg):
                     added = _accum_gfs_reproj(gv, add_start, gfs_end_ts)
                     if added is not None:
-                        key = f"gfs_{gv}"
+                        key = f"gfs_forecast_{gv}"
                         sums[key] = sums.get(key, np.zeros_like(added)) + added
-                n_gfs += add_n
+                n_gfs_forecast += add_n
 
     n_era5 = max(n_era5, 0)
-    n_gfs = max(n_gfs, 0)
+    if agg == "mode":
+        # Mode doesn't split stable/forecast; n_gfs was updated directly above.
+        n_gfs = max(n_gfs, 0)
+        n_gfs_stable = n_gfs
+        n_gfs_forecast = 0
+    else:
+        n_gfs_stable = max(n_gfs_stable, 0)
+        n_gfs_forecast = max(n_gfs_forecast, 0)
+        n_gfs = n_gfs_stable + n_gfs_forecast
     meta = {
         **old_meta,
         "era5_end_ts": era5_end_ts,
         "era5_window_start_ts": new_w_start,
         "gfs_start_ts": max(era5_end_ts + resolution, new_w_start),
         "gfs_end_ts": gfs_end_ts,
+        "gfs_cycle_init_ts": cycle_init_ts,
         "n_era5": n_era5, "n_gfs": n_gfs,
+        "n_gfs_stable": n_gfs_stable, "n_gfs_forecast": n_gfs_forecast,
         "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
     }
     save_raster_state(out_dir, var_id, window_label, agg, sums, meta)
@@ -617,23 +768,23 @@ def _gfs_rederive(
     era5_cidx: dict,
     gfs_cidx: dict,
     out_dir: str,
+    new_cycle_init_ts: float = 0.0,
 ) -> None:
-    """Re-accumulate GFS sums after a GFS cycle replaces the frontier chunk.
+    """Re-accumulate GFS forecast sums after a GFS cycle update.
 
-    A new GFS cycle revises recent short-range forecast hours (the 3-6 h ahead
-    values from the previous cycle's initialization). The incremental drop reads
-    from the current chunk; the stored sums were built from the older chunk.
-    When those values differ the drop over-subtracts, leaving negative residuals.
-
-    ERA5 sums are preserved — ERA5 is immutable. GFS sums are zeroed and rebuilt
-    from the current frontier chunk for the full GFS window (max 7 days).
-    For mode vars the sums interleave ERA5+GFS irretrievably; fall back to _full_build.
+    Strategy (stable/forecast split):
+    - Graduate [old_cycle_init_ts, new_cycle_init_ts) from forecast → stable (re-read ~6h, now frozen)
+    - Discard all gfs_forecast_* sums
+    - Rebuild gfs_forecast_* from [new_cycle_init_ts, new_gfs_end_ts]
+    - gfs_* (stable) sums are preserved as-is (chunk values frozen at ≤ old cycle init)
+    - ERA5 quality swap + ERA5 window drop applied normally
+    - For mode vars: can't separate ERA5/GFS in count arrays → fall back to _full_build
     """
     agg = cfg["agg"]
 
     if agg == "mode":
         _full_build(var_id, cfg, window_h, window_label, now_ts, era5_end_ts, gfs_end_ts,
-                    era5_cidx, gfs_cidx, out_dir)
+                    era5_cidx, gfs_cidx, out_dir, cycle_init_ts=new_cycle_init_ts)
         return
 
     era5_model = cfg["era5_model"]
@@ -647,13 +798,27 @@ def _gfs_rederive(
     old_w_start = float(existing_meta["era5_window_start_ts"])
     old_era5_end = float(existing_meta["era5_end_ts"])
     old_gfs_end = float(existing_meta["gfs_end_ts"])
+    old_cycle_init_ts = float(existing_meta.get("gfs_cycle_init_ts", 0.0))
 
-    # Deep-copy ERA5 sums; zero all GFS sums.
+    # Preserve ERA5 and stable GFS sums; zero only forecast sums.
     sums: dict = {}
     for k, v in existing_sums.items():
-        sums[k] = np.zeros_like(v) if str(k).startswith("gfs_") else v.copy()
+        sums[k] = np.zeros_like(v) if str(k).startswith("gfs_forecast_") else v.copy()
 
-    n_gfs = 0
+    n_gfs_stable = int(existing_meta.get("n_gfs_stable", existing_meta.get("n_gfs", 0)))
+    n_gfs_forecast = 0
+
+    def _gfs_acc(gv: str, start: float, end: float) -> np.ndarray | None:
+        cidx = gfs_cidx.get(gv)
+        if not cidx or end < start:
+            return None
+        acc, _ = accumulate_raster("ncep_gfs013", gv, start, end, cidx)
+        return reproject_to_grid(
+            acc.astype(np.float32),
+            gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+            dst_g["ny"], dst_g["nx"],
+            dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
+        )
 
     if var_id == "vapor_pressure_deficit":
         t_cidx = era5_cidx.get("temperature_2m")
@@ -667,6 +832,13 @@ def _gfs_rederive(
             acc, _ = accumulate_vpd_raster(era5_model, start, end, t_cidx, td_cidx)
             return acc.astype(np.float32)
 
+        def _vpd_gfs_acc(start: float, end: float) -> np.ndarray | None:
+            if not t_cidx_gfs or not rh_cidx_gfs or end < start:
+                return None
+            acc, _ = accumulate_vpd_raster_gfs(start, end, t_cidx_gfs, rh_cidx_gfs, era5_model)
+            return acc.astype(np.float32)
+
+        # ERA5 quality swap
         if era5_end_ts > old_era5_end:
             swap_start = max(old_era5_end + resolution, old_w_start)
             swap_end = min(era5_end_ts, old_gfs_end)
@@ -675,6 +847,7 @@ def _gfs_rederive(
                 if added is not None:
                     sums["era5_vpd"] = sums.get("era5_vpd", np.zeros_like(added)) + added
 
+        # ERA5 window drop
         if new_w_start > old_w_start:
             era5_drop_end = min(new_w_start - resolution, era5_end_ts)
             if era5_drop_end >= old_w_start:
@@ -682,17 +855,47 @@ def _gfs_rederive(
                 if dropped is not None and "era5_vpd" in sums:
                     sums["era5_vpd"] = sums["era5_vpd"] - dropped
 
-        if new_gfs_start <= gfs_end_ts and t_cidx_gfs and rh_cidx_gfs:
-            vpd_acc, n_gfs = accumulate_vpd_raster_gfs(
+        # Graduate old forecast → stable, then rebuild new forecast
+        if old_cycle_init_ts > 0 and new_cycle_init_ts > old_cycle_init_ts:
+            grad_end = new_cycle_init_ts - resolution
+            if grad_end >= old_cycle_init_ts:
+                graduated = _vpd_gfs_acc(old_cycle_init_ts, grad_end)
+                grad_n = int(round((grad_end - old_cycle_init_ts) / resolution)) + 1
+                if graduated is not None:
+                    sums["gfs_vpd"] = sums.get("gfs_vpd", np.zeros_like(graduated)) + graduated
+                    n_gfs_stable += grad_n
+
+        if new_cycle_init_ts > 0 and new_cycle_init_ts <= gfs_end_ts:
+            fc_start = max(new_cycle_init_ts, new_gfs_start)
+            if fc_start <= gfs_end_ts:
+                vpd_fc, n_f = accumulate_vpd_raster_gfs(fc_start, gfs_end_ts, t_cidx_gfs, rh_cidx_gfs, era5_model)
+                sums["gfs_forecast_vpd"] = vpd_fc
+                n_gfs_forecast = n_f
+        elif new_gfs_start <= gfs_end_ts and t_cidx_gfs and rh_cidx_gfs:
+            vpd_fc, n_gfs_forecast = accumulate_vpd_raster_gfs(
                 new_gfs_start, gfs_end_ts, t_cidx_gfs, rh_cidx_gfs, era5_model
             )
-            sums["gfs_vpd"] = vpd_acc
+            sums["gfs_forecast_vpd"] = vpd_fc
 
     elif var_id == "dew_point_2m":
         td_era5_cidx = era5_cidx.get("dew_point_2m")
         t_cidx_gfs = gfs_cidx.get("temperature_2m")
         rh_cidx_gfs = gfs_cidx.get("relative_humidity_2m")
 
+        def _accum_td(start: float, end: float) -> tuple[np.ndarray | None, int]:
+            if not t_cidx_gfs or not rh_cidx_gfs or start > end:
+                return None, 0
+            t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", start, end, t_cidx_gfs)
+            rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", start, end, rh_cidx_gfs)
+            n = min(t_n, rh_n)
+            if n == 0:
+                return None, 0
+            td = _derive_dew_point((t_sum / n).astype(np.float32), (rh_sum / n).astype(np.float32))
+            r = reproject_to_grid(td, gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                                  dst_g["ny"], dst_g["nx"], dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"])
+            return r.astype(np.float64) * n, n
+
+        # ERA5 quality swap
         if era5_end_ts > old_era5_end:
             swap_start = max(old_era5_end + resolution, old_w_start)
             swap_end = min(era5_end_ts, old_gfs_end)
@@ -701,6 +904,7 @@ def _gfs_rederive(
                 key = "era5_dew_point_2m"
                 sums[key] = sums.get(key, np.zeros_like(added)) + added
 
+        # ERA5 window drop
         if new_w_start > old_w_start and td_era5_cidx:
             era5_drop_end = min(new_w_start - resolution, era5_end_ts)
             if era5_drop_end >= old_w_start:
@@ -708,24 +912,24 @@ def _gfs_rederive(
                 if "era5_dew_point_2m" in sums:
                     sums["era5_dew_point_2m"] = sums["era5_dew_point_2m"] - dropped
 
-        if new_gfs_start <= gfs_end_ts and t_cidx_gfs and rh_cidx_gfs:
-            t_sum, t_n = accumulate_raster("ncep_gfs013", "temperature_2m", new_gfs_start, gfs_end_ts, t_cidx_gfs)
-            rh_sum, rh_n = accumulate_raster("ncep_gfs013", "relative_humidity_2m", new_gfs_start, gfs_end_ts, rh_cidx_gfs)
-            n_gfs = min(t_n, rh_n)
-            if n_gfs > 0:
-                t_avg = (t_sum / n_gfs).astype(np.float32)
-                rh_avg = (rh_sum / n_gfs).astype(np.float32)
-                td_gfs = _derive_dew_point(t_avg, rh_avg)
-                td_repr = reproject_to_grid(
-                    td_gfs,
-                    gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                    dst_g["ny"], dst_g["nx"],
-                    dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
-                )
-                sums["gfs_dew_point_2m"] = td_repr.astype(np.float64) * n_gfs
+        # Graduate old forecast → stable
+        if old_cycle_init_ts > 0 and new_cycle_init_ts > old_cycle_init_ts:
+            grad_end = new_cycle_init_ts - resolution
+            if grad_end >= old_cycle_init_ts:
+                arr, grad_n = _accum_td(old_cycle_init_ts, grad_end)
+                if arr is not None:
+                    sums["gfs_dew_point_2m"] = sums.get("gfs_dew_point_2m", np.zeros_like(arr)) + arr
+                    n_gfs_stable += grad_n
+
+        # Rebuild new forecast
+        fc_start = max(new_cycle_init_ts, new_gfs_start) if new_cycle_init_ts > 0 else new_gfs_start
+        if fc_start <= gfs_end_ts:
+            arr, n_gfs_forecast = _accum_td(fc_start, gfs_end_ts)
+            if arr is not None:
+                sums["gfs_forecast_dew_point_2m"] = arr
 
     else:
-        # Standard scalar vars with gfs_var
+        # Standard scalar vars
         def _era5_acc(rv: str, start: float, end: float) -> np.ndarray | None:
             cidx = era5_cidx.get(rv)
             if not cidx or end < start:
@@ -733,18 +937,7 @@ def _gfs_rederive(
             acc, _ = accumulate_raster(era5_model, rv, start, end, cidx)
             return acc.astype(np.float32)
 
-        def _gfs_acc(gv: str, start: float, end: float) -> np.ndarray | None:
-            cidx = gfs_cidx.get(gv)
-            if not cidx or end < start:
-                return None
-            acc, _ = accumulate_raster("ncep_gfs013", gv, start, end, cidx)
-            return reproject_to_grid(
-                acc.astype(np.float32),
-                gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                dst_g["ny"], dst_g["nx"],
-                dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
-            )
-
+        # ERA5 quality swap
         if era5_end_ts > old_era5_end:
             swap_start = max(old_era5_end + resolution, old_w_start)
             swap_end = min(era5_end_ts, old_gfs_end)
@@ -755,6 +948,7 @@ def _gfs_rederive(
                         key = f"era5_{rv}"
                         sums[key] = sums.get(key, np.zeros_like(added)) + added
 
+        # ERA5 window drop
         if new_w_start > old_w_start:
             era5_drop_end = min(new_w_start - resolution, era5_end_ts)
             if era5_drop_end >= old_w_start:
@@ -765,20 +959,35 @@ def _gfs_rederive(
                         if key in sums:
                             sums[key] = sums[key] - dropped
 
-        if new_gfs_start <= gfs_end_ts:
-            for gv in _gfs_raw_vars(cfg):
-                added = _gfs_acc(gv, new_gfs_start, gfs_end_ts)
-                if added is not None:
-                    sums[f"gfs_{gv}"] = added.astype(np.float64)
-                    n_gfs = max(n_gfs, int(round((gfs_end_ts - new_gfs_start) / resolution)) + 1)
+        # Graduate [old_cycle_init_ts, new_cycle_init_ts) from forecast → stable
+        if old_cycle_init_ts > 0 and new_cycle_init_ts > old_cycle_init_ts:
+            grad_end = new_cycle_init_ts - resolution
+            if grad_end >= old_cycle_init_ts:
+                grad_n = int(round((grad_end - old_cycle_init_ts) / resolution)) + 1
+                for gv in _gfs_raw_vars(cfg):
+                    arr = _gfs_acc(gv, old_cycle_init_ts, grad_end)
+                    if arr is not None:
+                        sums[f"gfs_{gv}"] = sums.get(f"gfs_{gv}", np.zeros_like(arr)) + arr.astype(np.float64)
+                n_gfs_stable += grad_n
 
-    # n_era5 derived from the window range — more reliable than tracking deltas.
+        # Rebuild forecast sums from [new_cycle_init_ts, gfs_end_ts]
+        fc_start = max(new_cycle_init_ts, new_gfs_start) if new_cycle_init_ts > 0 else new_gfs_start
+        if fc_start <= gfs_end_ts:
+            fc_n = int(round((gfs_end_ts - fc_start) / resolution)) + 1
+            for gv in _gfs_raw_vars(cfg):
+                arr = _gfs_acc(gv, fc_start, gfs_end_ts)
+                if arr is not None:
+                    sums[f"gfs_forecast_{gv}"] = arr.astype(np.float64)
+                    n_gfs_forecast = max(n_gfs_forecast, fc_n)
+
     n_era5 = (
         int(round((era5_end_ts - new_w_start) / resolution)) + 1
         if new_w_start <= era5_end_ts else 0
     )
     n_era5 = max(n_era5, 0)
-    n_gfs = max(n_gfs, 0)
+    n_gfs_stable = max(n_gfs_stable, 0)
+    n_gfs_forecast = max(n_gfs_forecast, 0)
+    n_gfs = n_gfs_stable + n_gfs_forecast
 
     meta = {
         **existing_meta,
@@ -786,12 +995,15 @@ def _gfs_rederive(
         "era5_window_start_ts": new_w_start,
         "gfs_start_ts": new_gfs_start,
         "gfs_end_ts": gfs_end_ts,
+        "gfs_cycle_init_ts": new_cycle_init_ts,
         "n_era5": n_era5,
         "n_gfs": n_gfs,
+        "n_gfs_stable": n_gfs_stable,
+        "n_gfs_forecast": n_gfs_forecast,
         "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
     }
     save_raster_state(out_dir, var_id, window_label, agg, sums, meta)
-    print(f"  [{window_label}] {var_id}: GFS re-derived ({n_gfs}h), ERA5 {n_era5}h preserved", flush=True)
+    print(f"  [{window_label}] {var_id}: GFS cycle rederive → {n_gfs_stable}h stable + {n_gfs_forecast}h forecast, ERA5 {n_era5}h preserved", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1113,22 @@ def _build_forecast_aggregates(
                     n_gfs += int(round((gfs_end_for_fc - old_gfs_end) / resolution))
 
             else:
+                cycle_init_ts = float(now_meta.get("gfs_cycle_init_ts", 0.0))
+                n_gfs_stable = int(now_meta.get("n_gfs_stable", n_gfs))
+                n_gfs_forecast = int(now_meta.get("n_gfs_forecast", 0))
+
+                def _gfs_reproj_fc(gv: str, start: float, end: float) -> np.ndarray | None:
+                    cidx = gfs_cidx.get(gv)
+                    if not cidx or end < start:
+                        return None
+                    acc, _ = accumulate_raster("ncep_gfs013", gv, start, end, cidx)
+                    return reproject_to_grid(
+                        acc.astype(np.float32),
+                        gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                        dst_g["ny"], dst_g["nx"],
+                        dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
+                    )
+
                 # Drop oldest forecast_h hours from ERA5 tail
                 era5_drop_end = min(new_w_start, era5_end_ts)
                 if era5_drop_end > old_w_start:
@@ -915,42 +1143,50 @@ def _build_forecast_aggregates(
                             sums[key] = np.maximum(0.0, sums[key] - dropped)
                     n_era5 -= drop_n
 
+                # GFS drops — split at cycle_init_ts
                 gfs_drop_end = min(new_w_start, old_gfs_end)
                 if gfs_drop_end > old_gfs_start:
-                    drop_n = int(round((gfs_drop_end - old_gfs_start) / resolution))
+                    stable_drop_end = min(gfs_drop_end, cycle_init_ts - resolution) if cycle_init_ts > 0 else gfs_drop_end
+                    fc_drop_start = max(old_gfs_start, cycle_init_ts) if cycle_init_ts > 0 else gfs_drop_end + 1
                     for gv in _gfs_raw_vars(cfg):
-                        cidx = gfs_cidx.get(gv)
-                        if not cidx:
-                            continue
-                        dropped, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_start, gfs_drop_end, cidx)
-                        reproj = reproject_to_grid(
-                            dropped.astype(np.float32),
-                            gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                            dst_g["ny"], dst_g["nx"],
-                            dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
-                        )
-                        key = f"gfs_{gv}"
-                        if key in sums:
-                            sums[key] = np.maximum(0.0, sums[key] - reproj)
-                    n_gfs -= drop_n
+                        if stable_drop_end >= old_gfs_start:
+                            r = _gfs_reproj_fc(gv, old_gfs_start, stable_drop_end)
+                            if r is not None and f"gfs_{gv}" in sums:
+                                sums[f"gfs_{gv}"] = np.maximum(0.0, sums[f"gfs_{gv}"] - r)
+                        if fc_drop_start <= gfs_drop_end:
+                            r = _gfs_reproj_fc(gv, fc_drop_start, gfs_drop_end)
+                            if r is not None and f"gfs_forecast_{gv}" in sums:
+                                sums[f"gfs_forecast_{gv}"] = np.maximum(0.0, sums[f"gfs_forecast_{gv}"] - r)
+                    sdn = max(0, int(round((stable_drop_end - old_gfs_start) / resolution))) if stable_drop_end >= old_gfs_start else 0
+                    fdn = max(0, int(round((gfs_drop_end - fc_drop_start) / resolution))) if fc_drop_start <= gfs_drop_end else 0
+                    n_gfs_stable -= sdn
+                    n_gfs_forecast -= fdn
 
-                # Add GFS forecast hours [old_gfs_end → future_ts]
+                # Add GFS forecast hours → always to forecast bucket
                 if gfs_end_for_fc > old_gfs_end:
                     add_n = int(round((gfs_end_for_fc - old_gfs_end) / resolution))
                     for gv in _gfs_raw_vars(cfg):
-                        cidx = gfs_cidx.get(gv)
-                        if not cidx:
-                            continue
-                        added, _ = accumulate_raster("ncep_gfs013", gv, old_gfs_end, gfs_end_for_fc, cidx)
-                        reproj = reproject_to_grid(
-                            added.astype(np.float32),
-                            gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
-                            dst_g["ny"], dst_g["nx"],
-                            dst_g["lat_min"], dst_g["lat_max"], dst_g["lon_min"], dst_g["lon_max"],
-                        )
-                        key = f"gfs_{gv}"
-                        sums[key] = sums.get(key, np.zeros_like(reproj)) + reproj
-                    n_gfs += add_n
+                        r = _gfs_reproj_fc(gv, old_gfs_end, gfs_end_for_fc)
+                        if r is not None:
+                            key = f"gfs_forecast_{gv}"
+                            sums[key] = sums.get(key, np.zeros_like(r)) + r
+                    n_gfs_forecast += add_n
+
+                n_era5 = max(n_era5, 0)
+                n_gfs_stable = max(n_gfs_stable, 0)
+                n_gfs_forecast = max(n_gfs_forecast, 0)
+                n_gfs = n_gfs_stable + n_gfs_forecast
+                fc_meta = {
+                    **now_meta,
+                    "era5_window_start_ts": new_w_start,
+                    "gfs_start_ts": max(era5_end_ts, new_w_start),
+                    "gfs_end_ts": gfs_end_for_fc,
+                    "n_era5": n_era5, "n_gfs": n_gfs,
+                    "n_gfs_stable": n_gfs_stable, "n_gfs_forecast": n_gfs_forecast,
+                    "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
+                }
+                save_raster_state(out_dir, vid, wl, agg, sums, fc_meta, suffix=suffix)
+                return
 
             n_era5 = max(n_era5, 0)
             n_gfs = max(n_gfs, 0)
@@ -1194,7 +1430,8 @@ def main() -> None:
     forecast_done: list[bool] = [
         same_data and bool(prior_state.get("forecast_completed"))
     ]
-    frontier_chunk_nums: dict = {}  # populated after chunk indices are built
+    gfs_chunk_last_modified: dict = {}  # populated after cycle detection
+    new_cycle_init_ts: float = 0.0     # set after cycle detection
 
     def _write_state(status: str, *, skipped: bool = False, error: str | None = None) -> None:
         state: dict = {
@@ -1206,7 +1443,7 @@ def main() -> None:
             "skipped": skipped,
             "completed_vars": completed_vars,
             "forecast_completed": forecast_done[0],
-            "gfs_frontier_chunks": frontier_chunk_nums,
+            "gfs_chunk_last_modified": gfs_chunk_last_modified,
         }
         if status == "completed":
             state["completed_at"] = datetime.now(UTC).isoformat()
@@ -1240,22 +1477,19 @@ def main() -> None:
             except Exception as e:
                 print(f"  GFS {gv}: unavailable ({e})")
 
-        # Detect GFS frontier chunk rotation — a new cycle may revise recent
-        # short-range forecast values, making stored GFS sums inconsistent.
-        for gv, cidx in gfs_cidx.items():
-            entry, _ = _chunk_entry_for_time(cidx, gfs_end_ts)
-            if entry is not None:
-                frontier_chunk_nums[gv] = entry.chunk_num
-
-        prev_frontier_nums: dict = prior_state.get("gfs_frontier_chunks", {})
-        gfs_cycle_changed = bool(frontier_chunk_nums) and any(
-            frontier_chunk_nums.get(gv) != prev_frontier_nums.get(gv)
-            for gv in frontier_chunk_nums
+        # Detect GFS cycle update via S3 LastModified comparison.
+        # chunk_num only changes ~every 20 days; LastModified changes every 6h cycle.
+        import fsspec as _fsspec
+        _fs = _fsspec.filesystem("s3", anon=True)
+        prev_lm: dict = prior_state.get("gfs_chunk_last_modified", {})
+        max_window_h = max((h for h, _ in windows), default=168)
+        gfs_cycle_changed, new_cycle_init_ts, gfs_chunk_last_modified = _gfs_detect_cycle(
+            gfs_cidx, gfs_end_ts, max_window_h, _fs, prev_lm
         )
         if gfs_cycle_changed:
-            changed = [gv for gv in frontier_chunk_nums
-                       if frontier_chunk_nums[gv] != prev_frontier_nums.get(gv)]
-            print(f"  GFS frontier chunk changed ({changed}) → will re-derive GFS sums", flush=True)
+            from datetime import datetime as _dt
+            cycle_label = _dt.fromtimestamp(new_cycle_init_ts, tz=UTC).strftime("%Y-%m-%dT%HZ")
+            print(f"  GFS cycle changed → new cycle_init_ts={cycle_label}, will re-derive GFS sums", flush=True)
 
         era5_cidx_by_var: dict[str, dict[str, ChunkIndex]] = {}
         for var_id, vcfg in var_configs.items():
@@ -1308,14 +1542,20 @@ def main() -> None:
             era5_end = era5_land_end_ts if era5_model == "copernicus_era5_land" else era5_end_ts
             era5_cidx = era5_cidx_by_var.get(var_id, {})
             existing_sums, existing_meta = load_raster_state(out_dir, var_id, wl)
-            if force or existing_sums is None:
-                print(f"  [{wl}] {var_id} full build …", flush=True)
+            # Migration: state missing gfs_cycle_init_ts → treat as stale, force full build
+            needs_migration = (existing_meta is not None
+                               and "gfs_cycle_init_ts" not in existing_meta
+                               and vcfg.get("agg") != "mode")
+            if force or existing_sums is None or needs_migration:
+                reason = "migration" if needs_migration else ("force" if force else "no state")
+                print(f"  [{wl}] {var_id} full build ({reason}) …", flush=True)
                 _full_build(var_id, vcfg, window_h, wl, now_ts, era5_end, gfs_end_ts,
-                            era5_cidx, gfs_cidx, out_dir)
+                            era5_cidx, gfs_cidx, out_dir, cycle_init_ts=new_cycle_init_ts)
             elif gfs_cycle_changed:
                 print(f"  [{wl}] {var_id} GFS cycle re-derive …", flush=True)
                 _gfs_rederive(var_id, vcfg, window_h, wl, existing_sums, existing_meta,
-                              now_ts, era5_end, gfs_end_ts, era5_cidx, gfs_cidx, out_dir)
+                              now_ts, era5_end, gfs_end_ts, era5_cidx, gfs_cidx, out_dir,
+                              new_cycle_init_ts=new_cycle_init_ts)
             else:
                 stale_h = (now_ts - float(existing_meta["gfs_end_ts"])) / 3600
                 print(f"  [{wl}] {var_id} incremental ({stale_h:.1f}h stale) …", flush=True)

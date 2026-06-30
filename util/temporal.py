@@ -2308,14 +2308,15 @@ def compute_raster_final(
     zero = np.zeros_like(next(iter(sums.values())), dtype=np.float64)
 
     if var_id == "vapor_pressure_deficit":
-        vpd_sum = sums.get("era5_vpd", zero) + sums.get("gfs_vpd", zero)
+        vpd_sum = sums.get("era5_vpd", zero) + sums.get("gfs_vpd", zero) + sums.get("gfs_forecast_vpd", zero)
         result = vpd_sum / n_total
         return np.maximum(result, 0.0).astype(np.float32)
 
     if var_id == "dew_point_2m":
         era5_val = sums.get("era5_dew_point_2m", zero) / max(n_era5, 1)
-        if n_gfs > 0 and "gfs_dew_point_2m" in sums:
-            gfs_val = sums["gfs_dew_point_2m"] / n_gfs
+        gfs_combined = sums.get("gfs_dew_point_2m", zero) + sums.get("gfs_forecast_dew_point_2m", zero)
+        if n_gfs > 0 and np.any(gfs_combined != 0):
+            gfs_val = gfs_combined / n_gfs
             return ((era5_val * n_era5 + gfs_val * n_gfs) / n_total).astype(np.float32)
         return era5_val.astype(np.float32)
 

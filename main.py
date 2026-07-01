@@ -44,7 +44,7 @@ from util.stats import (
     read_phenology_counts,
 )
 from util.storage import ParquetStorageProxy
-from util.taxa import format_common_name, iter_descendants, normalize_name, taxon_slug
+from util.taxa import format_common_name, iter_descendants, normalize_name, reload_catalog, taxon_slug
 
 _CONFIG = load_config("global")
 _SYNC_STATE_PATH = Path("data/sync_state.json")
@@ -286,6 +286,19 @@ async def push_pipeline_state(body: dict):
     await run_in_threadpool(
         lambda: _PIPELINE_STATE_PATH.write_text(json.dumps(body))
     )
+    return {"ok": True}
+
+
+@app.post("/internal/reload", status_code=200)
+async def reload_data():
+    """Clear all in-process caches so the next request reads fresh data from disk.
+    Called after a rebuild push so the API picks up the new catalog without a restart."""
+    reload_catalog()
+    _load_legend.cache_clear()
+    _load_hierarchy.cache_clear()
+    tiles._catalog.cache_clear()
+    tiles._load_nominal_colormap.cache_clear()
+    legend_cache.clear()
     return {"ok": True}
 
 

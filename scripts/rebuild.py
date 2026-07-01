@@ -175,6 +175,16 @@ def _push_stage() -> None:
     if r.returncode != 0:
         raise RuntimeError(f"rclone sync failed with exit code {r.returncode}")
 
+    if STATUS_PUSH_URL:
+        import urllib.request
+        reload_url = STATUS_PUSH_URL.rstrip("/") + "/internal/reload"
+        try:
+            req = urllib.request.Request(reload_url, method="POST", data=b"")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                print(f"  API reload: {resp.status} {resp.reason}")
+        except Exception as exc:
+            print(f"  WARNING: API reload failed — {exc} (restart the API manually)")
+
 
 def _run_download_gis(gis_dir: Path | None = None) -> None:
     """Discover and run every scripts/gis/download_*.py."""

@@ -627,10 +627,13 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
     sci = taxon.get("scientific_name", "")
     preferred_raw = taxon.get("inat_preferred_common_name") or ""
     common_raw = taxon.get("common_name") or ""
-    nominal_rows = _storage.read_table(
-        GLOBAL_STATS_DIR / NOMINAL_STATS_FILE,
-        filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
-    ).to_pylist()
+    try:
+        nominal_rows = _storage.read_table(
+            GLOBAL_STATS_DIR / NOMINAL_STATS_FILE,
+            filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+        ).to_pylist()
+    except FileNotFoundError:
+        nominal_rows = []
 
     def _class_fractions(variable: str) -> dict[int, float]:
         return {
@@ -645,16 +648,22 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
     kg2_class_fractions = _class_fractions("kg2")
     lc_class_fractions = _class_fractions("landcover")
 
-    numerical_rows = _storage.read_table(
-        GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
-        filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
-    ).to_pylist()
+    try:
+        numerical_rows = _storage.read_table(
+            GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
+            filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+        ).to_pylist()
+    except FileNotFoundError:
+        numerical_rows = []
     numerical_stats = {r["variable"]: r for r in numerical_rows}
 
-    circular_rows = _storage.read_table(
-        GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE,
-        filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
-    ).to_pylist()
+    try:
+        circular_rows = _storage.read_table(
+            GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE,
+            filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+        ).to_pylist()
+    except FileNotFoundError:
+        circular_rows = []
     circular_stats = {r["variable"]: r for r in circular_rows}
 
     description_profile = descriptions.build_description_profile(

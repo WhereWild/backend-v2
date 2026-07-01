@@ -1125,6 +1125,7 @@ def _build_forecast_aggregates(
     era5_cidx_by_var: dict[str, dict[str, ChunkIndex]],
     gfs_cidx: dict[str, ChunkIndex],
     out_dir: str,
+    max_workers: int = 8,
 ) -> None:
     print("\n=== forecast aggregate builds ===")
     for forecast_h in FORECAST_HOURS:
@@ -1138,11 +1139,8 @@ def _build_forecast_aggregates(
 
         def _process(vid: str, cfg: dict, wh: int, wl: str) -> None:
             agg = cfg["agg"]
-            _dbg = vid == "cloud_cover"
             now_sums, now_meta = load_raster_state(out_dir, vid, wl, suffix=suffix)
-            _loaded_from = "forecast"
             if now_sums is None:
-                _loaded_from = "base" if wh >= forecast_h else "full_build"
                 if wh >= forecast_h:
                     # Window is large enough that the new window start doesn't overshoot
                     # old_gfs_end — safe to slide from the base window state.
@@ -1150,18 +1148,11 @@ def _build_forecast_aggregates(
                 if now_sums is None:
                     # window_h < forecast_h: sliding would add the entire forecast period
                     # instead of just the window slice at the horizon, so full-build instead.
-                    if _dbg:
-                        print(f"  [DBG fc] {vid}_{wl}{suffix}: full_build (wh={wh} < forecast_h={forecast_h})", flush=True)
                     _full_build(vid, cfg, wh, wl, future_ts, era5_end_ts, gfs_end_for_fc,
                                 era5_cidx_by_var.get(vid, {}), gfs_cidx, out_dir, suffix=suffix)
                     return
             if float(now_meta.get("gfs_end_ts", 0)) >= gfs_end_for_fc:
-                if _dbg:
-                    print(f"  [DBG fc] {vid}_{wl}{suffix}: already up to date (gfs_end={now_meta.get('gfs_end_ts')} >= {gfs_end_for_fc})", flush=True)
                 return  # forecast state already up to date
-            if _dbg:
-                _sum_keys = {k: float(v[np.isfinite(v)].max()) if np.isfinite(v).any() else 0.0 for k, v in now_sums.items()}
-                print(f"  [DBG fc] {vid}_{wl}{suffix}: loaded_from={_loaded_from} n_era5={now_meta.get('n_era5')} n_gfs_stable={now_meta.get('n_gfs_stable')} n_gfs_forecast={now_meta.get('n_gfs_forecast')} gfs_start={now_meta.get('gfs_start_ts')} gfs_end={now_meta.get('gfs_end_ts')} cycle_init={now_meta.get('gfs_cycle_init_ts')} sum_maxes={_sum_keys}", flush=True)
 
             sums = {k: v.copy() for k, v in now_sums.items()}
             n_era5 = int(now_meta["n_era5"])
@@ -1278,10 +1269,6 @@ def _build_forecast_aggregates(
 
                 # GFS drops — split at cycle_init_ts
                 gfs_drop_end = min(new_w_start - resolution, old_gfs_end)
-                if _dbg:
-                    from datetime import datetime as _dt2
-                    _ts = lambda t: _dt2.fromtimestamp(t, tz=UTC).isoformat() if t else str(t)
-                    print(f"  [DBG fc] {vid}_{wl}{suffix}: new_w_start={_ts(new_w_start)} gfs_drop_end={_ts(gfs_drop_end)} old_gfs_start={_ts(old_gfs_start)} old_gfs_end={_ts(old_gfs_end)} cycle_init={_ts(cycle_init_ts)}", flush=True)
                 if gfs_drop_end >= old_gfs_start:
                     if cycle_init_ts > 0:
                         stable_drop_end = min(gfs_drop_end, cycle_init_ts - resolution)
@@ -1289,36 +1276,19 @@ def _build_forecast_aggregates(
                     else:
                         stable_drop_end = old_gfs_start - 1  # nothing in stable
                         fc_drop_start = old_gfs_start         # all in forecast
-                    if _dbg:
-                        print(f"  [DBG fc] {vid}_{wl}{suffix}: stable_drop=[{_ts(old_gfs_start)},{_ts(stable_drop_end)}] fires={stable_drop_end >= old_gfs_start} fc_drop=[{_ts(fc_drop_start)},{_ts(gfs_drop_end)}] fires={fc_drop_start <= gfs_drop_end}", flush=True)
                     for gv in _gfs_raw_vars(cfg):
                         if stable_drop_end >= old_gfs_start:
-                            _before = float(sums[f"gfs_{gv}"][np.isfinite(sums[f"gfs_{gv}"])].max()) if f"gfs_{gv}" in sums and np.isfinite(sums[f"gfs_{gv}"]).any() else 0.0
                             r = _gfs_reproj_fc(gv, old_gfs_start, stable_drop_end)
-                            _r_max = float(r[np.isfinite(r)].max()) if r is not None and np.isfinite(r).any() else 0.0
                             if r is not None and f"gfs_{gv}" in sums:
                                 sums[f"gfs_{gv}"] = np.maximum(0.0, sums[f"gfs_{gv}"] - r)
-                            _after = float(sums[f"gfs_{gv}"][np.isfinite(sums[f"gfs_{gv}"])].max()) if f"gfs_{gv}" in sums and np.isfinite(sums[f"gfs_{gv}"]).any() else 0.0
-                            if _dbg and gv == "cloud_cover":
-                                print(f"  [DBG fc] {vid}_{wl}{suffix}: stable_drop gv={gv} r_max={_r_max:.4f} sum_before={_before:.4f} sum_after={_after:.4f}", flush=True)
                         if fc_drop_start <= gfs_drop_end:
-                            _before = float(sums[f"gfs_forecast_{gv}"][np.isfinite(sums[f"gfs_forecast_{gv}"])].max()) if f"gfs_forecast_{gv}" in sums and np.isfinite(sums[f"gfs_forecast_{gv}"]).any() else 0.0
                             r = _gfs_reproj_fc(gv, fc_drop_start, gfs_drop_end)
-                            _r_max = float(r[np.isfinite(r)].max()) if r is not None and np.isfinite(r).any() else 0.0
                             if r is not None and f"gfs_forecast_{gv}" in sums:
                                 sums[f"gfs_forecast_{gv}"] = np.maximum(0.0, sums[f"gfs_forecast_{gv}"] - r)
-                            _after = float(sums[f"gfs_forecast_{gv}"][np.isfinite(sums[f"gfs_forecast_{gv}"])].max()) if f"gfs_forecast_{gv}" in sums and np.isfinite(sums[f"gfs_forecast_{gv}"]).any() else 0.0
-                            if _dbg and gv == "cloud_cover":
-                                print(f"  [DBG fc] {vid}_{wl}{suffix}: fc_drop gv={gv} r_max={_r_max:.4f} sum_before={_before:.4f} sum_after={_after:.4f}", flush=True)
                     sdn = max(0, int(round((stable_drop_end - old_gfs_start) / resolution)) + 1) if stable_drop_end >= old_gfs_start else 0
                     fdn = max(0, int(round((gfs_drop_end - fc_drop_start) / resolution)) + 1) if fc_drop_start <= gfs_drop_end else 0
                     n_gfs_stable -= sdn
                     n_gfs_forecast -= fdn
-                    if _dbg:
-                        print(f"  [DBG fc] {vid}_{wl}{suffix}: after drop n_gfs_stable={n_gfs_stable} n_gfs_forecast={n_gfs_forecast} (sdn={sdn} fdn={fdn})", flush=True)
-                else:
-                    if _dbg:
-                        print(f"  [DBG fc] {vid}_{wl}{suffix}: GFS drop skipped (gfs_drop_end={_ts(gfs_drop_end)} < old_gfs_start={_ts(old_gfs_start)})", flush=True)
 
                 # Add GFS forecast hours → always to forecast bucket (start from old_gfs_end+1 step)
                 if gfs_end_for_fc > old_gfs_end:
@@ -1328,20 +1298,12 @@ def _build_forecast_aggregates(
                         if r is not None:
                             key = f"gfs_forecast_{gv}"
                             sums[key] = sums.get(key, np.zeros_like(r)) + r
-                            if _dbg and gv == "cloud_cover":
-                                print(f"  [DBG fc] {vid}_{wl}{suffix}: add gv={gv} add_n={add_n} r_max={float(r[np.isfinite(r)].max()) if np.isfinite(r).any() else 0.0:.4f} new_sum_max={float(sums[key][np.isfinite(sums[key])].max()) if np.isfinite(sums[key]).any() else 0.0:.4f}", flush=True)
                     n_gfs_forecast += add_n
-                else:
-                    if _dbg:
-                        print(f"  [DBG fc] {vid}_{wl}{suffix}: no GFS add (gfs_end_for_fc={_ts(gfs_end_for_fc)} <= old_gfs_end={_ts(old_gfs_end)})", flush=True)
 
                 n_era5 = max(n_era5, 0)
                 n_gfs_stable = max(n_gfs_stable, 0)
                 n_gfs_forecast = max(n_gfs_forecast, 0)
                 n_gfs = n_gfs_stable + n_gfs_forecast
-                if _dbg:
-                    _all_maxes = {k: float(v[np.isfinite(v)].max()) if np.isfinite(v).any() else 0.0 for k, v in sums.items()}
-                    print(f"  [DBG fc] {vid}_{wl}{suffix}: FINAL n_era5={n_era5} n_gfs_stable={n_gfs_stable} n_gfs_forecast={n_gfs_forecast} n_gfs={n_gfs} sum_maxes={_all_maxes}", flush=True)
                 fc_meta = {
                     **now_meta,
                     "era5_window_start_ts": new_w_start,
@@ -1366,7 +1328,7 @@ def _build_forecast_aggregates(
             }
             save_raster_state(out_dir, vid, wl, agg, sums, fc_meta, suffix=suffix)
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(_process, vid, cfg, wh, wl): (vid, wl) for vid, cfg, wh, wl in combos}
             for fut in as_completed(futures):
                 if exc := fut.exception():
@@ -1765,9 +1727,10 @@ def main() -> None:
                     except OSError:
                         pass
                 print(f"  GFS cycle changed → cleared {len(fc_files)} forecast state files for fresh rebuild", flush=True)
+            _fc_workers = 1 if (gfs_cycle_changed and int(os.environ.get("WW_FORECAST_WORKERS", "8")) < 8) else 8
             _build_forecast_aggregates(
                 var_configs, windows, now_ts, era5_end_ts, gfs_data_end_ts,
-                era5_cidx_by_var, gfs_cidx, out_dir,
+                era5_cidx_by_var, gfs_cidx, out_dir, max_workers=_fc_workers,
             )
             forecast_done[0] = True
             _write_state("running")

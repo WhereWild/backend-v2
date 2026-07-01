@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 OLD_TREE_PATH = Path("data/tmp/old_tree")
@@ -137,26 +138,41 @@ def _carry_one(
     if n_carried == 0:
         return 0, n_changed, n_new_obs, n_total
 
-    new_cols: dict[str, np.ndarray] = {}
+    # Build enrichment columns as Arrow arrays directly so that:
+    #   matched row, valid value  → that value (float)
+    #   matched row, NaN value    → NaN (no-coverage sentinel, NOT null — skip re-enrichment)
+    #   unmatched row             → null (needs enrichment)
+    # Going through pandas (np.where → NaN → pa.Table.from_pandas) converts all NaN
+    # to Arrow null, which causes the worklist to re-queue rows that already have
+    # legitimate no-coverage sentinels.
+    new_cols: dict[str, pa.Array] = {}
+    coords_mask = pa.array(coords_same.to_numpy(), type=pa.bool_())
+    ts_mask = pa.array((coords_same & ts_same).to_numpy(), type=pa.bool_())
+
     for col in tree_cols:
         src = f"_old_{col}"
         if src in merged.columns:
-            new_cols[col] = np.where(coords_same, merged[src].values, np.nan)
+            old_arr = pa.array(merged[src].to_numpy(dtype=np.float64, na_value=np.nan), type=pa.float64(), from_pandas=False)
+            new_cols[col] = pc.if_else(coords_mask, old_arr, None)
 
     for col in temp_cols:
         src = f"_old_{col}"
         if src in merged.columns:
-            new_cols[col] = np.where(coords_same & ts_same, merged[src].values, np.nan)
+            old_arr = pa.array(merged[src].to_numpy(dtype=np.float64, na_value=np.nan), type=pa.float64(), from_pandas=False)
+            new_cols[col] = pc.if_else(ts_mask, old_arr, None)
 
     if new_cols:
-        result = pd.concat(
-            [new_df, pd.DataFrame(new_cols, index=new_df.index)],
-            axis=1,
-        )
+        base_table = pa.Table.from_pandas(new_df, preserve_index=False)
+        for col, arr in new_cols.items():
+            if col in base_table.schema.names:
+                base_table = base_table.set_column(base_table.schema.get_field_index(col), col, arr)
+            else:
+                base_table = base_table.append_column(col, arr)
+        result_table = base_table
     else:
-        result = new_df
+        result_table = pa.Table.from_pandas(new_df, preserve_index=False)
 
-    _atomic_write(new_path, pa.Table.from_pandas(result, preserve_index=False))
+    _atomic_write(new_path, result_table)
     return n_carried, n_changed, n_new_obs, n_total
 
 
@@ -171,6 +187,7 @@ def main() -> None:
     total_carried = 0
     total_changed = 0
     total_new_obs = 0
+    n_taxa = 0
 
     for new_path in sorted(TREE_ROOT.rglob(OCCURRENCE_FILE)):
         rel = new_path.relative_to(TREE_ROOT)
@@ -186,6 +203,12 @@ def main() -> None:
             total_carried += carried
             total_changed += changed
             total_new_obs += new_obs
+
+        n_taxa += 1
+        if n_taxa % 10_000 == 0:
+            elapsed = time.monotonic() - t0
+            pct = total_carried / total_rows * 100 if total_rows else 0.0
+            print(f"[carry_forward] {n_taxa} taxa  {total_rows:,} rows  {pct:.1f}% carried  {elapsed:.0f}s")
 
     elapsed = time.monotonic() - t0
     carry_pct = total_carried / total_rows * 100 if total_rows else 0.0

@@ -254,9 +254,18 @@ def run_consolidation() -> None:
     GLOBAL_STATS_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
 
+    tmp_dir = GLOBAL_STATS_DIR / ".tmp_consolidate"
+
+    # If no in-progress tmp work exists, this is a fresh consolidation run —
+    # clear stale global files from a previous cycle so they aren't silently skipped.
+    if not tmp_dir.exists():
+        for _, filename in _STATS_FILES:
+            dest = GLOBAL_STATS_DIR / filename
+            if dest.exists():
+                dest.unlink()
+
     print(f"[consolidate] building global stats files  [{time.monotonic()-t0:.1f}s]")
 
-    tmp_dir = GLOBAL_STATS_DIR / ".tmp_consolidate"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     for label, filename in _STATS_FILES:

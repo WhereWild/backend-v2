@@ -2365,6 +2365,47 @@ def load_raster_state(
     return sums, meta
 
 
+_RASTER_BOUNDS: dict[str, tuple[float, float]] = {
+    "cloud_cover": (0.0, 100.0),
+}
+
+
+def _check_raster_bounds(
+    final: "np.ndarray",
+    var_id: str,
+    window_label: str,
+    suffix: str,
+    meta: dict,
+) -> None:
+    bounds = _RASTER_BOUNDS.get(var_id)
+    if bounds is None:
+        return
+    lo, hi = bounds
+    finite = final[np.isfinite(final)]
+    if finite.size == 0:
+        return
+    vmin, vmax = float(finite.min()), float(finite.max())
+    eps = 1e-3
+    if vmin >= lo - eps and vmax <= hi + eps:
+        return
+    label = f"{var_id}_{window_label}{suffix}"
+    n_era5 = meta.get("n_era5", "?")
+    n_gfs_stable = meta.get("n_gfs_stable", "?")
+    n_gfs_forecast = meta.get("n_gfs_forecast", "?")
+    n_gfs = meta.get("n_gfs", "?")
+    ts = meta.get("built_at", "?")
+    gfs_start = meta.get("gfs_start_ts", "?")
+    gfs_end = meta.get("gfs_end_ts", "?")
+    cycle_init = meta.get("gfs_cycle_init_ts", "?")
+    print(
+        f"  [BOUNDS WARNING] {label} @ {ts}: expected [{lo}, {hi}] "
+        f"got [{vmin:.3g}, {vmax:.3g}] "
+        f"(n_era5={n_era5} n_gfs_stable={n_gfs_stable} n_gfs_forecast={n_gfs_forecast} n_gfs={n_gfs} "
+        f"gfs_start={gfs_start} gfs_end={gfs_end} cycle_init={cycle_init})",
+        flush=True,
+    )
+
+
 def save_raster_state(
     out_dir: str,
     var_id: str,
@@ -2382,6 +2423,7 @@ def save_raster_state(
     sums_path = Path(str(base) + ".sums.npz")
 
     final = compute_raster_final(var_id, agg, sums, meta["n_era5"], meta["n_gfs"])
+    _check_raster_bounds(final, var_id, window_label, suffix, meta)
     np.save(npy_path, final)
     meta_out = dict(meta)
     if agg != "mode":

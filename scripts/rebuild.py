@@ -269,10 +269,10 @@ STAGES: list[tuple[str, str, object]] = [
     ("build_overviews", "Building COG overviews",                             lambda: build_overviews.main()),
     ("enrich_tree",     "Enriching tree (GIS sampling)",                      lambda: enrich_tree.main()),
     ("enrich_temporal", "Enriching tree (temporal ERA5 weather)",              lambda: enrich_temporal.main()),
-    ("process_tree",          "Processing tree (summary stats + KDE)",   process_tree.run_stats),
-    ("process_tree_rankings", "Processing tree (relative rankings)",      process_tree.run_rankings),
-    ("process_tree_consolidate", "Processing tree (global consolidation)", process_tree.run_consolidation),
-    ("push",                  "Syncing data/ to production server",       _push_stage),
+    ("process_tree",             "Processing tree (summary stats + KDE)",    lambda: process_tree.run_stats()),
+    ("process_tree_rankings",    "Processing tree (relative rankings)",       lambda: process_tree.run_rankings()),
+    ("process_tree_consolidate", "Processing tree (global consolidation)",    lambda: process_tree.run_consolidation()),
+    ("push",                     "Syncing data/ to production server",        lambda: _push_stage()),
 ]
 
 

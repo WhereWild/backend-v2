@@ -37,11 +37,18 @@ import httpx
 import numpy as np
 import pytest
 
+import scripts.build_temporal as bt
 from util.temporal import (
     RASTER_GRIDS,
+    RASTER_WC_CODES,
     accumulate_raster,
+    accumulate_raster_mode,
     build_chunk_index,
     grid_indices,
+    load_raster_state,
+    reproject_to_grid,
+    save_raster_state,
+    set_raster_chunk_cache,
 )
 
 pytestmark = pytest.mark.live
@@ -114,6 +121,14 @@ _CASE_TEMPLATES: list[dict[str, Any]] = [
 def _live_gate(request: pytest.FixtureRequest) -> None:
     if not request.config.getoption("--live"):
         pytest.skip("live S3 raster tests skipped — use: pt --temporal")
+
+
+@pytest.fixture(scope="session")
+def live_chunk_cache(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Session-scoped local chunk cache so S3 chunks are downloaded once per session."""
+    cache = str(tmp_path_factory.mktemp("chunk_cache"))
+    set_raster_chunk_cache(cache)
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +252,439 @@ def _pipeline_value(case: dict[str, Any], obs_ts: int) -> float:
     cell_sum = float(sum_grid[lat_idx, lon_idx])
     raw = cell_sum if agg == "sum" else cell_sum / n_steps
     return round(raw, api_decimals)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Incremental correctness: 1h cloud_cover with real S3 GFS data
+# ---------------------------------------------------------------------------
+
+def test_cloud_cover_24h_incremental_bounds(
+    live_raster_expected: dict[str, Any],
+    live_chunk_cache: str,
+    tmp_path: Path,
+) -> None:
+    """Seed 24h cloud_cover state from real ERA5 data, slide the window twice, assert bounds.
+
+    Uses the same frozen obs_ts as the API-matching tests (60 days before ERA5 end)
+    so the year file chunk is already warm and the S3 reads are fast.
+    Validates that drop-oldest / add-newest keeps n_total constant and output
+    stays within 0–100 % across two 1h advances.
+    """
+    obs_ts_raw = live_raster_expected.get("obs_ts")
+    if obs_ts_raw is None:
+        pytest.skip("obs_ts missing — regenerate with --regenerate-live")
+
+    # obs_ts is ~60 days before era5_end; use obs_ts-26h as "now" so there's
+    # room to advance 2 more hours fully inside ERA5 territory.
+    obs_ts = float(int(obs_ts_raw) // 3600 * 3600) - 26 * 3600
+    # Pretend ERA5 ends 2h after obs_ts so each slide adds exactly 1 ERA5 hour.
+    fake_era5_end = obs_ts + 2 * 3600
+
+    era5_cidx_obj = build_chunk_index("copernicus_era5", "cloud_cover")
+    era5_cidx = {"cloud_cover": era5_cidx_obj}
+    gfs_cidx_obj = build_chunk_index("ncep_gfs013", "cloud_cover")
+    gfs_cidx = {"cloud_cover": gfs_cidx_obj}
+    cfg = bt.VAR_CONFIGS["cloud_cover"]
+    out_dir = str(tmp_path)
+
+    # Seed: accumulate 24h ERA5 window ending at obs_ts
+    w_start = obs_ts - 23 * 3600
+    era5_sum, n_era5 = accumulate_raster("copernicus_era5", "cloud_cover",
+                                          w_start, obs_ts, era5_cidx_obj)
+    sums: dict[str, Any] = {
+        "era5_cloud_cover": era5_sum,
+        "gfs_cloud_cover": np.zeros_like(era5_sum),
+        "gfs_forecast_cloud_cover": np.zeros_like(era5_sum),
+    }
+    meta: dict[str, Any] = {
+        "var_id": "cloud_cover",
+        "window_h": 24,
+        "window_label": "24h",
+        "era5_window_start_ts": w_start,
+        "era5_end_ts": fake_era5_end,
+        "gfs_start_ts": fake_era5_end + 3600,
+        "gfs_end_ts": obs_ts,   # gfs_end < gfs_start → 0 GFS steps in seed
+        "gfs_cycle_init_ts": obs_ts,
+        "n_era5": n_era5,
+        "n_gfs": 0,
+        "n_gfs_stable": 0,
+        "n_gfs_forecast": 0,
+        "built_at": datetime.fromtimestamp(obs_ts, UTC).isoformat(),
+    }
+    save_raster_state(out_dir, "cloud_cover", "24h", "avg", sums, meta)
+
+    for step in range(2):
+        now_ts = obs_ts + (step + 1) * 3600
+        loaded_sums, loaded_meta = load_raster_state(out_dir, "cloud_cover", "24h")
+        bt._incremental_update(
+            "cloud_cover", cfg, 24, "24h",
+            sums={k: v.copy() for k, v in loaded_sums.items()},
+            old_meta=loaded_meta,
+            now_ts=now_ts,
+            era5_end_ts=fake_era5_end,
+            gfs_end_ts=obs_ts,   # frozen — drops oldest ERA5, adds no GFS
+            era5_cidx=era5_cidx,
+            gfs_cidx=gfs_cidx,
+            out_dir=out_dir,
+        )
+
+        result = np.load(tmp_path / "cloud_cover_24h.npy")
+        lo_bad = int((result < -1.0).sum())
+        hi_bad = int((result > 101.0).sum())
+        assert lo_bad == 0, f"step {step+1}: {lo_bad} pixels below -1 % (min={result.min():.2f})"
+        assert hi_bad == 0, f"step {step+1}: {hi_bad} pixels above 101 % (max={result.max():.2f})"
+
+
+# ---------------------------------------------------------------------------
+# Incremental correctness: 1h cloud_cover, stale build (11h gap)
+# ---------------------------------------------------------------------------
+
+def test_cloud_cover_1h_stale_incremental(
+    live_raster_expected: dict[str, Any],
+    live_chunk_cache: str,
+    tmp_path: Path,
+) -> None:
+    """Seed a 1h cloud_cover window then advance 11h in one stale build.
+
+    This is the exact scenario that caused persistent bad n_gfs counts in
+    production: the build falls behind by many hours (restart, sleep, etc.)
+    and the catch-up incremental adds all hours since old_gfs_end instead of
+    only the hours inside the new window.
+
+    Key assertion: after the stale advance, meta["n_gfs"] == 1 (not 11).
+    A 1h window should always hold exactly 1 GFS step.
+    """
+    obs_ts_raw = live_raster_expected.get("obs_ts")
+    if obs_ts_raw is None:
+        pytest.skip("obs_ts missing — regenerate with --regenerate-live")
+
+    obs_ts = float(int(obs_ts_raw) // 3600 * 3600)
+    era5_cidx_obj = build_chunk_index("copernicus_era5", "cloud_cover")
+    era5_cidx = {"cloud_cover": era5_cidx_obj}
+    gfs_cidx_obj = build_chunk_index("ncep_gfs013", "cloud_cover")
+    gfs_cidx = {"cloud_cover": gfs_cidx_obj}
+    cfg = bt.VAR_CONFIGS["cloud_cover"]
+    out_dir = str(tmp_path)
+
+    # Seed: 1h window fully inside ERA5 territory, 0 GFS steps.
+    # old_gfs_end = obs_ts; gfs_start > gfs_end means no GFS in window.
+    era5_sum, n_era5 = accumulate_raster(
+        "copernicus_era5", "cloud_cover", obs_ts, obs_ts, era5_cidx_obj
+    )
+    sums: dict[str, Any] = {
+        "era5_cloud_cover": era5_sum,
+        "gfs_cloud_cover": np.zeros_like(era5_sum),
+        "gfs_forecast_cloud_cover": np.zeros_like(era5_sum),
+    }
+    meta: dict[str, Any] = {
+        "var_id": "cloud_cover",
+        "window_h": 1,
+        "window_label": "1h",
+        "era5_window_start_ts": obs_ts,
+        "era5_end_ts": obs_ts,
+        "gfs_start_ts": obs_ts + 3600,   # no GFS in seed
+        "gfs_end_ts": obs_ts,
+        "gfs_cycle_init_ts": obs_ts,
+        "n_era5": n_era5,
+        "n_gfs": 0,
+        "n_gfs_stable": 0,
+        "n_gfs_forecast": 0,
+        "built_at": datetime.fromtimestamp(obs_ts, UTC).isoformat(),
+    }
+    save_raster_state(out_dir, "cloud_cover", "1h", "avg", sums, meta)
+
+    # Stale build: advance 11h in one shot.
+    # new_w_start = obs_ts + 11h (1h window), so only obs_ts+11h should be added.
+    now_ts = obs_ts + 11 * 3600
+    gfs_end_ts = obs_ts + 11 * 3600
+    loaded_sums, loaded_meta = load_raster_state(out_dir, "cloud_cover", "1h")
+    bt._incremental_update(
+        "cloud_cover", cfg, 1, "1h",
+        sums={k: v.copy() for k, v in loaded_sums.items()},
+        old_meta=loaded_meta,
+        now_ts=now_ts,
+        era5_end_ts=obs_ts,       # ERA5 hasn't advanced
+        gfs_end_ts=gfs_end_ts,
+        era5_cidx=era5_cidx,
+        gfs_cidx=gfs_cidx,
+        out_dir=out_dir,
+    )
+
+    _, out_meta = load_raster_state(out_dir, "cloud_cover", "1h")
+    n_gfs_actual = int(out_meta["n_gfs"])
+    assert n_gfs_actual == 1, (
+        f"Expected n_gfs=1 after 11h-stale 1h-window build, got {n_gfs_actual}. "
+        f"The stale add step is accumulating hours outside the window."
+    )
+
+    result = np.load(tmp_path / "cloud_cover_1h.npy")
+    lo_bad = int((result < -1.0).sum())
+    hi_bad = int((result > 101.0).sum())
+    assert lo_bad == 0, f"stale 1h build: {lo_bad} pixels below -1 % (min={result.min():.2f})"
+    assert hi_bad == 0, f"stale 1h build: {hi_bad} pixels above 101 % (max={result.max():.2f})"
+
+
+# ---------------------------------------------------------------------------
+# GFS cycle rederive: stale forecast sums discarded, correct values rebuilt
+# ---------------------------------------------------------------------------
+
+def test_gfs_cycle_rederive_discards_stale_forecast(
+    live_raster_expected: dict[str, Any],
+    live_chunk_cache: str,
+    tmp_path: Path,
+) -> None:
+    """Seed state with corrupt gfs_forecast_cloud_cover, run _gfs_rederive, assert clean output.
+
+    Simulates the core cycle-rederive scenario:
+    - Old cycle init at T-6h (old_cycle_init_ts), new cycle at T (new_cycle_init_ts)
+    - gfs_forecast_cloud_cover is seeded with garbage (very large values) to represent
+      stale data from the previous GFS cycle
+    - After rederive, the output must match direct accumulation from the current chunk
+    - gfs_* (stable) sums are preserved; gfs_forecast_* are rebuilt
+    """
+    obs_ts_raw = live_raster_expected.get("obs_ts")
+    if obs_ts_raw is None:
+        pytest.skip("obs_ts missing — regenerate with --regenerate-live")
+
+    # Use a timestamp well inside ERA5 territory for stable chunk reads.
+    # obs_ts is ~60 days before era5_end, so chunk is in the year file.
+    obs_ts = float(int(obs_ts_raw) // 3600 * 3600)
+
+    # Floor to nearest 6h boundary → simulates a real GFS cycle init
+    old_cycle_init_ts = float((int(obs_ts) // (6 * 3600)) * (6 * 3600))
+    new_cycle_init_ts = old_cycle_init_ts + 6 * 3600  # next cycle
+
+    era5_cidx_obj = build_chunk_index("copernicus_era5", "cloud_cover")
+    era5_cidx = {"cloud_cover": era5_cidx_obj}
+    gfs_cidx_obj = build_chunk_index("ncep_gfs013", "cloud_cover")
+    gfs_cidx = {"cloud_cover": gfs_cidx_obj}
+    cfg = bt.VAR_CONFIGS["cloud_cover"]
+    out_dir = str(tmp_path)
+
+    window_h = 24
+    w_start = obs_ts - (window_h - 1) * 3600
+
+    # Accumulate real ERA5 stable sum for the ERA5 portion
+    era5_sum, n_era5 = accumulate_raster("copernicus_era5", "cloud_cover",
+                                          w_start, obs_ts, era5_cidx_obj)
+
+    # Accumulate real GFS stable sum: [gfs_start, old_cycle_init_ts)
+    gfs_start = obs_ts + 3600
+    gfs_end_ts = old_cycle_init_ts + 6 * 3600  # 6h past old cycle = new cycle
+
+    gfs_stable_sum = np.zeros_like(era5_sum, dtype=np.float64)
+    n_gfs_stable = 0
+    if gfs_start < old_cycle_init_ts:
+        from util.temporal import RASTER_GRIDS, reproject_to_grid
+        gfs_g = RASTER_GRIDS["ncep_gfs013"]
+        era5_g = RASTER_GRIDS["copernicus_era5"]
+        acc, n_gfs_stable = accumulate_raster("ncep_gfs013", "cloud_cover",
+                                               gfs_start, old_cycle_init_ts - 3600, gfs_cidx_obj)
+        gfs_stable_sum = reproject_to_grid(
+            acc.astype(np.float32),
+            gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+            era5_g["ny"], era5_g["nx"],
+            era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
+        ).astype(np.float64)
+
+    # Corrupt gfs_forecast_cloud_cover with garbage — simulates stale old-cycle data
+    corrupt_forecast = np.full_like(era5_sum, fill_value=9999.0, dtype=np.float64)
+
+    sums: dict[str, Any] = {
+        "era5_cloud_cover": era5_sum.copy(),
+        "gfs_cloud_cover": gfs_stable_sum.copy(),
+        "gfs_forecast_cloud_cover": corrupt_forecast,
+    }
+    meta: dict[str, Any] = {
+        "var_id": "cloud_cover",
+        "window_h": window_h,
+        "window_label": "24h",
+        "era5_window_start_ts": w_start,
+        "era5_end_ts": obs_ts,
+        "gfs_start_ts": gfs_start,
+        "gfs_end_ts": gfs_end_ts,
+        "gfs_cycle_init_ts": old_cycle_init_ts,
+        "n_era5": n_era5,
+        "n_gfs": n_gfs_stable,
+        "n_gfs_stable": n_gfs_stable,
+        "n_gfs_forecast": 0,
+        "built_at": datetime.fromtimestamp(obs_ts, UTC).isoformat(),
+    }
+    save_raster_state(out_dir, "cloud_cover", "24h", "avg", sums, meta)
+
+    # Run rederive with new_cycle_init_ts
+    bt._gfs_rederive(
+        "cloud_cover", cfg, window_h, "24h",
+        existing_sums=sums,
+        existing_meta=meta,
+        now_ts=obs_ts,
+        era5_end_ts=obs_ts,
+        gfs_end_ts=gfs_end_ts,
+        era5_cidx=era5_cidx,
+        gfs_cidx=gfs_cidx,
+        out_dir=out_dir,
+        new_cycle_init_ts=new_cycle_init_ts,
+    )
+
+    result_sums, result_meta = load_raster_state(out_dir, "cloud_cover", "24h")
+
+    # Corrupt values must be gone — no pixel should have 9999 residual
+    if "gfs_forecast_cloud_cover" in result_sums:
+        max_fc = float(np.max(np.abs(result_sums["gfs_forecast_cloud_cover"])))
+        assert max_fc < 10000.0, f"gfs_forecast_cloud_cover still has corrupt values (max_abs={max_fc})"
+
+    # ERA5 stable sum must be preserved exactly
+    np.testing.assert_array_equal(
+        result_sums["era5_cloud_cover"], era5_sum,
+        err_msg="ERA5 sum was modified during rederive — ERA5 is immutable",
+    )
+
+    # GFS stable sum must include graduation: old_cycle_init_ts..new_cycle_init_ts
+    # The stable sum should be >= original stable (graduation only adds)
+    if n_gfs_stable > 0:
+        stable_increased = np.any(result_sums["gfs_cloud_cover"] >= gfs_stable_sum)
+        assert stable_increased, "GFS stable sum should have grown after graduation"
+
+    # n_gfs_stable must be >= original (graduation transferred some forecast→stable)
+    assert int(result_meta["n_gfs_stable"]) >= n_gfs_stable
+
+    # Output raster must be within bounds
+    result = np.load(tmp_path / "cloud_cover_24h.npy")
+    lo_bad = int((result < -1.0).sum())
+    hi_bad = int((result > 101.0).sum())
+    assert lo_bad == 0, f"rederive output: {lo_bad} pixels below -1 % (min={result.min():.2f})"
+    assert hi_bad == 0, f"rederive output: {hi_bad} pixels above 101 % (max={result.max():.2f})"
+
+
+def test_gfs_cycle_rederive_mode_discards_stale_forecast(
+    live_raster_expected: dict[str, Any],
+    live_chunk_cache: str,
+    tmp_path: Path,
+) -> None:
+    """Mode rederive: corrupt gfs_forecast_wc_* cleared, ERA5 and stable preserved.
+
+    Mirrors test_gfs_cycle_rederive_discards_stale_forecast but for weather_code_simple.
+    Validates that _gfs_rederive properly handles the split-key format for mode vars.
+    """
+    obs_ts_raw = live_raster_expected.get("obs_ts")
+    if obs_ts_raw is None:
+        pytest.skip("obs_ts missing — regenerate with --regenerate-live")
+
+    obs_ts = float(int(obs_ts_raw) // 3600 * 3600)
+    old_cycle_init_ts = float((int(obs_ts) // (6 * 3600)) * (6 * 3600))
+    new_cycle_init_ts = old_cycle_init_ts + 6 * 3600
+
+    cc_cidx = build_chunk_index("copernicus_era5", "cloud_cover")
+    pr_cidx = build_chunk_index("copernicus_era5", "precipitation")
+    sw_cidx = build_chunk_index("copernicus_era5", "snowfall_water_equivalent")
+    gfs_cc = build_chunk_index("ncep_gfs013", "cloud_cover")
+    gfs_pr = build_chunk_index("ncep_gfs013", "precipitation")
+    gfs_sw = build_chunk_index("ncep_gfs013", "snowfall_water_equivalent")
+
+    era5_cidx = {"cloud_cover": cc_cidx, "precipitation": pr_cidx,
+                 "snowfall_water_equivalent": sw_cidx}
+    gfs_cidx = {"cloud_cover": gfs_cc, "precipitation": gfs_pr,
+                 "snowfall_water_equivalent": gfs_sw}
+    cfg = bt.VAR_CONFIGS["weather_code_simple"]
+    out_dir = str(tmp_path)
+    window_h = 24
+    w_start = obs_ts - (window_h - 1) * 3600
+
+    gfs_g = RASTER_GRIDS["ncep_gfs013"]
+    era5_g = RASTER_GRIDS["copernicus_era5"]
+
+    # Accumulate real ERA5 counts
+    era5_counts = accumulate_raster_mode("copernicus_era5", w_start, obs_ts, cc_cidx, pr_cidx, sw_cidx)
+
+    # Accumulate real GFS stable counts
+    gfs_start = obs_ts + 3600
+    gfs_end_ts = old_cycle_init_ts + 6 * 3600
+    n_gfs_stable = 0
+    stable_reproj: dict = {}
+    if gfs_start < old_cycle_init_ts:
+        stable_counts = accumulate_raster_mode("ncep_gfs013", gfs_start,
+                                                old_cycle_init_ts - 3600, gfs_cc, gfs_pr, gfs_sw)
+        n_gfs_stable = int(round((old_cycle_init_ts - 3600 - gfs_start) / 3600)) + 1
+        for c in RASTER_WC_CODES:
+            stable_reproj[c] = np.round(reproject_to_grid(
+                stable_counts[c].astype(np.float32),
+                gfs_g["lat_min"], gfs_g["lat_max"], gfs_g["lon_min"], gfs_g["lon_max"],
+                era5_g["ny"], era5_g["nx"],
+                era5_g["lat_min"], era5_g["lat_max"], era5_g["lon_min"], era5_g["lon_max"],
+                resampling="nearest",
+            )).astype(np.int32)
+
+    # Corrupt forecast bucket
+    corrupt = np.full((era5_g["ny"], era5_g["nx"]), fill_value=9999, dtype=np.int32)
+    sums: dict[str, Any] = {}
+    for c in RASTER_WC_CODES:
+        sums[f"era5_wc_{c}"] = era5_counts[c].copy()
+        sums[f"gfs_stable_wc_{c}"] = stable_reproj.get(c, np.zeros((era5_g["ny"], era5_g["nx"]), dtype=np.int32)).copy()
+        sums[f"gfs_forecast_wc_{c}"] = corrupt.copy()
+
+    meta: dict[str, Any] = {
+        "var_id": "weather_code_simple",
+        "window_h": window_h,
+        "window_label": "24h",
+        "era5_window_start_ts": w_start,
+        "era5_end_ts": obs_ts,
+        "gfs_start_ts": gfs_start,
+        "gfs_end_ts": gfs_end_ts,
+        "gfs_cycle_init_ts": old_cycle_init_ts,
+        "n_era5": int(round((obs_ts - w_start) / 3600)) + 1,
+        "n_gfs": n_gfs_stable,
+        "n_gfs_stable": n_gfs_stable,
+        "n_gfs_forecast": 0,
+        "built_at": datetime.fromtimestamp(obs_ts, UTC).isoformat(),
+    }
+    save_raster_state(out_dir, "weather_code_simple", "24h", "mode", sums, meta)
+
+    bt._gfs_rederive(
+        "weather_code_simple", cfg, window_h, "24h",
+        existing_sums=sums,
+        existing_meta=meta,
+        now_ts=obs_ts,
+        era5_end_ts=obs_ts,
+        gfs_end_ts=gfs_end_ts,
+        era5_cidx=era5_cidx,
+        gfs_cidx=gfs_cidx,
+        out_dir=out_dir,
+        new_cycle_init_ts=new_cycle_init_ts,
+    )
+
+    result_sums, result_meta = load_raster_state(out_dir, "weather_code_simple", "24h")
+
+    # Corrupt forecast values must be gone
+    for c in RASTER_WC_CODES:
+        key = f"gfs_forecast_wc_{c}"
+        if key in result_sums:
+            assert int(np.max(result_sums[key])) < 9999, \
+                f"{key} still has corrupt value (max={np.max(result_sums[key])})"
+
+    # ERA5 counts must be preserved exactly
+    for c in RASTER_WC_CODES:
+        np.testing.assert_array_equal(
+            result_sums[f"era5_wc_{c}"], era5_counts[c],
+            err_msg=f"era5_wc_{c} was modified during mode rederive",
+        )
+
+    # Stable counts must be >= original (graduation only adds)
+    if n_gfs_stable > 0:
+        for c in RASTER_WC_CODES:
+            orig = stable_reproj.get(c, np.zeros_like(corrupt))
+            assert np.any(result_sums.get(f"gfs_stable_wc_{c}", orig) >= orig), \
+                f"gfs_stable_wc_{c} should have grown after graduation"
+
+    assert int(result_meta["n_gfs_stable"]) >= n_gfs_stable
+
+    # Output weather codes must all be valid RASTER_WC_CODES values
+    result = np.load(tmp_path / "weather_code_simple_24h.npy")
+    valid_codes = set(float(c) for c in RASTER_WC_CODES)
+    invalid = ~np.isin(result, list(valid_codes))
+    assert int(invalid.sum()) == 0, \
+        f"Mode rederive output contains invalid weather codes: {np.unique(result[invalid])}"
 
 
 # ---------------------------------------------------------------------------

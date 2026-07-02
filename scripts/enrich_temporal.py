@@ -317,6 +317,7 @@ def main() -> None:
     Path(cfg.temporal_cache_dir).mkdir(parents=True, exist_ok=True)
     occ_index_path = Path(cfg.temporal_cache_dir) / "occ_index.parquet"
 
+    completed = False
     try:
         all_layers = load_temporal_layers(CATALOG_PATH)
         active_layers = _filter_layers(all_layers, VARS_TO_ENRICH)
@@ -342,6 +343,7 @@ def main() -> None:
 
         if n_obs == 0:
             print("[done] no observations to enrich")
+            completed = True
             return
 
         for layer in active_layers:
@@ -349,12 +351,16 @@ def main() -> None:
                 continue
             _run_layer(layer, occ_index_path, cfg, stop)
 
+        completed = True
     finally:
         if occ_index_path.exists():
             occ_index_path.unlink()
         if CLEAR_CACHE:
-            print(f"[cleanup] clearing cache {cfg.temporal_cache_dir}")
-            _cleanup_cache(cfg.temporal_cache_dir)
+            if completed:
+                print(f"[cleanup] clearing cache {cfg.temporal_cache_dir}")
+                _cleanup_cache(cfg.temporal_cache_dir)
+            else:
+                print(f"[cleanup] skipping cache clear — run did not complete cleanly ({cfg.temporal_cache_dir})")
         else:
             print(f"[cleanup] cache preserved (CLEAR_CACHE=0): {cfg.temporal_cache_dir}")
 

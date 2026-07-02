@@ -473,7 +473,6 @@ def _incremental_update(
     n_era5 = int(old_meta["n_era5"])
     n_gfs_stable = int(old_meta.get("n_gfs_stable", old_meta["n_gfs"]))
     n_gfs_forecast = int(old_meta.get("n_gfs_forecast", 0))
-    n_gfs = n_gfs_stable + n_gfs_forecast
     cycle_init_ts = float(old_meta.get("gfs_cycle_init_ts", 0.0))
 
     if agg == "mode":
@@ -1733,8 +1732,8 @@ def main() -> None:
                 for _f in fc_files:
                     try:
                         os.remove(_f)
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        print(f"  warning: could not remove forecast state {_f}: {exc}", flush=True)
                 print(f"  GFS cycle changed → cleared {len(fc_files)} forecast state files for fresh rebuild", flush=True)
             _fc_workers = 1 if (gfs_cycle_changed and int(os.environ.get("WW_FORECAST_WORKERS", "8")) < 8) else 8
             _build_forecast_aggregates(

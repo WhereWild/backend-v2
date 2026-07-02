@@ -1323,7 +1323,7 @@ def get_species_occurrences(
             filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
         ).to_pylist()
         _obs_count = max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
-    except FileNotFoundError:
+    except Exception:
         _obs_count = 0
     if _obs_count >= _LARGE_TAXON_THRESHOLD:
         raise HTTPException(status_code=400, detail="large_taxon")
@@ -1619,7 +1619,7 @@ def get_species_environment_slice(
             filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
         ).to_pylist()
         _obs_count = max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
-    except FileNotFoundError:
+    except Exception:
         _obs_count = 0
     if _obs_count >= _LARGE_TAXON_THRESHOLD:
         raise HTTPException(status_code=400, detail="large_taxon")

@@ -17,6 +17,7 @@ import io
 import json
 import math
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -370,9 +371,12 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEF
 # ---------------------------------------------------------------------------
 
 def _load_temporal_meta(var_id: str, window_label: str, suffix: str = "") -> dict:
+    if not (re.fullmatch(r"[\w-]+", var_id or "") and re.fullmatch(r"[\w-]+", window_label or "")):
+        return {}
+    safe_suffix = suffix if re.fullmatch(r"(?:|__f\d{3}h)", suffix or "") else ""
     try:
         base = TEMPORAL_RASTERS_DIR.resolve()
-        path = (TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{suffix}.meta.json").resolve()
+        path = (TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{safe_suffix}.meta.json").resolve()
         path.relative_to(base)
     except (ValueError, OSError):
         return {}

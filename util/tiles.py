@@ -376,15 +376,14 @@ def _load_temporal_meta(var_id: str, window_label: str, suffix: str = "") -> dic
     m_sfx = re.fullmatch(r"(?:|__f\d{3}h)", suffix or "")
     if not m_var or not m_win:
         return {}
-    safe_var = m_var.group()
-    safe_win = m_win.group()
-    safe_suffix = m_sfx.group() if m_sfx else ""
-    try:
-        base = TEMPORAL_RASTERS_DIR.resolve()
-        path = (TEMPORAL_RASTERS_DIR / f"{safe_var}_{safe_win}{safe_suffix}.meta.json").resolve()
-        path.relative_to(base)
-    except (ValueError, OSError):
+    base = str(TEMPORAL_RASTERS_DIR.resolve())
+    fullpath = os.path.normpath(os.path.join(
+        base,
+        f"{m_var.group()}_{m_win.group()}{m_sfx.group() if m_sfx else ''}.meta.json",
+    ))
+    if not fullpath.startswith(base + os.sep):
         return {}
+    path = Path(fullpath)
     storage = _storage.current()
     cached = _meta_cache.get(path)
     if cached is not None:

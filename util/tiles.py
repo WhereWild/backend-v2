@@ -371,12 +371,17 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEF
 # ---------------------------------------------------------------------------
 
 def _load_temporal_meta(var_id: str, window_label: str, suffix: str = "") -> dict:
-    if not (re.fullmatch(r"[\w-]+", var_id or "") and re.fullmatch(r"[\w-]+", window_label or "")):
+    m_var = re.fullmatch(r"[\w-]+", var_id or "")
+    m_win = re.fullmatch(r"[\w-]+", window_label or "")
+    m_sfx = re.fullmatch(r"(?:|__f\d{3}h)", suffix or "")
+    if not m_var or not m_win:
         return {}
-    safe_suffix = suffix if re.fullmatch(r"(?:|__f\d{3}h)", suffix or "") else ""
+    safe_var = m_var.group()
+    safe_win = m_win.group()
+    safe_suffix = m_sfx.group() if m_sfx else ""
     try:
         base = TEMPORAL_RASTERS_DIR.resolve()
-        path = (TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{safe_suffix}.meta.json").resolve()
+        path = (TEMPORAL_RASTERS_DIR / f"{safe_var}_{safe_win}{safe_suffix}.meta.json").resolve()
         path.relative_to(base)
     except (ValueError, OSError):
         return {}

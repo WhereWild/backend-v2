@@ -144,6 +144,16 @@ def get_taxon_by_slug(slug: str) -> TaxonRecord | None:
     return get_taxon_by_id(key) if key else None
 
 
+def reload_catalog() -> None:
+    """Clear all catalog caches so the next request re-reads from disk."""
+    _load_payload.cache_clear()
+    load_catalog.cache_clear()
+    load_name_index.cache_clear()
+    _slug_index.cache_clear()
+    _path_index.cache_clear()
+    _children_index.cache_clear()
+
+
 def search_taxa_by_name(
     name_query: str,
     limit: int = 10,

@@ -905,6 +905,8 @@ def test_get_species_occurrences_species_includes_subspecies():
     })
     call_count = {"n": 0}
     def _read_table_side_effect(path, **kwargs):
+        if "numerical_stats" in str(path):
+            return pa.table({"taxon_key": pa.array([], type=pa.string()), "count": pa.array([], type=pa.int64())})
         call_count["n"] += 1
         if call_count["n"] == 1:
             return _OCC_TABLE   # species own obs

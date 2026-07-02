@@ -47,6 +47,15 @@ _GBIF_SCOPE = "gbif_region"
 _BATCH_SIZE = 10_000
 _LOG_INTERVAL = 100
 
+# GADM 4.1 truncates NAME_0/COUNTRY at 32 characters in the GeoPackage.
+# These are the known casualties; keyed by GID_0.
+_NAME_OVERRIDES: dict[str, str] = {
+    "HMD": "Heard Island and McDonald Islands",
+    "SGS": "South Georgia and the South Sandwich Islands",
+    "SHN": "Saint Helena, Ascension and Tristan da Cunha",
+    "UMI": "United States Minor Outlying Islands",
+}
+
 
 # ---------------------------------------------------------------------------
 # Download
@@ -138,6 +147,7 @@ def _export_level(conn: sqlite3.Connection, level: int) -> list[tuple[str, str]]
         for gid, name in conn.execute(
             f'SELECT "{gid_col}", "{name_col}" FROM "{table}"'
         ):
+            name = _NAME_OVERRIDES.get(gid, name)
             key = (gid, name)
             if key in seen:
                 continue

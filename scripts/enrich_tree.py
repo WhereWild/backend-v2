@@ -396,7 +396,7 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
                 valid = _valid_class_ids(layer_id)
                 if valid is not None:
                     finite = np.isfinite(vals)
-                    int_vals = np.where(finite, np.rint(vals).astype(np.int64), 0)
+                    int_vals = np.rint(np.where(finite, vals, 0)).astype(np.int64)
                     vals[finite & ~np.isin(int_vals, np.array(sorted(valid), dtype=np.int64))] = np.nan
 
         full = np.full(len(lats), np.nan, dtype=np.float64)

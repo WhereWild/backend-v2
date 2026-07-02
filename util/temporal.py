@@ -636,11 +636,18 @@ def _download_chunk(
     model: str,
     variable: str,
     cache_dir: str,
+    *,
+    check_freshness: bool = False,
 ) -> Path:
     """Download a single .om chunk to local disk via fsspec and return the path.
 
     Uses per-file locking so concurrent workers don't race to download the same
     file, and writes via a .tmp rename so readers never see a partial file.
+
+    When check_freshness=True and the file is already cached, a cheap S3 HEAD
+    request compares LastModified against the local mtime. If S3 is newer the
+    local copy is deleted so the file is re-downloaded. Use this for frontier
+    chunks (the rolling chunk that Open-Meteo rewrites on each GFS cycle).
     """
     filename = _chunk_filename(chunk_entry)
     uri = f"s3://openmeteo/data/{model}/{variable}/{filename}"
@@ -650,7 +657,22 @@ def _download_chunk(
     target = dest_dir / f"{model}_{variable}_{filename}"
 
     if target.exists():
-        return target
+        if check_freshness:
+            try:
+                fs = fsspec.filesystem("s3", anon=True)
+                s3_mtime = fs.info(uri).get("LastModified")
+                if s3_mtime is not None:
+                    local_mtime = datetime.fromtimestamp(target.stat().st_mtime, tz=UTC)
+                    if s3_mtime > local_mtime:
+                        target.unlink(missing_ok=True)
+                    else:
+                        return target
+                else:
+                    return target
+            except Exception:
+                return target  # HEAD failed — use cached copy
+        else:
+            return target
 
     key = str(target)
     with _DOWNLOAD_CHUNK_LOCKS_MX:
@@ -2165,8 +2187,6 @@ def accumulate_raster_mode(
         if t1 <= t0:
             continue
 
-        # Open cc reader once for the whole chunk but read one step at a time to
-        # avoid materialising a (ny, nx, n_steps) float64 array for large windows.
         cc_reader = _open_chunk(cc_entry, model, "cloud_cover", n_steps=t1 - t0)
         rny, rnx, _ = cc_reader.shape
         ny, nx = rny, rnx
@@ -2175,39 +2195,42 @@ def accumulate_raster_mode(
             for c in RASTER_WC_CODES:
                 counts[c] = np.zeros((ny, nx), dtype=np.int32)
 
-        # Cache open readers for pr/sw so we don't reopen the same file every step.
+        # Read in batches of 24 (matching accumulate_raster) so _read_array_cached
+        # LRU entries are shared with concurrent standalone cloud/precip/snow builds.
         _pr_readers: dict[int, object] = {}
         _sw_readers: dict[int, object] = {}
+        _sub = 24
 
-        for i in range(t1 - t0):
-            step_ts = cc_entry.start + (t0 + i - cc_entry.file_offset) * resolution
+        for ts in range(t0, t1, _sub):
+            te = min(ts + _sub, t1)
+            bs = te - ts
+            batch_start_ts = cc_entry.start + (ts - cc_entry.file_offset) * resolution
 
-            cc_slice = _read_array_cached(cc_reader, ny, nx, t0 + i, t0 + i + 1)[:, :, 0]
+            cc_batch = _read_array_cached(cc_reader, ny, nx, ts, te)
 
-            pr_slice = np.zeros((ny, nx), dtype=np.float64)
-            pr_entry, pr_idx = _chunk_entry_for_time(precip_index, step_ts)
+            pr_batch = np.zeros((ny, nx, bs), dtype=np.float64)
+            pr_entry, pr_idx = _chunk_entry_for_time(precip_index, batch_start_ts)
             if pr_entry is not None:
                 if pr_entry.chunk_num not in _pr_readers:
                     _pr_readers[pr_entry.chunk_num] = _open_chunk(pr_entry, model, "precipitation", n_steps=t1 - t0)
-                pr_slice = _read_array_cached(
-                    _pr_readers[pr_entry.chunk_num], ny, nx, pr_idx, pr_idx + 1
-                )[:, :, 0]
+                pr_data = _read_array_cached(_pr_readers[pr_entry.chunk_num], ny, nx, pr_idx, pr_idx + bs)
+                pr_batch[:, :, :pr_data.shape[2]] = pr_data[:, :, :bs]
 
-            sw_slice = np.zeros((ny, nx), dtype=np.float64)
-            sw_entry, sw_idx = _chunk_entry_for_time(swe_index, step_ts)
+            sw_batch = np.zeros((ny, nx, bs), dtype=np.float64)
+            sw_entry, sw_idx = _chunk_entry_for_time(swe_index, batch_start_ts)
             if sw_entry is not None:
                 if sw_entry.chunk_num not in _sw_readers:
                     _sw_readers[sw_entry.chunk_num] = _open_chunk(sw_entry, model, "snowfall_water_equivalent", n_steps=t1 - t0)
-                sw_slice = _read_array_cached(
-                    _sw_readers[sw_entry.chunk_num], ny, nx, sw_idx, sw_idx + 1
-                )[:, :, 0]
+                sw_data = _read_array_cached(_sw_readers[sw_entry.chunk_num], ny, nx, sw_idx, sw_idx + bs)
+                sw_batch[:, :, :sw_data.shape[2]] = sw_data[:, :, :bs]
 
-            codes = weather_code_array(
-                cc_slice, pr_slice, sw_slice,
-                resolution, temp=temp_grid_025,
-            )
-            for c in RASTER_WC_CODES:
-                counts[c] += (np.round(codes) == c).astype(np.int32)
+            for j in range(bs):
+                codes = weather_code_array(
+                    cc_batch[:, :, j], pr_batch[:, :, j], sw_batch[:, :, j],
+                    resolution, temp=temp_grid_025,
+                )
+                for c in RASTER_WC_CODES:
+                    counts[c] += (np.round(codes) == c).astype(np.int32)
 
     # Initialise to zero arrays if no data was found
     g = RASTER_GRIDS[model]
@@ -2231,12 +2254,23 @@ def reproject_to_grid(
     dst_lat_max: float,
     dst_lon_min: float,
     dst_lon_max: float,
+    resampling: str = "bilinear",
 ) -> np.ndarray:
-    """Bilinear reproject src (lat-ascending float array) onto a new WGS84 grid.
+    """Reproject src (lat-ascending float array) onto a new WGS84 grid.
 
     Both grids must be in geographic coordinates (degrees).  src must already
     be lat-ascending (flipud applied before calling).
+
+    resampling: "bilinear" (default, for continuous data), "average"
+        (for count/integer data going fine→coarse), or "nearest"
+        (for same-resolution grids or classified/discrete data — no interpolation).
     """
+    if resampling == "average":
+        _resamp = _Resampling.average
+    elif resampling == "nearest":
+        _resamp = _Resampling.nearest
+    else:
+        _resamp = _Resampling.bilinear
     src_f = np.asarray(src, dtype=np.float32)
     src_ny, src_nx = src_f.shape
 
@@ -2248,7 +2282,7 @@ def reproject_to_grid(
         source=src_f, destination=dst,
         src_transform=src_transform, src_crs=_WGS84,
         dst_transform=dst_transform, dst_crs=_WGS84,
-        resampling=_Resampling.bilinear,
+        resampling=_resamp,
         src_nodata=np.nan, dst_nodata=np.nan,
     )
     return dst
@@ -2270,22 +2304,32 @@ def compute_raster_final(
     n_total = max(n_era5 + n_gfs, 1)
 
     if agg == "mode":
-        stack = np.stack([sums.get(c, np.zeros_like(next(iter(sums.values()))))
-                          for c in RASTER_WC_CODES], axis=0)
+        zero_wc = np.zeros_like(next(iter(sums.values())))
+        if f"era5_wc_{RASTER_WC_CODES[0]}" in sums:
+            combined = {
+                c: sums.get(f"era5_wc_{c}", zero_wc)
+                + sums.get(f"gfs_stable_wc_{c}", zero_wc)
+                + sums.get(f"gfs_forecast_wc_{c}", zero_wc)
+                for c in RASTER_WC_CODES
+            }
+        else:
+            combined = {c: sums.get(c, zero_wc) for c in RASTER_WC_CODES}
+        stack = np.stack([combined[c] for c in RASTER_WC_CODES], axis=0)
         best = np.argmax(stack, axis=0)
         return np.array(RASTER_WC_CODES, dtype=np.float32)[best]
 
     zero = np.zeros_like(next(iter(sums.values())), dtype=np.float64)
 
     if var_id == "vapor_pressure_deficit":
-        vpd_sum = sums.get("era5_vpd", zero) + sums.get("gfs_vpd", zero)
+        vpd_sum = sums.get("era5_vpd", zero) + sums.get("gfs_vpd", zero) + sums.get("gfs_forecast_vpd", zero)
         result = vpd_sum / n_total
         return np.maximum(result, 0.0).astype(np.float32)
 
     if var_id == "dew_point_2m":
         era5_val = sums.get("era5_dew_point_2m", zero) / max(n_era5, 1)
-        if n_gfs > 0 and "gfs_dew_point_2m" in sums:
-            gfs_val = sums["gfs_dew_point_2m"] / n_gfs
+        gfs_combined = sums.get("gfs_dew_point_2m", zero) + sums.get("gfs_forecast_dew_point_2m", zero)
+        if n_gfs > 0 and np.any(gfs_combined != 0):
+            gfs_val = gfs_combined / n_gfs
             return ((era5_val * n_era5 + gfs_val * n_gfs) / n_total).astype(np.float32)
         return era5_val.astype(np.float32)
 
@@ -2326,6 +2370,47 @@ def load_raster_state(
     return sums, meta
 
 
+_RASTER_BOUNDS: dict[str, tuple[float, float]] = {
+    "cloud_cover": (0.0, 100.0),
+}
+
+
+def _check_raster_bounds(
+    final: np.ndarray,
+    var_id: str,
+    window_label: str,
+    suffix: str,
+    meta: dict,
+) -> None:
+    bounds = _RASTER_BOUNDS.get(var_id)
+    if bounds is None:
+        return
+    lo, hi = bounds
+    finite = final[np.isfinite(final)]
+    if finite.size == 0:
+        return
+    vmin, vmax = float(finite.min()), float(finite.max())
+    eps = 1e-3
+    if vmin >= lo - eps and vmax <= hi + eps:
+        return
+    label = f"{var_id}_{window_label}{suffix}"
+    n_era5 = meta.get("n_era5", "?")
+    n_gfs_stable = meta.get("n_gfs_stable", "?")
+    n_gfs_forecast = meta.get("n_gfs_forecast", "?")
+    n_gfs = meta.get("n_gfs", "?")
+    ts = meta.get("built_at", "?")
+    gfs_start = meta.get("gfs_start_ts", "?")
+    gfs_end = meta.get("gfs_end_ts", "?")
+    cycle_init = meta.get("gfs_cycle_init_ts", "?")
+    print(
+        f"  [BOUNDS WARNING] {label} @ {ts}: expected [{lo}, {hi}] "
+        f"got [{vmin:.3g}, {vmax:.3g}] "
+        f"(n_era5={n_era5} n_gfs_stable={n_gfs_stable} n_gfs_forecast={n_gfs_forecast} n_gfs={n_gfs} "
+        f"gfs_start={gfs_start} gfs_end={gfs_end} cycle_init={cycle_init})",
+        flush=True,
+    )
+
+
 def save_raster_state(
     out_dir: str,
     var_id: str,
@@ -2343,6 +2428,7 @@ def save_raster_state(
     sums_path = Path(str(base) + ".sums.npz")
 
     final = compute_raster_final(var_id, agg, sums, meta["n_era5"], meta["n_gfs"])
+    _check_raster_bounds(final, var_id, window_label, suffix, meta)
     np.save(npy_path, final)
     meta_out = dict(meta)
     if agg != "mode":

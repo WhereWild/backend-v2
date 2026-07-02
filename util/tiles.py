@@ -17,6 +17,7 @@ import io
 import json
 import math
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -126,6 +127,7 @@ _MODEL_GRID_PARAMS: dict[str, dict] = {
 }
 
 _npy_cache: dict[Path, tuple[float, np.ndarray]] = {}
+_meta_cache: dict[Path, tuple[float, dict]] = {}
 
 
 def _load_temporal_npy(path: Path) -> np.ndarray | None:
@@ -368,14 +370,41 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEF
 # Tile renderer
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=128)
 def _load_temporal_meta(var_id: str, window_label: str, suffix: str = "") -> dict:
-    path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{suffix}.meta.json"
+    m_var = re.fullmatch(r"[\w-]+", var_id or "")
+    m_win = re.fullmatch(r"[\w-]+", window_label or "")
+    m_sfx = re.fullmatch(r"(?:|__f\d{3}h)", suffix or "")
+    if not m_var or not m_win:
+        return {}
+    base = str(TEMPORAL_RASTERS_DIR.resolve())
+    fullpath = os.path.normpath(os.path.join(
+        base,
+        f"{m_var.group()}_{m_win.group()}{m_sfx.group() if m_sfx else ''}.meta.json",
+    ))
+    if not fullpath.startswith(base + os.sep):
+        return {}
+    path = Path(fullpath)
+    storage = _storage.current()
+    cached = _meta_cache.get(path)
+    if cached is not None:
+        if not storage.is_remote and path.exists() and cached[0] != path.stat().st_mtime:
+            pass  # local file changed — fall through to reload
+        else:
+            return cached[1]
     try:
-        with _storage.open_input_file(path) as f:
-            return json.loads(f.read())
+        if path.exists():
+            meta = json.loads(path.read_text())
+            mtime = path.stat().st_mtime
+        elif storage.is_remote:
+            with _storage.open_input_file(path) as f:
+                meta = json.loads(f.read())
+            mtime = 0.0
+        else:
+            return {}
     except Exception:
         return {}
+    _meta_cache[path] = (mtime, meta)
+    return meta
 
 
 def get_layer_render_range(layer: dict, forecast_suffix: str = "") -> tuple[float | None, float | None]:

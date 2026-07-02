@@ -272,11 +272,8 @@ STAGES: list[tuple[str, str, object]] = [
     ("process_tree",          "Processing tree (summary stats + KDE)",   lambda: process_tree.run_stats()),
     ("process_tree_rankings", "Processing tree (relative rankings)",      lambda: process_tree.run_rankings()),
     ("process_tree_consolidate", "Processing tree (global consolidation)", lambda: process_tree.run_consolidation()),
+    ("push",                  "Syncing data/ to production server",       lambda: _push_stage()),
 ]
-
-# push is not in STAGES — it's always the final action when --push is passed,
-# regardless of which stage the run started at.
-_PUSH_STAGE = ("push", "Syncing data/ to production server", lambda: _push_stage())
 
 
 
@@ -403,17 +400,12 @@ def main() -> None:
             if stage_id in SKIPPABLE_REBUILD_STAGES:
                 print(f"\n--- Skipping {label} (SKIPPABLE_REBUILD_STAGES) ---")
                 continue
+            if stage_id == "push" and not args.push and args.stage != "push":
+                continue
             print(f"\n--- {label} ---")
             _set_stage(stage_id, "in_progress")
             fn()
             _set_stage(stage_id, "completed")
-
-        if args.push:
-            push_id, push_label, push_fn = _PUSH_STAGE
-            print(f"\n--- {push_label} ---")
-            _set_stage(push_id, "in_progress")
-            push_fn()
-            _set_stage(push_id, "completed")
 
         finished_at = _now()
         elapsed = int((datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds())

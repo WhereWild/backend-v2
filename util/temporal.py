@@ -2306,7 +2306,12 @@ def compute_raster_final(
     if agg == "mode":
         zero_wc = np.zeros_like(next(iter(sums.values())))
         if f"era5_wc_{RASTER_WC_CODES[0]}" in sums:
-            combined = {c: sums.get(f"era5_wc_{c}", zero_wc) + sums.get(f"gfs_stable_wc_{c}", zero_wc) + sums.get(f"gfs_forecast_wc_{c}", zero_wc) for c in RASTER_WC_CODES}
+            combined = {
+                c: sums.get(f"era5_wc_{c}", zero_wc)
+                + sums.get(f"gfs_stable_wc_{c}", zero_wc)
+                + sums.get(f"gfs_forecast_wc_{c}", zero_wc)
+                for c in RASTER_WC_CODES
+            }
         else:
             combined = {c: sums.get(c, zero_wc) for c in RASTER_WC_CODES}
         stack = np.stack([combined[c] for c in RASTER_WC_CODES], axis=0)
@@ -2371,7 +2376,7 @@ _RASTER_BOUNDS: dict[str, tuple[float, float]] = {
 
 
 def _check_raster_bounds(
-    final: "np.ndarray",
+    final: np.ndarray,
     var_id: str,
     window_label: str,
     suffix: str,

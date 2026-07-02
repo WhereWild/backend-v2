@@ -62,10 +62,10 @@ def _floor_to_6h(last_modified: datetime) -> float:
 
 
 def _gfs_detect_cycle(
-    gfs_cidx: dict[str, "ChunkIndex"],
+    gfs_cidx: dict[str, ChunkIndex],
     gfs_end_ts: float,
     max_window_h: int,
-    fs: "fsspec.AbstractFileSystem",
+    fs: fsspec.AbstractFileSystem,
     prior_last_modified: dict[str, str],
 ) -> tuple[bool, float, dict[str, str]]:
     """Check S3 LastModified for all GFS chunks that could affect this run.
@@ -439,7 +439,10 @@ def _full_build(
         "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
     }
     save_raster_state(out_dir, var_id, window_label, agg, sums, meta, suffix=suffix)
-    print(f"  [{window_label}] {var_id}: {n_era5}h ERA5 + {n_gfs_stable}h GFS-stable + {n_gfs_forecast}h GFS-fc → {out_dir}/{var_id}_{window_label}{suffix}.npy")
+    print(
+        f"  [{window_label}] {var_id}: {n_era5}h ERA5 + {n_gfs_stable}h GFS-stable"
+        f" + {n_gfs_forecast}h GFS-fc → {out_dir}/{var_id}_{window_label}{suffix}.npy"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -897,7 +900,10 @@ def _gfs_rederive(
             "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
         }
         save_raster_state(out_dir, var_id, window_label, agg, sums, meta)
-        print(f"  [{window_label}] {var_id}: GFS cycle rederive → {n_gfs_stable}h stable + {n_gfs_forecast}h forecast, ERA5 {n_era5}h preserved", flush=True)
+        print(
+            f"  [{window_label}] {var_id}: GFS cycle rederive → {n_gfs_stable}h stable"
+            f" + {n_gfs_forecast}h forecast, ERA5 {n_era5}h preserved", flush=True
+        )
         return
 
     # Preserve ERA5 and stable GFS sums; zero only forecast sums.
@@ -1109,7 +1115,10 @@ def _gfs_rederive(
         "built_at": datetime.fromtimestamp(now_ts, tz=UTC).isoformat(),
     }
     save_raster_state(out_dir, var_id, window_label, agg, sums, meta)
-    print(f"  [{window_label}] {var_id}: GFS cycle rederive → {n_gfs_stable}h stable + {n_gfs_forecast}h forecast, ERA5 {n_era5}h preserved", flush=True)
+    print(
+        f"  [{window_label}] {var_id}: GFS cycle rederive → {n_gfs_stable}h stable"
+        f" + {n_gfs_forecast}h forecast, ERA5 {n_era5}h preserved", flush=True
+    )
 
 
 # ---------------------------------------------------------------------------

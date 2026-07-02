@@ -279,7 +279,6 @@ def test_cloud_cover_24h_incremental_bounds(
     # obs_ts is ~60 days before era5_end; use obs_ts-26h as "now" so there's
     # room to advance 2 more hours fully inside ERA5 territory.
     obs_ts = float(int(obs_ts_raw) // 3600 * 3600) - 26 * 3600
-    era5_end = int(_model_end_ts(_ERA5_MODEL)) // 3600 * 3600
     # Pretend ERA5 ends 2h after obs_ts so each slide adds exactly 1 ERA5 hour.
     fake_era5_end = obs_ts + 2 * 3600
 

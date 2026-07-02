@@ -58,6 +58,7 @@ _LEGEND_DIR = Path("config/gis/legends")
 _OCC_FILE = "occurrence.parquet"
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
 _PHENOLOGY_VALUES: frozenset[str] = frozenset(_CONFIG.phenology_values)
+_LARGE_TAXON_THRESHOLD = 500_000
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
@@ -298,7 +299,6 @@ async def reload_data():
     _load_hierarchy.cache_clear()
     tiles._catalog.cache_clear()
     tiles._load_nominal_colormap.cache_clear()
-    legend_cache.clear()
     return {"ok": True}
 
 
@@ -697,6 +697,8 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
         (line["body"] for section in description_profile["sections"] for line in section["lines"]),
         "",
     )
+    observation_count = max((int(r["count"]) for r in numerical_rows if r.get("count")), default=0)
+    large_taxon = observation_count >= _LARGE_TAXON_THRESHOLD
     return {
         **taxon,
         "scientific_name": sci.replace("_", " "),
@@ -705,6 +707,8 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
         **_image_fields(taxon),
         "description": description,
         "description_profile": description_profile,
+        "observation_count": observation_count,
+        "large_taxon": large_taxon,
     }
 
 
@@ -1313,6 +1317,17 @@ def get_species_occurrences(
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
 
+    try:
+        _num_rows = _storage.read_table(
+            GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
+            filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+        ).to_pylist()
+        _obs_count = max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
+    except FileNotFoundError:
+        _obs_count = 0
+    if _obs_count >= _LARGE_TAXON_THRESHOLD:
+        raise HTTPException(status_code=400, detail="large_taxon")
+
     is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
     filter_col = _location_filter_col(location) if location is not None else None
     has_loc_or_pheno = filter_col is not None or phenology_norm is not None
@@ -1598,6 +1613,16 @@ def get_species_environment_slice(
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
+    try:
+        _num_rows = _storage.read_table(
+            GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
+            filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+        ).to_pylist()
+        _obs_count = max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
+    except FileNotFoundError:
+        _obs_count = 0
+    if _obs_count >= _LARGE_TAXON_THRESHOLD:
+        raise HTTPException(status_code=400, detail="large_taxon")
     phenology_norm = phenology.strip().lower() if phenology else None
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")

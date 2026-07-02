@@ -370,7 +370,12 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEF
 # ---------------------------------------------------------------------------
 
 def _load_temporal_meta(var_id: str, window_label: str, suffix: str = "") -> dict:
-    path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{suffix}.meta.json"
+    try:
+        base = TEMPORAL_RASTERS_DIR.resolve()
+        path = (TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{suffix}.meta.json").resolve()
+        path.relative_to(base)
+    except (ValueError, OSError):
+        return {}
     storage = _storage.current()
     cached = _meta_cache.get(path)
     if cached is not None:

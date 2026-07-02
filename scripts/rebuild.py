@@ -16,8 +16,10 @@ data directory (preserving sync_state.json) and runs the full pipeline:
   7. build_overviews — build COG overviews for all GIS layers
   8. enrich_tree     — sample GIS layer values into per-taxon occurrence parquets
   9. enrich_temporal — enrich occurrences with time-windowed ERA5 weather statistics
- 10. process_tree    — compute per-taxon summary statistics and KDE density graphs
- 11. push            — sync data/ to production server (only with --push)
+ 10. process_tree             — compute per-taxon summary statistics and KDE density graphs
+ 11. process_tree_rankings    — compute relative rankings across all taxa
+ 12. process_tree_consolidate — build global stats files
+ 13. push            — sync data/ to production server (only with --push)
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -267,7 +269,9 @@ STAGES: list[tuple[str, str, object]] = [
     ("build_overviews", "Building COG overviews",                             lambda: build_overviews.main()),
     ("enrich_tree",     "Enriching tree (GIS sampling)",                      lambda: enrich_tree.main()),
     ("enrich_temporal", "Enriching tree (temporal ERA5 weather)",              lambda: enrich_temporal.main()),
-    ("process_tree",    "Processing tree (summary stats + KDE)",              lambda: process_tree.main()),
+    ("process_tree",          "Processing tree (summary stats + KDE)",   lambda: process_tree.run_stats()),
+    ("process_tree_rankings", "Processing tree (relative rankings)",      lambda: process_tree.run_rankings()),
+    ("process_tree_consolidate", "Processing tree (global consolidation)", lambda: process_tree.run_consolidation()),
 ]
 
 # push is not in STAGES — it's always the final action when --push is passed,

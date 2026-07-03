@@ -26,7 +26,7 @@ import rasterio
 from PIL import Image
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
-from rasterio.transform import Affine, from_bounds
+from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import reproject as warp_reproject
 from rasterio.windows import Window
 from rasterio.windows import from_bounds as window_from_bounds
@@ -465,9 +465,13 @@ def render_temporal_tile_bytes(
         grid = _MODEL_GRID_PARAMS.get(detected, _MODEL_GRID_PARAMS["copernicus_era5"])
         # arr is lat-ascending (row 0 = south); flipud for rasterio north-up convention
         arr_nu = np.flipud(arr)
-        src_transform = from_bounds(
-            grid["lon_min"], grid["lat_min"], grid["lon_max"], grid["lat_max"],
-            grid["nx"], grid["ny"],
+        _cell_lon = (grid["lon_max"] - grid["lon_min"]) / (grid["nx"] - 1)
+        _cell_lat = (grid["lat_max"] - grid["lat_min"]) / (grid["ny"] - 1)
+        src_transform = from_origin(
+            grid["lon_min"] - _cell_lon / 2,
+            grid["lat_max"] + _cell_lat / 2,
+            _cell_lon,
+            _cell_lat,
         )
         mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
         dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
@@ -517,9 +521,13 @@ def _nominal_tile_range_classes_temporal(
     detected = shape_to_model.get(arr.shape, model)
     grid = _MODEL_GRID_PARAMS.get(detected, _MODEL_GRID_PARAMS["copernicus_era5"])
     arr_nu = np.flipud(arr)
-    src_transform = from_bounds(
-        grid["lon_min"], grid["lat_min"], grid["lon_max"], grid["lat_max"],
-        grid["nx"], grid["ny"],
+    _cell_lon = (grid["lon_max"] - grid["lon_min"]) / (grid["nx"] - 1)
+    _cell_lat = (grid["lat_max"] - grid["lat_min"]) / (grid["ny"] - 1)
+    src_transform = from_origin(
+        grid["lon_min"] - _cell_lon / 2,
+        grid["lat_max"] + _cell_lat / 2,
+        _cell_lon,
+        _cell_lat,
     )
     counts: dict[int, int] = {}
     for tx in range(x0, x1 + 1):
@@ -744,11 +752,16 @@ def render_layer_tile_bytes(
         rb1 = min(lat1, db.top)
 
         if rl0 < rl1 and rb0 < rb1:
-            src_window = window_from_bounds(rl0, rb0, rl1, rb1, ds.transform)
+            _fw = window_from_bounds(rl0, rb0, rl1, rb1, ds.transform)
+            _col0 = math.floor(_fw.col_off)
+            _row0 = math.floor(_fw.row_off)
+            _col1 = min(math.ceil(_fw.col_off + _fw.width),  ds.width)
+            _row1 = min(math.ceil(_fw.row_off + _fw.height), ds.height)
+            src_window = Window(_col0, _row0, _col1 - _col0, _row1 - _row0)
 
             # Pick read resolution: how many source pixels cover this tile?
-            src_px_w = ds.width  * (rl1 - rl0) / (db.right - db.left)
-            src_px_h = ds.height * (rb1 - rb0) / (db.top   - db.bottom)
+            src_px_w = src_window.width
+            src_px_h = src_window.height
             overviews = ds.overviews(1) or []
 
             # For continuous layers, oversample 2x so bilinear warp has enough

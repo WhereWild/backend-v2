@@ -323,27 +323,36 @@ def _nominal_fallback_color(class_id: int) -> tuple[int, int, int]:
     return int(r * 255), int(g * 255), int(b * 255)
 
 
-def _colorize_nominal(values: np.ndarray, colormap: dict[int, tuple[int, int, int]]) -> np.ndarray:
-    """Map integer class IDs to RGBA using legend colors (fully opaque)."""
+def _colorize_nominal(
+    values: np.ndarray,
+    colormap: dict[int, tuple[int, int, int]],
+    class_filter: int | None = None,
+) -> np.ndarray:
+    """Map integer class IDs to RGBA using legend colors (fully opaque).
+
+    If class_filter is set, only pixels matching that class ID are rendered;
+    all others are left transparent.
+    """
     rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
     if not colormap:
         return rgba
     max_id = max(colormap.keys()) + 1
     lut = np.zeros((max_id, 4), dtype=np.uint8)
     for cid, (r, g, b) in colormap.items():
-        if 0 <= cid < max_id:
+        if 0 <= cid < max_id and (class_filter is None or cid == class_filter):
             lut[cid] = [r, g, b, 255]
     finite = np.isfinite(values)
     ids    = np.where(finite, np.round(values).astype(np.int32), -1)
     known  = finite & (ids >= 0) & (ids < max_id)
     rgba[known] = lut[ids[known]]
     # Fall back to generated colors for any finite class ID not in the legend
-    unknown = finite & ~known
-    if np.any(unknown):
-        for cid in np.unique(ids[unknown]):
-            r, g, b = _nominal_fallback_color(int(cid))
-            mask = unknown & (ids == cid)
-            rgba[mask] = [r, g, b, 255]
+    if class_filter is None:
+        unknown = finite & ~known
+        if np.any(unknown):
+            for cid in np.unique(ids[unknown]):
+                r, g, b = _nominal_fallback_color(int(cid))
+                mask = unknown & (ids == cid)
+                rgba[mask] = [r, g, b, 255]
     return rgba
 
 
@@ -429,6 +438,7 @@ def render_temporal_tile_bytes(
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
     forecast_suffix: str = "",
+    class_filter: int | None = None,
 ) -> bytes:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
@@ -496,7 +506,7 @@ def render_temporal_tile_bytes(
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
+        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
     img = Image.fromarray(rgba, mode="RGBA")
@@ -723,11 +733,12 @@ def render_layer_tile_bytes(
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
     forecast_suffix: str = "",
+    class_filter: int | None = None,
 ) -> bytes:
     from util.gis import DERIVED_FROM_ELEVATION, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
-        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix)
+        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter)
     if layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
         return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap)
@@ -831,7 +842,7 @@ def render_layer_tile_bytes(
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
+        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
     img  = Image.fromarray(rgba, mode="RGBA")

@@ -1156,6 +1156,7 @@ def _patch_main_base(monkeypatch, tmp_path: Path, force: bool = True,
     cfg.temporal_raster_windows = windows_str
 
     monkeypatch.setenv("TEMPORAL_RASTER_NO_PUSH", "1")
+    monkeypatch.setenv("WW_DISABLE_FORECASTS", "0")
     monkeypatch.setattr("scripts.build_temporal.load_config", lambda _: cfg)
 
     # fsspec.filesystem mock

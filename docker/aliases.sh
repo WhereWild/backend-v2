@@ -9,6 +9,11 @@ if [[ -f /workspace/.env ]]; then
 fi
 
 _uv() {
+    # Unset any vars defined in .env so --env-file values always win (uv doesn't override existing env vars)
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        unset "${line%%=*}" 2>/dev/null || true
+    done < /workspace/.env
     uv run --env-file /workspace/.env "$@"
 }
 

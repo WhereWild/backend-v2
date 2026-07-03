@@ -570,10 +570,11 @@ async def variable_tile_compat(
     variable_id: str, z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis"),
     cb_mode: str = Query(""), forecast_h: int = Query(0, ge=0),
+    class_filter: int | None = Query(None),
 ):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h)
+    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter)
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
@@ -583,6 +584,7 @@ async def layer_tile(
     colormap: str = Query("viridis"),
     cb_mode: str = Query(""),
     forecast_h: int = Query(0, ge=0),
+    class_filter: int | None = Query(None),
 ):
     if colormap not in tiles.SUPPORTED_COLORMAPS and colormap not in tiles.SUPPORTED_CIRCULAR_COLORMAPS:
         colormap = "viridis"
@@ -598,7 +600,7 @@ async def layer_tile(
     forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h > 0 else ""
     payload = await run_in_threadpool(
         tiles.render_layer_tile_bytes,
-        layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix,
+        layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter,
     )
     is_temporal = layer.get("window_hours") is not None
     cache_max_age = 300 if is_temporal else 604800

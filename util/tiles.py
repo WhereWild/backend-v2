@@ -26,7 +26,7 @@ import rasterio
 from PIL import Image
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
-from rasterio.transform import Affine, from_bounds
+from rasterio.transform import Affine, from_bounds, from_origin
 from rasterio.warp import reproject as warp_reproject
 from rasterio.windows import Window
 from rasterio.windows import from_bounds as window_from_bounds
@@ -323,27 +323,36 @@ def _nominal_fallback_color(class_id: int) -> tuple[int, int, int]:
     return int(r * 255), int(g * 255), int(b * 255)
 
 
-def _colorize_nominal(values: np.ndarray, colormap: dict[int, tuple[int, int, int]]) -> np.ndarray:
-    """Map integer class IDs to RGBA using legend colors (fully opaque)."""
+def _colorize_nominal(
+    values: np.ndarray,
+    colormap: dict[int, tuple[int, int, int]],
+    class_filter: int | None = None,
+) -> np.ndarray:
+    """Map integer class IDs to RGBA using legend colors (fully opaque).
+
+    If class_filter is set, only pixels matching that class ID are rendered;
+    all others are left transparent.
+    """
     rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
     if not colormap:
         return rgba
     max_id = max(colormap.keys()) + 1
     lut = np.zeros((max_id, 4), dtype=np.uint8)
     for cid, (r, g, b) in colormap.items():
-        if 0 <= cid < max_id:
+        if 0 <= cid < max_id and (class_filter is None or cid == class_filter):
             lut[cid] = [r, g, b, 255]
     finite = np.isfinite(values)
     ids    = np.where(finite, np.round(values).astype(np.int32), -1)
     known  = finite & (ids >= 0) & (ids < max_id)
     rgba[known] = lut[ids[known]]
     # Fall back to generated colors for any finite class ID not in the legend
-    unknown = finite & ~known
-    if np.any(unknown):
-        for cid in np.unique(ids[unknown]):
-            r, g, b = _nominal_fallback_color(int(cid))
-            mask = unknown & (ids == cid)
-            rgba[mask] = [r, g, b, 255]
+    if class_filter is None:
+        unknown = finite & ~known
+        if np.any(unknown):
+            for cid in np.unique(ids[unknown]):
+                r, g, b = _nominal_fallback_color(int(cid))
+                mask = unknown & (ids == cid)
+                rgba[mask] = [r, g, b, 255]
     return rgba
 
 
@@ -429,6 +438,7 @@ def render_temporal_tile_bytes(
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
     forecast_suffix: str = "",
+    class_filter: int | None = None,
 ) -> bytes:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
@@ -465,9 +475,13 @@ def render_temporal_tile_bytes(
         grid = _MODEL_GRID_PARAMS.get(detected, _MODEL_GRID_PARAMS["copernicus_era5"])
         # arr is lat-ascending (row 0 = south); flipud for rasterio north-up convention
         arr_nu = np.flipud(arr)
-        src_transform = from_bounds(
-            grid["lon_min"], grid["lat_min"], grid["lon_max"], grid["lat_max"],
-            grid["nx"], grid["ny"],
+        _cell_lon = (grid["lon_max"] - grid["lon_min"]) / (grid["nx"] - 1)
+        _cell_lat = (grid["lat_max"] - grid["lat_min"]) / (grid["ny"] - 1)
+        src_transform = from_origin(
+            grid["lon_min"] - _cell_lon / 2,
+            grid["lat_max"] + _cell_lat / 2,
+            _cell_lon,
+            _cell_lat,
         )
         mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
         dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
@@ -492,7 +506,7 @@ def render_temporal_tile_bytes(
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
+        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
     img = Image.fromarray(rgba, mode="RGBA")
@@ -517,9 +531,13 @@ def _nominal_tile_range_classes_temporal(
     detected = shape_to_model.get(arr.shape, model)
     grid = _MODEL_GRID_PARAMS.get(detected, _MODEL_GRID_PARAMS["copernicus_era5"])
     arr_nu = np.flipud(arr)
-    src_transform = from_bounds(
-        grid["lon_min"], grid["lat_min"], grid["lon_max"], grid["lat_max"],
-        grid["nx"], grid["ny"],
+    _cell_lon = (grid["lon_max"] - grid["lon_min"]) / (grid["nx"] - 1)
+    _cell_lat = (grid["lat_max"] - grid["lat_min"]) / (grid["ny"] - 1)
+    src_transform = from_origin(
+        grid["lon_min"] - _cell_lon / 2,
+        grid["lat_max"] + _cell_lat / 2,
+        _cell_lon,
+        _cell_lat,
     )
     counts: dict[int, int] = {}
     for tx in range(x0, x1 + 1):
@@ -715,11 +733,12 @@ def render_layer_tile_bytes(
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
     forecast_suffix: str = "",
+    class_filter: int | None = None,
 ) -> bytes:
     from util.gis import DERIVED_FROM_ELEVATION, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
-        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix)
+        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter)
     if layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
         return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap)
@@ -744,11 +763,16 @@ def render_layer_tile_bytes(
         rb1 = min(lat1, db.top)
 
         if rl0 < rl1 and rb0 < rb1:
-            src_window = window_from_bounds(rl0, rb0, rl1, rb1, ds.transform)
+            _fw = window_from_bounds(rl0, rb0, rl1, rb1, ds.transform)
+            _col0 = math.floor(_fw.col_off)
+            _row0 = math.floor(_fw.row_off)
+            _col1 = min(math.ceil(_fw.col_off + _fw.width),  ds.width)
+            _row1 = min(math.ceil(_fw.row_off + _fw.height), ds.height)
+            src_window = Window(_col0, _row0, _col1 - _col0, _row1 - _row0)
 
             # Pick read resolution: how many source pixels cover this tile?
-            src_px_w = ds.width  * (rl1 - rl0) / (db.right - db.left)
-            src_px_h = ds.height * (rb1 - rb0) / (db.top   - db.bottom)
+            src_px_w = src_window.width
+            src_px_h = src_window.height
             overviews = ds.overviews(1) or []
 
             # For continuous layers, oversample 2x so bilinear warp has enough
@@ -818,7 +842,7 @@ def render_layer_tile_bytes(
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, nominal_cmap) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
+        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
     img  = Image.fromarray(rgba, mode="RGBA")

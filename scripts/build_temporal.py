@@ -1717,7 +1717,9 @@ def main() -> None:
         print(f"\n=== windows done in {time.perf_counter() - t_windows:.1f}s ===")
 
         # ── Forecast aggregates ────────────────────────────────────────────────
-        if forecast_done[0]:
+        if os.environ.get("WW_DISABLE_FORECASTS", "0") == "1":
+            print("=== forecast aggregates disabled (WW_DISABLE_FORECASTS=1), skipping ===", flush=True)
+        elif forecast_done[0]:
             print("=== forecast aggregates already completed, skipping ===")
         else:
             if gfs_cycle_changed:

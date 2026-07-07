@@ -663,6 +663,7 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
     kg2_class_fractions = _class_fractions("kg2")
     lc_class_fractions = _class_fractions("landcover")
     soil_texture_class_fractions = _class_fractions("soil_texture")
+    eco_class_fractions = _class_fractions("ecoregions")
 
     try:
         numerical_rows = _storage.read_table(
@@ -694,6 +695,8 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
         lc_legend=_load_legend_full("landcover") or None,
         soil_texture_class_fractions=soil_texture_class_fractions or None,
         soil_texture_legend=_load_legend_full("soil_texture") or None,
+        eco_class_fractions=eco_class_fractions or None,
+        eco_legend_classes=_load_legend("ecoregions") or None,
         numerical_stats=numerical_stats or None,
         circular_stats=circular_stats or None,
         unit_system=unit_system or None,

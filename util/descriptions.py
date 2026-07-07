@@ -175,6 +175,70 @@ def build_location_text(
     return text
 
 
+_ECOREGION_DISPLAY_LIMIT = 3
+_ECOREGION_MIN_FRACTION = 0.05
+
+
+def _top_ecoregion_names(
+    class_fractions: dict[int, float],
+    legend_classes: list[dict],
+    *,
+    limit: int = _ECOREGION_DISPLAY_LIMIT,
+    min_fraction: float = _ECOREGION_MIN_FRACTION,
+) -> tuple[list[str], bool]:
+    """Return (top ecoregion names by fraction, has_more).
+
+    Only ecoregions at or above min_fraction are shown (a single stray
+    observation shouldn't clutter the sentence), but has_more counts every
+    ecoregion with any presence at all — including ones hidden by the
+    threshold or past the display limit — so "and other ecoregions" stays
+    accurate either way.
+    """
+    qualifying: list[tuple[float, str]] = []
+    total_present = 0
+    for cls in legend_classes:
+        cid = cls.get("id")
+        name = cls.get("name")
+        if cid is None or not name:
+            continue
+        frac = float(class_fractions.get(cid, 0.0))
+        if frac <= 0:
+            continue
+        total_present += 1
+        if frac >= min_fraction:
+            qualifying.append((frac, str(name)))
+
+    if not qualifying:
+        return [], False
+
+    qualifying.sort(key=lambda e: -e[0])
+    shown = qualifying[:limit]
+    has_more = total_present > len(shown)
+    return [name for _, name in shown], has_more
+
+
+def build_ecoregion_text(
+    class_fractions: dict[int, float] | None,
+    legend_classes: list[dict] | None,
+) -> str:
+    """Return a standalone named-ecoregions line, e.g.
+
+        "Colorado Rockies forests, Western shortgrass prairie, and Colorado
+        Plateau shrublands and other ecoregions"
+
+    Empty string if there's no qualifying ecoregion data.
+    """
+    if not class_fractions or not legend_classes:
+        return ""
+    names, has_more = _top_ecoregion_names(class_fractions, legend_classes)
+    if not names:
+        return ""
+    text = _join_names(names, use_and=not has_more)
+    if has_more:
+        text = f"{text} and other ecoregions"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Terrain text
 # ---------------------------------------------------------------------------
@@ -666,6 +730,8 @@ def build_description_profile(
     lc_legend: dict | None = None,
     soil_texture_class_fractions: dict[int, float] | None = None,
     soil_texture_legend: dict | None = None,
+    eco_class_fractions: dict[int, float] | None = None,
+    eco_legend_classes: list[dict] | None = None,
     numerical_stats: dict[str, dict] | None = None,
     circular_stats: dict[str, dict] | None = None,
     unit_system: str | None = None,
@@ -680,11 +746,17 @@ def build_description_profile(
         location_gid=location_gid,
     )
     location_text = _capitalize_leading_the(location_text) if location_text else ""
+    ecoregion_text = build_ecoregion_text(eco_class_fractions, eco_legend_classes)
 
     sections = []
 
+    location_lines = []
     if location_text:
-        sections.append({"id": "locations", "title": "Locations", "lines": [{"body": location_text}]})
+        location_lines.append({"body": location_text})
+    if ecoregion_text:
+        location_lines.append({"body": ecoregion_text})
+    if location_lines:
+        sections.append({"id": "locations", "title": "Locations", "lines": location_lines})
 
     if kg2_class_fractions and kg2_legend_classes:
         climate_lines = build_climate_lines(kg2_class_fractions, kg2_legend_classes)

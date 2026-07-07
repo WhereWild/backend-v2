@@ -1,0 +1,141 @@
+{
+  "layer_id": "biome",
+  "source": "Dinerstein et al. (2017). An Ecoregion-Based Approach to Protecting Half the Terrestrial Realm. BioScience, 67(6), 534-545.",
+  "classes": [
+    {
+      "id": 1,
+      "name": "Tropical & Subtropical Moist Broadleaf Forests",
+      "group": "tropical_and_subtropical_moist_broadleaf_forests",
+      "group_label": "Tropical & Subtropical Moist Broadleaf Forests",
+      "traits": {
+        "color": "#38A700"
+      }
+    },
+    {
+      "id": 2,
+      "name": "Tropical & Subtropical Dry Broadleaf Forests",
+      "group": "tropical_and_subtropical_dry_broadleaf_forests",
+      "group_label": "Tropical & Subtropical Dry Broadleaf Forests",
+      "traits": {
+        "color": "#CCCD65"
+      }
+    },
+    {
+      "id": 3,
+      "name": "Tropical & Subtropical Coniferous Forests",
+      "group": "tropical_and_subtropical_coniferous_forests",
+      "group_label": "Tropical & Subtropical Coniferous Forests",
+      "traits": {
+        "color": "#88CE66"
+      }
+    },
+    {
+      "id": 4,
+      "name": "Temperate Broadleaf & Mixed Forests",
+      "group": "temperate_broadleaf_and_mixed_forests",
+      "group_label": "Temperate Broadleaf & Mixed Forests",
+      "traits": {
+        "color": "#00734C"
+      }
+    },
+    {
+      "id": 5,
+      "name": "Temperate Conifer Forests",
+      "group": "temperate_conifer_forests",
+      "group_label": "Temperate Conifer Forests",
+      "traits": {
+        "color": "#458970"
+      }
+    },
+    {
+      "id": 6,
+      "name": "Boreal Forests/Taiga",
+      "group": "boreal_forests_taiga",
+      "group_label": "Boreal Forests/Taiga",
+      "traits": {
+        "color": "#7AB6F5"
+      }
+    },
+    {
+      "id": 7,
+      "name": "Tropical & Subtropical Grasslands, Savannas & Shrublands",
+      "group": "tropical_and_subtropical_grasslands_savannas_and_shrublands",
+      "group_label": "Tropical & Subtropical Grasslands, Savannas & Shrublands",
+      "traits": {
+        "color": "#FEAA01"
+      }
+    },
+    {
+      "id": 8,
+      "name": "Temperate Grasslands, Savannas & Shrublands",
+      "group": "temperate_grasslands_savannas_and_shrublands",
+      "group_label": "Temperate Grasslands, Savannas & Shrublands",
+      "traits": {
+        "color": "#FEFF73"
+      }
+    },
+    {
+      "id": 9,
+      "name": "Flooded Grasslands & Savannas",
+      "group": "flooded_grasslands_and_savannas",
+      "group_label": "Flooded Grasslands & Savannas",
+      "traits": {
+        "color": "#BEE7FF"
+      }
+    },
+    {
+      "id": 10,
+      "name": "Montane Grasslands & Shrublands",
+      "group": "montane_grasslands_and_shrublands",
+      "group_label": "Montane Grasslands & Shrublands",
+      "traits": {
+        "color": "#D6C39D"
+      }
+    },
+    {
+      "id": 11,
+      "name": "Tundra",
+      "group": "tundra",
+      "group_label": "Tundra",
+      "traits": {
+        "color": "#9ED7C2"
+      }
+    },
+    {
+      "id": 12,
+      "name": "Mediterranean Forests, Woodlands & Scrub",
+      "group": "mediterranean_forests_woodlands_and_scrub",
+      "group_label": "Mediterranean Forests, Woodlands & Scrub",
+      "traits": {
+        "color": "#FE0000"
+      }
+    },
+    {
+      "id": 13,
+      "name": "Deserts & Xeric Shrublands",
+      "group": "deserts_and_xeric_shrublands",
+      "group_label": "Deserts & Xeric Shrublands",
+      "traits": {
+        "color": "#CC6767"
+      }
+    },
+    {
+      "id": 14,
+      "name": "Mangroves",
+      "group": "mangroves",
+      "group_label": "Mangroves",
+      "traits": {
+        "color": "#FE01C4"
+      }
+    },
+    {
+      "id": 15,
+      "name": "Rock and Ice",
+      "group": "rock_and_ice",
+      "group_label": "Rock and Ice",
+      "traits": {
+        "color": "#FFEAAF"
+      }
+    }
+  ]
+}

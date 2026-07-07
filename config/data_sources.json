@@ -213,6 +213,26 @@
       }
     ]
   },
+  "resolve_ecoregions_2017": {
+    "name": "RESOLVE Ecoregions2017",
+    "url": "https://ecoregions.appspot.com/",
+    "download_url": "https://storage.googleapis.com/teow2016/Ecoregions2017.zip",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Dinerstein, E., Olson, D., Joshi, A., Vynne, C., Burgess, N.D., Wikramanayake, E., Hahn, N., Palminteri, S., Hedao, P., Noss, R., Hansen, M., Locke, H., Ellis, E.C., Jones, B., Barber, C.V., Hayes, R., Kormos, C., Martin, V., Crist, E., Sechrest, W., Price, L., Baillie, J.E.M., Weeden, D., Suckling, K., Davis, C., Sizer, N., Moore, R., Thau, D., Birch, T., Potapov, P., Turubanova, S., Tyukavina, A., de Souza, N., Pintea, L., Brito, J.C., Llewellyn, O.A., Miller, A.G., Patzelt, A., Ghazanfar, S.A., Timberlake, J., Klöser, H., Shennan-Farpón, Y., Kindt, R., Lillesø, J.-P.B., van Breugel, P., Graudal, L., Voge, M., Al-Shammari, K.F., and Saleem, M. (2017). An Ecoregion-Based Approach to Protecting Half the Terrestrial Realm. BioScience, 67(6), 534-545.",
+    "doi": "https://doi.org/10.1093/biosci/bix014",
+    "references": [
+      {
+        "authors": "Dinerstein, E., Olson, D., Joshi, A., Vynne, C., Burgess, N.D., Wikramanayake, E., Hahn, N., Palminteri, S., Hedao, P., Noss, R., Hansen, M., Locke, H., Ellis, E.C., Jones, B., Barber, C.V., Hayes, R., Kormos, C., Martin, V., Crist, E., Sechrest, W., Price, L., Baillie, J.E.M., Weeden, D., Suckling, K., Davis, C., Sizer, N., Moore, R., Thau, D., Birch, T., Potapov, P., Turubanova, S., Tyukavina, A., de Souza, N., Pintea, L., Brito, J.C., Llewellyn, O.A., Miller, A.G., Patzelt, A., Ghazanfar, S.A., Timberlake, J., Klöser, H., Shennan-Farpón, Y., Kindt, R., Lillesø, J.-P.B., van Breugel, P., Graudal, L., Voge, M., Al-Shammari, K.F., and Saleem, M.",
+        "year": 2017,
+        "title": "An Ecoregion-Based Approach to Protecting Half the Terrestrial Realm",
+        "journal": "BioScience",
+        "volume_issue": "67(6)",
+        "pages": "534-545",
+        "doi": "https://doi.org/10.1093/biosci/bix014"
+      }
+    ]
+  },
   "gadm": {
     "name": "GADM (Global Administrative Areas)",
     "url": "https://gadm.org/",

@@ -1298,6 +1298,32 @@
           "render_max": 360.0
         },
         {
+          "id": "ecoregions",
+          "source": "resolve_ecoregions_2017",
+          "display_name": "Ecoregion",
+          "units": "",
+          "value_type": "nominal",
+          "download_url": "https://storage.googleapis.com/teow2016/Ecoregions2017.zip",
+          "filename": "ecoregions.tif",
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 0.0,
+          "render_max": 846.0
+        },
+        {
+          "id": "biome",
+          "source": "resolve_ecoregions_2017",
+          "display_name": "Biome",
+          "units": "",
+          "value_type": "nominal",
+          "download_url": "https://storage.googleapis.com/teow2016/Ecoregions2017.zip",
+          "filename": "biome.tif",
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 1.0,
+          "render_max": 15.0
+        },
+        {
           "id": "lithology",
           "source": "hengl_landform_2018",
           "display_name": "Lithology Class",

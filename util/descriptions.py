@@ -467,6 +467,24 @@ def _coarse_fragment_label(cfvo: float | None) -> str | None:
     return None
 
 
+def _salinity_phrase(median_class: float | None, legend_classes: list[dict] | None) -> str | None:
+    """Median salinity class name as a lowercase adjective phrase, e.g. "slightly saline".
+
+    Dropped entirely for "Non saline" (class 0) — only worth calling out when the
+    taxon's typical soil actually registers as saline.
+    """
+    if median_class is None or not legend_classes:
+        return None
+    cid = int(round(median_class))
+    if cid <= 0:
+        return None
+    for cls in legend_classes:
+        if cls.get("id") == cid:
+            name = cls.get("name")
+            return str(name).strip().lower() if name else None
+    return None
+
+
 def _build_nominal_lines(
     class_fractions: dict[int, float],
     legend_classes: list[dict],
@@ -644,7 +662,7 @@ def build_soil_texture_lines(
     return [{"body": body}]
 
 
-def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
+def build_soil_lines(numerical_stats: dict[str, dict], *, salinity_phrase: str | None = None) -> list[dict]:
     lines: list[dict] = []
 
     def _get(var: str, metric: str) -> float | None:
@@ -668,12 +686,9 @@ def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
         elif nitrogen >= 7:
             nutrient_phrase = "nutrient rich"
 
-    if ph_phrase and nutrient_phrase:
-        lines.append({"body": f"Usually {nutrient_phrase} and {ph_phrase} soil"})
-    elif ph_phrase:
-        lines.append({"body": f"Usually {ph_phrase} soil"})
-    elif nutrient_phrase:
-        lines.append({"body": f"Usually {nutrient_phrase} soil"})
+    parts = [p for p in (nutrient_phrase, ph_phrase, salinity_phrase) if p]
+    if parts:
+        lines.append({"body": f"Usually {_join_labels(parts)} soil"})
 
     return lines
 
@@ -744,6 +759,8 @@ def build_description_profile(
     eco_legend_classes: list[dict] | None = None,
     biome_class_fractions: dict[int, float] | None = None,
     biome_legend_classes: list[dict] | None = None,
+    salinity_median: float | None = None,
+    salinity_legend_classes: list[dict] | None = None,
     numerical_stats: dict[str, dict] | None = None,
     circular_stats: dict[str, dict] | None = None,
     unit_system: str | None = None,
@@ -805,7 +822,8 @@ def build_description_profile(
     elif coarse_part:
         soil_lines.append({"body": f"Prefers {coarse_part} soil"})
     if numerical_stats:
-        soil_lines.extend(build_soil_lines(numerical_stats))
+        salinity_phrase = _salinity_phrase(salinity_median, salinity_legend_classes)
+        soil_lines.extend(build_soil_lines(numerical_stats, salinity_phrase=salinity_phrase))
     if soil_lines:
         sections.append({"id": "soil", "title": "Soil", "lines": soil_lines})
 

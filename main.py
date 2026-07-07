@@ -684,6 +684,18 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
         circular_rows = []
     circular_stats = {r["variable"]: r for r in circular_rows}
 
+    try:
+        ordinal_rows = _storage.read_table(
+            GLOBAL_STATS_DIR / ORDINAL_STATS_FILE,
+            filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+        ).to_pylist()
+    except FileNotFoundError:
+        ordinal_rows = []
+    salinity_median = next(
+        (float(r["value"]) for r in ordinal_rows if r["variable"] == "salinity" and r["metric"] == "median"),
+        None,
+    )
+
     description_profile = descriptions.build_description_profile(
         taxon["taxon_key"],
         hierarchy=_load_hierarchy(),
@@ -700,6 +712,8 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
         eco_legend_classes=_load_legend("ecoregions") or None,
         biome_class_fractions=biome_class_fractions or None,
         biome_legend_classes=_load_legend("biome") or None,
+        salinity_median=salinity_median,
+        salinity_legend_classes=_load_legend("salinity") or None,
         numerical_stats=numerical_stats or None,
         circular_stats=circular_stats or None,
         unit_system=unit_system or None,

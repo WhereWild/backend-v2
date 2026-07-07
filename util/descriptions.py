@@ -575,6 +575,16 @@ def build_climate_lines(
     return _build_nominal_lines(class_fractions, legend_classes, body_suffix=" climates")
 
 
+def build_biome_lines(
+    class_fractions: dict[int, float],
+    legend_classes: list[dict],
+) -> list[dict]:
+    # No suffix — unlike kg2's short climate labels, biome names already end
+    # in their own descriptive noun ("...grasslands, savannas & shrublands"),
+    # so appending anything reads redundant.
+    return _build_nominal_lines(class_fractions, legend_classes)
+
+
 def build_habitat_lines(
     class_fractions: dict[int, float],
     legend_classes: list[dict],
@@ -732,6 +742,8 @@ def build_description_profile(
     soil_texture_legend: dict | None = None,
     eco_class_fractions: dict[int, float] | None = None,
     eco_legend_classes: list[dict] | None = None,
+    biome_class_fractions: dict[int, float] | None = None,
+    biome_legend_classes: list[dict] | None = None,
     numerical_stats: dict[str, dict] | None = None,
     circular_stats: dict[str, dict] | None = None,
     unit_system: str | None = None,
@@ -762,6 +774,11 @@ def build_description_profile(
         climate_lines = build_climate_lines(kg2_class_fractions, kg2_legend_classes)
         if climate_lines:
             sections.append({"id": "climate", "title": "Climates", "lines": climate_lines})
+
+    if biome_class_fractions and biome_legend_classes:
+        biome_lines = build_biome_lines(biome_class_fractions, biome_legend_classes)
+        if biome_lines:
+            sections.append({"id": "biomes", "title": "Biomes", "lines": biome_lines})
 
     if lc_class_fractions and lc_legend:
         lc_classes = lc_legend.get("classes") or []

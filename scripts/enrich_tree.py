@@ -37,9 +37,11 @@ import rasterio.transform
 from config.config import ZERO_NODATA_LAYERS, load_config
 from util.gis import (
     DERIVED_FROM_ELEVATION,
+    DERIVED_FROM_SOIL,
     sample_aspect_batch,
     sample_elevation_terrain_batch,
     sample_slope_batch,
+    sample_soil_texture_batch,
 )
 from util.taxa import TaxonRecord, load_catalog
 
@@ -107,8 +109,10 @@ def _load_layers() -> list[dict]:
         layer
         for category in cat["categories"]
         for layer in category["layers"]
-        # Include raster layers (have a filename) and derived-from-elevation layers
-        if layer.get("filename") or layer.get("id") in DERIVED_FROM_ELEVATION
+        # Include raster layers (have a filename) and derived (no-file) layers
+        if layer.get("filename")
+        or layer.get("id") in DERIVED_FROM_ELEVATION
+        or layer.get("id") in DERIVED_FROM_SOIL
     ]
 
 
@@ -382,6 +386,9 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
                 raw = sample_aspect_batch(lats[arr], lons[arr])
             else:
                 raw = sample_slope_batch(lats[arr], lons[arr])
+            vals = np.array([v if v is not None else np.nan for v in raw], dtype=np.float64)
+        elif layer_id in DERIVED_FROM_SOIL:
+            raw = sample_soil_texture_batch(lats[arr], lons[arr])
             vals = np.array([v if v is not None else np.nan for v in raw], dtype=np.float64)
         else:
             cog_path = LAYERS_DIR / layer["filename"]

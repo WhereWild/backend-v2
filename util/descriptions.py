@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from util.gis import usda_texture_class
+
 # ---------------------------------------------------------------------------
 # Text helpers
 # ---------------------------------------------------------------------------
@@ -351,40 +353,6 @@ def _seasonal_precip_label(mm_quarter: float) -> str:
     return _precip_label(mm_quarter * 4)
 
 
-def _usda_texture_class(sand: float, silt: float, clay: float) -> str:
-    # Conditions taken directly from NRCS Soil Texture Calculator (MultiPointTriangle_100pt_508.xlsx, Calc1 sheet)
-    if clay >= 40:
-        if silt >= 40:
-            return "silty clay"
-        if sand <= 45:
-            return "clay"
-        return "sandy clay"
-    if clay >= 35 and sand > 45:
-        return "sandy clay"
-    if clay >= 27:
-        if sand <= 20:
-            return "silty clay loam"
-        if sand <= 45:
-            return "clay loam"
-        return "sandy clay loam"
-    if clay >= 20 and sand > 45 and silt < 28:
-        return "sandy clay loam"
-    if silt >= 80 and clay < 12:
-        return "silt"
-    if silt >= 50:
-        return "silt loam"
-    if clay >= 7 and silt >= 28 and sand <= 52:
-        return "loam"
-    if (silt + 1.5 * clay) < 15:
-        return "sand"
-    if (silt + 1.5 * clay) >= 15 and (silt + 2 * clay) < 30:
-        return "loamy sand"
-    if (7 <= clay < 20 and sand > 52 and (silt + 2 * clay) >= 30) or \
-       (clay < 7 and (silt + 2 * clay) >= 30):
-        return "sandy loam"
-    return "sandy loam"
-
-
 def _ph_label(ph: float) -> str:
     if ph < 3.5:
         return "ultra acidic"
@@ -567,7 +535,7 @@ def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
     }
 
     if sand is not None and silt is not None and clay is not None:
-        _raw = _usda_texture_class(sand, silt, clay)
+        _raw = usda_texture_class(sand, silt, clay)
         texture = _texture_display.get(_raw, _raw)
         if coarse_part:
             lines.append({"body": f"Prefers {coarse_part}, {texture} soil"})

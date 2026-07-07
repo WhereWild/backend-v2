@@ -1371,6 +1371,21 @@
           "domain": "continuous"
         },
         {
+          "id": "soil_texture",
+          "source": "soilgrids_2_0",
+          "display_name": "Soil Texture",
+          "units": "",
+          "value_type": "nominal",
+          "domain": "categorical",
+          "derived": true,
+          "filename": null,
+          "download_url": null,
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 1.0,
+          "render_max": 12.0
+        },
+        {
           "id": "cfvo",
           "source": "soilgrids_2_0",
           "display_name": "Coarse Fragments (0–5cm)",

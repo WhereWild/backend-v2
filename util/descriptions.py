@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from util.gis import usda_texture_class
-
 # ---------------------------------------------------------------------------
 # Text helpers
 # ---------------------------------------------------------------------------
@@ -391,6 +389,20 @@ def _swe_tier(swe_mm: float) -> str:
     return "incredibly snowy"
 
 
+def _coarse_fragment_label(cfvo: float | None) -> str | None:
+    if cfvo is None:
+        return None
+    if cfvo < 2:
+        return "very fine"
+    if cfvo < 5:
+        return "fine"
+    if cfvo >= 25:
+        return "very coarse"
+    if cfvo >= 15:
+        return "coarse"
+    return None
+
+
 def _build_nominal_lines(
     class_fractions: dict[int, float],
     legend_classes: list[dict],
@@ -507,40 +519,63 @@ def build_habitat_lines(
     return _build_nominal_lines(class_fractions, legend_classes, attribute_axes=attribute_axes)
 
 
+# Pure single-word texture classes read better as adjectives than as bare nouns
+# ("clay-rich soil" vs "clay soil"); compound classes (e.g. "Sandy Loam") already
+# read correctly as-is, with the "loam"/"clay"/etc. head noun naturally last.
+_PURE_TEXTURE_ADJECTIVES: dict[str, str] = {
+    "clay": "clay-rich", "loam": "loamy", "silt": "silty", "sand": "sandy",
+}
+
+
+def _texture_phrase(name: str) -> str:
+    lname = name.strip().lower()
+    return _PURE_TEXTURE_ADJECTIVES.get(lname, lname)
+
+
+def build_soil_texture_lines(
+    class_fractions: dict[int, float],
+    legend_classes: list[dict],
+    *,
+    coarse_part: str | None = None,
+) -> list[dict]:
+    entries: list[tuple[float, str]] = []
+    for cls in legend_classes:
+        cid = cls.get("id")
+        name = cls.get("name")
+        if cid is None or not name:
+            continue
+        frac = float(class_fractions.get(cid, 0.0))
+        if frac <= 0:
+            continue
+        entries.append((frac, _texture_phrase(str(name))))
+
+    texture_phrase: str | None = None
+    if entries:
+        entries.sort(key=lambda e: e[0], reverse=True)
+        top_verb = _frequency_verb(entries[0][0])
+        if top_verb is not None:
+            band = [phrase for frac, phrase in entries if _frequency_verb(frac) == top_verb]
+            seen: set[str] = set()
+            ordered = [p for p in band if not (p in seen or seen.add(p))]
+            texture_phrase = _join_labels(ordered)
+
+    if not texture_phrase and not coarse_part:
+        return []
+    if texture_phrase and coarse_part:
+        body = f"Prefers {coarse_part}, {texture_phrase} soil"
+    elif texture_phrase:
+        body = f"Prefers {texture_phrase} soil"
+    else:
+        body = f"Prefers {coarse_part} soil"
+    return [{"body": body}]
+
+
 def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
     lines: list[dict] = []
 
     def _get(var: str, metric: str) -> float | None:
         v = (numerical_stats.get(var) or {}).get(metric)
         return float(v) if v is not None else None
-
-    sand = _get("sand", "median")
-    silt = _get("silt", "median")
-    clay = _get("clay", "median")
-
-    cfvo = _get("cfvo", "mean")
-    coarse_part: str | None = None
-    if cfvo is not None:
-        if cfvo < 2:
-            coarse_part = "very fine"
-        elif cfvo < 5:
-            coarse_part = "fine"
-        elif cfvo >= 25:
-            coarse_part = "very coarse"
-        elif cfvo >= 15:
-            coarse_part = "coarse"
-
-    _texture_display = {
-        "loam": "loamy", "sand": "sandy", "silt": "silty", "clay": "clay-rich",
-    }
-
-    if sand is not None and silt is not None and clay is not None:
-        _raw = usda_texture_class(sand, silt, clay)
-        texture = _texture_display.get(_raw, _raw)
-        if coarse_part:
-            lines.append({"body": f"Prefers {coarse_part}, {texture} soil"})
-        else:
-            lines.append({"body": f"Prefers {texture} soil"})
 
     # pH — SoilGrids stores phh2o as pH × 10
     phh2o_raw = _get("phh2o", "mean")
@@ -629,6 +664,8 @@ def build_description_profile(
     kg2_legend_classes: list[dict] | None = None,
     lc_class_fractions: dict[int, float] | None = None,
     lc_legend: dict | None = None,
+    soil_texture_class_fractions: dict[int, float] | None = None,
+    soil_texture_legend: dict | None = None,
     numerical_stats: dict[str, dict] | None = None,
     circular_stats: dict[str, dict] | None = None,
     unit_system: str | None = None,
@@ -671,9 +708,16 @@ def build_description_profile(
         if weather_lines:
             sections.append({"id": "weather", "title": "Weather", "lines": weather_lines})
 
+    soil_lines: list[dict] = []
+    coarse_part = _coarse_fragment_label((numerical_stats or {}).get("cfvo", {}).get("mean"))
+    if soil_texture_class_fractions and soil_texture_legend:
+        soil_classes = soil_texture_legend.get("classes") or []
+        soil_lines.extend(build_soil_texture_lines(soil_texture_class_fractions, soil_classes, coarse_part=coarse_part))
+    elif coarse_part:
+        soil_lines.append({"body": f"Prefers {coarse_part} soil"})
     if numerical_stats:
-        soil_lines = build_soil_lines(numerical_stats)
-        if soil_lines:
-            sections.append({"id": "soil", "title": "Soil", "lines": soil_lines})
+        soil_lines.extend(build_soil_lines(numerical_stats))
+    if soil_lines:
+        sections.append({"id": "soil", "title": "Soil", "lines": soil_lines})
 
     return {"sections": sections}

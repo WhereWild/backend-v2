@@ -315,7 +315,10 @@ class TestMain:
 
         monkeypatch.setattr("scripts.enrich_temporal.load_config", lambda _: _Cfg())
         monkeypatch.setattr("scripts.enrich_temporal.load_temporal_layers", lambda _: _all_layers())
-        monkeypatch.setattr("scripts.enrich_temporal.build_occ_index", lambda *a, **kw: occ_table.num_rows)
+        monkeypatch.setattr(
+            "scripts.enrich_temporal.build_per_layer_occ_indices",
+            lambda *a, layers=(), **kw: {l.id: occ_table.num_rows for l in layers},
+        )
         monkeypatch.setattr("scripts.enrich_temporal.VARS_TO_ENRICH", None)
 
     def test_no_observations_exits_early(self, monkeypatch, tmp_path: Path, capsys) -> None:

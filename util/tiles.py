@@ -507,6 +507,8 @@ def render_temporal_tile_bytes(
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
         rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
+    elif str(layer.get("value_type") or "").lower() == "circular":
+        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
     img = Image.fromarray(rgba, mode="RGBA")
@@ -967,6 +969,8 @@ def render_layer_tile_bytes(
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
         rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
+    elif str(layer.get("value_type") or "").lower() == "circular":
+        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
     img  = Image.fromarray(rgba, mode="RGBA")

@@ -1189,23 +1189,48 @@
           "render_max": null
         },
         {
-          "id": "dew_point_2m",
+          "id": "wind_speed_10m",
           "source": "open_meteo",
           "model": "copernicus_era5",
           "grid_mode": "lat_asc_lon_pm180",
           "grid_step": 0.25,
-          "display_name": "Dew Point (2m)",
-          "units": "°C",
-          "value_type": "interval",
+          "display_name": "Wind Speed (10m)",
+          "units": "m/s",
+          "value_type": "ratio",
           "domain": "continuous",
           "agg": "avg",
+          "sources": [
+            "wind_u_component_10m",
+            "wind_v_component_10m"
+          ],
           "filename": null,
           "download_url": null,
           "scale_factor": null,
           "add_offset": null,
           "render_min": null,
-          "render_max": null,
-          "imperial_unit": "°F"
+          "render_max": null
+        },
+        {
+          "id": "wind_direction_10m",
+          "source": "open_meteo",
+          "model": "copernicus_era5",
+          "grid_mode": "lat_asc_lon_pm180",
+          "grid_step": 0.25,
+          "display_name": "Wind Direction (10m)",
+          "units": "°",
+          "value_type": "circular",
+          "domain": "continuous",
+          "agg": "avg",
+          "sources": [
+            "wind_u_component_10m",
+            "wind_v_component_10m"
+          ],
+          "filename": null,
+          "download_url": null,
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": null,
+          "render_max": null
         },
         {
           "id": "weather_code_simple",

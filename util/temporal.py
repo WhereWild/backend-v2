@@ -28,6 +28,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -999,6 +1000,121 @@ def build_occ_index(
         f"skipped={total_skipped}  elapsed={elapsed:.1f}s"
     )
     return total_rows
+
+
+def build_per_layer_occ_indices(
+    root_taxon_id: str,
+    data_root: str,
+    occ_filename: str,
+    layers: list[TemporalLayer],
+    index_paths: dict[str, Path],
+    min_date: str | None = None,
+) -> dict[str, int]:
+    """Single tree scan; writes one occ_index file per layer in index_paths.
+
+    A row is written to a layer's index only when that layer still has null
+    columns for that row — already-enriched rows are never re-processed.
+    Returns {layer_id: n_obs}.
+    """
+    if not layers:
+        return {}
+
+    root = get_taxon_by_id(root_taxon_id)
+    if root is None:
+        raise RuntimeError(f"Unknown root taxon {root_taxon_id}")
+
+    cutoff = (
+        datetime.fromisoformat(min_date).replace(tzinfo=UTC).timestamp()
+        if min_date is not None
+        else None
+    )
+
+    tree_root = Path(data_root) / "taxonomy" / "tree"
+    counts: dict[str, int] = {layer.id: 0 for layer in layers}
+
+    per_layer_cols: dict[str, list[str]] = {
+        layer.id: [f"{layer.id}_{layer.agg}_{w}h" for w in layer.windows]
+        for layer in layers
+    }
+    all_skip_cols = list({c for cols in per_layer_cols.values() for c in cols})
+
+    n_files = 0
+    t0 = time.monotonic()
+    last_report = t0
+
+    with ExitStack() as stack:
+        writers: dict[str, pq.ParquetWriter] = {
+            layer.id: stack.enter_context(pq.ParquetWriter(index_paths[layer.id], _OCC_INDEX_SCHEMA))
+            for layer in layers
+        }
+
+        for node in iter_descendants(root, include_self=True):
+            occ_path = tree_root / node["path"] / occ_filename
+            if not occ_path.exists():
+                continue
+            n_files += 1
+            schema = pq.read_schema(occ_path)
+
+            read_cols = [_LAT_COL, _LON_COL, _TIME_COL]
+            has_elev = "elevation" in schema.names
+            if has_elev:
+                read_cols.append("elevation")
+            df = pq.read_table(occ_path, columns=read_cols).to_pandas()
+
+            valid = df[_TIME_COL].notna() & df[_LAT_COL].notna() & df[_LON_COL].notna()
+            if cutoff is not None:
+                valid &= df[_TIME_COL] >= cutoff
+            if not valid.any():
+                continue
+
+            # Read all skip columns across all layers in one shot
+            present_skip = {c for c in all_skip_cols if c in schema.names}
+            skip_table = pq.read_table(occ_path, columns=list(present_skip)) if present_skip else None
+            n_rows = len(df)
+
+            for layer in layers:
+                layer_cols = per_layer_cols[layer.id]
+                present_g = [c for c in layer_cols if c in present_skip]
+
+                if len(present_g) == len(layer_cols) and skip_table is not None:
+                    layer_done = np.ones(n_rows, dtype=bool)
+                    for c in present_g:
+                        layer_done &= np.asarray(pc.invert(pc.is_null(skip_table.column(c))))
+                    needs = valid & ~layer_done
+                else:
+                    needs = valid  # columns absent → all valid rows need enrichment
+
+                if not needs.any():
+                    continue
+
+                row_idx = df.index[needs].to_numpy(dtype=np.int64)
+                times   = df.loc[needs, _TIME_COL].to_numpy(dtype=np.float64)
+                lats    = df.loc[needs, _LAT_COL].to_numpy(dtype=np.float64)
+                lons    = df.loc[needs, _LON_COL].to_numpy(dtype=np.float64)
+                elevs   = (
+                    df.loc[needs, "elevation"].to_numpy(dtype=np.float64)
+                    if has_elev else np.full(len(row_idx), np.nan)
+                )
+                writers[layer.id].write_table(pa.table({
+                    "taxon_path": pa.array([str(occ_path)] * len(row_idx), type=pa.string()),
+                    "row_idx":    pa.array(row_idx, type=pa.int64()),
+                    "latitude":   pa.array(lats,    type=pa.float64()),
+                    "longitude":  pa.array(lons,    type=pa.float64()),
+                    "timestamp":  pa.array(times,   type=pa.float64()),
+                    "elevation":  pa.array(elevs,   type=pa.float64()),
+                }))
+                counts[layer.id] += len(row_idx)
+
+            now = time.monotonic()
+            if now - last_report >= 30:
+                summary = "  ".join(f"{layer.id}={counts[layer.id]}" for layer in layers)
+                print(f"[occ_index] {n_files} files  {summary}  elapsed={now - t0:.0f}s")
+                last_report = now
+
+    elapsed = time.monotonic() - t0
+    summary = "  ".join(f"{layer.id}:{counts[layer.id]}" for layer in layers)
+    print(f"[occ_index] done: {n_files} files  elapsed={elapsed:.1f}s  {summary}")
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -2332,6 +2448,24 @@ def compute_raster_final(
             gfs_val = gfs_combined / n_gfs
             return ((era5_val * n_era5 + gfs_val * n_gfs) / n_total).astype(np.float32)
         return era5_val.astype(np.float32)
+
+    if var_id in ("wind_speed_10m", "wind_direction_10m"):
+        # Keep u and v separate throughout accumulation; derive speed/direction only here.
+        u_sum = (sums.get("era5_wind_u_component_10m", zero)
+                 + sums.get("gfs_wind_u_component_10m", zero)
+                 + sums.get("gfs_forecast_wind_u_component_10m", zero))
+        v_sum = (sums.get("era5_wind_v_component_10m", zero)
+                 + sums.get("gfs_wind_v_component_10m", zero)
+                 + sums.get("gfs_forecast_wind_v_component_10m", zero))
+        mean_u = u_sum / n_total
+        mean_v = v_sum / n_total
+        if var_id == "wind_speed_10m":
+            return np.sqrt(mean_u ** 2 + mean_v ** 2).astype(np.float32)
+        # wind_direction_10m: meteorological convention — direction wind comes FROM.
+        # atan2(-u, -v): eastward wind (u>0) → 270° (westerly), northward (v>0) → 180° (southerly).
+        direction = np.degrees(np.arctan2(-mean_u, -mean_v)) % 360.0
+        calm = (mean_u == 0.0) & (mean_v == 0.0)
+        return np.where(calm, np.nan, direction).astype(np.float32)
 
     # Generic avg / sum
     combined = zero.copy()

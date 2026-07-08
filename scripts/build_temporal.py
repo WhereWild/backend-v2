@@ -174,6 +174,18 @@ VAR_CONFIGS: dict[str, dict] = {
         "gfs_derived_needs": ["temperature_2m", "relative_humidity_2m"],
         "agg": "avg",
     },
+    "wind_speed_10m": {
+        "era5_model": "copernicus_era5",
+        "era5_derived_needs": ["wind_u_component_10m", "wind_v_component_10m"],
+        "gfs_derived_needs": ["wind_u_component_10m", "wind_v_component_10m"],
+        "agg": "avg",
+    },
+    "wind_direction_10m": {
+        "era5_model": "copernicus_era5",
+        "era5_derived_needs": ["wind_u_component_10m", "wind_v_component_10m"],
+        "gfs_derived_needs": ["wind_u_component_10m", "wind_v_component_10m"],
+        "agg": "avg",
+    },
     "weather_code_simple": {
         "era5_model": "copernicus_era5",
         "agg": "mode",

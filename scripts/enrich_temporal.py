@@ -40,7 +40,7 @@ from util.temporal import (
     _chunk_entry_for_time,
     _download_layer_chunk,
     build_chunk_index,
-    build_occ_index,
+    build_per_layer_occ_indices,
     iter_occ_index_batches,
     load_temporal_layers,
     map_to_worklist,
@@ -315,33 +315,31 @@ def main() -> None:
             print(f"[warn] could not register handler for signal {sig}: {exc}")
 
     Path(cfg.temporal_cache_dir).mkdir(parents=True, exist_ok=True)
-    occ_index_path = Path(cfg.temporal_cache_dir) / "occ_index.parquet"
+    cache_dir = Path(cfg.temporal_cache_dir)
+
+    all_layers = load_temporal_layers(CATALOG_PATH)
+    active_layers = _filter_layers(all_layers, VARS_TO_ENRICH)
+    print(f"[init] active layers: {[layer.id for layer in active_layers]}")
+
+    non_derived = [layer for layer in active_layers if not layer.derived]
+    layer_index_paths: dict[str, Path] = {
+        layer.id: cache_dir / f"occ_index_{layer.id}.parquet"
+        for layer in non_derived
+    }
 
     completed = False
     try:
-        all_layers = load_temporal_layers(CATALOG_PATH)
-        active_layers = _filter_layers(all_layers, VARS_TO_ENRICH)
-        print(f"[init] active layers: {[layer.id for layer in active_layers]}")
-
-        # One group per non-derived layer: a row is re-queued if ANY layer is incomplete.
-        skip_col_groups: list[list[str]] = [
-            [f"{layer.id}_{layer.agg}_{w}h" for w in layer.windows]
-            for layer in active_layers
-            if not layer.derived
-        ]
-
         print(f"[occ_index] scanning root={str(cfg.plantae_key)}")
-        n_obs = build_occ_index(
+        counts = build_per_layer_occ_indices(
             str(cfg.plantae_key),
             cfg.data_root,
             cfg.occurrence_parquet_filename,
-            occ_index_path,
+            layers=non_derived,
+            index_paths=layer_index_paths,
             min_date=cfg.temporal_min_date,
-            skip_if_cols=skip_col_groups if skip_col_groups else None,
         )
-        print(f"[occ_index] {n_obs} observations")
 
-        if n_obs == 0:
+        if all(n == 0 for n in counts.values()):
             print("[done] no observations to enrich")
             completed = True
             return
@@ -349,12 +347,21 @@ def main() -> None:
         for layer in active_layers:
             if layer.derived or stop.is_set():
                 continue
-            _run_layer(layer, occ_index_path, cfg, stop)
+            n = counts.get(layer.id, 0)
+            if n == 0:
+                print(f"[skip] {layer.id}: no observations to enrich")
+                continue
+            print(f"[occ_index] {layer.id}: {n} observations")
+            _run_layer(layer, layer_index_paths[layer.id], cfg, stop)
 
         completed = True
     finally:
-        if occ_index_path.exists():
-            occ_index_path.unlink()
+        for idx_path in layer_index_paths.values():
+            try:
+                if idx_path.exists():
+                    idx_path.unlink()
+            except Exception:
+                pass
         if CLEAR_CACHE:
             if completed:
                 print(f"[cleanup] clearing cache {cfg.temporal_cache_dir}")

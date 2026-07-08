@@ -66,6 +66,10 @@ ELEVATION_CORRECTABLE_VARS: frozenset[str] = frozenset({
     "soil_temperature_100_to_255cm",
 })
 
+# Environmental lapse rate: T_corrected = T_ERA5 + (z_ERA5 − z_obs) × Γ
+# Adjusts ERA5 grid-cell temperature to the observation's actual elevation.
+# Γ = 6.5°C/km from U.S. Standard Atmosphere, 1976 (COESA) — https://www.pdas.com/atmos.html
+# Same constant and formula used by Open-Meteo (GenericReader.swift, https://github.com/open-meteo/open-meteo).
 _LAPSE_RATE = 0.0065  # °C per metre
 
 # ERA5 coverage begins 1940-01-01; the longest enrichment window is 90 days,
@@ -351,8 +355,9 @@ def _window_mode_batch(
 def vpd_kpa(temp_c: Any, dew_c: Any) -> Any:
     """Vapour-pressure deficit (kPa) from temperature and dew-point (°C).
 
-    VPD = e_s(temp) − e_s(dew), where e_s is the Magnus saturation formula.
-    Works on scalars and numpy arrays; NaN propagates naturally.
+    VPD = e_s(temp) − e_s(dew), where e_s is the August-Roche-Magnus saturation
+    vapour pressure formula. Works on scalars and numpy arrays; NaN propagates naturally.
+    Coefficients (17.27, 237.3, 0.6108) from the standard Magnus approximation.
     """
     def _es(t: Any) -> Any:
         return 0.6108 * np.exp(17.27 * t / (t + 237.3))
@@ -371,6 +376,13 @@ def weather_code_simple(
     temperature_2m: float | None = None,
 ) -> int | None:
     """Derive simplified WMO weather code from 1-timestep aggregates.
+
+    Thresholds and code table adapted from Open-Meteo (WeatherCode.swift):
+      Zippenfenig, P. Open-Meteo.com Weather API [Computer software].
+      https://doi.org/10.5281/zenodo.7970649 | https://github.com/open-meteo/open-meteo
+    Upstream references cited by Open-Meteo:
+      Hoffmann (2008) COSMO Newsletter No. 6 — http://www.cosmo-model.org/content/model/documentation/newsLetters/newsLetter06/cnl6_hoffmann.pdf
+      DWD Promet 28(1/2) — https://www.dwd.de/DE/leistungen/pbfb_verlag_promet/pdf_promethefte/28_1_2_pdf.pdf
 
     Args:
         cloudcover:               Cloud cover percent (0–100).
@@ -458,7 +470,7 @@ def weather_code_array(
 ) -> np.ndarray:
     """Vectorized per-timestep weather codes (NaN where any input is non-finite).
 
-    Same code table as weather_code_simple; uses np.select for speed.
+    Same code table and citations as weather_code_simple; uses np.select for speed.
     When temp is provided, applies a hard snow/rain cutoff: snow codes → rain
     when >0°C; rain codes 61/63/65 → snow when <0°C. Drizzle codes are unaffected.
     """

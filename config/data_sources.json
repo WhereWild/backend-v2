@@ -246,5 +246,20 @@
         "url": "https://gadm.org/data.html"
       }
     ]
+  },
+  "usda_nrcs": {
+    "name": "USDA Soil Texture Classification",
+    "url": "https://www.nrcs.usda.gov/resources/education-and-teaching-materials/soil-texture-calculator",
+    "license": "Public Domain (U.S. Government Work)",
+    "license_url": null,
+    "citation": "U.S. Department of Agriculture. Soil Texture Calculator. Natural Resources Conservation Service. https://www.nrcs.usda.gov/resources/education-and-teaching-materials/soil-texture-calculator",
+    "doi": null,
+    "references": [
+      {
+        "authors": "U.S. Department of Agriculture",
+        "title": "Soil Texture Calculator",
+        "url": "https://www.nrcs.usda.gov/resources/education-and-teaching-materials/soil-texture-calculator"
+      }
+    ]
   }
 }

@@ -186,6 +186,12 @@ VAR_CONFIGS: dict[str, dict] = {
         "gfs_derived_needs": ["wind_u_component_10m", "wind_v_component_10m"],
         "agg": "avg",
     },
+    "shortwave_radiation": {
+        "era5_model": "copernicus_era5",
+        "era5_var": "shortwave_radiation",
+        "gfs_var": "shortwave_radiation",
+        "agg": "avg",
+    },
     "weather_code_simple": {
         "era5_model": "copernicus_era5",
         "agg": "mode",

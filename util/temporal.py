@@ -1892,6 +1892,248 @@ def process_chunk_vpd(
     return updates, new_tail
 
 
+def process_chunk_wind(
+    chunk_entry: ChunkRange,
+    worklist_slice: pa.Table,
+    tail_buffer: TailBuffer,
+    model: str,
+    source_variables: list[str],
+    col_prefix: str,
+    steps: dict[int, int],
+    resolution: float,
+    cache_dir: str,
+    secondary_indices: dict[str, ChunkIndex] | None = None,
+    range_request: bool = False,
+    raw_cache: dict | None = None,
+) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
+    """Derive wind speed or direction per-timestep from u/v components, then avg over windows.
+
+    source_variables must be ['wind_u_component_10m', 'wind_v_component_10m'].
+    col_prefix == 'wind_speed_10m'    → sqrt(u²+v²) averaged over each window.
+    col_prefix == 'wind_direction_10m' → vector-mean direction via atan2(-u_sum, -v_sum).
+    """
+    max_window_steps = max(steps.values()) if steps else 0
+    is_direction = col_prefix == "wind_direction_10m"
+
+    def _open(entry: ChunkRange, var: str) -> OmFileReader:
+        return (_open_chunk_s3(entry, model, var) if range_request
+                else OmFileReader(str(_download_chunk(entry, model, var, cache_dir))))
+
+    primary_var = source_variables[0]
+    readers: list[OmFileReader | None] = [_open(chunk_entry, primary_var)]
+    reader_vars_wind: list[str] = [primary_var]
+    reader_chunk_nums_wind: list[int] = [chunk_entry.chunk_num]
+    sec_offsets: list[int] = [0]
+    _sec_exts_wind: list[tuple[OmFileReader | None, int, int]] = [(None, 0, 0)]
+    primary_file_start_ts_wind = chunk_entry.start - chunk_entry.file_offset * resolution
+    for var in source_variables[1:]:
+        if secondary_indices is not None and var in secondary_indices:
+            sec_entry, sec_t0 = _chunk_entry_for_time(secondary_indices[var], primary_file_start_ts_wind)
+            if sec_entry is not None:
+                readers.append(_open(sec_entry, var))
+                reader_vars_wind.append(var)
+                reader_chunk_nums_wind.append(sec_entry.chunk_num)
+                sec_offsets.append(sec_t0)
+                primary_total_wind = chunk_entry.file_offset + chunk_entry.time_len
+                sec_total_wind = sec_entry.file_offset + sec_entry.time_len
+                sec_available = sec_total_wind - sec_t0
+                if sec_available < primary_total_wind:
+                    _ext_e, _ext_t0 = _chunk_entry_for_time(
+                        secondary_indices[var], sec_entry.end + resolution
+                    )
+                    if _ext_e is not None:
+                        _sec_exts_wind.append((_open(_ext_e, var), _ext_t0, primary_total_wind - sec_available))
+                    else:
+                        _sec_exts_wind.append((None, 0, 0))
+                else:
+                    _sec_exts_wind.append((None, 0, 0))
+            else:
+                readers.append(None)
+                reader_vars_wind.append(var)
+                reader_chunk_nums_wind.append(chunk_entry.chunk_num)
+                sec_offsets.append(0)
+                _sec_exts_wind.append((None, 0, 0))
+        else:
+            readers.append(_open(chunk_entry, var))
+            reader_vars_wind.append(var)
+            reader_chunk_nums_wind.append(chunk_entry.chunk_num)
+            sec_offsets.append(0)
+            _sec_exts_wind.append((None, 0, 0))
+
+    ny, nx, _ = readers[0].shape
+
+    data = worklist_slice.to_pydict()
+    lat = np.asarray(data["lat_idx"], dtype=np.int32)
+    lon = np.asarray(data["lon_idx"], dtype=np.int32)
+    time_idx = np.asarray(data["time_idx"], dtype=np.int32)
+    taxon_path = np.asarray(data["taxon_path"])
+    row_idx = np.asarray(data["row_idx"], dtype=np.int64)
+
+    lat = np.clip(lat, 0, ny - 1)
+    lon = np.clip(lon, 0, nx - 1)
+
+    order = np.lexsort((lon, lat))
+    lat, lon = lat[order], lon[order]
+    time_idx = time_idx[order]
+    taxon_path, row_idx = taxon_path[order], row_idx[order]
+
+    change = np.empty(len(lat), dtype=bool)
+    change[0] = True
+    change[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
+    group_starts = np.flatnonzero(change)
+    group_ends = np.append(group_starts[1:], len(lat))
+
+    _reader_caches_wind: list[dict[tuple[int, int], np.ndarray]] = [{} for _ in readers]
+    if range_request and group_starts.size > 0:
+        _unique = [(int(lat[s]), int(lon[s])) for s in group_starts]
+        if raw_cache is not None:
+            for r_idx, (rvar, rcnum) in enumerate(zip(reader_vars_wind, reader_chunk_nums_wind)):
+                for li, lo in _unique:
+                    hit = raw_cache.get((model, rvar, rcnum, li, lo))
+                    if hit is not None:
+                        _reader_caches_wind[r_idx][(li, lo)] = hit
+        _tasks = [
+            (r_idx, r, li, lo)
+            for r_idx, r in enumerate(readers) if r is not None
+            for li, lo in _unique
+            if (li, lo) not in _reader_caches_wind[r_idx]
+        ]
+        def _fetch_wind(task: tuple) -> tuple:
+            r_idx, r, li, lo = task
+            try:
+                return r_idx, li, lo, np.asarray(r[li, lo, :], dtype=np.float64)
+            except Exception:
+                return r_idx, li, lo, np.empty(0, dtype=np.float64)
+        if _tasks:
+            with ThreadPoolExecutor(max_workers=_RANGE_FETCH_WORKERS) as _ex:
+                for _r_idx, _li, _lo, _arr in _ex.map(_fetch_wind, _tasks):
+                    _reader_caches_wind[_r_idx][(_li, _lo)] = _arr
+                    if raw_cache is not None:
+                        raw_cache[(model, reader_vars_wind[_r_idx], reader_chunk_nums_wind[_r_idx], _li, _lo)] = _arr
+
+    updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]] = {}
+    new_tail: TailBuffer = {}
+
+    for s, e in zip(group_starts, group_ends):
+        li, lo = int(lat[s]), int(lon[s])
+
+        try:
+            if range_request:
+                u_arr = _reader_caches_wind[0].get((li, lo), np.empty(0, dtype=np.float64))
+            else:
+                u_arr = np.asarray(readers[0][li, lo, :], dtype=np.float64)
+            primary_len = len(u_arr)
+            if len(readers) > 1 and readers[1] is not None:
+                if range_request:
+                    v_raw = _reader_caches_wind[1].get((li, lo), np.empty(0, dtype=np.float64))
+                else:
+                    v_raw = np.asarray(readers[1][li, lo, :], dtype=np.float64)
+                off = sec_offsets[1]
+                sliced = v_raw[off:off + primary_len]
+                if len(sliced) < primary_len:
+                    ext_r, ext_off, ext_n = _sec_exts_wind[1]
+                    if ext_r is not None and ext_n > 0:
+                        try:
+                            ext_arr = np.asarray(ext_r[li, lo, :], dtype=np.float64)
+                            sliced = np.concatenate([sliced, ext_arr[ext_off:ext_off + ext_n]])
+                        except Exception:
+                            pass
+                    if len(sliced) < primary_len:
+                        padded = np.full(primary_len, np.nan, dtype=np.float64)
+                        padded[:len(sliced)] = sliced
+                        v_arr = padded
+                    else:
+                        v_arr = sliced[:primary_len]
+                else:
+                    v_arr = sliced
+            else:
+                v_arr = np.full(primary_len, np.nan, dtype=np.float64)
+        except Exception:
+            continue
+        if u_arr.size == 0 or v_arr.size == 0:
+            continue
+
+        if is_direction:
+            derived_u = u_arr
+            derived_v = v_arr
+            tail_u = derived_u[-max_window_steps:].copy() if max_window_steps > 0 else np.empty(0)
+            tail_v = derived_v[-max_window_steps:].copy() if max_window_steps > 0 else np.empty(0)
+            new_tail[(li, lo)] = np.stack([tail_u, tail_v])
+        else:
+            derived = np.sqrt(u_arr ** 2 + v_arr ** 2)
+            if max_window_steps > 0:
+                new_tail[(li, lo)] = derived[-max_window_steps:].copy()
+
+        time_slice = time_idx[s:e]
+        prev_tail = tail_buffer.get((li, lo))
+        prev_len = 0
+
+        if is_direction:
+            if prev_tail is not None and max_window_steps > 1:
+                min_t = int(time_slice.min())
+                need = (max_window_steps - 1) - min_t
+                if need > 0:
+                    prev_len = min(int(need), prev_tail.shape[1] if prev_tail.ndim == 2 else 0)
+                    if prev_len > 0:
+                        derived_u = np.concatenate([prev_tail[0, -prev_len:], derived_u])
+                        derived_v = np.concatenate([prev_tail[1, -prev_len:], derived_v])
+
+            min_t = int(time_slice.min())
+            max_t = int(time_slice.max())
+            slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
+            slice_end = min(derived_u.size - 1, max_t + prev_len)
+            u_slice = derived_u[slice_start:slice_end + 1]
+            v_slice = derived_v[slice_start:slice_end + 1]
+            local_time = np.clip((time_slice + prev_len) - slice_start, 0, u_slice.size - 1)
+
+            u_sums, u_counts = window_stats_batch(u_slice, local_time, steps)
+            v_sums, _ = window_stats_batch(v_slice, local_time, steps)
+
+            for tpath in np.unique(taxon_path[s:e]):
+                mask = taxon_path[s:e] == tpath
+                rids = row_idx[s:e][mask]
+                for hours in steps:
+                    cnts = u_counts[hours]
+                    valid = cnts > 0
+                    u_mean = np.where(valid, u_sums[hours] / np.where(valid, cnts, 1), np.nan)
+                    v_mean = np.where(valid, v_sums[hours] / np.where(valid, cnts, 1), np.nan)
+                    direction = np.degrees(np.arctan2(-u_mean, -v_mean)) % 360.0
+                    values = np.where(valid, direction, np.nan)
+                    col = f"{col_prefix}_avg_{hours}h"
+                    updates.setdefault(str(tpath), {}).setdefault(col, []).append(
+                        (rids, values[mask])
+                    )
+        else:
+            if prev_tail is not None and max_window_steps > 1:
+                min_t = int(time_slice.min())
+                need = (max_window_steps - 1) - min_t
+                if need > 0:
+                    prev_len = min(int(need), len(prev_tail))
+                    derived = np.concatenate([prev_tail[-prev_len:], derived])
+
+            min_t = int(time_slice.min())
+            max_t = int(time_slice.max())
+            slice_start = max(0, (min_t + prev_len) - (max_window_steps - 1))
+            slice_end = min(derived.size - 1, max_t + prev_len)
+            series_slice = derived[slice_start:slice_end + 1]
+            local_time = np.clip((time_slice + prev_len) - slice_start, 0, series_slice.size - 1)
+
+            window_sums, window_counts = window_stats_batch(series_slice, local_time, steps)
+
+            for tpath in np.unique(taxon_path[s:e]):
+                mask = taxon_path[s:e] == tpath
+                rids = row_idx[s:e][mask]
+                for hours, sums in window_sums.items():
+                    cnts = window_counts[hours]
+                    values = np.where(cnts > 0, sums / np.where(cnts > 0, cnts, 1), np.nan)
+                    col = f"{col_prefix}_avg_{hours}h"
+                    updates.setdefault(str(tpath), {}).setdefault(col, []).append(
+                        (rids, values[mask])
+                    )
+
+    return updates, new_tail
+
+
 # ---------------------------------------------------------------------------
 # Parquet write-back
 # ---------------------------------------------------------------------------
@@ -2464,8 +2706,7 @@ def compute_raster_final(
         # wind_direction_10m: meteorological convention — direction wind comes FROM.
         # atan2(-u, -v): eastward wind (u>0) → 270° (westerly), northward (v>0) → 180° (southerly).
         direction = np.degrees(np.arctan2(-mean_u, -mean_v)) % 360.0
-        calm = (mean_u == 0.0) & (mean_v == 0.0)
-        return np.where(calm, np.nan, direction).astype(np.float32)
+        return direction.astype(np.float32)
 
     # Generic avg / sum
     combined = zero.copy()

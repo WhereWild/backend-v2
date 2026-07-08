@@ -47,6 +47,7 @@ from util.temporal import (
     process_chunk,
     process_chunk_mode,
     process_chunk_vpd,
+    process_chunk_wind,
     window_steps,
     write_back,
 )
@@ -241,6 +242,14 @@ def _run_layer(
             try:
                 if layer.id == "vapor_pressure_deficit":
                     updates, tail_buffer = process_chunk_vpd(
+                        chunk_entry, chunk_worklist, tail_buffer,
+                        layer.model, layer.sources, layer.id,
+                        steps, chunk_index.resolution, cfg.temporal_cache_dir,
+                        secondary_indices=secondary_indices,
+                        range_request=use_range,
+                    )
+                elif layer.id in ("wind_speed_10m", "wind_direction_10m"):
+                    updates, tail_buffer = process_chunk_wind(
                         chunk_entry, chunk_worklist, tail_buffer,
                         layer.model, layer.sources, layer.id,
                         steps, chunk_index.resolution, cfg.temporal_cache_dir,

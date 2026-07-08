@@ -163,7 +163,7 @@ def _run_layer(
             break
         batch_num += 1
 
-        worklist = map_to_worklist(occ_batch, chunk_index, layer.grid_mode, layer.grid_step)
+        worklist = map_to_worklist(occ_batch, chunk_index, layer.grid_mode, layer.grid_step, accumulated=layer.accumulated)
         if worklist.num_rows == 0:
             continue
 
@@ -263,6 +263,7 @@ def _run_layer(
                         steps, chunk_index.resolution, cfg.temporal_cache_dir,
                         secondary_indices=secondary_indices,
                         range_request=use_range,
+                        source_accumulated=layer.source_accumulated,
                     )
                 else:
                     updates, tail_buffer = process_chunk(

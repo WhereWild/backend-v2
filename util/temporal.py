@@ -133,6 +133,8 @@ class TemporalLayer:
     derived: bool = False
     sources: list[str] = field(default_factory=list)
     grid_step: float = 0.25
+    accumulated: bool = False
+    source_accumulated: list[bool] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -144,23 +146,36 @@ def load_temporal_layers(catalog_path: str | Path) -> list[TemporalLayer]:
     with open(catalog_path) as f:
         cat = json.load(f)
     category_windows: list[int] = []
-    layers: list[TemporalLayer] = []
+    raw_layers: list[dict] = []
     for category in cat.get("categories", []):
         if category.get("id") != "temporal":
             continue
         category_windows = category.get("windows", [])
         for layer in category.get("layers", []):
-            windows = layer.get("windows", category_windows)
-            layers.append(TemporalLayer(
-                id=layer["id"],
-                model=layer.get("model", ""),
-                grid_mode=layer.get("grid_mode", "lat_asc_lon_pm180"),
-                agg=layer.get("agg", "avg"),
-                windows=list(windows),
-                derived=bool(layer.get("derived", False)),
-                sources=list(layer.get("sources", [])),
-                grid_step=float(layer.get("grid_step", 0.25)),
-            ))
+            layer["_category_windows"] = category_windows
+            raw_layers.append(layer)
+
+    # Build accumulated lookup so derived layers can resolve per-source flags.
+    accumulated_by_id: dict[str, bool] = {
+        l["id"]: bool(l.get("accumulated", False)) for l in raw_layers
+    }
+
+    layers: list[TemporalLayer] = []
+    for layer in raw_layers:
+        windows = layer.get("windows", layer["_category_windows"])
+        sources = list(layer.get("sources", []))
+        layers.append(TemporalLayer(
+            id=layer["id"],
+            model=layer.get("model", ""),
+            grid_mode=layer.get("grid_mode", "lat_asc_lon_pm180"),
+            agg=layer.get("agg", "avg"),
+            windows=list(windows),
+            derived=bool(layer.get("derived", False)),
+            sources=sources,
+            grid_step=float(layer.get("grid_step", 0.25)),
+            accumulated=bool(layer.get("accumulated", False)),
+            source_accumulated=[accumulated_by_id.get(s, False) for s in sources],
+        ))
     return layers
 
 
@@ -1126,6 +1141,7 @@ def map_to_worklist(
     chunk_index: ChunkIndex,
     grid_mode: str,
     step: float,
+    accumulated: bool = False,
 ) -> pa.Table:
     """Project occurrence index onto a model chunk grid.
 
@@ -1151,6 +1167,7 @@ def map_to_worklist(
             "lat_idx": pa.array([], type=pa.int32()),
             "lon_idx": pa.array([], type=pa.int32()),
             "time_idx": pa.array([], type=pa.int32()),
+            "time_idx_accum": pa.array([], type=pa.int32()),
             "elevation": pa.array([], type=pa.float64()),
         })
 
@@ -1185,16 +1202,17 @@ def map_to_worklist(
     # null rather than getting a stale value clamped from the wrong chunk.
     in_range = times <= chunk_ends
 
-    # Floor to hour boundary then add file_offset to get the true file position
-    time_indices = (
-        np.floor((times - chunk_starts) / chunk_index.resolution).astype(np.int32)
-        + chunk_file_offsets
-    )
-    time_indices = np.clip(
-        time_indices,
-        chunk_file_offsets,
-        chunk_file_offsets + chunk_time_lens - 1,
-    )
+    # Round to nearest hour (instantaneous vars) or ceil to end-of-period hour
+    # (accumulated vars: precip, snowfall, shortwave — value at T covers [T-1h, T]).
+    # Always compute both so derived layers can use per-source correct snapping.
+    raw_offsets = (times - chunk_starts) / chunk_index.resolution
+    instant_indices = np.round(raw_offsets).astype(np.int32) + chunk_file_offsets
+    accum_indices = np.ceil(raw_offsets).astype(np.int32) + chunk_file_offsets
+    lo_bound = chunk_file_offsets
+    hi_bound = chunk_file_offsets + chunk_time_lens - 1
+    instant_indices = np.clip(instant_indices, lo_bound, hi_bound)
+    accum_indices = np.clip(accum_indices, lo_bound, hi_bound)
+    time_indices = accum_indices if accumulated else instant_indices
 
     return pa.table({
         "taxon_path": taxon_path_col.filter(in_range),
@@ -1203,6 +1221,7 @@ def map_to_worklist(
         "lat_idx": lat_idx[in_range],
         "lon_idx": lon_idx[in_range],
         "time_idx": time_indices[in_range],
+        "time_idx_accum": accum_indices[in_range],
         "elevation": elevation[in_range],
     })
 
@@ -1427,6 +1446,7 @@ def process_chunk_mode(
     secondary_indices: dict[str, ChunkIndex] | None = None,
     range_request: bool = False,
     raw_cache: dict | None = None,
+    source_accumulated: list[bool] | None = None,
 ) -> tuple[dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]], TailBuffer]:
     """Download multiple .om files, derive a per-timestep series, apply sliding-window mode.
 
@@ -1493,6 +1513,7 @@ def process_chunk_mode(
     lat = np.asarray(data["lat_idx"], dtype=np.int32)
     lon = np.asarray(data["lon_idx"], dtype=np.int32)
     time_idx = np.asarray(data["time_idx"], dtype=np.int32)
+    time_idx_accum = np.asarray(data["time_idx_accum"], dtype=np.int32)
     taxon_path = np.asarray(data["taxon_path"])
     row_idx = np.asarray(data["row_idx"], dtype=np.int64)
     obs_elev = np.asarray(
@@ -1515,6 +1536,7 @@ def process_chunk_mode(
     order = np.lexsort((lon, lat))
     lat, lon = lat[order], lon[order]
     time_idx = time_idx[order]
+    time_idx_accum = time_idx_accum[order]
     taxon_path, row_idx = taxon_path[order], row_idx[order]
     if elev_correction is not None:
         elev_correction = elev_correction[order]
@@ -1612,6 +1634,7 @@ def process_chunk_mode(
             new_tail[(li, lo)] = derived[-max_window_steps:].copy()
 
         time_slice = time_idx[s:e]
+        time_slice_accum = time_idx_accum[s:e]
         prev_tail = tail_buffer.get((li, lo))
         prev_len = 0
         if prev_tail is not None and max_window_steps > 1:
@@ -1629,6 +1652,39 @@ def process_chunk_mode(
         local_time = np.clip(
             (time_slice + prev_len) - slice_start, 0, series_slice.size - 1
         )
+
+        # For observations where instant and accumulated snaps disagree, patch the
+        # center code in series_slice to use per-source correct indices: round for
+        # instantaneous sources (cloud, temp), ceil for accumulated (precip, snow).
+        if source_accumulated and any(source_accumulated):
+            snap_diff = time_slice != time_slice_accum
+            if snap_diff.any():
+                series_slice = series_slice.copy()
+                seen_inst_t: set[int] = set()
+                for obs_i in np.flatnonzero(snap_diff):
+                    inst_t = int(time_slice[obs_i])
+                    if inst_t in seen_inst_t:
+                        continue
+                    seen_inst_t.add(inst_t)
+                    accum_t = int(time_slice_accum[obs_i])
+                    pos = (inst_t + prev_len) - slice_start
+                    if not (0 <= pos < len(series_slice)):
+                        continue
+                    corrected = [
+                        raw[r_i][min(accum_t if is_acc else inst_t, primary_len - 1)]
+                        for r_i, is_acc in enumerate(source_accumulated)
+                    ]
+                    ct = (
+                        temp_arr[min(inst_t, primary_len - 1)]
+                        if temp_arr is not None else None
+                    )
+                    series_slice[pos] = weather_code_simple(
+                        corrected[_cloud_idx],
+                        corrected[_precip_idx],
+                        corrected[_snow_idx],
+                        resolution,
+                        temperature_2m=ct,
+                    )
 
         if series_slice.size > 0 and not np.isfinite(series_slice[-1]):
             finite_in_slice = np.flatnonzero(np.isfinite(series_slice))
@@ -2175,9 +2231,14 @@ def _apply_updates_arrow(
         if name in table.column_names:
             continue
         np_arr = np.full(length, np.nan, dtype=np.float64)
+        written = np.zeros(length, dtype=bool)
         for row_ids, vals in chunks:
             np_arr[row_ids] = vals
-        cols.append(pa.array(np_arr, type=pa.float64()))
+            written[row_ids] = True
+        result = pa.array(np_arr, type=pa.float64())
+        if (~written).any():
+            result = pc.if_else(pa.array(written), result, None)
+        cols.append(result)
         names.append(name)
 
     return pa.table(cols, names=names)

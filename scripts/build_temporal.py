@@ -1707,7 +1707,6 @@ def main() -> None:
             if var_key in resume_completed:
                 print(f"  [{wl}] {var_id} already completed, skipping", flush=True)
                 return
-            era5_model = vcfg["era5_model"]
             era5_end = era5_end_ts
             era5_cidx = era5_cidx_by_var.get(var_id, {})
             existing_sums, existing_meta = load_raster_state(out_dir, var_id, wl)

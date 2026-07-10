@@ -161,7 +161,7 @@ def load_temporal_layers(catalog_path: str | Path) -> list[TemporalLayer]:
 
     # Build accumulated lookup so derived layers can resolve per-source flags.
     accumulated_by_id: dict[str, bool] = {
-        l["id"]: bool(l.get("accumulated", False)) for l in raw_layers
+        lyr["id"]: bool(lyr.get("accumulated", False)) for lyr in raw_layers
     }
 
     layers: list[TemporalLayer] = []

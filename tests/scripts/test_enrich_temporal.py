@@ -317,7 +317,7 @@ class TestMain:
         monkeypatch.setattr("scripts.enrich_temporal.load_temporal_layers", lambda _: _all_layers())
         monkeypatch.setattr(
             "scripts.enrich_temporal.build_per_layer_occ_indices",
-            lambda *a, layers=(), **kw: {l.id: occ_table.num_rows for l in layers},
+            lambda *a, layers=(), **kw: {lyr.id: occ_table.num_rows for lyr in layers},
         )
         monkeypatch.setattr("scripts.enrich_temporal.VARS_TO_ENRICH", None)
 

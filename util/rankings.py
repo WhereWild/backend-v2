@@ -758,6 +758,17 @@ def _build_rank_index(
 
 
     if _stats_cache is not None:
+        # class_{id} columns only hold taxa with nonzero presence in that
+        # class (see util/stats.py) — the true population for percentile
+        # purposes is {variable}::total_samples, which still has an entry
+        # for every taxon with any data for the variable. Precompute per
+        # variable before the main loop pops entries out of col_idx below.
+        total_samples_len: dict[str, int] = {}
+        for key, vals in col_idx.items():
+            var, metric = key.split("::", 1)
+            if metric == "total_samples":
+                total_samples_len[var] = len(vals)
+
         for col_key in sorted(col_idx):
             idx_list = col_idx.pop(col_key)
             val_list = col_val.pop(col_key)
@@ -797,15 +808,24 @@ def _build_rank_index(
 
                 if metric.startswith("class_"):
                     indices = np.where(sorted_vals != 0.0)[0]
+                    # Real entries only occupy the top of the true population
+                    # (every taxon missing from this class has an implicit
+                    # 0.0, which is always <= any real value here) — offset
+                    # position by however many implicit zeros exist, and use
+                    # the full population as the percentile denominator.
+                    full_n = total_samples_len.get(variable, n)
+                    offset = max(full_n - n, 0)
                 else:
                     indices = np.arange(n, dtype=np.int32)
+                    full_n = n
+                    offset = 0
 
                 if len(indices):
                     pos_tks.extend([sorted_tks[i] for i in indices])
                     pos_vars.extend([variable] * len(indices))
                     pos_mets.extend([metric] * len(indices))
-                    pos_pos_chunks.append(min_rank_arr[indices])
-                    pos_cnt_chunks.append(np.full(len(indices), n, dtype=np.int32))
+                    pos_pos_chunks.append((min_rank_arr[indices] + offset).astype(np.int32))
+                    pos_cnt_chunks.append(np.full(len(indices), full_n, dtype=np.int32))
                     pos_sc_chunks.append(sorted_scs[indices].astype(np.int32))
     else:
         for col_key, entries in col_idx_fb.items():  # type: ignore[possibly-undefined]
@@ -1066,13 +1086,35 @@ def _query_ranked_scoped(
         if tk:
             index_map[tk] = (pos, float(entry.get("value") or 0.0), int(entry.get("sampleCount") or 0))
 
+    # class_{id} metrics are no longer zero-expanded at write time (see
+    # util/stats.py _nominal_cat_entries) — nominal_stats.parquet, and thus
+    # this index column, only has entries for taxa with real (nonzero)
+    # presence in the class. Taxa with zero presence are synthesized here
+    # from {variable}::total_samples, which is still written unconditionally
+    # for every taxon with any data for the variable, so it's the full
+    # eligible population for this sort.
+    is_class_metric = sort_metric.startswith("class_")
+    implicit_zero: dict[str, int] = {}  # taxon_key → sample_count, value implicitly 0.0
+    full_population = col_len
+    if is_class_metric:
+        total_col = f"{sort_variable}::total_samples"
+        total_col_len = _load_column_lengths(index_path).get(total_col) or 0
+        if total_col_len:
+            full_population = total_col_len
+            for entry in _read_index_entries(index_path, total_col, total_col_len):
+                tk = str(entry.get("taxonKey") or "")
+                if tk and tk not in index_map:
+                    implicit_zero[tk] = int(entry.get("sampleCount") or 0)
+
+    eligible_keys = frozenset(index_map) | frozenset(implicit_zero)
+
     # Mode 3: restrict to text-matched taxon keys
     candidate_keys: frozenset[str] | None = None
     match_scores: dict[str, float] = {}
     match_names: dict[str, str] = {}
     if q:
         text_matches = search_taxa_by_name(q, limit=max(limit * 10, 200))
-        candidate_keys = frozenset(str(t["taxon_key"]) for t, _, _ in text_matches if str(t["taxon_key"]) in index_map)
+        candidate_keys = frozenset(str(t["taxon_key"]) for t, _, _ in text_matches if str(t["taxon_key"]) in eligible_keys)
         match_scores = {str(t["taxon_key"]): score for t, score, _ in text_matches}
         match_names = {str(t["taxon_key"]): name for t, _, name in text_matches}
 
@@ -1091,7 +1133,13 @@ def _query_ranked_scoped(
                 if tk:
                     rbar_map[tk] = float(entry.get("value") or 0.0)
 
-    # Filter
+    # Filter — real (nonzero) entries first, then implicit-zero entries.
+    # raw_pos for real entries is offset by the implicit-zero count so it
+    # still reflects true ascending rank within the full population (used
+    # for percentile below); implicit-zero entries occupy the remaining
+    # low end of that range, tiebroken by taxon_key for stable pagination
+    # since they're all tied at 0.0 with no other meaningful order.
+    implicit_count = len(implicit_zero)
     filtered: list[tuple[int, str, float, int]] = []  # (raw_pos, taxon_key, value, sample_count)
     for tk, (pos, val, sc) in index_map.items():
         if candidate_keys is not None and tk not in candidate_keys:
@@ -1107,7 +1155,22 @@ def _query_ranked_scoped(
             taxon = get_taxon_by_id(tk)
             if taxon is None or taxon.get("rank") not in accepted_ranks:
                 continue
-        filtered.append((pos, tk, val, sc))
+        filtered.append((implicit_count + pos, tk, val, sc))
+
+    for local_idx, tk in enumerate(sorted(implicit_zero)):
+        if candidate_keys is not None and tk not in candidate_keys:
+            continue
+        if loc_keys is not None and tk not in loc_keys:
+            continue
+        sc = implicit_zero[tk]
+        effective_sc = loc_counts.get(tk, 0) if loc_counts else sc
+        if effective_sc < min_samples:
+            continue
+        if accepted_ranks is not None:
+            taxon = get_taxon_by_id(tk)
+            if taxon is None or taxon.get("rank") not in accepted_ranks:
+                continue
+        filtered.append((local_idx, tk, 0.0, sc))
 
     if is_circular_bearing:
         ref = float(reference_value)  # type: ignore[arg-type]
@@ -1127,7 +1190,7 @@ def _query_ranked_scoped(
         taxon = get_taxon_by_id(tk)
         if taxon is None:
             continue
-        percentile = round(raw_pos / col_len * 100, 3) if col_len > 0 else None
+        percentile = round(raw_pos / full_population * 100, 3) if full_population > 0 else None
         results.append({
             "taxon": taxon,
             "match_score": match_scores.get(tk),
@@ -1142,7 +1205,7 @@ def _query_ranked_scoped(
     return {
         "total": total,
         "matched_total": total,
-        "eligible_total": col_len,
+        "eligible_total": full_population,
         "empty_reason": None if results else "no_results",
         "results": results,
     }
@@ -1176,6 +1239,13 @@ def _query_ranked_text(
             continue
         taxon_dir = TREE_ROOT / taxon["path"]
         val = _taxon_metric_value(taxon_dir, sort_variable, sort_metric)
+        if val is None and sort_metric.startswith("class_"):
+            # No row for this class means zero presence, not missing data —
+            # class_{id} rows are no longer written for classes a taxon has
+            # zero observations in (see util/stats.py). Only truly exclude
+            # the taxon if it has no data for the variable at all.
+            if _taxon_metric_value(taxon_dir, sort_variable, "total_samples") is not None:
+                val = 0.0
         if val is None:
             continue
         sc = _infer_sample_count(taxon_dir)

@@ -976,30 +976,23 @@ def _nominal_stats(counts: Counter, unique_samples: int) -> tuple[dict, list[dic
 
 
 def _nominal_cat_entries(layer_id: str, layer: dict, counts: Counter, summary: dict) -> list[dict]:
+    # No zero-expansion here: only classes a taxon actually has observations
+    # in get a class_{id} row. Taxa with zero presence in a given class are
+    # synthesized at query time in util/rankings.py (via the total_samples
+    # column, always written below) rather than materialized per class —
+    # for a high-cardinality legend like ecoregions (847 classes) that keeps
+    # nominal_stats.parquet at O(taxa) instead of O(taxa * classes).
     total = summary["total_samples"]
     entries: list[dict] = [
         {"variable": layer_id, "metric": "unique_samples", "value": float(summary["unique_samples"])},
         {"variable": layer_id, "metric": "total_samples",  "value": float(total)},
         {"variable": layer_id, "metric": "unique_classes", "value": float(summary["unique_classes"])},
         {"variable": layer_id, "metric": "entropy",        "value": float(summary["entropy"])},
+        {"variable": layer_id, "metric": "mode",           "value": float(summary["mode"])},
     ]
-    entries.append({"variable": layer_id, "metric": "mode", "value": float(summary["mode"])})
     for cls_id, count in counts.items():
         fraction = count / total if total else 0.0
         entries.append({"variable": layer_id, "metric": f"class_{cls_id}", "value": fraction})
-    # Add zero entries for all legend classes not observed, so every class
-    # appears in the rank index and search results include this taxon when
-    # sorting by that class ascending.
-    base_id = re.sub(r'_(avg|sum|mode|mean|min|max)_\d+h$', '', layer_id)
-    legend_path = Path("config/gis/legends") / f"{base_id}_legend.json"
-    if legend_path.exists():
-        try:
-            known_ids = {int(c["id"]) for c in json.loads(legend_path.read_text()).get("classes", [])}
-            for cls_id in known_ids:
-                if cls_id not in counts:
-                    entries.append({"variable": layer_id, "metric": f"class_{cls_id}", "value": 0.0})
-        except Exception:
-            pass
     return entries
 
 

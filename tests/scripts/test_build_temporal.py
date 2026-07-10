@@ -1209,6 +1209,7 @@ def test_main_force_false_data_unchanged_skips(monkeypatch, tmp_path: Path):
         "status": "completed",
         "era5_end_ts": era5_end,
         "gfs_end_ts": gfs_end,
+        "now_ts": round(__import__("time").time() / 3600) * 3600,
     }))
 
     full_build_calls = []
@@ -1242,6 +1243,7 @@ def test_main_resumes_skips_completed_vars(monkeypatch, tmp_path: Path):
         "status": "running",
         "era5_end_ts": era5_end,
         "gfs_end_ts": gfs_end,
+        "now_ts": round(__import__("time").time() / 3600) * 3600,
         "completed_vars": ["temperature_2m_1h"],
         "forecast_completed": False,
     }))
@@ -1265,6 +1267,7 @@ def test_main_resumes_skips_forecast_if_done(monkeypatch, tmp_path: Path):
         "status": "running",
         "era5_end_ts": era5_end,
         "gfs_end_ts": gfs_end,
+        "now_ts": round(__import__("time").time() / 3600) * 3600,
         "completed_vars": [],
         "forecast_completed": True,
     }))

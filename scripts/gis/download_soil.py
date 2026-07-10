@@ -65,7 +65,7 @@ def _soil_layers(catalog: dict) -> list[dict]:
         layer
         for category in catalog["categories"]
         for layer in category["layers"]
-        if layer.get("source") in _SOURCES
+        if layer.get("source") in _SOURCES and layer.get("filename")
     ]
 
 

@@ -34,7 +34,15 @@ import rasterio
 from fastapi import HTTPException
 
 from config.config import ZERO_NODATA_LAYERS
-from util.gis import DERIVED_FROM_ELEVATION, hilbert_index, sample_aspect_batch, sample_elevation_terrain_batch, sample_slope_batch
+from util.gis import (
+    DERIVED_FROM_ELEVATION,
+    DERIVED_FROM_SOIL,
+    hilbert_index,
+    sample_aspect_batch,
+    sample_elevation_terrain_batch,
+    sample_slope_batch,
+    sample_soil_texture_batch,
+)
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -349,7 +357,7 @@ def _build_layer_meta() -> dict[str, dict]:
             "category_display_name": cat.get("display_name", cat["id"]),
         }
         for layer, cat in load_layers_with_category()
-        if (layer.get("filename") or layer["id"] in DERIVED_FROM_ELEVATION)
+        if (layer.get("filename") or layer["id"] in DERIVED_FROM_ELEVATION or layer["id"] in DERIVED_FROM_SOIL)
         and layer.get("window_hours") is None
     }
 
@@ -390,6 +398,9 @@ def enrich_with_gis(df: pd.DataFrame) -> pd.DataFrame:
                     sorted_vals = sample_aspect_batch(s_lats, s_lons)
                 else:
                     sorted_vals = sample_slope_batch(s_lats, s_lons)
+                result[layer_id] = [sorted_vals[i] for i in restore]
+            elif layer_id in DERIVED_FROM_SOIL:
+                sorted_vals = sample_soil_texture_batch(s_lats, s_lons)
                 result[layer_id] = [sorted_vals[i] for i in restore]
             else:
                 cog_path = LAYERS_DIR / layer["filename"]

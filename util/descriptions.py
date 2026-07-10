@@ -175,6 +175,70 @@ def build_location_text(
     return text
 
 
+_ECOREGION_DISPLAY_LIMIT = 3
+_ECOREGION_MIN_FRACTION = 0.05
+
+
+def _top_ecoregion_names(
+    class_fractions: dict[int, float],
+    legend_classes: list[dict],
+    *,
+    limit: int = _ECOREGION_DISPLAY_LIMIT,
+    min_fraction: float = _ECOREGION_MIN_FRACTION,
+) -> tuple[list[str], bool]:
+    """Return (top ecoregion names by fraction, has_more).
+
+    Only ecoregions at or above min_fraction are shown (a single stray
+    observation shouldn't clutter the sentence), but has_more counts every
+    ecoregion with any presence at all — including ones hidden by the
+    threshold or past the display limit — so "and other ecoregions" stays
+    accurate either way.
+    """
+    qualifying: list[tuple[float, str]] = []
+    total_present = 0
+    for cls in legend_classes:
+        cid = cls.get("id")
+        name = cls.get("name")
+        if cid is None or not name:
+            continue
+        frac = float(class_fractions.get(cid, 0.0))
+        if frac <= 0:
+            continue
+        total_present += 1
+        if frac >= min_fraction:
+            qualifying.append((frac, str(name)))
+
+    if not qualifying:
+        return [], False
+
+    qualifying.sort(key=lambda e: -e[0])
+    shown = qualifying[:limit]
+    has_more = total_present > len(shown)
+    return [name for _, name in shown], has_more
+
+
+def build_ecoregion_text(
+    class_fractions: dict[int, float] | None,
+    legend_classes: list[dict] | None,
+) -> str:
+    """Return a standalone named-ecoregions line, e.g.
+
+        "Colorado Rockies forests, Western shortgrass prairie, and Colorado
+        Plateau shrublands and other ecoregions"
+
+    Empty string if there's no qualifying ecoregion data.
+    """
+    if not class_fractions or not legend_classes:
+        return ""
+    names, has_more = _top_ecoregion_names(class_fractions, legend_classes)
+    if not names:
+        return ""
+    text = _join_names(names, use_and=not has_more)
+    if has_more:
+        text = f"{text} and other ecoregions"
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Terrain text
 # ---------------------------------------------------------------------------
@@ -351,40 +415,6 @@ def _seasonal_precip_label(mm_quarter: float) -> str:
     return _precip_label(mm_quarter * 4)
 
 
-def _usda_texture_class(sand: float, silt: float, clay: float) -> str:
-    # Conditions taken directly from NRCS Soil Texture Calculator (MultiPointTriangle_100pt_508.xlsx, Calc1 sheet)
-    if clay >= 40:
-        if silt >= 40:
-            return "silty clay"
-        if sand <= 45:
-            return "clay"
-        return "sandy clay"
-    if clay >= 35 and sand > 45:
-        return "sandy clay"
-    if clay >= 27:
-        if sand <= 20:
-            return "silty clay loam"
-        if sand <= 45:
-            return "clay loam"
-        return "sandy clay loam"
-    if clay >= 20 and sand > 45 and silt < 28:
-        return "sandy clay loam"
-    if silt >= 80 and clay < 12:
-        return "silt"
-    if silt >= 50:
-        return "silt loam"
-    if clay >= 7 and silt >= 28 and sand <= 52:
-        return "loam"
-    if (silt + 1.5 * clay) < 15:
-        return "sand"
-    if (silt + 1.5 * clay) >= 15 and (silt + 2 * clay) < 30:
-        return "loamy sand"
-    if (7 <= clay < 20 and sand > 52 and (silt + 2 * clay) >= 30) or \
-       (clay < 7 and (silt + 2 * clay) >= 30):
-        return "sandy loam"
-    return "sandy loam"
-
-
 def _ph_label(ph: float) -> str:
     if ph < 3.5:
         return "ultra acidic"
@@ -421,6 +451,38 @@ def _swe_tier(swe_mm: float) -> str:
     if swe_mm < 300:
         return "very snowy"
     return "incredibly snowy"
+
+
+def _coarse_fragment_label(cfvo: float | None) -> str | None:
+    if cfvo is None:
+        return None
+    if cfvo < 2:
+        return "very fine"
+    if cfvo < 5:
+        return "fine"
+    if cfvo >= 25:
+        return "very coarse"
+    if cfvo >= 15:
+        return "coarse"
+    return None
+
+
+def _salinity_phrase(median_class: float | None, legend_classes: list[dict] | None) -> str | None:
+    """Median salinity class name as a lowercase adjective phrase, e.g. "slightly saline".
+
+    Dropped entirely for "Non saline" (class 0) — only worth calling out when the
+    taxon's typical soil actually registers as saline.
+    """
+    if median_class is None or not legend_classes:
+        return None
+    cid = int(round(median_class))
+    if cid <= 0:
+        return None
+    for cls in legend_classes:
+        if cls.get("id") == cid:
+            name = cls.get("name")
+            return str(name).strip().lower() if name else None
+    return None
 
 
 def _build_nominal_lines(
@@ -531,6 +593,16 @@ def build_climate_lines(
     return _build_nominal_lines(class_fractions, legend_classes, body_suffix=" climates")
 
 
+def build_biome_lines(
+    class_fractions: dict[int, float],
+    legend_classes: list[dict],
+) -> list[dict]:
+    # No suffix — unlike kg2's short climate labels, biome names already end
+    # in their own descriptive noun ("...grasslands, savannas & shrublands"),
+    # so appending anything reads redundant.
+    return _build_nominal_lines(class_fractions, legend_classes)
+
+
 def build_habitat_lines(
     class_fractions: dict[int, float],
     legend_classes: list[dict],
@@ -539,40 +611,63 @@ def build_habitat_lines(
     return _build_nominal_lines(class_fractions, legend_classes, attribute_axes=attribute_axes)
 
 
-def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
+# Pure single-word texture classes read better as adjectives than as bare nouns
+# ("clay-rich soil" vs "clay soil"); compound classes (e.g. "Sandy Loam") already
+# read correctly as-is, with the "loam"/"clay"/etc. head noun naturally last.
+_PURE_TEXTURE_ADJECTIVES: dict[str, str] = {
+    "clay": "clay-rich", "loam": "loamy", "silt": "silty", "sand": "sandy",
+}
+
+
+def _texture_phrase(name: str) -> str:
+    lname = name.strip().lower()
+    return _PURE_TEXTURE_ADJECTIVES.get(lname, lname)
+
+
+def build_soil_texture_lines(
+    class_fractions: dict[int, float],
+    legend_classes: list[dict],
+    *,
+    coarse_part: str | None = None,
+) -> list[dict]:
+    entries: list[tuple[float, str]] = []
+    for cls in legend_classes:
+        cid = cls.get("id")
+        name = cls.get("name")
+        if cid is None or not name:
+            continue
+        frac = float(class_fractions.get(cid, 0.0))
+        if frac <= 0:
+            continue
+        entries.append((frac, _texture_phrase(str(name))))
+
+    texture_phrase: str | None = None
+    if entries:
+        entries.sort(key=lambda e: e[0], reverse=True)
+        top_verb = _frequency_verb(entries[0][0])
+        if top_verb is not None:
+            band = [phrase for frac, phrase in entries if _frequency_verb(frac) == top_verb]
+            seen: set[str] = set()
+            ordered = [p for p in band if not (p in seen or seen.add(p))]
+            texture_phrase = _join_labels(ordered)
+
+    if not texture_phrase and not coarse_part:
+        return []
+    if texture_phrase and coarse_part:
+        body = f"Prefers {coarse_part}, {texture_phrase} soil"
+    elif texture_phrase:
+        body = f"Prefers {texture_phrase} soil"
+    else:
+        body = f"Prefers {coarse_part} soil"
+    return [{"body": body}]
+
+
+def build_soil_lines(numerical_stats: dict[str, dict], *, salinity_phrase: str | None = None) -> list[dict]:
     lines: list[dict] = []
 
     def _get(var: str, metric: str) -> float | None:
         v = (numerical_stats.get(var) or {}).get(metric)
         return float(v) if v is not None else None
-
-    sand = _get("sand", "median")
-    silt = _get("silt", "median")
-    clay = _get("clay", "median")
-
-    cfvo = _get("cfvo", "mean")
-    coarse_part: str | None = None
-    if cfvo is not None:
-        if cfvo < 2:
-            coarse_part = "very fine"
-        elif cfvo < 5:
-            coarse_part = "fine"
-        elif cfvo >= 25:
-            coarse_part = "very coarse"
-        elif cfvo >= 15:
-            coarse_part = "coarse"
-
-    _texture_display = {
-        "loam": "loamy", "sand": "sandy", "silt": "silty", "clay": "clay-rich",
-    }
-
-    if sand is not None and silt is not None and clay is not None:
-        _raw = _usda_texture_class(sand, silt, clay)
-        texture = _texture_display.get(_raw, _raw)
-        if coarse_part:
-            lines.append({"body": f"Prefers {coarse_part}, {texture} soil"})
-        else:
-            lines.append({"body": f"Prefers {texture} soil"})
 
     # pH — SoilGrids stores phh2o as pH × 10
     phh2o_raw = _get("phh2o", "mean")
@@ -591,12 +686,9 @@ def build_soil_lines(numerical_stats: dict[str, dict]) -> list[dict]:
         elif nitrogen >= 7:
             nutrient_phrase = "nutrient rich"
 
-    if ph_phrase and nutrient_phrase:
-        lines.append({"body": f"Usually {nutrient_phrase} and {ph_phrase} soil"})
-    elif ph_phrase:
-        lines.append({"body": f"Usually {ph_phrase} soil"})
-    elif nutrient_phrase:
-        lines.append({"body": f"Usually {nutrient_phrase} soil"})
+    parts = [p for p in (nutrient_phrase, ph_phrase, salinity_phrase) if p]
+    if parts:
+        lines.append({"body": f"Usually {_join_labels(parts)} soil"})
 
     return lines
 
@@ -661,6 +753,14 @@ def build_description_profile(
     kg2_legend_classes: list[dict] | None = None,
     lc_class_fractions: dict[int, float] | None = None,
     lc_legend: dict | None = None,
+    soil_texture_class_fractions: dict[int, float] | None = None,
+    soil_texture_legend: dict | None = None,
+    eco_class_fractions: dict[int, float] | None = None,
+    eco_legend_classes: list[dict] | None = None,
+    biome_class_fractions: dict[int, float] | None = None,
+    biome_legend_classes: list[dict] | None = None,
+    salinity_median: float | None = None,
+    salinity_legend_classes: list[dict] | None = None,
     numerical_stats: dict[str, dict] | None = None,
     circular_stats: dict[str, dict] | None = None,
     unit_system: str | None = None,
@@ -675,16 +775,27 @@ def build_description_profile(
         location_gid=location_gid,
     )
     location_text = _capitalize_leading_the(location_text) if location_text else ""
+    ecoregion_text = build_ecoregion_text(eco_class_fractions, eco_legend_classes)
 
     sections = []
 
+    location_lines = []
     if location_text:
-        sections.append({"id": "locations", "title": "Locations", "lines": [{"body": location_text}]})
+        location_lines.append({"body": location_text})
+    if ecoregion_text:
+        location_lines.append({"body": ecoregion_text})
+    if location_lines:
+        sections.append({"id": "locations", "title": "Locations", "lines": location_lines})
 
     if kg2_class_fractions and kg2_legend_classes:
         climate_lines = build_climate_lines(kg2_class_fractions, kg2_legend_classes)
         if climate_lines:
             sections.append({"id": "climate", "title": "Climates", "lines": climate_lines})
+
+    if biome_class_fractions and biome_legend_classes:
+        biome_lines = build_biome_lines(biome_class_fractions, biome_legend_classes)
+        if biome_lines:
+            sections.append({"id": "biomes", "title": "Biomes", "lines": biome_lines})
 
     if lc_class_fractions and lc_legend:
         lc_classes = lc_legend.get("classes") or []
@@ -703,9 +814,17 @@ def build_description_profile(
         if weather_lines:
             sections.append({"id": "weather", "title": "Weather", "lines": weather_lines})
 
+    soil_lines: list[dict] = []
+    coarse_part = _coarse_fragment_label((numerical_stats or {}).get("cfvo", {}).get("mean"))
+    if soil_texture_class_fractions and soil_texture_legend:
+        soil_classes = soil_texture_legend.get("classes") or []
+        soil_lines.extend(build_soil_texture_lines(soil_texture_class_fractions, soil_classes, coarse_part=coarse_part))
+    elif coarse_part:
+        soil_lines.append({"body": f"Prefers {coarse_part} soil"})
     if numerical_stats:
-        soil_lines = build_soil_lines(numerical_stats)
-        if soil_lines:
-            sections.append({"id": "soil", "title": "Soil", "lines": soil_lines})
+        salinity_phrase = _salinity_phrase(salinity_median, salinity_legend_classes)
+        soil_lines.extend(build_soil_lines(numerical_stats, salinity_phrase=salinity_phrase))
+    if soil_lines:
+        sections.append({"id": "soil", "title": "Soil", "lines": soil_lines})
 
     return {"sections": sections}

@@ -42,6 +42,8 @@ def sample_point(layer: dict, lat: float, lon: float, forecast_suffix: str = "")
         return compute_slope_at_point(lat, lon)
     if layer["id"] == "aspect":
         return compute_aspect_at_point(lat, lon)
+    if layer["id"] == "soil_texture":
+        return compute_soil_texture_at_point(lat, lon)
     return _sample_cog_point(layer, lat, lon)
 
 
@@ -344,6 +346,142 @@ def derive_aspect_array(dem: np.ndarray, transform) -> np.ndarray:
     aspect = ((90.0 - raw) % 360.0).astype(np.float32)
     aspect[~finite] = np.nan
     return aspect
+
+
+# ---------------------------------------------------------------------------
+# Soil texture derivation helpers
+# ---------------------------------------------------------------------------
+
+# Layers derived on-the-fly from sand/silt/clay COGs (no separate COG stored).
+DERIVED_FROM_SOIL: frozenset[str] = frozenset({"soil_texture"})
+
+# SoilGrids stores sand/silt/clay as integer g/kg *10 — must match catalog.json's
+# scale_factor for the sand/silt/clay layers.
+_SOILGRIDS_SCALE = 0.1
+_SOIL_TEXTURE_INPUT_FILES = {"sand": "sand.tif", "silt": "silt.tif", "clay": "clay.tif"}
+
+# Canonical USDA texture classes, ordered to match config/gis/legends/soil_texture_legend.json.
+USDA_TEXTURE_CLASSES: list[tuple[int, str]] = [
+    (1, "clay"), (2, "sandy clay"), (3, "silty clay"),
+    (4, "clay loam"), (5, "sandy clay loam"), (6, "silty clay loam"),
+    (7, "loam"), (8, "sandy loam"), (9, "silt loam"),
+    (10, "silt"), (11, "loamy sand"), (12, "sand"),
+]
+_USDA_TEXTURE_LABEL_TO_ID: dict[str, int] = {label: cid for cid, label in USDA_TEXTURE_CLASSES}
+
+
+def usda_texture_class(sand: float, silt: float, clay: float) -> str:
+    """Classify a sand/silt/clay percentage triple into a USDA texture class.
+
+    Conditions taken directly from NRCS Soil Texture Calculator
+    (MultiPointTriangle_100pt_508.xlsx, Calc1 sheet).
+    """
+    if clay >= 40:
+        if silt >= 40:
+            return "silty clay"
+        if sand <= 45:
+            return "clay"
+        return "sandy clay"
+    if clay >= 35 and sand > 45:
+        return "sandy clay"
+    if clay >= 27:
+        if sand <= 20:
+            return "silty clay loam"
+        if sand <= 45:
+            return "clay loam"
+        return "sandy clay loam"
+    if clay >= 20 and sand > 45 and silt < 28:
+        return "sandy clay loam"
+    if silt >= 80 and clay < 12:
+        return "silt"
+    if silt >= 50:
+        return "silt loam"
+    if clay >= 7 and silt >= 28 and sand <= 52:
+        return "loam"
+    if (silt + 1.5 * clay) < 15:
+        return "sand"
+    if (silt + 1.5 * clay) >= 15 and (silt + 2 * clay) < 30:
+        return "loamy sand"
+    if (7 <= clay < 20 and sand > 52 and (silt + 2 * clay) >= 30) or \
+       (clay < 7 and (silt + 2 * clay) >= 30):
+        return "sandy loam"
+    return "sandy loam"
+
+
+def derive_soil_texture_array(sand: np.ndarray, silt: np.ndarray, clay: np.ndarray) -> np.ndarray:
+    """Vectorized USDA texture classification, returning class ids (see USDA_TEXTURE_CLASSES).
+
+    Mirrors usda_texture_class's if/elif chain via np.select, whose first-match-wins
+    semantics reproduce the same priority order. NaN inputs produce NaN output.
+    Returns a float32 array of the same shape as the inputs.
+    """
+    s, si, c = sand, silt, clay
+    label_order = [
+        "silty clay", "clay", "sandy clay", "sandy clay", "silty clay loam",
+        "clay loam", "sandy clay loam", "sandy clay loam", "silt", "silt loam",
+        "loam", "sand", "loamy sand", "sandy loam",
+    ]
+    conditions = [
+        (c >= 40) & (si >= 40),
+        (c >= 40) & (s <= 45),
+        (c >= 40),
+        (c >= 35) & (s > 45),
+        (c >= 27) & (s <= 20),
+        (c >= 27) & (s <= 45),
+        (c >= 27),
+        (c >= 20) & (s > 45) & (si < 28),
+        (si >= 80) & (c < 12),
+        (si >= 50),
+        (c >= 7) & (si >= 28) & (s <= 52),
+        (si + 1.5 * c) < 15,
+        ((si + 1.5 * c) >= 15) & ((si + 2 * c) < 30),
+        (((c >= 7) & (c < 20) & (s > 52) & ((si + 2 * c) >= 30)) | ((c < 7) & ((si + 2 * c) >= 30))),
+    ]
+    choices = [_USDA_TEXTURE_LABEL_TO_ID[label] for label in label_order]
+    ids = np.select(conditions, choices, default=_USDA_TEXTURE_LABEL_TO_ID["sandy loam"])
+    result = ids.astype(np.float32)
+    finite = np.isfinite(s) & np.isfinite(si) & np.isfinite(c)
+    result[~finite] = np.nan
+    return result
+
+
+def sample_soil_texture_batch(lats: np.ndarray, lons: np.ndarray) -> list[int | None]:
+    """Compute the USDA texture class id for many points.
+
+    Points should be hilbert-sorted for GDAL block-cache locality — sand/silt/clay
+    are large global SoilGrids COGs, so each is opened once and sampled with
+    ds.sample(), matching the large-raster path used elsewhere for these same files.
+    """
+    n = len(lats)
+    out: list[int | None] = [None] * n
+    if n == 0:
+        return out
+    paths = {k: LAYERS_DIR / v for k, v in _SOIL_TEXTURE_INPUT_FILES.items()}
+    if not all(p.exists() for p in paths.values()):
+        return out
+    coords = list(zip(lons.tolist(), lats.tolist()))
+    try:
+        readings: dict[str, np.ndarray] = {}
+        for key, path in paths.items():
+            vals = np.full(n, np.nan, dtype=np.float64)
+            with rasterio.open(path) as ds:
+                nodata = ds.nodata
+                for i, point in enumerate(ds.sample(coords)):
+                    raw = float(point[0])
+                    if nodata is not None and raw == nodata:
+                        continue
+                    vals[i] = raw * _SOILGRIDS_SCALE
+            readings[key] = vals
+        classes = derive_soil_texture_array(readings["sand"], readings["silt"], readings["clay"])
+        out = [int(v) if np.isfinite(v) else None for v in classes]
+    except Exception:
+        return [None] * n
+    return out
+
+
+def compute_soil_texture_at_point(lat: float, lon: float) -> int | None:
+    """Compute the USDA texture class id at a single lat/lon."""
+    return sample_soil_texture_batch(np.array([lat]), np.array([lon]))[0]
 
 
 # ---------------------------------------------------------------------------

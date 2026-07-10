@@ -507,6 +507,8 @@ def render_temporal_tile_bytes(
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
         rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
+    elif str(layer.get("value_type") or "").lower() == "circular":
+        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
     img = Image.fromarray(rgba, mode="RGBA")
@@ -565,6 +567,29 @@ def _nominal_tile_range_classes_temporal(
     return counts
 
 
+def _nominal_tile_range_classes_soil(z: int, x0: int, y0: int, x1: int, y1: int) -> dict[int, int]:
+    """Class-count variant for the soil_texture derived nominal layer."""
+    from util.gis import _SOIL_TEXTURE_INPUT_FILES, derive_soil_texture_array
+    counts: dict[int, int] = {}
+    for tx in range(x0, x1 + 1):
+        for ty in range(y0, y1 + 1):
+            lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, tx, ty)
+            mx0, my0, mx1, my1 = tile_bounds_mercator(z, tx, ty)
+            dst_transform = from_bounds(mx0, my0, mx1, my1, 256, 256)
+            bands = {
+                key: _sample_soil_band_to_tile(LAYERS_DIR / filename, lon0, lat0, lon1, lat1, dst_transform, 256)
+                for key, filename in _SOIL_TEXTURE_INPUT_FILES.items()
+            }
+            dest = derive_soil_texture_array(bands["sand"], bands["silt"], bands["clay"])
+            finite = np.isfinite(dest)
+            if not finite.any():
+                continue
+            vals, tile_counts = np.unique(np.round(dest[finite]).astype(np.int32), return_counts=True)
+            for v, c in zip(vals.tolist(), tile_counts.tolist()):
+                counts[int(v)] = counts.get(int(v), 0) + int(c)
+    return counts
+
+
 def nominal_tile_range_classes(
     layer_id: str, z: int, x0: int, y0: int, x1: int, y1: int
 ) -> dict[int, int]:
@@ -580,6 +605,10 @@ def nominal_tile_range_classes(
 
     if layer.get("window_hours") is not None:
         return _nominal_tile_range_classes_temporal(layer, z, x0, y0, x1, y1)
+
+    from util.gis import DERIVED_FROM_SOIL
+    if layer_id in DERIVED_FROM_SOIL:
+        return _nominal_tile_range_classes_soil(z, x0, y0, x1, y1)
 
     path = LAYERS_DIR / layer["filename"]
     counts: dict[int, int] = {}
@@ -724,6 +753,101 @@ def _render_derived_elevation_tile_bytes(
     return buf.getvalue()
 
 
+def _sample_soil_band_to_tile(
+    path: Path, lon0: float, lat0: float, lon1: float, lat1: float,
+    dst_transform, tile_size: int,
+) -> np.ndarray:
+    """Read one sand/silt/clay COG into a tile-sized array, scaled to percent."""
+    from util.gis import _SOILGRIDS_SCALE
+    dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+    if not path.exists():
+        return dest
+    try:
+        with _open_raster(path) as ds:
+            db = ds.bounds
+            rl0 = max(lon0, db.left)
+            rl1 = min(lon1, db.right)
+            rb0 = max(lat0, db.bottom)
+            rb1 = min(lat1, db.top)
+            if rl0 >= rl1 or rb0 >= rb1:
+                return dest
+            _fw = window_from_bounds(rl0, rb0, rl1, rb1, ds.transform)
+            _col0 = math.floor(_fw.col_off)
+            _row0 = math.floor(_fw.row_off)
+            _col1 = min(math.ceil(_fw.col_off + _fw.width), ds.width)
+            _row1 = min(math.ceil(_fw.row_off + _fw.height), ds.height)
+            src_window = Window(_col0, _row0, _col1 - _col0, _row1 - _row0)
+
+            src_px_w = src_window.width
+            src_px_h = src_window.height
+            overviews = ds.overviews(1) or []
+            if overviews and src_px_w > tile_size:
+                desired = src_px_w / tile_size
+                factor  = min(overviews, key=lambda f: abs(f - desired))
+                read_w  = max(1, round(src_px_w / factor))
+                read_h  = max(1, round(src_px_h / factor))
+            else:
+                read_w = max(1, round(src_px_w))
+                read_h = max(1, round(src_px_h))
+
+            raw = ds.read(1, window=src_window, out_shape=(read_h, read_w),
+                          resampling=Resampling.nearest).astype(np.float32)
+            if ds.nodata is not None:
+                raw[raw == ds.nodata] = np.nan
+            raw = raw * _SOILGRIDS_SCALE
+
+            src_tf = window_transform(src_window, ds.transform) * Affine.scale(
+                src_window.width  / read_w,
+                src_window.height / read_h,
+            )
+            warp_reproject(
+                source=raw, destination=dest,
+                src_transform=src_tf, src_crs=ds.crs,
+                src_nodata=np.nan,
+                dst_transform=dst_transform, dst_crs=WEB_MERCATOR,
+                dst_nodata=np.nan,
+                resampling=Resampling.nearest,
+            )
+    except Exception:
+        pass
+    return dest
+
+
+def _render_derived_soil_texture_tile_bytes(
+    layer: dict,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    colormap: str = _DEFAULT_COLORMAP,
+    cb_mode: str = "",
+    class_filter: int | None = None,
+) -> bytes:
+    """Render a soil_texture tile derived on-the-fly from sand/silt/clay COGs."""
+    from util.gis import _SOIL_TEXTURE_INPUT_FILES, derive_soil_texture_array
+
+    lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
+    mx0,  my0,  mx1,  my1  = tile_bounds_mercator(z, x, y)
+    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+
+    bands = {
+        key: _sample_soil_band_to_tile(LAYERS_DIR / filename, lon0, lat0, lon1, lat1, dst_transform, tile_size)
+        for key, filename in _SOIL_TEXTURE_INPUT_FILES.items()
+    }
+    dest = derive_soil_texture_array(bands["sand"], bands["silt"], bands["clay"])
+
+    if cb_mode in SUPPORTED_CB_MODES:
+        nominal_cmap = _cb_colormap_for_layer(layer["id"], cb_mode) or _load_nominal_colormap(layer["id"])
+    else:
+        nominal_cmap = _load_nominal_colormap(layer["id"])
+    vmin, vmax = layer.get("render_min", 1.0), layer.get("render_max", 12.0)
+    rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
+    img  = Image.fromarray(rgba, mode="RGBA")
+    buf  = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def render_layer_tile_bytes(
     layer_id: str,
     z: int,
@@ -735,13 +859,15 @@ def render_layer_tile_bytes(
     forecast_suffix: str = "",
     class_filter: int | None = None,
 ) -> bytes:
-    from util.gis import DERIVED_FROM_ELEVATION, derive_aspect_array, derive_slope_array
+    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
         return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter)
     if layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
         return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap)
+    if layer_id in DERIVED_FROM_SOIL:
+        return _render_derived_soil_texture_tile_bytes(layer, z, x, y, tile_size, colormap, cb_mode, class_filter)
     path    = LAYERS_DIR / layer["filename"]
     scale   = layer.get("scale_factor") or 1.0
     offset  = layer.get("add_offset")   or 0.0
@@ -843,6 +969,8 @@ def render_layer_tile_bytes(
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
         rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
+    elif str(layer.get("value_type") or "").lower() == "circular":
+        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap)
     img  = Image.fromarray(rgba, mode="RGBA")

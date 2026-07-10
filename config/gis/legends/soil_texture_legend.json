@@ -1,0 +1,18 @@
+{
+  "layer_id": "soil_texture",
+  "source": "USDA texture triangle, computed from SoilGrids 2.0 sand/silt/clay (0-5cm)",
+  "classes": [
+    { "id": 1,  "name": "Clay",             "group": "clay", "group_label": "Clay", "traits": { "color": "#964F2C" } },
+    { "id": 2,  "name": "Sandy Clay",       "group": "clay", "group_label": "Clay", "traits": { "color": "#B98046" } },
+    { "id": 3,  "name": "Silty Clay",       "group": "clay", "group_label": "Clay", "traits": { "color": "#8F6756" } },
+    { "id": 4,  "name": "Clay Loam",        "group": "loam", "group_label": "Loam", "traits": { "color": "#A37B43" } },
+    { "id": 5,  "name": "Sandy Clay Loam",  "group": "sand", "group_label": "Sand", "traits": { "color": "#BC9C5C" } },
+    { "id": 6,  "name": "Silty Clay Loam",  "group": "silt", "group_label": "Silt", "traits": { "color": "#A59373" } },
+    { "id": 7,  "name": "Loam",             "group": "loam", "group_label": "Loam", "traits": { "color": "#C2A970" } },
+    { "id": 8,  "name": "Sandy Loam",       "group": "sand", "group_label": "Sand", "traits": { "color": "#D2C189" } },
+    { "id": 9,  "name": "Silt Loam",        "group": "silt", "group_label": "Silt", "traits": { "color": "#C6BCA9" } },
+    { "id": 10, "name": "Silt",             "group": "silt", "group_label": "Silt", "traits": { "color": "#AFB9C0" } },
+    { "id": 11, "name": "Loamy Sand",       "group": "sand", "group_label": "Sand", "traits": { "color": "#D9D0A6" } },
+    { "id": 12, "name": "Sand",             "group": "sand", "group_label": "Sand", "traits": { "color": "#EAE5C8" } }
+  ]
+}

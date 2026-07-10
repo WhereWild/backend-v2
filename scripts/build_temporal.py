@@ -1506,43 +1506,10 @@ def main() -> None:
     var_configs = {k: v for k, v in VAR_CONFIGS.items() if only_vars is None or k in only_vars}
     windows = [(h, WINDOW_LABELS[h]) for h in WINDOW_HOURS if only_windows is None or WINDOW_LABELS[h] in only_windows]
 
-    # ── Probe GFS for snow_depth ──────────────────────────────────────────
-    fs = fsspec.filesystem("s3", anon=True)
-    try:
-        fs.ls("s3://openmeteo/data/ncep_gfs013/snow_depth")
-        print("GFS snow_depth: available")
-    except Exception:
-        if "snow_depth" in var_configs:
-            var_configs["snow_depth"] = {k: v for k, v in var_configs["snow_depth"].items() if k != "gfs_var"}
-        print("GFS snow_depth: not found, ERA5-land only")
-
-    # ── Read S3 model metadata ────────────────────────────────────────────
-    def _read_meta(model: str) -> dict:
-        with fs.open(f"s3://openmeteo/data/{model}/static/meta.json") as fh:
-            return json.loads(fh.read())
-
-    era5_meta = _read_meta("copernicus_era5")
-    era5_land_meta = _read_meta("copernicus_era5_land")
-    gfs_meta = _read_meta("ncep_gfs013")
-
-    era5_end_ts = float(era5_meta["data_end_time"])
-    era5_land_end_ts = float(era5_land_meta["data_end_time"])
-    gfs_data_end_ts = float(gfs_meta["data_end_time"])
-
-    now_ts = round(datetime.now(UTC).timestamp() / 3600) * 3600
-    gfs_end_ts = min(gfs_data_end_ts, now_ts)
-    max_window_h = max(h for h, _ in windows)
-
-    print(f"ERA5      ends: {datetime.fromtimestamp(era5_end_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}")
-    print(f"ERA5-land ends: {datetime.fromtimestamp(era5_land_end_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}")
-    print(f"GFS       ends: {datetime.fromtimestamp(gfs_end_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}")
-    print(f"Now:            {datetime.fromtimestamp(now_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}")
-    print(f"Max window: {max_window_h}h  Force: {force}\n")
-
     state_path = Path(out_dir) / "temporal_state.json"
     started_at = datetime.now(UTC)
 
-    # Read prior state before overwriting it
+    # Read prior state before any S3 contact
     prior_state: dict = {}
     if state_path.exists():
         try:
@@ -1563,15 +1530,61 @@ def main() -> None:
                 print(f"build_temporal already running (pid {running_pid}), exiting.")
                 return
 
+    fs = fsspec.filesystem("s3", anon=True)
+
+    def _read_meta(model: str) -> dict:
+        with fs.open(f"s3://openmeteo/data/{model}/static/meta.json") as fh:
+            return json.loads(fh.read())
+
+    # ── ERA5 meta — short-circuit if unchanged and window hasn't slid ────
+    now_ts = round(datetime.now(UTC).timestamp() / 3600) * 3600
+
+    era5_meta   = _read_meta("copernicus_era5")
+    era5_end_ts = float(era5_meta["data_end_time"])
+    prev_era5_end = prior_state.get("era5_end_ts")
+
+    if (not force
+            and prior_state.get("status") == "completed"
+            and prev_era5_end == era5_end_ts
+            and prior_state.get("now_ts") == now_ts):
+        # ERA5 unchanged and window hasn't slid — check GFS before deciding to skip
+        gfs_meta        = _read_meta("ncep_gfs013")
+        gfs_data_end_ts = float(gfs_meta["data_end_time"])
+        gfs_end_ts      = min(gfs_data_end_ts, now_ts)
+        if prior_state.get("gfs_end_ts") == gfs_end_ts:
+            print("=== no new data and window unchanged, skipping ===")
+            return
+    else:
+        gfs_meta        = _read_meta("ncep_gfs013")
+        gfs_data_end_ts = float(gfs_meta["data_end_time"])
+        gfs_end_ts      = min(gfs_data_end_ts, now_ts)
+
+    # ── Probe GFS for snow_depth ──────────────────────────────────────────
+    try:
+        fs.ls("s3://openmeteo/data/ncep_gfs013/snow_depth")
+        print("GFS snow_depth: available")
+    except Exception:
+        if "snow_depth" in var_configs:
+            var_configs["snow_depth"] = {k: v for k, v in var_configs["snow_depth"].items() if k != "gfs_var"}
+        print("GFS snow_depth: not found, ERA5-land only")
+
+    max_window_h = max(h for h, _ in windows)
+
+    # Log advancement vs prior run so update cadence becomes visible over time
+    prev_gfs_end = prior_state.get("gfs_end_ts")
+    era5_adv = f"+{int((era5_end_ts - prev_era5_end) / 3600)}h" if prev_era5_end and era5_end_ts > prev_era5_end else "same"
+    gfs_adv  = f"+{int((gfs_end_ts  - prev_gfs_end)  / 3600)}h" if prev_gfs_end  and gfs_end_ts  > prev_gfs_end  else "same"
+    print(f"ERA5 ends: {datetime.fromtimestamp(era5_end_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')} ({era5_adv})")
+    print(f"GFS  ends: {datetime.fromtimestamp(gfs_end_ts,  tz=UTC).strftime('%Y-%m-%dT%HZ')} ({gfs_adv})")
+    print(f"Now:       {datetime.fromtimestamp(now_ts, tz=UTC).strftime('%Y-%m-%dT%HZ')}  max_window={max_window_h}h  force={force}\n")
+
     same_data = (
-        prior_state.get("era5_end_ts") == era5_end_ts
-        and prior_state.get("gfs_end_ts") == gfs_end_ts
+        prev_era5_end == era5_end_ts
+        and prev_gfs_end == gfs_end_ts
+        and prior_state.get("now_ts") == now_ts
     )
 
-    # Skip entirely only if last run completed successfully with the same data
-    if not force and prior_state.get("status") == "completed" and same_data:
-        print("=== no new S3 data since last completed run, skipping ===")
-        return
+    _now_real = time.time()
 
     # Resume vars already finished in a prior interrupted run with the same data
     resume_completed: set[str] = set()
@@ -1594,6 +1607,8 @@ def main() -> None:
             "started_at": started_at.isoformat(),
             "era5_end_ts": era5_end_ts,
             "gfs_end_ts": gfs_end_ts,
+            "now_ts": now_ts,
+            "last_check_ts": _now_real,
             "skipped": skipped,
             "completed_vars": completed_vars,
             "forecast_completed": forecast_done[0],
@@ -1693,7 +1708,7 @@ def main() -> None:
                 print(f"  [{wl}] {var_id} already completed, skipping", flush=True)
                 return
             era5_model = vcfg["era5_model"]
-            era5_end = era5_land_end_ts if era5_model == "copernicus_era5_land" else era5_end_ts
+            era5_end = era5_end_ts
             era5_cidx = era5_cidx_by_var.get(var_id, {})
             existing_sums, existing_meta = load_raster_state(out_dir, var_id, wl)
             # Migration: scalar/VPD missing gfs_cycle_init_ts, or mode using old blended format

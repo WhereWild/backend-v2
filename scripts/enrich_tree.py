@@ -37,9 +37,11 @@ import rasterio.transform
 from config.config import ZERO_NODATA_LAYERS, load_config
 from util.gis import (
     DERIVED_FROM_ELEVATION,
+    DERIVED_FROM_SOIL,
     sample_aspect_batch,
     sample_elevation_terrain_batch,
     sample_slope_batch,
+    sample_soil_texture_batch,
 )
 from util.taxa import TaxonRecord, load_catalog
 
@@ -107,8 +109,10 @@ def _load_layers() -> list[dict]:
         layer
         for category in cat["categories"]
         for layer in category["layers"]
-        # Include raster layers (have a filename) and derived-from-elevation layers
-        if layer.get("filename") or layer.get("id") in DERIVED_FROM_ELEVATION
+        # Include raster layers (have a filename) and derived (no-file) layers
+        if layer.get("filename")
+        or layer.get("id") in DERIVED_FROM_ELEVATION
+        or layer.get("id") in DERIVED_FROM_SOIL
     ]
 
 
@@ -141,7 +145,18 @@ def _drop_stale_gis_columns(df, layer_ids: list[str], data_path: Path) -> None:
     if not stale:
         return
     df.drop(columns=stale, inplace=True)
-    _atomic_write(data_path, pa.Table.from_pandas(df, preserve_index=False))
+    arrow_table = pa.Table.from_pandas(df, preserve_index=False)
+    # pa.Table.from_pandas converts float NaN → Arrow null; restore NaN sentinels
+    # so nodata rows aren't re-queued as needing enrichment on the next scan.
+    new_columns = {}
+    for name in arrow_table.schema.names:
+        col = arrow_table.column(name)
+        if pa.types.is_floating(col.type) and pc.any(pc.is_null(col)).as_py():
+            new_columns[name] = pc.if_else(pc.is_null(col), float("nan"), col)
+    for col_name, new_col in new_columns.items():
+        idx = arrow_table.schema.get_field_index(col_name)
+        arrow_table = arrow_table.set_column(idx, col_name, new_col)
+    _atomic_write(data_path, arrow_table)
 
 
 def _missing_rows_for_taxon(taxon: TaxonRecord, layer_ids: list[str]) -> pa.Table | None:
@@ -383,6 +398,9 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
             else:
                 raw = sample_slope_batch(lats[arr], lons[arr])
             vals = np.array([v if v is not None else np.nan for v in raw], dtype=np.float64)
+        elif layer_id in DERIVED_FROM_SOIL:
+            raw = sample_soil_texture_batch(lats[arr], lons[arr])
+            vals = np.array([v if v is not None else np.nan for v in raw], dtype=np.float64)
         else:
             cog_path = LAYERS_DIR / layer["filename"]
             if not cog_path.exists():
@@ -563,12 +581,13 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
         # so we restore NaN in Arrow after the conversion.
         # NaN is ignored by all stats computation (same as for continuous layers).
         arrow_table = pa.Table.from_pandas(df_taxon, preserve_index=False)
+        # pa.Table.from_pandas converts ALL float NaN → Arrow null, including
+        # NaN sentinels in columns we didn't touch this pass. Stamp NaN back
+        # across every floating column, not just the ones in taxon_updates.
         new_columns = {}
-        for layer_id in taxon_updates:
-            if layer_id not in arrow_table.schema.names:
-                continue
+        for layer_id in arrow_table.schema.names:
             col = arrow_table.column(layer_id)
-            if pa.types.is_floating(col.type):
+            if pa.types.is_floating(col.type) and pc.any(pc.is_null(col)).as_py():
                 new_columns[layer_id] = pc.if_else(pc.is_null(col), float("nan"), col)
         if new_columns:
             for col_name, new_col in new_columns.items():

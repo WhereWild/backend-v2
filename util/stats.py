@@ -27,9 +27,11 @@ import re
 from collections import Counter
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from fastdigest import TDigest
 from KDEpy import FFTKDE
@@ -40,13 +42,13 @@ from scipy.stats import entropy as _scipy_entropy
 
 from config.config import ValueType, load_config
 from util.storage import ParquetStorage, atomic_write_parquet
-from util.taxa import TaxonRecord, get_children, iter_descendants
+from util.taxa import TaxonRecord, get_children, load_catalog
 
 CONFIG = load_config("global")
 
 TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
 GLOBAL_STATS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "global"
-OCCURRENCE_FILE = "occurrence.parquet"
+OCCURRENCES_FILE = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "occurrences.parquet"
 NUMERICAL_STATS_FILE = "numerical_stats.parquet"
 NOMINAL_STATS_FILE = "nominal_stats.parquet"
 ORDINAL_STATS_FILE = "ordinal_stats.parquet"
@@ -69,12 +71,90 @@ _OCC_BASE_COLS: frozenset[str] = frozenset({
 })
 
 
-def _read_occ_table(occ_path: Path, layer_meta: dict[str, dict]) -> pa.Table:
-    """Read only the columns needed for stats computation from an occurrence parquet."""
-    needed = _OCC_BASE_COLS | layer_meta.keys()
-    pf = pq.ParquetFile(occ_path)
-    cols = [c for c in pf.schema_arrow.names if c in needed]
-    return pf.read(columns=cols)
+def _scope_taxon_keys(taxon: TaxonRecord, *, include_self: bool) -> list[str]:
+    """taxon_keys of taxon's descendants (and optionally itself), from the in-memory catalog.
+
+    Occurrence rows carry only taxon_key, not a path — a taxon's ancestry
+    already lives once in the catalog, no reason to duplicate it onto every
+    one of its rows — so subtree scoping is a membership check against this
+    key set rather than a stored-path LIKE predicate.
+    """
+    prefix = taxon["path"]
+    catalog = load_catalog()
+    if include_self:
+        return [
+            str(t["taxon_key"]) for t in catalog.values()
+            if t["path"] == prefix or t["path"].startswith(prefix + "/")
+        ]
+    return [str(t["taxon_key"]) for t in catalog.values() if t["path"].startswith(prefix + "/")]
+
+
+def _select_cols(columns: list[str] | None) -> str:
+    """Column list for a SELECT, restricted to columns actually present in the
+    file — callers pass in the full set of columns they might want (base cols
+    + whatever GIS layers are being processed), but not every occurrence file
+    necessarily has every optional base column populated yet."""
+    if columns is None:
+        return "*"
+    existing = set(pq.read_schema(OCCURRENCES_FILE).names)
+    present = [c for c in columns if c in existing]
+    return ", ".join(f'"{c}"' for c in present)
+
+
+def _read_own_rows(taxon_key: str, columns: list[str] | None = None) -> pa.Table:
+    """Rows for exactly this taxon (no descendants). Local storage only."""
+    if not OCCURRENCES_FILE.exists():
+        return pa.table({})
+    col_list = _select_cols(columns)
+    con = duckdb.connect()
+    try:
+        return con.execute(
+            f'SELECT {col_list} FROM read_parquet(\'{OCCURRENCES_FILE.as_posix()}\') WHERE "taxon_key" = ?',
+            [str(taxon_key)],
+        ).to_arrow_table()
+    finally:
+        con.close()
+
+
+def _read_subtree_rows(
+    taxon: TaxonRecord, *, include_self: bool, columns: list[str] | None = None
+) -> pa.Table:
+    """Rows for taxon's descendants (and optionally itself). Local storage only."""
+    if not OCCURRENCES_FILE.exists():
+        return pa.table({})
+    keys = _scope_taxon_keys(taxon, include_self=include_self)
+    if not keys:
+        return pa.table({})
+    col_list = _select_cols(columns)
+    con = duckdb.connect()
+    try:
+        con.register("scope_keys", pa.table({"taxon_key": pa.array(keys, type=pa.string())}))
+        return con.execute(
+            f"SELECT {col_list} FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') "
+            'WHERE "taxon_key" IN (SELECT "taxon_key" FROM scope_keys)'
+        ).to_arrow_table()
+    finally:
+        con.close()
+
+
+def _read_subtree_rows_via_storage(
+    storage: ParquetStorage, taxon: TaxonRecord, *, include_self: bool
+) -> pa.Table | None:
+    """Same scoping as _read_subtree_rows, but via the ParquetStorage abstraction
+    (remote-mode fallback — no DuckDB, since B2/S3 credentials live in ParquetStorage,
+    not a DuckDB connection). Reads the whole file then masks in Arrow."""
+    if not storage.exists(OCCURRENCES_FILE):
+        return None
+    table = storage.read_table(OCCURRENCES_FILE)
+    if "taxon_key" not in table.schema.names:
+        return None
+    keys = _scope_taxon_keys(taxon, include_self=include_self)
+    if not keys:
+        return None
+    key_col = pc.cast(table.column("taxon_key"), pa.string())
+    mask = pc.is_in(key_col, pa.array(keys, type=pa.string()))
+    filtered = table.filter(mask)
+    return filtered if filtered.num_rows > 0 else None
 
 
 def apply_phenology_filter(df: pd.DataFrame, phenology: str) -> pd.DataFrame:
@@ -1183,11 +1263,9 @@ def process_observations_df(directory: Path, df: pd.DataFrame, layer_meta: dict[
     _process_leaf_df(directory, df, layer_meta)
 
 
-def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
-    occ_path = taxon_dir / OCCURRENCE_FILE
-    if not occ_path.exists():
-        return
-    table = _read_occ_table(occ_path, layer_meta)
+def _process_leaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
+    needed = list(_OCC_BASE_COLS | layer_meta.keys())
+    table = _read_own_rows(taxon["taxon_key"], columns=needed)
     if table.num_rows == 0:
         return
     df = _filter_df(table.to_pandas())
@@ -1199,27 +1277,18 @@ def _process_leaf(taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
 def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> pd.DataFrame | None:
     """Combine occurrence data for a SPECIES and all its subspecies-equivalent descendants.
 
-    Deduplicates by catalogNumber so shared observations are not double-counted.
-    Handles the edge case where the species itself has no observations but its
-    subspecies do.
+    Deduplicates by catalogNumber so shared observations are not double-counted
+    (a defensive check — the consolidated file already guarantees each
+    catalogNumber appears at most once, so this is normally a no-op).
     """
-    frames = []
-    for desc in iter_descendants(taxon, include_self=True):
-        occ_path = TREE_ROOT / desc["path"] / OCCURRENCE_FILE
-        if not occ_path.exists():
-            continue
-        table = _read_occ_table(occ_path, layer_meta)
-        if table.num_rows == 0:
-            continue
-        df = _filter_df(table.to_pandas())
-        if not df.empty:
-            frames.append(df)
-    if not frames:
+    needed = list(_OCC_BASE_COLS | layer_meta.keys())
+    table = _read_subtree_rows(taxon, include_self=True, columns=needed)
+    if table.num_rows == 0:
         return None
-    if len(frames) == 1:
-        return frames[0]
-    combined = pd.concat(frames, ignore_index=True)
-    return combined.drop_duplicates(subset=["catalogNumber"])
+    df = _filter_df(table.to_pandas())
+    if df.empty:
+        return None
+    return df.drop_duplicates(subset=["catalogNumber"])
 
 
 def _process_species(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
@@ -1237,45 +1306,37 @@ def _process_species(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
 def collect_taxon_df(taxon: TaxonRecord, storage: ParquetStorage | None = None) -> pd.DataFrame | None:
     """Quality-filtered occurrence DataFrame for a taxon, deduped by catalogNumber.
 
-    Leaf (subspecies/variety): reads own occurrence file only.
+    Leaf (subspecies/variety): reads own rows only.
     Species: reads self + descendants (include_self=True), deduplicates.
     Non-leaf: reads all descendants (include_self=False), deduplicates.
-    """
-    def _read(path: Path):
-        if storage is not None:
-            if not storage.exists(path):
-                return None
-            return storage.read_table(path)
-        if not path.exists():
-            return None
-        return pq.read_table(path)
 
+    ``storage`` is accepted for callers that always pass the app's storage
+    proxy (e.g. main.py); it's only actually needed for genuinely remote
+    storage (B2/S3) — for local storage, even when a storage object is
+    passed, this queries the consolidated occurrences file directly via
+    DuckDB instead, since that's faster than the full-read-then-mask
+    fallback ``_read_subtree_rows_via_storage`` uses.
+    """
     rank = taxon["rank"]
-    taxon_dir = TREE_ROOT / taxon["path"]
-    if rank in CONFIG.subspecies_equivalents:
-        occ_path = taxon_dir / OCCURRENCE_FILE
-        table = _read(occ_path)
-        if table is None or table.num_rows == 0:
+    is_leaf = rank in CONFIG.subspecies_equivalents
+    include_self = is_leaf or rank == CONFIG.species_rank
+
+    if storage is not None and storage.is_remote:
+        table = _read_subtree_rows_via_storage(storage, taxon, include_self=include_self)
+        if table is None:
             return None
-        df = _filter_df(table.to_pandas())
-        return df if not df.empty else None
-    include_self = rank == CONFIG.species_rank
-    frames: list[pd.DataFrame] = []
-    seen: set[str] = set()
-    for desc in iter_descendants(taxon, include_self=include_self):
-        occ_path = TREE_ROOT / desc["path"] / OCCURRENCE_FILE
-        table = _read(occ_path)
-        if table is None or table.num_rows == 0:
-            continue
-        df = _filter_df(table.to_pandas())
-        if df.empty:
-            continue
-        new = df[~df["catalogNumber"].astype(str).isin(seen)]
-        seen.update(new["catalogNumber"].astype(str).tolist())
-        frames.append(new)
-    if not frames:
+    else:
+        if is_leaf:
+            table = _read_own_rows(taxon["taxon_key"])
+        else:
+            table = _read_subtree_rows(taxon, include_self=include_self)
+        if table.num_rows == 0:
+            return None
+
+    df = _filter_df(table.to_pandas())
+    if df.empty:
         return None
-    return pd.concat(frames, ignore_index=True)
+    return df.drop_duplicates(subset=["catalogNumber"])
 
 
 def compute_location_filtered_stats(
@@ -1384,13 +1445,12 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
 
     # Include any direct observations on this taxon (e.g. genus-level GBIF records
     # not identified to species). Rare but valid.
-    occ_path = taxon_dir / OCCURRENCE_FILE
-    if occ_path.exists():
-        table = _read_occ_table(occ_path, layer_meta)
-        if table.num_rows > 0:
-            df = _filter_df(table.to_pandas())
-            if not df.empty:
-                child_accs.append(_df_to_acc(df, layer_meta))
+    needed = list(_OCC_BASE_COLS | layer_meta.keys())
+    table = _read_own_rows(taxon["taxon_key"], columns=needed)
+    if table.num_rows > 0:
+        df = _filter_df(table.to_pandas())
+        if not df.empty:
+            child_accs.append(_df_to_acc(df, layer_meta))
 
     # Collect all direct children's accumulators, then batch-merge in one shot.
     # Each child already accumulated its entire subtree (species acc = species + subspecies).
@@ -1450,7 +1510,7 @@ def compute_taxon_stats(
         layer_meta = {layer["id"]: layer for layer in layers}
     rank = taxon["rank"]
     if rank in CONFIG.subspecies_equivalents:
-        _process_leaf(taxon_dir, layer_meta)
+        _process_leaf(taxon, taxon_dir, layer_meta)
     elif rank == CONFIG.species_rank:
         _process_species(taxon, taxon_dir, layer_meta)
     else:

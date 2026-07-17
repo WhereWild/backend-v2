@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -26,7 +27,7 @@ def _patch_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(pg, "GADM_PATH", tmp_path / "gadm.gpkg")
     monkeypatch.setattr(pg, "_GADM_ZIP", tmp_path / "gadm_410-gpkg.zip")
     monkeypatch.setattr(pg, "LOCATIONS_DIR", tmp_path / "locations")
-    monkeypatch.setattr(pg, "TREE_ROOT", tmp_path / "tree")
+    monkeypatch.setattr(pg, "OCCURRENCES_FILE", tmp_path / "occurrences.parquet")
 
 
 def _make_gpkg(path: Path) -> Path:
@@ -58,18 +59,25 @@ def _make_zip(tmp_path: Path) -> Path:
     return zip_path
 
 
-def _make_occ_parquet(path: Path, **cols) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _make_occ_parquet(occurrences_file: Path, taxon_key: str = "1", taxon_path: str = "Root_1", **cols) -> None:
+    """Append 5 rows for one taxon to the shared consolidated occurrences file."""
+    occurrences_file.parent.mkdir(parents=True, exist_ok=True)
     n = 5
     data = {
-        "catalogNumber": [f"obs{i}" for i in range(n)],
+        "catalogNumber": [f"{taxon_key}_obs{i}" for i in range(n)],
+        "taxon_key": [taxon_key] * n,
+        "path": [taxon_path] * n,
         "level0Gid": ["USA"] * n,
         "level1Gid": ["USA.1_1"] * n,
         "level2Gid": ["USA.1.1_1"] * n,
         "gbifRegion": ["NORTH_AMERICA"] * n,
         **cols,
     }
-    pq.write_table(pa.Table.from_pandas(__import__("pandas").DataFrame(data), preserve_index=False), path)
+    new_table = pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False)
+    if occurrences_file.exists():
+        existing = pq.read_table(occurrences_file)
+        new_table = pa.concat_tables([existing, new_table], promote_options="default")
+    pq.write_table(new_table, occurrences_file)
 
 
 _TAXON_A = {"taxon_key": "1", "path": "Root_1", "scientific_name": "Root", "common_name": "", "rank": "KINGDOM"}
@@ -279,53 +287,48 @@ def test_build_tables_corrupt_gadm(tmp_path, monkeypatch):
 # Location catalog helpers
 # ---------------------------------------------------------------------------
 
-def test_iter_taxa_with_occurrences(tmp_path, monkeypatch):
-    monkeypatch.setattr(pg, "load_catalog", lambda: _FAKE_CATALOG)
-    occ = tmp_path / "tree" / _TAXON_B["path"] / pg.OCCURRENCE_FILE
-    _make_occ_parquet(occ)
-    result = pg._iter_taxa_with_occurrences()
-    keys = {k for k, _ in result}
-    assert "2" in keys
-    assert "1" not in keys
-    assert "3" not in keys
+def test_direct_gid_counts_no_file(tmp_path):
+    assert pg._direct_gid_counts() == {}
 
 
-def test_collect_gid_counts(tmp_path):
-    occ = tmp_path / "occ.parquet"
-    _make_occ_parquet(occ)
-    result = pg._collect_gid_counts(occ)
-    assert result["gadm_level0"]["USA"] == 5
-    assert result["gadm_level1"]["USA.1_1"] == 5
-    assert result["gbif_region"]["NORTH_AMERICA"] == 5
+def test_direct_gid_counts(tmp_path):
+    _make_occ_parquet(pg.OCCURRENCES_FILE, taxon_key="2", taxon_path=_TAXON_B["path"])
+    counts = pg._direct_gid_counts()
+    assert counts[("gadm_level0", "USA", "2")] == 5
+    assert counts[("gadm_level1", "USA.1_1", "2")] == 5
+    assert counts[("gbif_region", "NORTH_AMERICA", "2")] == 5
 
 
-def test_collect_gid_counts_skips_null_column(tmp_path):
-    occ = tmp_path / "occ.parquet"
-    df = __import__("pandas").DataFrame({
-        "level0Gid": [None] * 5,
-        "level1Gid": [None] * 5,
-        "level2Gid": [None] * 5,
-        "gbifRegion": [None] * 5,
-    })
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), occ)
-    result = pg._collect_gid_counts(occ)
-    for scope in result.values():
-        assert len(scope) == 0
-
-
-def test_collect_gid_counts_skips_non_string(tmp_path):
-    import pandas as pd
-    occ = tmp_path / "occ.parquet"
+def test_direct_gid_counts_skips_null_column(tmp_path):
+    pg.OCCURRENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame({
-        "level0Gid": ["USA", None, ""],
-        "level1Gid": [None] * 3,
-        "level2Gid": [None] * 3,
-        "gbifRegion": [None] * 3,
+        "catalogNumber": [f"obs{i}" for i in range(5)],
+        "taxon_key": ["1"] * 5,
+        "path": ["Root_1"] * 5,
+        "level0Gid": pd.array([None] * 5, dtype="string"),
+        "level1Gid": pd.array([None] * 5, dtype="string"),
+        "level2Gid": pd.array([None] * 5, dtype="string"),
+        "gbifRegion": pd.array([None] * 5, dtype="string"),
     })
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), occ)
-    result = pg._collect_gid_counts(occ)
-    assert result["gadm_level0"].get("USA") == 1
-    assert "" not in result["gadm_level0"]
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), pg.OCCURRENCES_FILE)
+    assert pg._direct_gid_counts() == {}
+
+
+def test_direct_gid_counts_skips_empty_string(tmp_path):
+    pg.OCCURRENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame({
+        "catalogNumber": ["obs0", "obs1", "obs2"],
+        "taxon_key": ["1"] * 3,
+        "path": ["Root_1"] * 3,
+        "level0Gid": ["USA", None, ""],
+        "level1Gid": pd.array([None] * 3, dtype="string"),
+        "level2Gid": pd.array([None] * 3, dtype="string"),
+        "gbifRegion": pd.array([None] * 3, dtype="string"),
+    })
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), pg.OCCURRENCES_FILE)
+    counts = pg._direct_gid_counts()
+    assert counts.get(("gadm_level0", "USA", "1")) == 1
+    assert ("gadm_level0", "", "1") not in counts
 
 
 def test_build_parent_map(monkeypatch):
@@ -351,8 +354,7 @@ def test_ancestor_keys():
 def test_build_catalog(tmp_path, monkeypatch):
     monkeypatch.setattr(pg, "load_catalog", lambda: _FAKE_CATALOG)
     monkeypatch.setattr(pg, "_build_parent_map", lambda: {"3": "2", "2": "1"})
-    occ = tmp_path / "tree" / _TAXON_C["path"] / pg.OCCURRENCE_FILE
-    _make_occ_parquet(occ)
+    _make_occ_parquet(pg.OCCURRENCES_FILE, taxon_key="3", taxon_path=_TAXON_C["path"])
     pg._build_catalog()
     out = tmp_path / "locations" / "location_taxa.parquet"
     assert out.exists()
@@ -365,7 +367,6 @@ def test_build_catalog(tmp_path, monkeypatch):
 
 def test_build_catalog_no_data(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(pg, "load_catalog", lambda: _FAKE_CATALOG)
-    monkeypatch.setattr(pg, "_iter_taxa_with_occurrences", lambda: [])
     pg._build_catalog()
     assert "No location mappings" in capsys.readouterr().out
     assert not (tmp_path / "locations" / "location_taxa.parquet").exists()
@@ -374,8 +375,7 @@ def test_build_catalog_no_data(tmp_path, monkeypatch, capsys):
 def test_build_catalog_counts_deduplicated(tmp_path, monkeypatch):
     monkeypatch.setattr(pg, "load_catalog", lambda: _FAKE_CATALOG)
     monkeypatch.setattr(pg, "_build_parent_map", lambda: {"3": "2", "2": "1"})
-    occ = tmp_path / "tree" / _TAXON_C["path"] / pg.OCCURRENCE_FILE
-    _make_occ_parquet(occ)
+    _make_occ_parquet(pg.OCCURRENCES_FILE, taxon_key="3", taxon_path=_TAXON_C["path"])
     pg._build_catalog()
     df = pq.read_table(tmp_path / "locations" / "location_taxa.parquet").to_pandas()
     leaf_count = df[(df["taxon_key"] == "3") & (df["scope"] == "gadm_level0")]["count"].iloc[0]
@@ -387,20 +387,15 @@ def test_build_catalog_progress_logs(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(pg, "_LOG_INTERVAL", 1)
     parent_map: dict[str, str] = {}
     catalog: dict[str, dict] = {}
-    taxa_with_occ: list[tuple[str, Path]] = []
     for i in range(3):
         key = str(i)
         path = f"Root_{i}"
         catalog[key] = {"taxon_key": key, "path": path, "scientific_name": f"Sp {i}", "common_name": "", "rank": "SPECIES"}
-        occ = tmp_path / "tree" / path / pg.OCCURRENCE_FILE
-        _make_occ_parquet(occ)
-        taxa_with_occ.append((key, occ))
+        _make_occ_parquet(pg.OCCURRENCES_FILE, taxon_key=key, taxon_path=path)
     monkeypatch.setattr(pg, "load_catalog", lambda: catalog)
-    monkeypatch.setattr(pg, "_iter_taxa_with_occurrences", lambda: taxa_with_occ)
     monkeypatch.setattr(pg, "_build_parent_map", lambda: parent_map)
     pg._build_catalog()
     out = capsys.readouterr().out
-    assert "Processed" in out
     assert "Rolled up" in out
 
 
@@ -413,6 +408,6 @@ def test_main(tmp_path, monkeypatch):
     monkeypatch.setattr(pg, "_build_parent_map", lambda: {})
     gpkg = _make_gpkg(tmp_path / "gadm.gpkg")
     monkeypatch.setattr(pg, "GADM_PATH", gpkg)
-    monkeypatch.setattr(pg, "_iter_taxa_with_occurrences", lambda: [])
+    monkeypatch.setattr(pg, "_direct_gid_counts", lambda: {})
     pg.main()
     assert (tmp_path / "locations" / "hierarchy.csv").exists()

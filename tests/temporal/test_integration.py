@@ -233,8 +233,8 @@ class TestProcessChunk:
 # ---------------------------------------------------------------------------
 
 class TestDerivedVariables:
-    def _fake_taxon_node(self, path) -> dict:
-        return {"taxon_key": "1", "path": str(path.parent),
+    def _fake_taxon_node(self) -> dict:
+        return {"taxon_key": "1", "path": "Root_1",
                 "scientific_name": "Test", "common_name": "", "rank": "SPECIES"}
 
     def test_derive_vpd_matches_formula(self, require_fixtures, tmp_path, monkeypatch) -> None:
@@ -245,7 +245,9 @@ class TestDerivedVariables:
         t_avg = expected_window(fix, obs_ts, "temperature_2m", 24, "avg")
         td_avg = expected_window(fix, obs_ts, "dew_point_2m", 24, "avg")
 
-        occ_path = tmp_path / "occurrence.parquet"
+        occ_dir = tmp_path / "taxonomy"
+        occ_dir.mkdir(parents=True)
+        occ_path = occ_dir / "occurrences.parquet"
         pq.write_table(
             pa.table({
                 "decimalLatitude": pa.array([_BERLIN_LAT]),
@@ -257,18 +259,18 @@ class TestDerivedVariables:
             occ_path,
         )
 
-        node = self._fake_taxon_node(occ_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: self._fake_taxon_node())
 
-        derive_vpd("1", str(tmp_path), "occurrence.parquet", [24])
+        derive_vpd("1", str(tmp_path), "occurrences.parquet", [24])
 
         result = pq.read_table(occ_path).to_pydict()
         expected_vpd = float(vpd_kpa(float(t_avg), float(td_avg)))
         assert result["vapor_pressure_deficit_avg_24h"][0] == pytest.approx(expected_vpd, abs=1e-5)
 
     def test_derive_vpd_nan_when_source_missing(self, tmp_path, monkeypatch) -> None:
-        occ_path = tmp_path / "occurrence.parquet"
+        occ_dir = tmp_path / "taxonomy"
+        occ_dir.mkdir(parents=True)
+        occ_path = occ_dir / "occurrences.parquet"
         pq.write_table(
             pa.table({
                 "decimalLatitude": pa.array([_BERLIN_LAT]),
@@ -278,11 +280,9 @@ class TestDerivedVariables:
             }),
             occ_path,
         )
-        node = self._fake_taxon_node(occ_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: self._fake_taxon_node())
 
-        derive_vpd("1", str(tmp_path), "occurrence.parquet", [24])
+        derive_vpd("1", str(tmp_path), "occurrences.parquet", [24])
 
         result = pq.read_table(occ_path)
         assert "vapor_pressure_deficit_avg_24h" not in result.column_names
@@ -554,32 +554,30 @@ class TestApplyUpdatesArrow:
 # ---------------------------------------------------------------------------
 
 class TestDeriveVpdEdgeCases:
-    def _node(self, path):
-        return {"taxon_key": "1", "path": str(path), "scientific_name": "X",
+    def _node(self):
+        return {"taxon_key": "1", "path": "Root_1", "scientific_name": "X",
                 "common_name": "", "rank": "SPECIES"}
 
     def test_unknown_root_raises(self, monkeypatch):
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: None)
         with pytest.raises(RuntimeError, match="Unknown root taxon"):
-            derive_vpd("bad", "/data", "occurrence.parquet", [24])
+            derive_vpd("bad", "/data", "occurrences.parquet", [24])
 
     def test_missing_parquet_skipped(self, tmp_path, monkeypatch):
-        node = self._node(tmp_path)  # no occurrence.parquet written
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        derive_vpd("1", str(tmp_path), "occurrence.parquet", [24])  # no error
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: self._node())
+        derive_vpd("1", str(tmp_path), "occurrences.parquet", [24])  # no error, no file written
 
     def test_empty_df_skipped(self, tmp_path, monkeypatch):
-        occ_path = tmp_path / "occurrence.parquet"
+        occ_dir = tmp_path / "taxonomy"
+        occ_dir.mkdir(parents=True)
+        occ_path = occ_dir / "occurrences.parquet"
         pq.write_table(pa.table({
             "decimalLatitude": pa.array([], type=pa.float64()),
             "decimalLongitude": pa.array([], type=pa.float64()),
             "eventTimestamp": pa.array([], type=pa.float64()),
         }), occ_path)
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        derive_vpd("1", str(tmp_path), "occurrence.parquet", [24])  # no error
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: self._node())
+        derive_vpd("1", str(tmp_path), "occurrences.parquet", [24])  # no error
 
 
 class TestProcessChunkModeEdgeCases:

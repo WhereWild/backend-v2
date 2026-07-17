@@ -51,7 +51,7 @@ import scripts.sync_gbif as sync_gbif
 
 DATA_DIR = Path("data")
 SYNC_STATE_PATH = Path("data/sync_state.json")
-OLD_TREE_STAGE = Path("data/tmp/old_tree")
+OLD_OCCURRENCES_STAGE = Path("data/tmp/old_occurrences.parquet")
 NOTIFY_URL = os.environ.get("WHEREWILD_NOTIFY_URL", "")
 STATUS_PUSH_URL = os.environ.get("WHEREWILD_STATUS_PUSH_URL", "")
 SKIPPABLE_REBUILD_STAGES: frozenset[str] = frozenset(
@@ -207,15 +207,14 @@ TAXONOMY_CACHE_DIR = DATA_DIR / "taxonomy" / "cache"
 # the remote files haven't changed — the ETags live in sync_state.json (also
 # preserved) and are useless without the matching local files.
 def _preserve_old_tree() -> None:
-    """Move data/taxonomy/tree/ to data/tmp/old_tree/ so carry_forward can use it."""
-    live_tree = DATA_DIR / "taxonomy" / "tree"
-    if not live_tree.exists():
+    """Move data/taxonomy/occurrences.parquet to data/tmp/ so carry_forward can use it."""
+    live_occurrences = DATA_DIR / "taxonomy" / "occurrences.parquet"
+    if not live_occurrences.exists():
         return
-    OLD_TREE_STAGE.parent.mkdir(parents=True, exist_ok=True)
-    if OLD_TREE_STAGE.exists():
-        shutil.rmtree(OLD_TREE_STAGE)
-    shutil.move(str(live_tree), str(OLD_TREE_STAGE))
-    print(f"[rebuild] preserved old tree → {OLD_TREE_STAGE} ({sum(1 for _ in OLD_TREE_STAGE.rglob('*.parquet'))} parquets)")
+    OLD_OCCURRENCES_STAGE.parent.mkdir(parents=True, exist_ok=True)
+    OLD_OCCURRENCES_STAGE.unlink(missing_ok=True)
+    shutil.move(str(live_occurrences), str(OLD_OCCURRENCES_STAGE))
+    print(f"[rebuild] preserved old occurrences → {OLD_OCCURRENCES_STAGE}")
 
 
 def wipe_data_dir() -> None:

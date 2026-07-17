@@ -360,77 +360,78 @@ class TestBuildChunkIndex:
 # ---------------------------------------------------------------------------
 
 class TestBuildOccIndex:
-    def _write_occ(self, path, lats, lons, times):
+    def _write_occ(self, data_root, lats, lons, times, taxon_keys=None):
+        occ_dir = Path(data_root) / "taxonomy"
+        occ_dir.mkdir(parents=True, exist_ok=True)
         pq.write_table(pa.table({
             "decimalLatitude": pa.array(lats, type=pa.float64()),
             "decimalLongitude": pa.array(lons, type=pa.float64()),
             "eventTimestamp": pa.array(times, type=pa.float64()),
-        }), path)
+            "taxon_key": pa.array(taxon_keys or ["1"] * len(lats), type=pa.string()),
+        }), occ_dir / "occurrences.parquet")
 
-    def _node(self, path):
-        return {"taxon_key": "1", "path": str(path), "scientific_name": "X",
+    def _node(self):
+        return {"taxon_key": "1", "path": "Root_1", "scientific_name": "X",
                 "common_name": "", "rank": "SPECIES"}
+
+    def _catalog(self):
+        # "9" lives outside Root_1's subtree — used by the scoping test below.
+        return {
+            "1": self._node(),
+            "9": {"taxon_key": "9", "path": "Other_9", "scientific_name": "Y",
+                  "common_name": "", "rank": "SPECIES"},
+        }
 
     def _build(self, tmp_path, root_id, data_root, occ_filename, min_date=None, **kw):
         idx = tmp_path / "occ_index.parquet"
         util.temporal.build_occ_index(root_id, data_root, occ_filename, idx, min_date=min_date, **kw)
         return pq.read_table(idx)
 
+    def _patch_catalog(self, monkeypatch):
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: self._node())
+        monkeypatch.setattr("util.temporal.load_catalog", self._catalog)
+
     def test_unknown_root_raises(self, tmp_path, monkeypatch):
         monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: None)
         with pytest.raises(RuntimeError, match="Unknown root taxon"):
-            util.temporal.build_occ_index("bad", "/data", "occurrence.parquet", tmp_path / "idx.parquet")
+            util.temporal.build_occ_index("bad", "/data", "occurrences.parquet", tmp_path / "idx.parquet")
 
     def test_empty_when_no_files(self, tmp_path, monkeypatch):
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet")
+        self._patch_catalog(monkeypatch)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrences.parquet")
         assert result.num_rows == 0
 
     def test_scans_parquet(self, tmp_path, monkeypatch):
-        self._write_occ(tmp_path / "occurrence.parquet", [52.52], [13.40], [1_000_000.0])
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet")
+        self._write_occ(tmp_path, [52.52], [13.40], [1_000_000.0])
+        self._patch_catalog(monkeypatch)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrences.parquet")
         assert result.num_rows == 1
         assert result["latitude"][0].as_py() == pytest.approx(52.52)
 
     def test_min_year_filters(self, tmp_path, monkeypatch):
         t_old = datetime(1990, 6, 1, tzinfo=UTC).timestamp()
         t_new = datetime(2020, 6, 1, tzinfo=UTC).timestamp()
-        self._write_occ(tmp_path / "occurrence.parquet", [0.0, 1.0], [0.0, 1.0], [t_old, t_new])
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet", min_date="2000-01-01")
+        self._write_occ(tmp_path, [0.0, 1.0], [0.0, 1.0], [t_old, t_new])
+        self._patch_catalog(monkeypatch)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrences.parquet", min_date="2000-01-01")
         assert result.num_rows == 1
         assert result["timestamp"][0].as_py() == pytest.approx(t_new)
 
     def test_all_null_timestamps_skipped(self, tmp_path, monkeypatch):
-        pq.write_table(pa.table({
-            "decimalLatitude": pa.array([52.52], type=pa.float64()),
-            "decimalLongitude": pa.array([13.40], type=pa.float64()),
-            "eventTimestamp": pa.array([None], type=pa.float64()),
-        }), tmp_path / "occurrence.parquet")
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
-        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet")
+        self._write_occ(tmp_path, [52.52], [13.40], [None])
+        self._patch_catalog(monkeypatch)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrences.parquet")
         assert result.num_rows == 0
 
-    def test_skips_missing_parquet(self, tmp_path, monkeypatch):
-        sub_a = tmp_path / "a"
-        sub_a.mkdir()
-        sub_b = tmp_path / "b"
-        sub_b.mkdir()
-        self._write_occ(sub_b / "occurrence.parquet", [1.0], [1.0], [9_999_999.0])
-        node_a = self._node(sub_a)
-        node_b = self._node(sub_b)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node_a)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [node_a, node_b])
-        result = self._build(tmp_path, "1", str(tmp_path), "occurrence.parquet")
+    def test_skips_rows_outside_scope(self, tmp_path, monkeypatch):
+        # Scoping is a taxon_key-set membership check (resolved from the
+        # catalog) over one consolidated file, not a per-taxon file's existence.
+        self._write_occ(
+            tmp_path, [1.0, 2.0], [1.0, 2.0], [9_999_999.0, 9_999_999.0],
+            taxon_keys=["9", "1"],
+        )
+        self._patch_catalog(monkeypatch)
+        result = self._build(tmp_path, "1", str(tmp_path), "occurrences.parquet")
         assert result.num_rows == 1
 
 
@@ -460,45 +461,49 @@ class TestMapToWorklist:
 # ---------------------------------------------------------------------------
 
 class TestBuildOccIndexElevation:
-    def _node(self, path):
-        return {"taxon_key": "1", "path": str(path), "scientific_name": "X",
+    def _node(self):
+        return {"taxon_key": "1", "path": "Root_1", "scientific_name": "X",
                 "common_name": "", "rank": "SPECIES"}
 
     def _build(self, tmp_path, data_root, **kw):
         idx = tmp_path / "occ_index.parquet"
-        util.temporal.build_occ_index("1", data_root, "occurrence.parquet", idx, **kw)
+        util.temporal.build_occ_index("1", data_root, "occurrences.parquet", idx, **kw)
         return pq.read_table(idx)
 
+    def _patch_catalog(self, monkeypatch):
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: self._node())
+        monkeypatch.setattr("util.temporal.load_catalog", lambda: {"1": self._node()})
+
     def test_elevation_nan_when_column_absent(self, tmp_path, monkeypatch):
+        occ_dir = tmp_path / "taxonomy"
+        occ_dir.mkdir(parents=True)
         pq.write_table(pa.table({
             "decimalLatitude": pa.array([52.52], type=pa.float64()),
             "decimalLongitude": pa.array([13.40], type=pa.float64()),
             "eventTimestamp": pa.array([1_000_000.0], type=pa.float64()),
-        }), tmp_path / "occurrence.parquet")
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
+            "taxon_key": pa.array(["1"], type=pa.string()),
+        }), occ_dir / "occurrences.parquet")
+        self._patch_catalog(monkeypatch)
         result = self._build(tmp_path, str(tmp_path))
         assert "elevation" in result.column_names
         assert np.isnan(result["elevation"][0].as_py())
 
     def test_elevation_read_when_column_present(self, tmp_path, monkeypatch):
+        occ_dir = tmp_path / "taxonomy"
+        occ_dir.mkdir(parents=True)
         pq.write_table(pa.table({
             "decimalLatitude": pa.array([52.52], type=pa.float64()),
             "decimalLongitude": pa.array([13.40], type=pa.float64()),
             "eventTimestamp": pa.array([1_000_000.0], type=pa.float64()),
             "elevation": pa.array([420.0], type=pa.float64()),
-        }), tmp_path / "occurrence.parquet")
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
+            "taxon_key": pa.array(["1"], type=pa.string()),
+        }), occ_dir / "occurrences.parquet")
+        self._patch_catalog(monkeypatch)
         result = self._build(tmp_path, str(tmp_path))
         assert result["elevation"][0].as_py() == pytest.approx(420.0)
 
     def test_empty_result_has_elevation_column(self, tmp_path, monkeypatch):
-        node = self._node(tmp_path)
-        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda _: node)
-        monkeypatch.setattr("util.temporal.iter_descendants", lambda r, **kw: [r])
+        self._patch_catalog(monkeypatch)
         result = self._build(tmp_path, str(tmp_path))
         assert "elevation" in result.column_names
 

@@ -22,15 +22,15 @@ Pass 2 — Rankings (top-down, shallowest first):
 from __future__ import annotations
 
 import argparse
-import gc
+import shutil
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
 
+import duckdb
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from config.config import load_config
@@ -43,11 +43,10 @@ from util.stats import (
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
     ORDINAL_STATS_FILE,
-    PHENOLOGY_COUNTS_FILE,
     TREE_ROOT,
+    StatsSink,
     compute_taxon_stats,
 )
-from util.storage import atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants
 from util.tiles import load_layers
 
@@ -74,8 +73,17 @@ def _level_pass(
     max_workers: int,
     label: str,
     total: int,
+    should_skip_level=None,
+    on_level_start=None,
+    on_level_end=None,
 ) -> tuple[int, int]:
-    """Run task_fn(node) over all taxa level by level, returning (completed, failed)."""
+    """Run task_fn(node) over all taxa level by level, returning (completed, failed).
+
+    should_skip_level(depth) / on_level_start(depth) / on_level_end(depth) are
+    optional hooks used by run_stats() to checkpoint at the level boundary —
+    skip whole already-finished levels on resume, and open/close a per-level
+    StatsSink around each level's taxa.
+    """
     completed = 0
     failed = 0
     t0 = time.monotonic()
@@ -85,6 +93,12 @@ def _level_pass(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for depth in levels:
             level_taxa = by_depth[depth]
+            if should_skip_level and should_skip_level(depth):
+                completed += len(level_taxa)
+                print(f"[{label}] level {depth}: already done, skipping ({len(level_taxa)} taxa)  [{time.monotonic()-t0:.1f}s]")
+                continue
+            if on_level_start:
+                on_level_start(depth)
             futures = {executor.submit(task_fn, node): node for node in level_taxa}
             for future in as_completed(futures):
                 node = futures[future]
@@ -114,6 +128,8 @@ def _level_pass(
                         f"[{label}] FAIL [{elapsed:.0f}s]"
                         f"  {node['rank']} {node['scientific_name']}: {exc}"
                     )
+            if on_level_end:
+                on_level_end(depth)
 
     elapsed = time.monotonic() - t0
     print(f"[{label}] done — {completed} ok, {failed} failed, {_fmt_duration(elapsed)} total")
@@ -251,119 +267,63 @@ def _consolidate_positions(t0: float) -> None:
         _shutil.rmtree(runs_dir, ignore_errors=True)
 
 
+_STATS_STAGING_DIRNAME = ".stats_staging"
+
+
+def _stats_staging_dir() -> Path:
+    return GLOBAL_STATS_DIR / _STATS_STAGING_DIRNAME
+
+
+def _level_marker_path(staging_dir: Path, depth: int) -> Path:
+    return staging_dir / ".done" / f"level_{depth:04d}"
+
+
+def _finalize_stats(staging_dir: Path) -> None:
+    """Sort each stat type's per-level chunks by taxon_key into its final
+    global file — one DuckDB pass per type, replacing what used to be a
+    separate glob-thousands-of-per-taxon-files consolidation stage, since
+    run_stats() now streams straight into these staged chunks instead of
+    one file per taxon directory."""
+    GLOBAL_STATS_DIR.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
+    kinds = [*_STATS_FILES, ("phenology_counts", "phenology_counts.parquet")]
+    con = duckdb.connect()
+    try:
+        for kind, filename in kinds:
+            chunk_dir = staging_dir / kind
+            if not chunk_dir.exists() or not any(chunk_dir.glob("*.parquet")):
+                continue
+            dest = GLOBAL_STATS_DIR / filename
+            tmp_dest = dest.with_suffix(".parquet.tmp")
+            con.execute(f"""
+                COPY (
+                    SELECT * FROM read_parquet('{(chunk_dir / "*.parquet").as_posix()}', union_by_name=True)
+                    ORDER BY taxon_key
+                ) TO '{tmp_dest.as_posix()}'
+                (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {_CONSOLIDATION_ROW_GROUP_SIZE})
+            """)
+            tmp_dest.replace(dest)
+            print(f"[stats] {kind} -> {filename}  [{time.monotonic()-t0:.1f}s]")
+    finally:
+        con.close()
+    shutil.rmtree(staging_dir, ignore_errors=True)
+
+
 def run_consolidation() -> None:
-    """Merge per-node stats files into global files under data/taxonomy/global/."""
+    """Merge per-node ranking positions into a global file, and clean up
+    now-unneeded per-node intermediate state (.acc accumulators, rank
+    catalogs). Summary stats no longer need consolidating here —
+    run_stats() already streams them straight into their final global
+    files (see _finalize_stats)."""
     GLOBAL_STATS_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
 
-    tmp_dir = GLOBAL_STATS_DIR / ".tmp_consolidate"
+    _consolidate_positions(t0)
 
-    # If no in-progress tmp work exists, this is a fresh consolidation run —
-    # clear stale global files from a previous cycle so they aren't silently skipped.
-    if not tmp_dir.exists():
-        for _, filename in _STATS_FILES:
-            dest = GLOBAL_STATS_DIR / filename
-            if dest.exists():
-                dest.unlink()
-
-    print(f"[consolidate] building global stats files  [{time.monotonic()-t0:.1f}s]")
-
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    for label, filename in _STATS_FILES:
-        dest = GLOBAL_STATS_DIR / filename
-        if dest.exists():
-            print(f"[consolidate] {label}: already exists, skipping  [{time.monotonic()-t0:.1f}s]")
-            continue
-        tmp_path = tmp_dir / filename
-        if tmp_path.exists():
-            print(f"[consolidate] {label}: resuming from tmp  [{time.monotonic()-t0:.1f}s]")
-            tmp_path.replace(dest)
-            print(f"[consolidate] {label}: moved to global  [{time.monotonic()-t0:.1f}s]")
-            continue
-        print(f"[consolidate] {label}: scanning tree...  [{time.monotonic()-t0:.1f}s]")
-        paths = sorted(TREE_ROOT.rglob(filename), key=lambda p: p.parent.name.rsplit("_", 1)[-1])
-        print(f"[consolidate] {label}: {len(paths)} files found, reading...  [{time.monotonic()-t0:.1f}s]")
-        if not paths:
-            print(f"[consolidate] {label}: no files found, skipping")
-            continue
-
-        # Stream-write in batches to avoid holding all frames in memory at once.
-        writer: pq.ParquetWriter | None = None
-        batch: list[pa.Table] = []
-        total_rows = 0
-        batch_size = 100_000
-        try:
-            for n, path in enumerate(paths, 1):
-                taxon_key = path.parent.name.rsplit("_", 1)[-1]
-                tbl = pq.read_table(path)
-                tbl = tbl.append_column(
-                    pa.field("taxon_key", pa.string()),
-                    pa.array([taxon_key] * len(tbl), type=pa.string()),
-                )
-                batch.append(tbl)
-                if len(batch) >= batch_size:
-                    chunk = pa.concat_tables(batch, promote_options="default")
-                    if writer is None:
-                        writer = pq.ParquetWriter(tmp_path, chunk.schema)
-                    elif chunk.schema.names != writer.schema.names:
-                        chunk = chunk.select(writer.schema.names)
-                    writer.write_table(chunk, row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
-                    total_rows += len(chunk)
-                    batch.clear()
-                    gc.collect()
-                    pa.default_memory_pool().release_unused()
-                if n % 10_000 == 0:
-                    print(f"[consolidate] {label}: {n}/{len(paths)}  [{time.monotonic()-t0:.1f}s]")
-
-            if batch:
-                chunk = pa.concat_tables(batch, promote_options="default")
-                if writer is None:
-                    writer = pq.ParquetWriter(tmp_path, chunk.schema)
-                elif chunk.schema.names != writer.schema.names:
-                    chunk = chunk.select(writer.schema.names)
-                writer.write_table(chunk, row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE)
-                total_rows += len(chunk)
-                batch.clear()
-        finally:
-            if writer:
-                writer.close()
-
-        # Move into final location only after fully written.
-        tmp_path.replace(dest)
-        print(
-            f"[consolidate] {label}: {len(paths)} taxa  {total_rows} rows"
-            f"  → {filename}  [{time.monotonic() - t0:.1f}s]"
-        )
-
-    # Extract per-taxon phenology counts from numerical_stats metadata → global file
-    pheno_rows: list[dict] = []
-    for path in sorted(TREE_ROOT.rglob(NUMERICAL_STATS_FILE)):
-        taxon_key = path.parent.name.rsplit("_", 1)[-1]
-        try:
-            meta = pq.read_schema(path).metadata or {}
-            raw = meta.get(b"phenology_counts")
-            if raw:
-                import json as _json
-                for pheno_val, count in _json.loads(raw).items():
-                    pheno_rows.append({"taxon_key": taxon_key, "phenology_value": pheno_val, "count": count})
-        except Exception:
-            pass
-    if pheno_rows:
-        pheno_tbl = pa.Table.from_pylist(pheno_rows)
-        sort_idx = pc.sort_indices(pheno_tbl, sort_keys=[("taxon_key", "ascending")])
-        pheno_tbl = pheno_tbl.take(sort_idx)
-        atomic_write_parquet(
-            GLOBAL_STATS_DIR / "phenology_counts.parquet", pheno_tbl,
-            row_group_size=_CONSOLIDATION_ROW_GROUP_SIZE,
-        )
-        n_taxa = len(set(r["taxon_key"] for r in pheno_rows))
-        print(f"[consolidate] phenology: {len(pheno_rows)} rows for {n_taxa} taxa  [{time.monotonic() - t0:.1f}s]")
-
-    # Remove per-node stats files, accumulator state, rank catalogs, and any tmp parquets
+    # Remove accumulator state and rank catalogs — no longer needed once
+    # rankings have been computed from them.
     removed = 0
-    patterns = [filename for _, filename in _STATS_FILES] + [
-        PHENOLOGY_COUNTS_FILE,
+    patterns = [
         "species.parquet", "subspecies.parquet", "genus.parquet",
         "family.parquet", "order.parquet", "variety.parquet", "form.parquet",
         ".acc",
@@ -387,10 +347,45 @@ def run_consolidation() -> None:
 
 
 def run_stats(resume: bool = False) -> None:
+    """Compute stats bottom-up, streaming each tree-depth level straight into
+    shared per-type staging chunks (see util.stats.StatsSink) instead of one
+    file per taxon directory, then sort those chunks into the final global
+    stats files. Resume checkpoints at the level boundary: a level is skipped
+    if it already has a completion marker from a prior run, otherwise the
+    whole level is (re)computed — cheap, since per-taxon accumulator merging
+    is already fast and only leaf levels are large.
+    """
     layers, layer_meta, by_depth, stats_levels, _, total = _setup()
     print(f"[process_tree] {total} taxa — stats:{STATS_WORKERS} workers" + (" — RESUME" if resume else ""))
-    task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta, resume=resume)
-    _level_pass(by_depth, stats_levels, task, max_workers=STATS_WORKERS, label="stats", total=total)
+
+    staging_dir = _stats_staging_dir()
+    if not resume and staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    marker_dir = staging_dir / ".done"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+
+    sink_holder: dict[str, StatsSink] = {}
+
+    def _should_skip(depth: int) -> bool:
+        return resume and _level_marker_path(staging_dir, depth).exists()
+
+    def _on_start(depth: int) -> None:
+        sink_holder["sink"] = StatsSink(staging_dir, f"level_{depth:04d}")
+
+    def _on_end(depth: int) -> None:
+        sink_holder.pop("sink").close()
+        _level_marker_path(staging_dir, depth).touch()
+
+    def _task(node: TaxonRecord) -> None:
+        compute_taxon_stats(node, layers=layers, layer_meta=layer_meta, sink=sink_holder["sink"])
+
+    _level_pass(
+        by_depth, stats_levels, _task, max_workers=STATS_WORKERS, label="stats", total=total,
+        should_skip_level=_should_skip, on_level_start=_on_start, on_level_end=_on_end,
+    )
+
+    print("[stats] finalizing global stats files...")
+    _finalize_stats(staging_dir)
 
 
 def run_rankings() -> None:
@@ -419,46 +414,25 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip taxa whose stats files are already written (for restarts).",
+        help="Skip tree-depth levels whose stats are already finalized (for restarts).",
     )
     args, _ = parser.parse_known_args()
 
     try:
-        layers, layer_meta, by_depth, stats_levels, rank_levels, total = _setup()
+        _setup()
     except RuntimeError as exc:
         print(str(exc))
         return
 
-    print(
-        f"[process_tree] {total} taxa across {len(stats_levels)} levels"
-        f" — stats:{STATS_WORKERS} workers  rankings:{RANK_WORKERS} workers"
-        f" — phase:{args.phase}"
-        + (" — RESUME" if args.resume else "")
-    )
+    print(f"[process_tree] phase:{args.phase}" + (" — RESUME" if args.resume else ""))
 
     if args.phase in ("stats", "all"):
-        task = partial(compute_taxon_stats, layers=layers, layer_meta=layer_meta, resume=args.resume)
-        _level_pass(
-            by_depth, stats_levels, task,
-            max_workers=STATS_WORKERS, label="stats", total=total,
-        )
+        run_stats(resume=args.resume)
         if args.phase == "all":
             print("[process_tree] stats complete — starting rankings pass")
 
     if args.phase in ("rankings", "all"):
-        removed = 0
-        for pattern in ["tmp*.parquet", POSITION_CTX_GLOB, POSITION_FILE]:
-            for p in TREE_ROOT.rglob(pattern):
-                p.unlink(missing_ok=True)
-                removed += 1
-        if removed:
-            print(f"[process_tree] cleaned up {removed} stale position/tmp files")
-        preload_stats_cache(layers)
-        task = partial(compute_relative_ranks, layers=layers)
-        _level_pass(
-            by_depth, rank_levels, task,
-            max_workers=RANK_WORKERS, label="rankings", total=total,
-        )
+        run_rankings()
         if args.phase == "all":
             print("[process_tree] rankings complete — starting consolidation pass")
 

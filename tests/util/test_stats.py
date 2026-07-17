@@ -318,7 +318,13 @@ def test_process_observations_df_delegates_to_leaf(tmp_path):
     })
     with patch("util.stats._process_leaf_df") as mock_leaf:
         st.process_observations_df(tmp_path, df, {})
-    mock_leaf.assert_called_once_with(tmp_path, df, {})
+    mock_leaf.assert_called_once()
+    call_args = mock_leaf.call_args[0]
+    assert isinstance(call_args[0], st._DirStatsTarget)
+    assert call_args[0].directory == tmp_path
+    assert call_args[1] == ""
+    assert call_args[2] is df
+    assert call_args[3] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +376,65 @@ def test_write_density_empty(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# StatsSink
+# ---------------------------------------------------------------------------
+
+def test_stats_sink_writes_numerical_chunk_with_taxon_key(tmp_path):
+    sink = st.StatsSink(tmp_path, "level_0001")
+    sink.write_numerical("111", {"bio1": {"mean": 5.0, "count": 10}})
+    sink.write_numerical("222", {"bio1": {"mean": 7.0, "count": 20}})
+    sink.close()
+    chunk = tmp_path / "numerical_stats" / "level_0001.parquet"
+    assert chunk.exists()
+    df = pq.read_table(chunk).to_pandas()
+    assert set(df["taxon_key"]) == {"111", "222"}
+    assert "variable" in df.columns
+    assert "mean" in df.columns
+
+
+def test_stats_sink_writes_phenology_alongside_numerical(tmp_path):
+    sink = st.StatsSink(tmp_path, "level_0001")
+    sink.write_numerical("111", {"bio1": {"mean": 5.0}}, pheno_meta={"phenology_counts": '{"flowers": 3}'})
+    sink.close()
+    pheno_chunk = tmp_path / "phenology_counts" / "level_0001.parquet"
+    assert pheno_chunk.exists()
+    rows = pq.read_table(pheno_chunk).to_pylist()
+    assert rows == [{"taxon_key": "111", "phenology_value": "flowers", "count": 3}]
+
+
+def test_stats_sink_skips_empty_writes(tmp_path):
+    sink = st.StatsSink(tmp_path, "level_0001")
+    sink.write_numerical("111", {})
+    sink.write_nominal("111", [])
+    sink.write_ordinal("111", [])
+    sink.write_circular("111", {})
+    sink.write_density("111", [])
+    sink.close()
+    assert not any(tmp_path.iterdir())
+
+
+def test_stats_sink_nominal_and_density_include_taxon_key(tmp_path):
+    sink = st.StatsSink(tmp_path, "level_0001")
+    sink.write_nominal("111", [{"variable": "kg2", "metric": "class_1", "value": 0.5}])
+    sink.write_density("111", [{"variable": "bio1", "points": [1.0], "density": [1.0]}])
+    sink.close()
+    nom = pq.read_table(tmp_path / "nominal_stats" / "level_0001.parquet").to_pylist()
+    assert nom == [{"taxon_key": "111", "variable": "kg2", "metric": "class_1", "value": 0.5}]
+    den = pq.read_table(tmp_path / "density" / "level_0001.parquet").to_pylist()
+    assert den[0]["taxon_key"] == "111"
+
+
+def test_stats_sink_multiple_taxa_append_to_same_level_chunk(tmp_path):
+    sink = st.StatsSink(tmp_path, "level_0001")
+    for i in range(5):
+        sink.write_nominal(str(i), [{"variable": "kg2", "metric": "class_1", "value": float(i)}])
+    sink.close()
+    df = pq.read_table(tmp_path / "nominal_stats" / "level_0001.parquet").to_pandas()
+    assert len(df) == 5
+    assert set(df["taxon_key"]) == {"0", "1", "2", "3", "4"}
+
+
+# ---------------------------------------------------------------------------
 # _process_leaf
 # ---------------------------------------------------------------------------
 
@@ -379,7 +444,7 @@ def test_process_leaf_continuous(tmp_path, monkeypatch):
     bio1_vals = list(np.linspace(10.0, 30.0, 20))
     _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": bio1_vals})
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"bio1": _CONTINUOUS_LAYER})
     assert (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
     assert (taxon_dir / st.DENSITY_FILE).exists()
     df = pd.read_parquet(taxon_dir / st.NUMERICAL_STATS_FILE)
@@ -394,7 +459,7 @@ def test_process_leaf_discrete(tmp_path, monkeypatch):
     vals = [42] * 10 + [43] * 5 + [44] * 5
     _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"gsl": [float(v) for v in vals]})
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"gsl": _DISCRETE_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"gsl": _DISCRETE_LAYER})
     assert (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
     assert (taxon_dir / st.DENSITY_FILE).exists()
     df = pd.read_parquet(taxon_dir / st.NUMERICAL_STATS_FILE)
@@ -413,7 +478,7 @@ def test_process_leaf_nominal(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
     _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"kg2": [1.0] * 15 + [2.0] * 5})
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"kg2": _NOMINAL_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"kg2": _NOMINAL_LAYER})
     assert (taxon_dir / st.NOMINAL_STATS_FILE).exists()
     df = pd.read_parquet(taxon_dir / st.NOMINAL_STATS_FILE)
     metrics = dict(zip(df["metric"], df["value"]))
@@ -426,7 +491,7 @@ def test_process_leaf_nominal(tmp_path, monkeypatch):
 def test_process_leaf_no_occurrences_file(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", tmp_path / "nonexistent.parquet")
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"bio1": _CONTINUOUS_LAYER})
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -438,7 +503,7 @@ def test_process_leaf_empty_parquet(tmp_path, monkeypatch):
         "taxon_key": pa.array([], type=pa.string()),
     }), occurrences_file)
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"bio1": _CONTINUOUS_LAYER})
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -450,7 +515,7 @@ def test_process_leaf_all_filtered_out(tmp_path, monkeypatch):
     df["obscured"] = "Yes"
     pq.write_table(pa.Table.from_pandas(df, preserve_index=False), occurrences_file)
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"bio1": _CONTINUOUS_LAYER})
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -459,7 +524,7 @@ def test_process_leaf_circular_produces_stats(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
     _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"circ": [45.0] * 20})
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"circ": {"id": "circ", "value_type": "circular"}})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"circ": {"id": "circ", "value_type": "circular"}})
     assert (taxon_dir / st.CIRCULAR_STATS_FILE).exists()
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
@@ -469,7 +534,7 @@ def test_process_leaf_no_gis_cols(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
     _write_occ_rows(occurrences_file, _LEAF_TAXON)
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"bio1": _CONTINUOUS_LAYER})
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -478,7 +543,7 @@ def test_process_leaf_all_null_continuous(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
     _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": [None] * 20})
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"bio1": _CONTINUOUS_LAYER})
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -493,7 +558,7 @@ def test_compute_taxon_stats_dispatches_species(tmp_path, monkeypatch):
     species = {**CHILD_TAXON, "rank": "SPECIES"}
     species_dir = tmp_path / species["path"]
     _write_occ_rows(occurrences_file, species, extra_cols={"bio1": list(np.linspace(1, 10, 20))})
-    st.compute_taxon_stats(species, [_CONTINUOUS_LAYER])
+    st.compute_taxon_stats(species, [_CONTINUOUS_LAYER], st._DirStatsTarget(species_dir))
     assert (species_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -561,7 +626,7 @@ def test_process_species_builds_stats_from_subspecies(tmp_path, monkeypatch):
     _write_occ_rows(occurrences_file, SPECIES_TAXON, extra_cols={"bio1": [10.0] * 20})
     _write_occ_rows(occurrences_file, SUBSPECIES_TAXON, extra_cols={"bio1": [20.0] * 20}, offset=100)
     species_dir = tmp_path / "species_dir"
-    st._process_species(SPECIES_TAXON, species_dir, {"bio1": _CONTINUOUS_LAYER})
+    st._process_species(SPECIES_TAXON, species_dir, st._DirStatsTarget(species_dir), {"bio1": _CONTINUOUS_LAYER})
     df = pd.read_parquet(species_dir / st.NUMERICAL_STATS_FILE)
     row = df[df["variable"] == "bio1"].iloc[0]
     assert row["count"] == 40
@@ -570,7 +635,7 @@ def test_process_species_builds_stats_from_subspecies(tmp_path, monkeypatch):
 def test_process_species_no_data_writes_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", tmp_path / "nonexistent.parquet")
     species_dir = tmp_path / "species_dir"
-    st._process_species(SPECIES_TAXON, species_dir, {"bio1": _CONTINUOUS_LAYER})
+    st._process_species(SPECIES_TAXON, species_dir, st._DirStatsTarget(species_dir), {"bio1": _CONTINUOUS_LAYER})
     assert not (species_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -585,7 +650,7 @@ def test_process_leaf_unknown_value_type_skipped(tmp_path, monkeypatch):
     _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": [1.0] * 20})
     taxon_dir = tmp_path / "taxon_dir"
     # value_type "bogus" → _layer_value_type returns None → continue
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"bio1": {"id": "bio1", "value_type": "bogus"}})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"bio1": {"id": "bio1", "value_type": "bogus"}})
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -595,7 +660,7 @@ def test_process_leaf_all_nan_after_isfinite(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
     _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": [float("inf")] * 20})
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"bio1": _CONTINUOUS_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"bio1": _CONTINUOUS_LAYER})
     assert not (taxon_dir / st.NUMERICAL_STATS_FILE).exists()
 
 
@@ -605,7 +670,7 @@ def test_process_leaf_nominal_series_empty_after_dropna(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
     _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"kg2": [None] * 20})
     taxon_dir = tmp_path / "taxon_dir"
-    st._process_leaf(_LEAF_TAXON, taxon_dir, {"kg2": _NOMINAL_LAYER})
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(taxon_dir), {"kg2": _NOMINAL_LAYER})
     assert not (taxon_dir / st.NOMINAL_STATS_FILE).exists()
 
 

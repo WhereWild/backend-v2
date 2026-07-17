@@ -319,6 +319,7 @@ class TestDerivedVariables:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([5], type=pa.int32()),
+            "time_idx_accum": pa.array([5], type=pa.int32()),
         })
         steps = {1: 1, 8: 8}
         updates, _ = process_chunk_mode(
@@ -362,6 +363,7 @@ class TestDerivedVariables:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([5], type=pa.int32()),
+            "time_idx_accum": pa.array([5], type=pa.int32()),
         })
         updates, _ = process_chunk_mode(
             chunk, worklist, {}, "copernicus_era5",
@@ -405,6 +407,7 @@ class TestDerivedVariables:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([5], type=pa.int32()),
+            "time_idx_accum": pa.array([5], type=pa.int32()),
         })
         updates, _ = process_chunk_mode(
             chunk, worklist, {}, "copernicus_era5",
@@ -453,6 +456,7 @@ class TestProcessChunkEdgeCases:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([time_idx], type=pa.int32()),
+            "time_idx_accum": pa.array([time_idx], type=pa.int32()),
         })
 
     def _make_chunk(self, chunk_num=1, tlen=24):
@@ -587,6 +591,7 @@ class TestProcessChunkModeEdgeCases:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([5], type=pa.int32()),
+            "time_idx_accum": pa.array([5], type=pa.int32()),
         })
 
     def _make_chunk(self):
@@ -667,6 +672,7 @@ class TestProcessChunkModeEdgeCases:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([0], type=pa.int32()),
+            "time_idx_accum": pa.array([0], type=pa.int32()),
         })
         chunk = ChunkRange(chunk_num=0, start=0.0, end=4 * 3600.0, time_len=5, source="chunk")
         updates, _ = process_chunk_mode(
@@ -692,6 +698,7 @@ class TestProcessChunkModeEdgeCases:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([4], type=pa.int32()),  # in NaN zone
+            "time_idx_accum": pa.array([4], type=pa.int32()),
         })
         updates, _ = process_chunk_mode(
             chunk, worklist, {}, "copernicus_era5",
@@ -715,6 +722,7 @@ class TestProcessChunkModeEdgeCases:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([4], type=pa.int32()),  # in NaN zone
+            "time_idx_accum": pa.array([4], type=pa.int32()),
         })
         # window=3: slice = derived[2:5] = [0, nan, nan] → clamped to pos 0 → mode 0
         updates, _ = process_chunk_mode(
@@ -750,6 +758,7 @@ class TestElevationCorrection:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([5], type=pa.int32()),
+            "time_idx_accum": pa.array([5], type=pa.int32()),
             "elevation": pa.array([200.0], type=pa.float64()),  # obs at 200 m
         })
         dummy = tmp_path / "dummy.om"
@@ -782,6 +791,7 @@ class TestElevationCorrection:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([4], type=pa.int32()),  # last step, NaN
+            "time_idx_accum": pa.array([4], type=pa.int32()),
         })
         dummy = tmp_path / "dummy.om"
         dummy.write_bytes(b"")
@@ -807,6 +817,7 @@ class TestElevationCorrection:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([5], type=pa.int32()),  # past last valid timestep
+            "time_idx_accum": pa.array([5], type=pa.int32()),
         })
         dummy = tmp_path / "dummy.om"
         dummy.write_bytes(b"")
@@ -866,6 +877,7 @@ class TestElevationCorrection:
             "lat_idx": pa.array([360], type=pa.int32()),
             "lon_idx": pa.array([720], type=pa.int32()),
             "time_idx": pa.array([5], type=pa.int32()),
+            "time_idx_accum": pa.array([5], type=pa.int32()),
             "elevation": pa.array([0.0], type=pa.float64()),  # obs at sea level
         })
         updates, _ = process_chunk_mode(

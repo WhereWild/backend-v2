@@ -781,6 +781,14 @@ EOF
 # ---------------------------------------------------------------------------
 
 api() {
+  ww_load_b2_env
+  local data_root
+  data_root="$(ww_data_root "$@")"
+  export WHEREWILD_DATA_ROOT="$data_root"
+  _uv uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info --reload
+}
+
+api-bg() {
   local log_dir="/workspace/logs"
   local pid_dir="/workspace/logs/pids"
   local pid_file="${pid_dir}/api.pid"
@@ -793,7 +801,7 @@ api() {
   mkdir -p "$log_dir" "$pid_dir"
 
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-    echo "api: already running (pid $(cat "$pid_file"))"
+    echo "api-bg: already running (pid $(cat "$pid_file"))"
     return 0
   fi
 
@@ -804,15 +812,7 @@ api() {
   setsid uv run --env-file /workspace/.env uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info \
     > "$log_dir/api.log" 2>&1 &
   echo "$!" > "$pid_file"
-  echo "api started: http://localhost:8000/docs (data: $data_root)"
-}
-
-api-fg() {
-  ww_load_b2_env
-  local data_root
-  data_root="$(ww_data_root "$@")"
-  export WHEREWILD_DATA_ROOT="$data_root"
-  _uv uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
+  echo "api-bg started: http://localhost:8000/docs (data: $data_root)"
 }
 
 api-stop() {
@@ -1042,8 +1042,8 @@ sync-gis-layers() {
 
 ww-help() {
   cat <<'EOF'
-api [--remote|--local]   start api in background (default: auto-detect mount)
-api-fg [--remote|--local] start api in foreground (with reload)
+api              start api in foreground (with reload)
+api-bg           start api in background
 api-stop                 stop api
 
 b2-help   show B2 storage commands

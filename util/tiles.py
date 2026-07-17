@@ -72,7 +72,7 @@ WEB_MERCATOR      = CRS.from_epsg(3857)
 WGS84             = CRS.from_epsg(4326)
 _MERCATOR_HALF    = 2 * math.pi * 6378137 / 2.0
 
-SUPPORTED_COLORMAPS = frozenset({"viridis", "plasma", "inferno", "magma", "cividis"})
+SUPPORTED_COLORMAPS = frozenset({"viridis", "plasma", "inferno", "magma", "cividis", "gray"})
 _DEFAULT_COLORMAP = "viridis"
 
 SUPPORTED_CIRCULAR_COLORMAPS = frozenset({"twilight", "twilight_90", "twilight_180", "twilight_270"})

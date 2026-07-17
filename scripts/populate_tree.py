@@ -3,21 +3,31 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
-Stream occurrence.txt (DWCA) and route each row into per-taxon parquet files.
+Stream occurrence.txt (DWCA) into one consolidated occurrences.parquet.
 
-Each leaf taxon (SPECIES / SUBSPECIES / VARIETY / FORM) gets an
-occurrence.parquet written under its taxonomy tree path.  Rows are buffered
-in memory and flushed in batches to reduce I/O.
+Rows are parsed and buffered in memory, periodically flushed as unsorted
+batches to a temp parquet file via ParquetWriter to bound memory use. Once
+the whole input is consumed, a single DuckDB pass dedupes on catalogNumber
+(first-seen wins, tiebroken by insertion order) and sorts by taxon_key so
+single-taxon reads get row-group pruning, then writes the final
+data/taxonomy/occurrences.parquet.
+
+Rows carry only taxon_key, not the taxon's path — the taxonomy tree
+(path, rank, ancestry) already lives in the in-memory catalog
+(util.taxa.load_catalog), keyed by taxon_key, so there is no reason to
+duplicate a taxon's ~100-byte path string onto every one of its occurrence
+rows. Subtree-scoped reads resolve a taxon_key set from the catalog
+(iter_descendants) and join/filter against that instead.
 """
 
 import csv
 import json
 import shutil
 import sys
-from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -30,12 +40,16 @@ csv.field_size_limit(sys.maxsize)
 CONFIG = load_config("global")
 
 OCCURRENCE_PATH = Path("data/occurrences/occurrence.txt")
-TREE_ROOT = Path("data/taxonomy/tree")
+OCCURRENCES_FILE = Path("data/taxonomy/occurrences.parquet")
 
-BUFFER_LIMIT = 5_000
+# Rows buffered in memory before a streaming flush to the unsorted temp file.
+BATCH_ROWS = 500_000
 
 OCCURRENCE_DELIMITER = "|"
 
+# ``_seq`` is a monotonic insertion counter used only to make the final
+# dedup-by-catalogNumber pass deterministic (first-seen wins); it is dropped
+# before the final file is written.
 SCHEMA = pa.schema([
     ("decimalLatitude",               pa.float64()),
     ("decimalLongitude",              pa.float64()),
@@ -51,6 +65,8 @@ SCHEMA = pa.schema([
     ("dp",                            pa.string()),
     ("vitality",                      pa.string()),
     ("rcs",                           pa.string()),
+    ("taxon_key",                     pa.string()),
+    ("_seq",                          pa.int64()),
 ])
 
 
@@ -89,35 +105,47 @@ def _parse_obscured(info_withheld: str) -> str:
     return "Hidden" if info_withheld.split(" ")[-1] == "taxon" else "Obscured"
 
 
-def _flush(buffers: dict, taxon_path: str) -> None:
-    rows = buffers[taxon_path]
+def _flush(writer_holder: dict, tmp_path: Path, rows: list[dict]) -> None:
+    """Write one unsorted batch of parsed rows to the streaming temp file."""
     if not rows:
         return
-
-    folder = TREE_ROOT / taxon_path
-    folder.mkdir(parents=True, exist_ok=True)
-    file_path = folder / "occurrence.parquet"
 
     arrays = {field.name: [] for field in SCHEMA}
     for row in rows:
         for k, v in row.items():
             arrays[k].append(v)
 
-    new_table = pa.table(
+    table = pa.table(
         {name: pa.array(vals, type=SCHEMA.field(name).type) for name, vals in arrays.items()},
         schema=SCHEMA,
     )
 
-    if file_path.exists():
-        existing = pq.read_table(file_path)
-        if existing.schema != new_table.schema:
-            existing = existing.cast(new_table.schema)
-        new_table = pa.concat_tables([existing, new_table])
+    writer = writer_holder.get("writer")
+    if writer is None:
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = pq.ParquetWriter(tmp_path, SCHEMA)
+        writer_holder["writer"] = writer
+    writer.write_table(table, row_group_size=50_000)
 
-    from util.storage import atomic_write_parquet
-    atomic_write_parquet(file_path, new_table, row_group_size=50_000)
+    rows.clear()
 
-    buffers[taxon_path].clear()
+
+def _consolidate(tmp_path: Path) -> None:
+    """Dedup on catalogNumber (first-seen wins) and write the final taxon_key-sorted file."""
+    dest = OCCURRENCES_FILE
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dest = dest.with_suffix(".parquet.tmp")
+    con = duckdb.connect()
+    con.execute(f"""
+        COPY (
+            SELECT * EXCLUDE ("_seq")
+            FROM read_parquet('{tmp_path.as_posix()}')
+            QUALIFY row_number() OVER (PARTITION BY "catalogNumber" ORDER BY "_seq") = 1
+            ORDER BY taxon_key
+        ) TO '{tmp_dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 50000)
+    """)
+    con.close()
+    tmp_dest.replace(dest)
 
 
 def main() -> None:
@@ -127,9 +155,13 @@ def main() -> None:
     for taxon in catalog.values():
         for syn_key in (taxon.get("gbif_synonym_keys") or []):
             synonym_to_taxon[str(syn_key)] = taxon
-    buffers: dict[str, list] = defaultdict(list)
+
     rows_read = 0
     rows_written = 0
+    seq = 0
+    buffer: list[dict] = []
+    writer_holder: dict = {}
+    tmp_path = OCCURRENCES_FILE.parent / ".occurrences_unsorted.tmp.parquet"
 
     with open(OCCURRENCE_PATH, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -168,7 +200,7 @@ def main() -> None:
             except ValueError:
                 uncertainty = None
 
-            buffers[taxon["path"]].append({
+            buffer.append({
                 "decimalLatitude":               lat,
                 "decimalLongitude":              lon,
                 "catalogNumber":                 catalog_num,
@@ -183,17 +215,28 @@ def main() -> None:
                 "dp":                            _parse_dp(row.get("dynamicProperties") or ""),
                 "vitality":                      (row.get("vitality") or "").strip().lower(),
                 "rcs":                           (row.get("reproductiveCondition") or "").strip(),
+                "taxon_key":                     taxon["taxon_key"],
+                "_seq":                          seq,
             })
+            seq += 1
             rows_written += 1
 
-            if len(buffers[taxon["path"]]) >= BUFFER_LIMIT:
-                _flush(buffers, taxon["path"])
+            if len(buffer) >= BATCH_ROWS:
+                _flush(writer_holder, tmp_path, buffer)
 
-    print("  Flushing remaining buffers...", flush=True)
-    for path in list(buffers):
-        _flush(buffers, path)
+    print("  Flushing remaining rows...", flush=True)
+    _flush(writer_holder, tmp_path, buffer)
+    writer = writer_holder.get("writer")
+    if writer is not None:
+        writer.close()
 
-    print(f"Done. {rows_read:,} rows read, {rows_written:,} written to tree.")
+    print(f"Done reading. {rows_read:,} rows read, {rows_written:,} written.")
+
+    if rows_written:
+        print("  Consolidating into occurrences.parquet...", flush=True)
+        _consolidate(tmp_path)
+    tmp_path.unlink(missing_ok=True)
+
     # Only remove the occurrences dir when it's the real pipeline path (not a test tmp dir).
     occ_dir = OCCURRENCE_PATH.parent
     if occ_dir.name == "occurrences":

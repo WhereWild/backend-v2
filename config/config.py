@@ -105,7 +105,7 @@ class GlobalConfig:
     )
 
     # Taxonomy / occurrence
-    occurrence_parquet_filename: str = "occurrence.parquet"
+    occurrence_parquet_filename: str = "occurrences.parquet"
     data_root: str = "data"
 
     # Temporal enrichment

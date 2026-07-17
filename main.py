@@ -35,6 +35,7 @@ from util.stats import (
     GLOBAL_STATS_DIR,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
+    OCCURRENCES_FILE,
     ORDINAL_STATS_FILE,
     TREE_ROOT,
     apply_chained_filters,
@@ -59,7 +60,6 @@ _storage = ParquetStorageProxy(
     project_root=Path(__file__).parent,
 )
 _LEGEND_DIR = Path("config/gis/legends")
-_OCC_FILE = "occurrence.parquet"
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
 _PHENOLOGY_VALUES: frozenset[str] = frozenset(_CONFIG.phenology_values)
 _LARGE_TAXON_THRESHOLD = 500_000
@@ -128,18 +128,46 @@ def _load_legend_full(layer_id: str) -> dict:
     return json.loads(Path(path).read_text())
 
 
-def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
-    """Read an env value for a known observation directly from occurrence.parquet."""
-    occ_path = TREE_ROOT / taxon["path"] / "occurrence.parquet"
+def _scope_taxon_keys(taxon: dict) -> list[str]:
+    """taxon_keys in scope for occurrence-level queries: species rolls up
+    subspecies/variety/form; a leaf is itself; other ranks read only their
+    descendant leaves (not any stray direct-to-ancestor observations) —
+    mirrors util.stats.collect_taxon_df's own scope dispatch."""
+    rank = taxon["rank"]
+    if rank == _CONFIG.species_rank:
+        return [str(t["taxon_key"]) for t in iter_descendants(taxon, include_self=True)]
+    if rank in _CONFIG.leaf_rank_set:
+        return [str(taxon["taxon_key"])]
+    return [str(t["taxon_key"]) for t in iter_descendants(taxon, include_self=False)]
+
+
+def _read_occurrences_scoped(taxon: dict, columns: list[str] | None = None) -> pd.DataFrame:
+    """Occurrence rows for taxon's scope, read from the consolidated occurrences file."""
     try:
-        import pyarrow.parquet as _pq
-        tbl = _pq.read_table(occ_path, columns=["catalogNumber", variable_id])
-        df = tbl.to_pandas()
-        row = df[df["catalogNumber"] == catalog_number]
-        if row.empty or variable_id not in row.columns:
+        schema_names = set(_storage.read_schema(OCCURRENCES_FILE).names)
+    except Exception:
+        return pd.DataFrame()
+    cols = [c for c in columns if c in schema_names] if columns is not None else None
+    keys = _scope_taxon_keys(taxon)
+    try:
+        table = _storage.read_table(OCCURRENCES_FILE, columns=cols, filters=[("taxon_key", "in", keys)])
+    except Exception:
+        return pd.DataFrame()
+    return table.to_pandas()
+
+
+def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
+    """Read an env value for a known observation directly from the consolidated occurrences file."""
+    try:
+        tbl = _storage.read_table(
+            OCCURRENCES_FILE,
+            columns=["catalogNumber", variable_id],
+            filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("catalogNumber", "=", catalog_number)],
+        )
+        if tbl.num_rows == 0 or variable_id not in tbl.schema.names:
             return None
-        val = row.iloc[0][variable_id]
-        return float(val) if val is not None and pd.notna(val) else None
+        val = tbl.column(variable_id)[0].as_py()
+        return float(val) if val is not None else None
     except Exception:
         return None
 
@@ -863,45 +891,15 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
 def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
     """Return True when every observation in scope has obscured coordinates."""
     filter_col = _location_filter_col(location_gid) if location_gid else None
-    has_any = False
-    has_non_obscured = False
-
-    def _scan(path: Path) -> None:
-        nonlocal has_any, has_non_obscured
-        if has_non_obscured:
-            return
-        try:
-            needed = ["obscured"]
-            if filter_col:
-                needed.append(filter_col)
-            schema_names = set(_storage.read_schema(path).names)
-            cols = [c for c in needed if c in schema_names]
-            if "obscured" not in cols:
-                has_non_obscured = True
-                return
-            tbl = _storage.read_table(path, columns=cols)
-            df = tbl.to_pandas()
-            if filter_col and filter_col in df.columns:
-                df = df[df[filter_col].astype(str) == str(location_gid)]
-            if df.empty:
-                return
-            has_any = True
-            if (df["obscured"] == "No").any():
-                has_non_obscured = True
-        except Exception:
-            return
-
-    is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
-    if taxon["rank"] == _CONFIG.species_rank:
-        for desc in iter_descendants(taxon, include_self=True):
-            _scan(TREE_ROOT / desc["path"] / _OCC_FILE)
-    elif is_leaf:
-        _scan(TREE_ROOT / taxon["path"] / _OCC_FILE)
-    else:
-        for desc in iter_descendants(taxon, include_self=False):
-            _scan(TREE_ROOT / desc["path"] / _OCC_FILE)
-
-    return has_any and not has_non_obscured
+    needed = ["obscured"] + ([filter_col] if filter_col else [])
+    df = _read_occurrences_scoped(taxon, columns=needed)
+    if "obscured" not in df.columns:
+        return False
+    if filter_col and filter_col in df.columns:
+        df = df[df[filter_col].astype(str) == str(location_gid)]
+    if df.empty:
+        return False
+    return not (df["obscured"] == "No").any()
 
 
 @app.get("/api/species/{taxon_id}/obscured")
@@ -1075,34 +1073,8 @@ def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
 _GADM_LEVEL_COLS: dict[int, str] = {0: "level0Gid", 1: "level1Gid", 2: "level2Gid"}
 
 
-def _timestamp_range_from_metadata(path: Path) -> tuple[int, int] | None:
-    """Read min/max eventTimestamp from parquet footer stats — no row scan required."""
-    try:
-        meta = _storage.read_metadata(path)
-        if meta.num_row_groups == 0:
-            return None
-        col_idx = None
-        rg0 = meta.row_group(0)
-        for j in range(rg0.num_columns):
-            if rg0.column(j).path_in_schema == "eventTimestamp":
-                col_idx = j
-                break
-        if col_idx is None:
-            return None
-        ts_min: int | None = None
-        ts_max: int | None = None
-        for i in range(meta.num_row_groups):
-            stats = meta.row_group(i).column(col_idx).statistics
-            if stats and stats.has_statistics and stats.min is not None:
-                ts_min = stats.min if ts_min is None else min(ts_min, stats.min)
-                ts_max = stats.max if ts_max is None else max(ts_max, stats.max)
-        return (int(ts_min), int(ts_max)) if ts_min is not None and ts_max is not None else None
-    except Exception:
-        return None
-
-
 def _location_filter_col(gid: str) -> str | None:
-    """Return the occurrence.parquet column to use when filtering observations to gid."""
+    """Return the occurrences.parquet column to use when filtering observations to gid."""
     rec = _load_hierarchy().get(gid)
     if rec is not None:
         return _GADM_LEVEL_COLS.get(rec["level"])
@@ -1533,7 +1505,6 @@ def get_species_occurrences(
 
     _reject_if_large_taxon(taxon)
 
-    is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
     filter_col = _location_filter_col(location) if location is not None else None
     has_loc_or_pheno = filter_col is not None or phenology_norm is not None
     has_ts = start_ts is not None or end_ts is not None
@@ -1544,67 +1515,36 @@ def get_species_occurrences(
         extra_cols.append(filter_col)
     # Always read rcs so we can fall back to live phenology counts if precomputed is missing
     extra_cols.append("rcs")
-    # Need eventTimestamp in data when filtering by it, or when computing range
-    # from row-filtered data (loc/pheno active).
-    if has_ts or has_loc_or_pheno:
-        extra_cols.append("eventTimestamp")
+    extra_cols.append("eventTimestamp")
     occ_columns = list(_OCC_COLUMNS) + extra_cols
 
-    collected: list[dict] = []
-    seen: set[str] = set()
     ts_min: int | None = None
     ts_max: int | None = None
     pheno_acc: Counter = Counter()
 
-    def _read_occ(path: Path) -> None:
-        nonlocal ts_min, ts_max
-        # Fast path: parquet footer stats when no row-level filters change the range
-        if not has_loc_or_pheno:
-            result = _timestamp_range_from_metadata(path)
-            if result:
-                lo, hi = result
-                ts_min = lo if ts_min is None else min(ts_min, lo)
-                ts_max = hi if ts_max is None else max(ts_max, hi)
-        try:
-            schema_names = set(_storage.read_schema(path).names)
-            cols_to_read = [c for c in occ_columns if c in schema_names]
-            table = _storage.read_table(path, columns=cols_to_read)
-        except Exception:
-            return
-        if table.num_rows == 0:
-            return
-        df = _filter_occ_df(table.to_pandas())
-        if filter_col is not None:
+    df = _read_occurrences_scoped(taxon, columns=occ_columns)
+    if df.empty:
+        collected: list[dict] = []
+    else:
+        df = _filter_occ_df(df)
+        if filter_col is not None and filter_col in df.columns:
             df = df[df[filter_col].astype(str) == str(location)]
         if phenology_norm is not None:
             df = apply_phenology_filter(df, phenology_norm)
-        # Range from actual data when loc/pheno filters are active (before ts filter)
-        if has_loc_or_pheno and "eventTimestamp" in df.columns:
+        if "eventTimestamp" in df.columns:
             ts_col = pd.to_numeric(df["eventTimestamp"], errors="coerce").dropna()
             if len(ts_col):
-                lo, hi = int(ts_col.min()), int(ts_col.max())
-                ts_min = lo if ts_min is None else min(ts_min, lo)
-                ts_max = hi if ts_max is None else max(ts_max, hi)
+                ts_min, ts_max = int(ts_col.min()), int(ts_col.max())
         if has_ts:
             df = apply_timestamp_filter(df, start_ts, end_ts)
         if not use_precomputed_pheno and "rcs" in df.columns:
             pheno_acc.update(compute_phenology_counts(df))
         df = df[["catalogNumber", "decimalLatitude", "decimalLongitude"]].dropna()
-        for r in df.to_dict("records"):
-            cid = str(r["catalogNumber"])
-            if cid in seen:
-                continue
-            seen.add(cid)
-            collected.append({"catalogNumber": cid, "latitude": r["decimalLatitude"], "longitude": r["decimalLongitude"]})
-
-    if taxon["rank"] == _CONFIG.species_rank:
-        for desc in iter_descendants(taxon, include_self=True):
-            _read_occ(TREE_ROOT / desc["path"] / _OCC_FILE)
-    elif is_leaf:
-        _read_occ(TREE_ROOT / taxon["path"] / _OCC_FILE)
-    else:
-        for desc in iter_descendants(taxon, include_self=False):
-            _read_occ(TREE_ROOT / desc["path"] / _OCC_FILE)
+        df = df.drop_duplicates(subset="catalogNumber")
+        collected = [
+            {"catalogNumber": str(r["catalogNumber"]), "latitude": r["decimalLatitude"], "longitude": r["decimalLongitude"]}
+            for r in df.to_dict("records")
+        ]
 
     if use_precomputed_pheno:
         pheno_counts = read_phenology_counts(TREE_ROOT / taxon["path"]) or dict(
@@ -1775,37 +1715,19 @@ def get_observation_variable_values(
         raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
 
     collected: dict[str, float] = {}
-
-    def _read_occ(path: Path) -> None:
-        if not path.exists():
-            return
-        try:
-            import pyarrow.parquet as _pq
-            schema_names = set(_pq.read_schema(path).names)
-            extra = [c for c in ("obscured", "coordinateUncertaintyInMeters") if c in schema_names]
-            tbl = _pq.read_table(path, columns=["catalogNumber", variable_id] + extra).to_pandas()
-            if "obscured" in tbl.columns:
-                tbl = tbl[tbl["obscured"] == "No"]
-            if "coordinateUncertaintyInMeters" in tbl.columns:
-                col = tbl["coordinateUncertaintyInMeters"]
-                tbl = tbl[col.isna() | (col <= 500)]
-            for cat, val in zip(tbl["catalogNumber"].tolist(), tbl[variable_id].tolist()):
-                if cat not in collected and val is not None and not (isinstance(val, float) and math.isnan(val)):
-                    converted = units.convert_value(float(val), layer, unit_system)
-                    if converted is not None:
-                        collected[cat] = converted
-        except Exception:
-            pass
-
-    is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
-    if taxon["rank"] == _CONFIG.species_rank:
-        for desc in iter_descendants(taxon, include_self=True):
-            _read_occ(TREE_ROOT / desc["path"] / "occurrence.parquet")
-    elif is_leaf:
-        _read_occ(TREE_ROOT / taxon["path"] / "occurrence.parquet")
-    else:
-        for desc in iter_descendants(taxon, include_self=False):
-            _read_occ(TREE_ROOT / desc["path"] / "occurrence.parquet")
+    df = _read_occurrences_scoped(taxon, columns=["catalogNumber", variable_id, "obscured", "coordinateUncertaintyInMeters"])
+    if variable_id in df.columns:
+        if "obscured" in df.columns:
+            df = df[df["obscured"] == "No"]
+        if "coordinateUncertaintyInMeters" in df.columns:
+            col = df["coordinateUncertaintyInMeters"]
+            df = df[col.isna() | (col <= 500)]
+        for cat, val in zip(df["catalogNumber"].tolist(), df[variable_id].tolist()):
+            cat = str(cat)
+            if cat not in collected and val is not None and not (isinstance(val, float) and math.isnan(val)):
+                converted = units.convert_value(float(val), layer, unit_system)
+                if converted is not None:
+                    collected[cat] = converted
 
     vals = list(collected.values())
     obs_min = min(vals) if vals else None

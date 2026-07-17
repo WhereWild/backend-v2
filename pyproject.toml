@@ -23,6 +23,7 @@ dependencies = [
     "geopandas>=1.0.0",
     "pyogrio>=0.10.0",
     "matplotlib>=3.8.0",
+    "duckdb>=1.5.4",
 ]
 
 [tool.ruff]

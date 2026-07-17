@@ -26,6 +26,7 @@ import zipfile
 from collections import defaultdict
 from pathlib import Path
 
+import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -39,12 +40,10 @@ GIS_DIR = Path("data/gis")
 GADM_PATH = GIS_DIR / "gadm.gpkg"
 _GADM_ZIP = GIS_DIR / "gadm_410-gpkg.zip"
 LOCATIONS_DIR = Path("data/gis/locations")
-TREE_ROOT = Path("data/taxonomy/tree")
-OCCURRENCE_FILE = "occurrence.parquet"
+OCCURRENCES_FILE = Path("data/taxonomy/occurrences.parquet")
 
 _GBIF_COL = "gbifRegion"
 _GBIF_SCOPE = "gbif_region"
-_BATCH_SIZE = 10_000
 _LOG_INTERVAL = 100
 
 # GADM 4.1 truncates NAME_0/COUNTRY at 32 characters in the GeoPackage.
@@ -216,36 +215,37 @@ def _build_tables() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Location catalog (occurrence parquet → location_taxa.parquet)
+# Location catalog (occurrences.parquet → location_taxa.parquet)
 # ---------------------------------------------------------------------------
 
-def _iter_taxa_with_occurrences() -> list[tuple[str, Path]]:
-    result = []
-    for key, taxon in load_catalog().items():
-        occ_path = TREE_ROOT / taxon["path"] / OCCURRENCE_FILE
-        if occ_path.exists():
-            result.append((key, occ_path))
-    return result
+def _direct_gid_counts() -> dict[tuple[str, str, str], int]:
+    """(scope, gid, taxon_key) -> direct observation count.
 
-
-def _collect_gid_counts(parquet_path: Path) -> dict[str, dict[str, int]]:
+    One GROUP BY per location column against the consolidated occurrences
+    file, replacing what used to be a per-taxon-file scan + manual Python
+    counting loop.
+    """
+    if not OCCURRENCES_FILE.exists():
+        return {}
     col_defs: list[tuple[str, str]] = list(CONFIG.location_columns) + [
         (_GBIF_COL, _GBIF_SCOPE)
     ]
-    col_names = [col for col, _ in col_defs]
-    per_scope: dict[str, dict[str, int]] = {
-        scope: defaultdict(int) for _, scope in col_defs
-    }
-    pf = pq.ParquetFile(parquet_path)
-    for batch in pf.iter_batches(columns=col_names, batch_size=_BATCH_SIZE):
-        for idx, (_, scope) in enumerate(col_defs):
-            column = batch.column(idx)
-            if column.null_count == len(column):
-                continue
-            for val in column.to_pylist():
-                if val and isinstance(val, str):
-                    per_scope[scope][val] += 1
-    return {scope: dict(counts) for scope, counts in per_scope.items()}
+    counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    con = duckdb.connect()
+    try:
+        for col, scope in col_defs:
+            rows = con.execute(f"""
+                SELECT "taxon_key", "{col}" AS gid, COUNT(*) AS n
+                FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')
+                WHERE "{col}" IS NOT NULL
+                GROUP BY "taxon_key", "{col}"
+            """).fetchall()
+            for taxon_key, gid, n in rows:
+                if gid:
+                    counts[(scope, gid, taxon_key)] += n
+    finally:
+        con.close()
+    return counts
 
 
 def _build_parent_map() -> dict[str, str]:
@@ -274,17 +274,7 @@ def _build_catalog() -> None:
     out_path = LOCATIONS_DIR / "location_taxa.parquet"
     LOCATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-    counts: dict[tuple[str, str, str], int] = defaultdict(int)
-
-    taxa = _iter_taxa_with_occurrences()
-    for idx, (taxon_key, occ_path) in enumerate(taxa, start=1):
-        per_scope = _collect_gid_counts(occ_path)
-        for scope, gid_counts in per_scope.items():
-            for gid, count in gid_counts.items():
-                if count > 0:
-                    counts[(scope, gid, taxon_key)] += count
-        if idx % _LOG_INTERVAL == 0:
-            print(f"  Processed {idx}/{len(taxa)} taxa…")
+    counts = _direct_gid_counts()
 
     if not counts:
         print("No location mappings found (no occurrence data).")

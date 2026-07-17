@@ -18,7 +18,6 @@ import util.stats as st_module
 import util.taxa as taxa
 import util.tiles as tiles
 from main import app
-from util.indexing import build_leaf_index
 
 client = TestClient(app)
 
@@ -205,21 +204,6 @@ def test_query_taxa_ranked_scoped_no_index(tmp_path):
                        "&sort_variable=bio1&sort_metric=mean")
     assert r.status_code == 200
     assert r.json()["empty_reason"] == "no_column"
-
-
-def _write_occ_index(taxon_dir: Path, rows=None) -> None:
-    """Write a struct-format occurrence_index.parquet to taxon_dir."""
-    if rows is None:
-        rows = [
-            {"catalogNumber": "OCC001", "decimalLatitude": 40.5, "decimalLongitude": -75.0, "bio1": 10.0, "kg2": 1.0},
-            {"catalogNumber": "OCC002", "decimalLatitude": 41.0, "decimalLongitude": -74.5, "bio1": 20.0, "kg2": 2.0},
-            {"catalogNumber": "OCC003", "decimalLatitude": 42.0, "decimalLongitude": -73.0, "bio1": 30.0, "kg2": 1.0},
-        ]
-    df = pd.DataFrame(rows)
-    layer_meta = {c: {"id": c, "value_type": "nominal" if c == "kg2" else "interval"}
-                  for c in df.columns if c not in ("catalogNumber", "decimalLatitude", "decimalLongitude")}
-    taxon_dir.mkdir(parents=True, exist_ok=True)
-    build_leaf_index(taxon_dir, df, layer_meta, "test")
 
 
 def _build_index_parquet(ancestor_dir: Path, col_name: str, entries: list[dict]) -> None:
@@ -608,9 +592,7 @@ def _env_stats_read(path, **kw):
     }.get(Path(str(path)).name, pa.table({}))
 
 
-# ---------------------------------------------------------------------------
-# _load_relative_ranks
-# ---------------------------------------------------------------------------
+def test_load_legend_missing_returns_empty():
     main_module._load_legend.cache_clear()
     assert main_module._load_legend("no_such_layer_xyz") == []
 
@@ -1667,44 +1649,109 @@ def test_ranking_options_returns_options(tmp_path, monkeypatch):
 
 def test_lookup_index_value_missing_file(tmp_path):
     from main import _lookup_index_value
-    taxon = {**TAXON, "path": "no_such_path"}
-    with patch.object(main_module, "TREE_ROOT", tmp_path):
-        result = _lookup_index_value(taxon, "bio1", "12345")
+    with patch.object(main_module, "OCCURRENCES_FILE", tmp_path / "occurrences.parquet"):
+        result = _lookup_index_value(TAXON, "bio1", "12345")
     assert result is None
 
 
 def test_lookup_index_value_column_absent(tmp_path):
     from main import _lookup_index_value
-    taxon_dir = tmp_path / TAXON["path"]
-    taxon_dir.mkdir(parents=True)
-    pq.write_table(pa.table({"catalogNumber": pa.array(["12345"])}), taxon_dir / "occurrence_index.parquet")
-    with patch.object(main_module, "TREE_ROOT", tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    pq.write_table(pa.table({
+        "catalogNumber": pa.array(["12345"]),
+        "taxon_key": pa.array([TAXON["taxon_key"]]),
+    }), occ_path)
+    with patch.object(main_module, "OCCURRENCES_FILE", occ_path):
         result = _lookup_index_value(TAXON, "bio1", "12345")
     assert result is None
 
 
 def test_lookup_index_value_catalog_number_not_found(tmp_path):
     from main import _lookup_index_value
-    taxon_dir = tmp_path / TAXON["path"]
-    taxon_dir.mkdir(parents=True)
-    pq.write_table(
-        pa.table({"catalogNumber": pa.array(["99999"]), "bio1": pa.array([14.35])}),
-        taxon_dir / "occurrence_index.parquet",
-    )
-    with patch.object(main_module, "TREE_ROOT", tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    pq.write_table(pa.table({
+        "catalogNumber": pa.array(["99999"]),
+        "taxon_key": pa.array([TAXON["taxon_key"]]),
+        "bio1": pa.array([14.35]),
+    }), occ_path)
+    with patch.object(main_module, "OCCURRENCES_FILE", occ_path):
         result = _lookup_index_value(TAXON, "bio1", "12345")
     assert result is None
+
+
 def test_lookup_index_value_null_value_returns_none(tmp_path):
     from main import _lookup_index_value
-    taxon_dir = tmp_path / TAXON["path"]
-    taxon_dir.mkdir(parents=True)
-    pq.write_table(
-        pa.table({"catalogNumber": pa.array(["12345"]), "bio1": pa.array([None], type=pa.float64())}),
-        taxon_dir / "occurrence_index.parquet",
-    )
-    with patch.object(main_module, "TREE_ROOT", tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    pq.write_table(pa.table({
+        "catalogNumber": pa.array(["12345"]),
+        "taxon_key": pa.array([TAXON["taxon_key"]]),
+        "bio1": pa.array([None], type=pa.float64()),
+    }), occ_path)
+    with patch.object(main_module, "OCCURRENCES_FILE", occ_path):
         result = _lookup_index_value(TAXON, "bio1", "12345")
     assert result is None
+
+
+def test_lookup_index_value_found(tmp_path):
+    from main import _lookup_index_value
+    occ_path = tmp_path / "occurrences.parquet"
+    pq.write_table(pa.table({
+        "catalogNumber": pa.array(["12345"]),
+        "taxon_key": pa.array([TAXON["taxon_key"]]),
+        "bio1": pa.array([14.35]),
+    }), occ_path)
+    with patch.object(main_module, "OCCURRENCES_FILE", occ_path):
+        result = _lookup_index_value(TAXON, "bio1", "12345")
+    assert result == pytest.approx(14.35)
+
+
+def test_lookup_index_value_wrong_taxon_key_not_matched(tmp_path):
+    """A row with a matching catalogNumber but a different taxon_key isn't returned."""
+    from main import _lookup_index_value
+    occ_path = tmp_path / "occurrences.parquet"
+    pq.write_table(pa.table({
+        "catalogNumber": pa.array(["12345"]),
+        "taxon_key": pa.array(["999999"]),
+        "bio1": pa.array([14.35]),
+    }), occ_path)
+    with patch.object(main_module, "OCCURRENCES_FILE", occ_path):
+        result = _lookup_index_value(TAXON, "bio1", "12345")
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _load_relative_ranks
+# ---------------------------------------------------------------------------
+
+def test_load_relative_ranks_reads_consolidated_positions_file(tmp_path):
+    """One row per ancestor context for this taxon+variable, read straight
+    from the single global positions file (no per-ancestor directory walk)."""
+    from main import _load_relative_ranks
+    positions_path = tmp_path / main_module.POSITION_FILE
+    pq.write_table(pa.table({
+        "taxon_key": pa.array([TAXON["taxon_key"], TAXON["taxon_key"], "other"]),
+        "variable": pa.array(["bio1", "bio1", "bio1"]),
+        "metric": pa.array(["mean", "mean", "mean"]),
+        "position": pa.array([4, 19, 0], type=pa.int32()),
+        "count": pa.array([5, 40, 1], type=pa.int32()),
+        "sampleCount": pa.array([30, 30, 1], type=pa.int32()),
+        "contextTaxonId": pa.array(["genusX", "familyY", "genusX"]),
+        "contextLabel": pa.array(["Genus X", "Family Y", "Genus X"]),
+    }), positions_path)
+    with patch.object(main_module, "GLOBAL_STATS_DIR", tmp_path):
+        result = _load_relative_ranks(TAXON["taxon_key"], "bio1")
+    assert len(result) == 2
+    by_label = {r["context_label"]: r for r in result}
+    assert by_label["Genus X"]["position"] == 5
+    assert by_label["Genus X"]["percentile"] == pytest.approx(1.0)
+    assert by_label["Family Y"]["position"] == 20
+    assert by_label["Family Y"]["percentile"] == pytest.approx(0.5)
+
+
+def test_load_relative_ranks_missing_file_returns_empty(tmp_path):
+    from main import _load_relative_ranks
+    with patch.object(main_module, "GLOBAL_STATS_DIR", tmp_path):
+        assert _load_relative_ranks(TAXON["taxon_key"], "bio1") == []
 
 
 # ---------------------------------------------------------------------------

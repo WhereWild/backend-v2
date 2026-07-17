@@ -888,3 +888,124 @@ def test_query_catalog_taxon_none_skipped(tmp_path, monkeypatch):
             loc_keys=None, loc_counts={},
         )
     assert result["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# preload_stats_cache — reads the consolidated global stats files (not
+# per-taxon files) since scripts/process_tree.py::run_stats() now writes
+# stats straight into one sorted file per type.
+# ---------------------------------------------------------------------------
+
+def test_accumulate_numerical_or_circular_numerical(tmp_path):
+    path = tmp_path / "numerical_stats.parquet"
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "200"],
+        "variable": ["bio1", "bio1"],
+        "count": [10, 20],
+        "mean": [5.0, 7.5],
+    }), path)
+    raw: dict[str, dict] = {}
+    rk._accumulate_numerical_or_circular(
+        raw, path, "numerical", {"bio1"}, {"bio1": ("mean", "count")},
+    )
+    assert raw["100"]["bio1::mean"] == pytest.approx(5.0)
+    assert raw["100"]["__sample_count__"] == 10
+    assert raw["200"]["bio1::mean"] == pytest.approx(7.5)
+
+
+def test_accumulate_numerical_or_circular_ignores_unknown_variable(tmp_path):
+    path = tmp_path / "numerical_stats.parquet"
+    pq.write_table(pa.table({
+        "taxon_key": ["100"],
+        "variable": ["not_a_configured_layer"],
+        "count": [10],
+        "mean": [5.0],
+    }), path)
+    raw: dict[str, dict] = {}
+    rk._accumulate_numerical_or_circular(raw, path, "numerical", {"bio1"}, {"bio1": ("mean",)})
+    assert raw == {}
+
+
+def test_accumulate_numerical_or_circular_missing_file_is_noop(tmp_path):
+    raw: dict[str, dict] = {}
+    rk._accumulate_numerical_or_circular(raw, tmp_path / "nope.parquet", "numerical", {"bio1"}, {})
+    assert raw == {}
+
+
+def test_accumulate_numerical_or_circular_circular(tmp_path):
+    path = tmp_path / "circular_stats.parquet"
+    pq.write_table(pa.table({
+        "taxon_key": ["100"],
+        "variable": ["aspect_deg"],
+        "circular_mean": [180.0],
+        "rbar": [0.9],
+    }), path)
+    raw: dict[str, dict] = {}
+    rk._accumulate_numerical_or_circular(
+        raw, path, "circular", {"aspect_deg"}, None, circ_metrics=("circular_mean", "rbar"),
+    )
+    assert raw["100"]["aspect_deg::circular_mean"] == pytest.approx(180.0)
+    assert raw["100"]["aspect_deg::rbar"] == pytest.approx(0.9)
+
+
+def test_accumulate_tall_nominal(tmp_path):
+    path = tmp_path / "nominal_stats.parquet"
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "100"],
+        "variable": ["kg2", "kg2"],
+        "metric": ["total_samples", "class_1"],
+        "value": [50.0, 0.6],
+    }), path)
+    raw: dict[str, dict] = {}
+    rk._accumulate_tall(raw, path, {"kg2"}, {"total_samples"})
+    assert raw["100"]["__sample_count__"] == 50
+    assert raw["100"]["kg2::class_1"] == pytest.approx(0.6)
+
+
+def test_accumulate_tall_ignores_unknown_variable(tmp_path):
+    path = tmp_path / "nominal_stats.parquet"
+    pq.write_table(pa.table({
+        "taxon_key": ["100"],
+        "variable": ["not_configured"],
+        "metric": ["total_samples"],
+        "value": [50.0],
+    }), path)
+    raw: dict[str, dict] = {}
+    rk._accumulate_tall(raw, path, {"kg2"}, {"total_samples"})
+    assert raw == {}
+
+
+def test_preload_stats_cache_end_to_end(tmp_path, monkeypatch):
+    """Reads the four global stats files and builds the compact
+    (sample_count, float32 array) cache format."""
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    monkeypatch.setattr(rk, "_CACHE_FILE", tmp_path / "stats_cache.pkl.gz")
+    pq.write_table(pa.table({
+        "taxon_key": ["100"],
+        "variable": ["bio1"],
+        "count": [10],
+        "mean": [5.0],
+    }), tmp_path / rk.NUMERICAL_STATS_FILE)
+    pq.write_table(pa.table({
+        "taxon_key": ["100"],
+        "variable": ["kg2"],
+        "metric": ["class_1"],
+        "value": [0.6],
+    }), tmp_path / rk.NOMINAL_STATS_FILE)
+
+    rk.preload_stats_cache([_RATIO_LAYER, _NOMINAL_LAYER])
+
+    assert "100" in rk._stats_cache
+    sample_count, arr = rk._stats_cache["100"]
+    assert sample_count == 10
+    mean_idx = rk._metric_to_idx["bio1::mean"]
+    assert arr[mean_idx] == pytest.approx(5.0, abs=1e-4)
+    class_idx = rk._metric_to_idx["kg2::class_1"]
+    assert arr[class_idx] == pytest.approx(0.6, abs=1e-4)
+
+
+def test_preload_stats_cache_missing_files_yields_empty_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    monkeypatch.setattr(rk, "_CACHE_FILE", tmp_path / "stats_cache.pkl.gz")
+    rk.preload_stats_cache([_RATIO_LAYER])
+    assert rk._stats_cache == {}

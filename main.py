@@ -27,7 +27,7 @@ from starlette.concurrency import run_in_threadpool
 import util.rankings as rankings
 from config.config import load_config
 from util import citations, descriptions, gis, taxa, tiles, units, upload
-from util.rankings import TREE_ROOT as RANKINGS_TREE_ROOT
+from util.rankings import POSITION_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -894,56 +894,34 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
 # ---------------------------------------------------------------------------
 
 def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
-    """Read per-context {rank}_positions.parquet files for one taxon+variable."""
-    taxon = taxa.get_taxon_by_id(taxon_key)
-    if not taxon:
+    """Read this taxon's ranking positions (one row per ancestor context) from
+    the consolidated global positions file."""
+    positions_file = GLOBAL_STATS_DIR / POSITION_FILE
+    if not positions_file.exists():
         return []
-    path = taxon.get("path", "")
-    rank = (taxon.get("rank") or "").upper()
-    if not path or not rank:
+    try:
+        rows = _storage.read_table(
+            positions_file,
+            filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
+        ).to_pylist()
+    except Exception:
         return []
 
-    # Subspecies-equivalent taxa (SUBSPECIES/VARIETY/FORM) appear in two kinds of
-    # positions files, depending on the ancestor level:
-    #   - subspecies_positions.parquet at their parent SPECIES directory
-    #   - species_positions.parquet at GENUS/FAMILY/etc. directories (treated as species)
-    # Regular SPECIES appear only in species_positions.parquet at each ancestor.
-    # Higher taxa appear only in {rank.lower()}_positions.parquet.
-    if rank in _CONFIG.subspecies_equivalents:
-        candidate_files = {"subspecies_positions.parquet", "species_positions.parquet"}
-    else:
-        candidate_files = {f"{rank.lower()}_positions.parquet"}
-
-    parts = path.split("/")
     result = []
-    cumulative = ""
-    for i, part in enumerate(parts[:-1]):
-        cumulative = part if i == 0 else f"{cumulative}/{part}"
-        for filename in candidate_files:
-            positions_file = RANKINGS_TREE_ROOT / cumulative / filename
-            if not positions_file.exists():
-                continue
-            try:
-                rows = _storage.read_table(
-                    positions_file,
-                    filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
-                ).to_pylist()
-            except Exception:
-                continue
-            for row in rows:
-                position = row.get("position") or 0
-                count = row.get("count") or 0
-                # (position + 1) / count: rank n/n = 100th percentile
-                percentile = round((position + 1) / count, 3) if count > 0 else 0.0
-                result.append({
-                    "metric": row.get("metric"),
-                    "position": position + 1,
-                    "count": count,
-                    "percentile": percentile,
-                    "sampleCount": row.get("sampleCount"),
-                    "context_label": row.get("contextLabel"),
-                    "label": row.get("contextLabel"),
-                })
+    for row in rows:
+        position = row.get("position") or 0
+        count = row.get("count") or 0
+        # (position + 1) / count: rank n/n = 100th percentile
+        percentile = round((position + 1) / count, 3) if count > 0 else 0.0
+        result.append({
+            "metric": row.get("metric"),
+            "position": position + 1,
+            "count": count,
+            "percentile": percentile,
+            "sampleCount": row.get("sampleCount"),
+            "context_label": row.get("contextLabel"),
+            "label": row.get("contextLabel"),
+        })
     return result
 
 

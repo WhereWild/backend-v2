@@ -24,6 +24,7 @@ import os
 import pickle
 import random
 import re
+import threading
 from collections import Counter
 from pathlib import Path
 
@@ -71,6 +72,47 @@ _OCC_BASE_COLS: frozenset[str] = frozenset({
 })
 
 
+_conn_local = threading.local()
+
+
+def _get_connection() -> duckdb.DuckDBPyConnection:
+    """One DuckDB connection per thread, reused across calls.
+
+    compute_taxon_stats runs once per taxon (hundreds of thousands at full
+    scale) — opening a fresh connection every call was a real, measurable
+    per-call cost multiplied by every taxon in the tree. STATS_WORKERS=1
+    means this is single-threaded in the batch pipeline; in the live API
+    each request thread gets its own connection, so no locking is needed.
+    """
+    conn = getattr(_conn_local, "conn", None)
+    if conn is None:
+        conn = duckdb.connect()
+        _conn_local.conn = conn
+    return conn
+
+
+_schema_cache: dict[str, tuple[float, set[str]]] = {}
+
+
+def _occurrences_schema_names() -> set[str]:
+    """Column names in OCCURRENCES_FILE, cached and invalidated on mtime change.
+
+    _select_cols used to call pq.read_schema on every single call — another
+    per-taxon disk read multiplied across the whole tree.
+    """
+    try:
+        mtime = OCCURRENCES_FILE.stat().st_mtime
+    except OSError:
+        return set()
+    key = str(OCCURRENCES_FILE)
+    cached = _schema_cache.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    names = set(pq.read_schema(OCCURRENCES_FILE).names)
+    _schema_cache[key] = (mtime, names)
+    return names
+
+
 def _scope_taxon_keys(taxon: TaxonRecord, *, include_self: bool) -> list[str]:
     """taxon_keys of taxon's descendants (and optionally itself), from the in-memory catalog.
 
@@ -78,6 +120,13 @@ def _scope_taxon_keys(taxon: TaxonRecord, *, include_self: bool) -> list[str]:
     already lives once in the catalog, no reason to duplicate it onto every
     one of its rows — so subtree scoping is a membership check against this
     key set rather than a stored-path LIKE predicate.
+
+    This does a full catalog scan, so it's only appropriate for genuinely
+    broad/deep scopes (arbitrary non-leaf, non-species ranks via
+    collect_taxon_df). The species case has its own cheap path — see
+    _read_species_rows — since it's called once per species on every stats
+    run and a full-catalog scan there would be O(species count * catalog
+    size).
     """
     prefix = taxon["path"]
     catalog = load_catalog()
@@ -96,7 +145,7 @@ def _select_cols(columns: list[str] | None) -> str:
     necessarily has every optional base column populated yet."""
     if columns is None:
         return "*"
-    existing = set(pq.read_schema(OCCURRENCES_FILE).names)
+    existing = _occurrences_schema_names()
     present = [c for c in columns if c in existing]
     return ", ".join(f'"{c}"' for c in present)
 
@@ -106,14 +155,66 @@ def _read_own_rows(taxon_key: str, columns: list[str] | None = None) -> pa.Table
     if not OCCURRENCES_FILE.exists():
         return pa.table({})
     col_list = _select_cols(columns)
-    con = duckdb.connect()
-    try:
-        return con.execute(
-            f'SELECT {col_list} FROM read_parquet(\'{OCCURRENCES_FILE.as_posix()}\') WHERE "taxon_key" = ?',
-            [str(taxon_key)],
-        ).to_arrow_table()
-    finally:
-        con.close()
+    con = _get_connection()
+    return con.execute(
+        f'SELECT {col_list} FROM read_parquet(\'{OCCURRENCES_FILE.as_posix()}\') WHERE "taxon_key" = ?',
+        [str(taxon_key)],
+    ).to_arrow_table()
+
+
+def _read_rows_for_keys(keys: list[str], columns: list[str] | None = None) -> pa.Table:
+    col_list = _select_cols(columns)
+    con = _get_connection()
+    con.register("scope_keys", pa.table({"taxon_key": pa.array(keys, type=pa.string())}))
+    return con.execute(
+        f"SELECT {col_list} FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') "
+        'WHERE "taxon_key" IN (SELECT "taxon_key" FROM scope_keys)'
+    ).to_arrow_table()
+
+
+_children_index_cache: tuple[dict, dict[str, list[str]]] | None = None
+
+
+def _children_index(catalog: dict[str, TaxonRecord]) -> dict[str, list[str]]:
+    """taxon_key -> direct child taxon_keys, built from the locally-imported
+    (and test-patchable) load_catalog() reference.
+
+    util.taxa.get_children() builds this same index from util.taxa's own
+    module-level load_catalog(), which has its own independent lru_cache —
+    it doesn't see a test's (or a rebuild run's) patched/reloaded catalog
+    here. Rebuilding it locally, keyed by catalog object identity, keeps
+    this correct while staying O(catalog size) once per catalog rather than
+    O(species count * catalog size): the build only reruns when the catalog
+    object actually changes, and compute_taxon_stats runs against one
+    already-loaded catalog for the whole tree walk.
+    """
+    global _children_index_cache
+    if _children_index_cache is not None and _children_index_cache[0] is catalog:
+        return _children_index_cache[1]
+    path_to_key = {t["path"]: k for k, t in catalog.items()}
+    index: dict[str, list[str]] = {}
+    for key, t in catalog.items():
+        path = t["path"]
+        if "/" not in path:
+            continue
+        parent_key = path_to_key.get(path.rsplit("/", 1)[0])
+        if parent_key:
+            index.setdefault(parent_key, []).append(key)
+    _children_index_cache = (catalog, index)
+    return index
+
+
+def _read_species_rows(taxon: TaxonRecord, columns: list[str] | None = None) -> pa.Table:
+    """Species + direct subspecies-equivalent children — a small, shallow set
+    resolved via a locally-built children index (O(1) lookup after one O(catalog
+    size) build), not a full catalog scan. Called once per species on every
+    stats run, so this needs to stay cheap regardless of total catalog size."""
+    if not OCCURRENCES_FILE.exists():
+        return pa.table({})
+    catalog = load_catalog()
+    child_keys = _children_index(catalog).get(str(taxon["taxon_key"]), [])
+    keys = [str(taxon["taxon_key"]), *child_keys]
+    return _read_rows_for_keys(keys, columns=columns)
 
 
 def _read_subtree_rows(
@@ -125,16 +226,7 @@ def _read_subtree_rows(
     keys = _scope_taxon_keys(taxon, include_self=include_self)
     if not keys:
         return pa.table({})
-    col_list = _select_cols(columns)
-    con = duckdb.connect()
-    try:
-        con.register("scope_keys", pa.table({"taxon_key": pa.array(keys, type=pa.string())}))
-        return con.execute(
-            f"SELECT {col_list} FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') "
-            'WHERE "taxon_key" IN (SELECT "taxon_key" FROM scope_keys)'
-        ).to_arrow_table()
-    finally:
-        con.close()
+    return _read_rows_for_keys(keys, columns=columns)
 
 
 def _read_subtree_rows_via_storage(
@@ -576,7 +668,7 @@ def _load_acc(taxon_dir: Path) -> dict | None:
     }
 
 
-def _write_stats_from_acc(taxon_dir: Path, acc: dict, layer_meta: dict[str, dict]) -> None:
+def _write_stats_from_acc(target, taxon_key: str, acc: dict, layer_meta: dict[str, dict]) -> None:
     """Compute and write stats files from a merged accumulator."""
     numerical_stats: dict[str, dict] = {}
     circular_stats: dict[str, dict] = {}
@@ -684,12 +776,11 @@ def _write_stats_from_acc(taxon_dir: Path, acc: dict, layer_meta: dict[str, dict
         return
     pheno_acc = Counter(acc.get("pheno", {}))
     pheno_meta = {"phenology_counts": json.dumps(dict(pheno_acc))} if pheno_acc else None
-    taxon_dir.mkdir(parents=True, exist_ok=True)
-    _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats, pheno_meta)
-    _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
-    _write_nominal_stats(taxon_dir, nominal_entries)
-    _write_ordinal_stats(taxon_dir, ordinal_entries)
-    _write_density(taxon_dir, density_rows)
+    target.write_numerical(taxon_key, numerical_stats, pheno_meta)
+    target.write_circular(taxon_key, circular_stats)
+    target.write_nominal(taxon_key, nominal_entries)
+    target.write_ordinal(taxon_key, ordinal_entries)
+    target.write_density(taxon_key, density_rows)
 
 
 def _atomic_write(path: Path, table: pa.Table, custom_metadata: dict[str, str] | None = None) -> None:
@@ -1111,10 +1202,134 @@ def _write_density(directory: Path, rows: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stats output targets
+#
+# Two implementations of the same write_* interface, so the actual stats
+# computation (_process_leaf_df / _write_stats_from_acc) doesn't need to know
+# which one it's writing to:
+#   - _DirStatsTarget: one small file per stat type under a given directory —
+#     the upload pipeline's self-contained-archive behavior, unchanged.
+#   - StatsSink: the taxonomy tree pipeline's target — every taxon in a batch
+#     (one tree depth level) streams into shared per-type parquet chunks
+#     instead of writing its own per-taxon-directory files.
+# ---------------------------------------------------------------------------
+
+class _DirStatsTarget:
+    def __init__(self, directory: Path):
+        self.directory = directory
+
+    def write_numerical(self, taxon_key: str, stats: dict[str, dict], pheno_meta: dict | None = None) -> None:
+        if not stats:
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        _write_stats_frame(self.directory / NUMERICAL_STATS_FILE, stats, pheno_meta)
+
+    def write_circular(self, taxon_key: str, stats: dict[str, dict]) -> None:
+        if not stats:
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        _write_stats_frame(self.directory / CIRCULAR_STATS_FILE, stats)
+
+    def write_nominal(self, taxon_key: str, entries: list[dict]) -> None:
+        if not entries:
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        _write_nominal_stats(self.directory, entries)
+
+    def write_ordinal(self, taxon_key: str, entries: list[dict]) -> None:
+        if not entries:
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        _write_ordinal_stats(self.directory, entries)
+
+    def write_density(self, taxon_key: str, rows: list[dict]) -> None:
+        if not rows:
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        _write_density(self.directory, rows)
+
+
+class StatsSink:
+    """Buffers one tree-depth level's computed stats into shared per-type
+    staged parquet chunks (one streaming ParquetWriter per type, opened on
+    first write and closed when the level finishes), keyed by taxon_key —
+    replacing one-file-per-taxon-directory output. scripts/process_tree.py
+    creates one sink per level and sorts all levels' chunks into the final
+    global stats files once the whole stats pass completes.
+    """
+
+    def __init__(self, staging_dir: Path, level_id: str):
+        self._staging_dir = staging_dir
+        self._level_id = level_id
+        self._writers: dict[str, pq.ParquetWriter] = {}
+        self._lock = threading.Lock()
+
+    def _write(self, kind: str, table: pa.Table) -> None:
+        if table.num_rows == 0:
+            return
+        with self._lock:
+            writer = self._writers.get(kind)
+            if writer is None:
+                out_dir = self._staging_dir / kind
+                out_dir.mkdir(parents=True, exist_ok=True)
+                writer = pq.ParquetWriter(out_dir / f"{self._level_id}.parquet", table.schema)
+                self._writers[kind] = writer
+            writer.write_table(table)
+
+    def write_numerical(self, taxon_key: str, stats: dict[str, dict], pheno_meta: dict | None = None) -> None:
+        if stats:
+            frame = pd.DataFrame.from_dict(stats, orient="index")
+            frame.index.name = "variable"
+            frame = frame.reset_index()
+            frame.insert(0, "taxon_key", taxon_key)
+            self._write("numerical_stats", pa.Table.from_pandas(frame, preserve_index=False))
+        if pheno_meta:
+            counts = json.loads(pheno_meta["phenology_counts"])
+            if counts:
+                rows = [{"taxon_key": taxon_key, "phenology_value": k, "count": v} for k, v in counts.items()]
+                self._write("phenology_counts", pa.Table.from_pylist(rows))
+
+    def write_circular(self, taxon_key: str, stats: dict[str, dict]) -> None:
+        if not stats:
+            return
+        frame = pd.DataFrame.from_dict(stats, orient="index")
+        frame.index.name = "variable"
+        frame = frame.reset_index()
+        frame.insert(0, "taxon_key", taxon_key)
+        self._write("circular_stats", pa.Table.from_pandas(frame, preserve_index=False))
+
+    def write_nominal(self, taxon_key: str, entries: list[dict]) -> None:
+        if not entries:
+            return
+        frame = pd.DataFrame(entries)
+        frame.insert(0, "taxon_key", taxon_key)
+        self._write("nominal_stats", pa.Table.from_pandas(frame, preserve_index=False))
+
+    def write_ordinal(self, taxon_key: str, entries: list[dict]) -> None:
+        if not entries:
+            return
+        frame = pd.DataFrame(entries)
+        frame.insert(0, "taxon_key", taxon_key)
+        self._write("ordinal_stats", pa.Table.from_pandas(frame, preserve_index=False))
+
+    def write_density(self, taxon_key: str, rows: list[dict]) -> None:
+        if not rows:
+            return
+        stamped = [{**r, "taxon_key": taxon_key} for r in rows]
+        self._write("density", pa.Table.from_pylist(stamped))
+
+    def close(self) -> None:
+        with self._lock:
+            for w in self._writers.values():
+                w.close()
+            self._writers.clear()
+
+
+# ---------------------------------------------------------------------------
 # Leaf (exact) processing
 # ---------------------------------------------------------------------------
 
-def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:
+def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:
     """Compute exact stats from a pre-loaded, pre-filtered DataFrame and write all outputs."""
     gis_cols = [col for col in df.columns if col in layer_meta]
     if not gis_cols:
@@ -1245,12 +1460,11 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
 
     pheno_counts = compute_phenology_counts(df)
     pheno_meta = {"phenology_counts": json.dumps(dict(pheno_counts))} if pheno_counts else None
-    taxon_dir.mkdir(parents=True, exist_ok=True)
-    _write_stats_frame(taxon_dir / NUMERICAL_STATS_FILE, numerical_stats, pheno_meta)
-    _write_stats_frame(taxon_dir / CIRCULAR_STATS_FILE, circular_stats)
-    _write_nominal_stats(taxon_dir, nominal_entries)
-    _write_ordinal_stats(taxon_dir, ordinal_entries)
-    _write_density(taxon_dir, density_rows)
+    target.write_numerical(taxon_key, numerical_stats, pheno_meta)
+    target.write_circular(taxon_key, circular_stats)
+    target.write_nominal(taxon_key, nominal_entries)
+    target.write_ordinal(taxon_key, ordinal_entries)
+    target.write_density(taxon_key, density_rows)
 
 
 def process_observations_df(directory: Path, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:
@@ -1260,10 +1474,10 @@ def process_observations_df(directory: Path, df: pd.DataFrame, layer_meta: dict[
     normal per-taxon leaf processing but operates on a caller-supplied DataFrame
     rather than reading from a fixed occurrence.parquet path.
     """
-    _process_leaf_df(directory, df, layer_meta)
+    _process_leaf_df(_DirStatsTarget(directory), "", df, layer_meta)
 
 
-def _process_leaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
+def _process_leaf(taxon: TaxonRecord, target, layer_meta: dict[str, dict]) -> None:
     needed = list(_OCC_BASE_COLS | layer_meta.keys())
     table = _read_own_rows(taxon["taxon_key"], columns=needed)
     if table.num_rows == 0:
@@ -1271,7 +1485,7 @@ def _process_leaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dic
     df = _filter_df(table.to_pandas())
     if df.empty:
         return
-    _process_leaf_df(taxon_dir, df, layer_meta)
+    _process_leaf_df(target, taxon["taxon_key"], df, layer_meta)
 
 
 def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> pd.DataFrame | None:
@@ -1282,7 +1496,7 @@ def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[st
     catalogNumber appears at most once, so this is normally a no-op).
     """
     needed = list(_OCC_BASE_COLS | layer_meta.keys())
-    table = _read_subtree_rows(taxon, include_self=True, columns=needed)
+    table = _read_species_rows(taxon, columns=needed)
     if table.num_rows == 0:
         return None
     df = _filter_df(table.to_pandas())
@@ -1291,14 +1505,16 @@ def _collect_species_df(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[st
     return df.drop_duplicates(subset=["catalogNumber"])
 
 
-def _process_species(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
+def _process_species(taxon: TaxonRecord, taxon_dir: Path, target, layer_meta: dict[str, dict]) -> None:
     """Compute exact stats for a SPECIES, rolling in all subspecies observations."""
     df = _collect_species_df(taxon, taxon_dir, layer_meta)
     if df is None or df.empty:
         return
-    _process_leaf_df(taxon_dir, df, layer_meta)
+    _process_leaf_df(target, taxon["taxon_key"], df, layer_meta)
     # Save accumulator so genus (parent) can merge without re-reading parquets.
     # The acc includes all subspecies data (already combined by _collect_species_df).
+    # This stays a per-taxon-directory file — unlike the stats output above,
+    # a parent needs to fetch a *specific* child's accumulator, not a batch.
     taxon_dir.mkdir(parents=True, exist_ok=True)
     _save_acc(taxon_dir, _df_to_acc(df, layer_meta))
 
@@ -1319,7 +1535,8 @@ def collect_taxon_df(taxon: TaxonRecord, storage: ParquetStorage | None = None) 
     """
     rank = taxon["rank"]
     is_leaf = rank in CONFIG.subspecies_equivalents
-    include_self = is_leaf or rank == CONFIG.species_rank
+    is_species = rank == CONFIG.species_rank
+    include_self = is_leaf or is_species
 
     if storage is not None and storage.is_remote:
         table = _read_subtree_rows_via_storage(storage, taxon, include_self=include_self)
@@ -1328,6 +1545,8 @@ def collect_taxon_df(taxon: TaxonRecord, storage: ParquetStorage | None = None) 
     else:
         if is_leaf:
             table = _read_own_rows(taxon["taxon_key"])
+        elif is_species:
+            table = _read_species_rows(taxon)
         else:
             table = _read_subtree_rows(taxon, include_self=include_self)
         if table.num_rows == 0:
@@ -1440,7 +1659,7 @@ def compute_location_filtered_stats(
 # Non-leaf (streaming) processing
 # ---------------------------------------------------------------------------
 
-def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, dict]) -> None:
+def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, target, layer_meta: dict[str, dict]) -> None:
     child_accs: list[dict] = []
 
     # Include any direct observations on this taxon (e.g. genus-level GBIF records
@@ -1466,7 +1685,7 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
 
     taxon_dir.mkdir(parents=True, exist_ok=True)
     _save_acc(taxon_dir, acc)
-    _write_stats_from_acc(taxon_dir, acc, layer_meta)
+    _write_stats_from_acc(target, taxon["taxon_key"], acc, layer_meta)
 
 
 
@@ -1475,45 +1694,34 @@ def _process_nonleaf(taxon: TaxonRecord, taxon_dir: Path, layer_meta: dict[str, 
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def stats_complete(taxon: TaxonRecord) -> bool:
-    """True if stats for this taxon have already been written and can be skipped."""
-    taxon_dir = TREE_ROOT / taxon["path"]
-    if not (taxon_dir / NUMERICAL_STATS_FILE).exists():
-        return False
-    # Non-leaf taxa must also have their .acc file so the parent can merge it.
-    if taxon["rank"] not in CONFIG.subspecies_equivalents:
-        return (taxon_dir / _ACC_FILE).exists()
-    return True
-
-
 def compute_taxon_stats(
     taxon: TaxonRecord,
     layers: list[dict],
+    sink: StatsSink,
     layer_meta: dict[str, dict] | None = None,
-    resume: bool = False,
 ) -> None:
-    """Compute and write summary stats for one taxon node.
+    """Compute and write summary stats for one taxon node into the given sink.
 
-    SUBSPECIES/VARIETY/FORM use exact stats from their own occurrence file.
+    SUBSPECIES/VARIETY/FORM use exact stats from their own occurrence rows.
     SPECIES combine their own observations with any subspecies-equivalent descendants
     before computing exact stats (so a species always reflects all sub-rank obs).
-    Higher taxa stream all descendant parquets via T-Digest approximations.
-    Must be called in leaf-first (bottom-up) order so non-leaf index builds
-    can read from already-completed children's occurrence_index.parquet files.
+    Higher taxa merge descendants' accumulator state (T-Digest + reservoir) rather
+    than rescanning raw occurrences. Must be called in leaf-first (bottom-up) order
+    so a non-leaf taxon's merge can read its already-completed children's .acc files.
 
+    ``sink`` batches this call's output with every other taxon at the same tree
+    depth into shared per-level chunk files — see scripts/process_tree.py::run_stats.
     ``layer_meta`` may be pre-built and passed in to avoid rebuilding it for every taxon.
     """
     taxon_dir = TREE_ROOT / taxon["path"]
-    if resume and stats_complete(taxon):
-        return
     if layer_meta is None:
         layer_meta = {layer["id"]: layer for layer in layers}
     rank = taxon["rank"]
     if rank in CONFIG.subspecies_equivalents:
-        _process_leaf(taxon, taxon_dir, layer_meta)
+        _process_leaf(taxon, sink, layer_meta)
     elif rank == CONFIG.species_rank:
-        _process_species(taxon, taxon_dir, layer_meta)
+        _process_species(taxon, taxon_dir, sink, layer_meta)
     else:
-        _process_nonleaf(taxon, taxon_dir, layer_meta)
+        _process_nonleaf(taxon, taxon_dir, sink, layer_meta)
 
 

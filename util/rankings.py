@@ -30,7 +30,13 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from config.config import METRICS_BY_TYPE, ValueType, load_config
-from util.stats import CIRCULAR_STATS_FILE, NOMINAL_STATS_FILE, NUMERICAL_STATS_FILE, ORDINAL_STATS_FILE
+from util.stats import (
+    CIRCULAR_STATS_FILE,
+    GLOBAL_STATS_DIR,
+    NOMINAL_STATS_FILE,
+    NUMERICAL_STATS_FILE,
+    ORDINAL_STATS_FILE,
+)
 from util.storage import ParquetStorageProxy, atomic_write_parquet
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
 
@@ -150,42 +156,44 @@ def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
             return ()
 
 
-def _preload_one_taxon(
-    num_path: Path,
-    ratio_interval_ids: set[str],
-    circular_ids: set[str],
-    nominal_ids: set[str],
-    ordinal_ids: set[str],
-    layer_metrics: dict[str, tuple[str, ...]],
-    nominal_metrics: set[str],
-    ordinal_metrics: set[str],
-    circ_metrics: tuple[str, ...],
-) -> tuple[str, dict]:
-    taxon_key = num_path.parent.name.rsplit("_", 1)[-1]
-    entry: dict = {"__sample_count__": 0}
-    taxon_dir = num_path.parent
-
-    # numerical stats — wide format: one row per variable, metric columns
+def _accumulate_numerical_or_circular(
+    raw: dict[str, dict], path: Path, kind: str, ids: set[str], metrics_by_var: dict[str, tuple[str, ...]] | None,
+    circ_metrics: tuple[str, ...] = (),
+) -> None:
+    """Wide-format stats (one row per taxon_key+variable, metric columns) —
+    shared by numerical and circular stats, which have the same shape."""
+    if not path.exists():
+        return
     try:
-        tbl = pq.ParquetFile(num_path).read()
+        tbl = pq.read_table(path)
         col_names = set(tbl.schema.names)
+        if "taxon_key" not in col_names:
+            return
+        taxon_keys = tbl.column("taxon_key").to_pylist()
         variables = tbl.column("variable").to_pylist()
-        counts = tbl.column("count").to_pylist() if "count" in col_names else [None] * len(variables)
-        needed_metrics: set[str] = set()
-        for var in variables:
-            if var in ratio_interval_ids:
-                needed_metrics.update(layer_metrics.get(var, ()))
-        metric_cols = {m: tbl.column(m).to_pylist() for m in needed_metrics if m in col_names}
-        for i, variable in enumerate(variables):
-            if not variable or variable not in ratio_interval_ids:
+        if kind == "numerical":
+            counts = tbl.column("count").to_pylist() if "count" in col_names else [None] * len(variables)
+            needed_metrics: set[str] = set()
+            for var in set(variables):
+                if var in ids:
+                    needed_metrics.update((metrics_by_var or {}).get(var, ()))
+            metric_cols = {m: tbl.column(m).to_pylist() for m in needed_metrics if m in col_names}
+        else:
+            counts = None
+            metric_cols = {m: tbl.column(m).to_pylist() for m in circ_metrics if m in col_names}
+        for i, (taxon_key, variable) in enumerate(zip(taxon_keys, variables)):
+            if not variable or variable not in ids:
                 continue
-            cnt = counts[i]
-            if cnt and entry["__sample_count__"] == 0:
-                try:
-                    entry["__sample_count__"] = int(cnt)
-                except (TypeError, ValueError):
-                    pass
-            for metric in layer_metrics.get(variable, ()):
+            entry = raw.setdefault(taxon_key, {"__sample_count__": 0})
+            if counts is not None:
+                cnt = counts[i]
+                if cnt and entry["__sample_count__"] == 0:
+                    try:
+                        entry["__sample_count__"] = int(cnt)
+                    except (TypeError, ValueError):
+                        pass
+            row_metrics = (metrics_by_var or {}).get(variable, ()) if kind == "numerical" else circ_metrics
+            for metric in row_metrics:
                 col = metric_cols.get(metric)
                 if col is None:
                     continue
@@ -195,91 +203,50 @@ def _preload_one_taxon(
     except Exception:
         pass
 
-    # nominal stats — long format: columns variable, metric, value
-    nom_path = taxon_dir / NOMINAL_STATS_FILE
-    if nom_path.exists():
-        try:
-            tbl = pq.ParquetFile(nom_path).read()
-            nom_variables = tbl.column("variable").to_pylist()
-            nom_metrics_col = tbl.column("metric").to_pylist()
-            nom_values = tbl.column("value").to_pylist()
-            for variable, metric, val in zip(nom_variables, nom_metrics_col, nom_values):
-                variable = str(variable or "")
-                metric = str(metric or "")
-                if variable not in nominal_ids:
-                    continue
-                if metric not in nominal_metrics and not metric.startswith("class_"):
-                    continue
-                if entry["__sample_count__"] == 0 and metric == "total_samples":
-                    try:
-                        entry["__sample_count__"] = int(float(val or 0))
-                    except (TypeError, ValueError):
-                        pass
-                if _safe_finite(val):
-                    entry[f"{variable}::{metric}"] = float(val)
-        except Exception:
-            pass
 
-    # ordinal stats — tall format: same as nominal_stats
-    ord_path = taxon_dir / ORDINAL_STATS_FILE
-    if ord_path.exists():
-        try:
-            tbl = pq.ParquetFile(ord_path).read()
-            ord_variables = tbl.column("variable").to_pylist()
-            ord_metrics_col = tbl.column("metric").to_pylist()
-            ord_values = tbl.column("value").to_pylist()
-            for variable, metric, val in zip(ord_variables, ord_metrics_col, ord_values):
-                variable = str(variable or "")
-                metric = str(metric or "")
-                if variable not in ordinal_ids:
-                    continue
-                if metric not in ordinal_metrics and not metric.startswith("class_"):
-                    continue
-                if entry["__sample_count__"] == 0 and metric == "total_samples":
-                    try:
-                        entry["__sample_count__"] = int(float(val or 0))
-                    except (TypeError, ValueError):
-                        pass
-                if _safe_finite(val):
-                    entry[f"{variable}::{metric}"] = float(val)
-        except Exception:
-            pass
-
-    # circular stats — wide format: one row per variable, metric columns
-    circ_path = taxon_dir / CIRCULAR_STATS_FILE
-    if circ_path.exists():
-        try:
-            tbl = pq.ParquetFile(circ_path).read()
-            col_names = set(tbl.schema.names)
-            circ_variables = tbl.column("variable").to_pylist()
-            circ_metric_cols = {m: tbl.column(m).to_pylist() for m in circ_metrics if m in col_names}
-            for i, variable in enumerate(circ_variables):
-                if not variable or variable not in circular_ids:
-                    continue
-                for metric in circ_metrics:
-                    col = circ_metric_cols.get(metric)
-                    if col is None:
-                        continue
-                    val = col[i]
-                    if val is not None and _safe_finite(val):
-                        entry[f"{variable}::{metric}"] = float(val)
-        except Exception:
-            pass
-
-    return taxon_key, entry
+def _accumulate_tall(raw: dict[str, dict], path: Path, ids: set[str], metrics: set[str]) -> None:
+    """Tall-format stats (taxon_key, variable, metric, value rows) — shared
+    by nominal and ordinal stats, which have the same shape."""
+    if not path.exists():
+        return
+    try:
+        tbl = pq.read_table(path)
+        if "taxon_key" not in tbl.schema.names:
+            return
+        taxon_keys = tbl.column("taxon_key").to_pylist()
+        tall_variables = tbl.column("variable").to_pylist()
+        tall_metrics = tbl.column("metric").to_pylist()
+        tall_values = tbl.column("value").to_pylist()
+        for taxon_key, variable, metric, val in zip(taxon_keys, tall_variables, tall_metrics, tall_values):
+            variable = str(variable or "")
+            metric = str(metric or "")
+            if variable not in ids:
+                continue
+            if metric not in metrics and not metric.startswith("class_"):
+                continue
+            entry = raw.setdefault(taxon_key, {"__sample_count__": 0})
+            if entry["__sample_count__"] == 0 and metric == "total_samples":
+                try:
+                    entry["__sample_count__"] = int(float(val or 0))
+                except (TypeError, ValueError):
+                    pass
+            if _safe_finite(val):
+                entry[f"{variable}::{metric}"] = float(val)
+    except Exception:
+        pass
 
 
 def preload_stats_cache(layers: list[dict]) -> None:
-    """Walk all per-node stats files once and populate the module-level cache.
+    """Read the (already-consolidated) global stats files once and populate
+    the module-level cache.
 
     Call this before the rankings pass so every lookup is an O(1) dict access
-    instead of a disk read. Uses pyarrow column access directly (no pandas) and
-    a thread pool so pyarrow I/O can overlap across threads (GIL released during reads).
+    instead of a disk read. Since scripts/process_tree.py::run_stats() now
+    streams stats straight into one sorted global file per type instead of
+    thousands of per-taxon files, this is four bulk column reads instead of
+    a thread pool scanning one file per taxon.
     """
     import time as _time
-    from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
-    from concurrent.futures import as_completed as _as_completed
-    from functools import partial as _partial
 
     global _stats_cache
     _stats_cache = {}
@@ -304,18 +271,6 @@ def preload_stats_cache(layers: list[dict]) -> None:
             circular_ids.add(lid)
     circ_metrics = METRICS_BY_TYPE[ValueType.CIRCULAR]
 
-    worker = _partial(
-        _preload_one_taxon,
-        ratio_interval_ids=ratio_interval_ids,
-        circular_ids=circular_ids,
-        nominal_ids=nominal_ids,
-        ordinal_ids=ordinal_ids,
-        layer_metrics=layer_metrics,
-        nominal_metrics=nominal_metrics,
-        ordinal_metrics=ordinal_metrics,
-        circ_metrics=circ_metrics,
-    )
-
     import gzip as _gzip
     import pickle as _pickle
 
@@ -338,20 +293,18 @@ def preload_stats_cache(layers: list[dict]) -> None:
             _metric_vocab.clear()
             _metric_to_idx.clear()
 
-    all_paths = list(TREE_ROOT.rglob(NUMERICAL_STATS_FILE))
-    total_paths = len(all_paths)
     t0 = _time.monotonic()
-    # Phase 1: read all stats files in parallel, collect raw dicts
+    # Phase 1: read the four global stats files, collect raw per-taxon dicts
     raw: dict[str, dict] = {}
-    print(f"[rankings] preloading stats cache for {total_paths:,} taxa...")
-    with _ThreadPoolExecutor(max_workers=4) as executor:
-        futs = {executor.submit(worker, p): p for p in all_paths}
-        for fut in _as_completed(futs):
-            try:
-                taxon_key, entry = fut.result()
-                raw[taxon_key] = entry
-            except Exception:
-                pass
+    print("[rankings] preloading stats cache from global stats files...")
+    _accumulate_numerical_or_circular(
+        raw, GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE, "numerical", ratio_interval_ids, layer_metrics,
+    )
+    _accumulate_tall(raw, GLOBAL_STATS_DIR / NOMINAL_STATS_FILE, nominal_ids, nominal_metrics)
+    _accumulate_tall(raw, GLOBAL_STATS_DIR / ORDINAL_STATS_FILE, ordinal_ids, ordinal_metrics)
+    _accumulate_numerical_or_circular(
+        raw, GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE, "circular", circular_ids, None, circ_metrics=circ_metrics,
+    )
 
     # Phase 2: build global metric vocab and convert to numpy float32 arrays (~6x RAM reduction)
     all_keys: set[str] = set()

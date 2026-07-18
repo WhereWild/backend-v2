@@ -481,6 +481,7 @@ def list_variables(unit_system: str | None = Query(None), forecast_h: int = Quer
             "group": layer.get("group") or None,
             "group_label": layer.get("group_label") or None,
             "agg": layer.get("agg") or None,
+            "version": tiles.get_layer_version(layer, forecast_suffix),
         })
     return result
 
@@ -603,8 +604,12 @@ async def layer_tile(
         layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter,
     )
     is_temporal = layer.get("window_hours") is not None
-    cache_max_age = 300 if is_temporal else 604800
-    headers: dict[str, str] = {"Cache-Control": f"public, max-age={cache_max_age}"}
+    # URLs are versioned client-side with the layer's mtime-derived version token
+    # (see tiles.get_layer_version), so a given URL's content never changes —
+    # safe to cache aggressively; staleness is bounded by how promptly clients
+    # pick up a new version, not by this TTL.
+    cache_control = "public, max-age=86400" if is_temporal else "public, max-age=31536000, immutable"
+    headers: dict[str, str] = {"Cache-Control": cache_control}
     if str(layer.get("value_type") or "").lower() in ("nominal", "ordinal"):
         class_counts = await run_in_threadpool(tiles.nominal_tile_range_classes, layer_id, z, x, y, x, y)
         if class_counts:

@@ -443,12 +443,23 @@ def get_layer_version(layer: dict, forecast_suffix: str = "") -> int:
     indefinitely, since a new version only appears once the underlying file
     is actually rebuilt.
     """
-    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, _SOIL_TEXTURE_INPUT_FILES
+    from util.gis import _SOIL_TEXTURE_INPUT_FILES, DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL
 
     layer_id = layer["id"]
     if layer.get("window_hours") is not None:
-        npy_path = TEMPORAL_RASTERS_DIR / f"{layer['var_id']}_{layer['window_label']}{forecast_suffix}.npy"
-        return _mtime(npy_path)
+        m_var = re.fullmatch(r"[\w-]+", layer.get("var_id") or "")
+        m_win = re.fullmatch(r"[\w-]+", layer.get("window_label") or "")
+        m_sfx = re.fullmatch(r"(?:|__f\d{3}h)", forecast_suffix or "")
+        if not m_var or not m_win or not m_sfx:
+            return 0
+        base = str(TEMPORAL_RASTERS_DIR.resolve())
+        fullpath = os.path.normpath(os.path.join(
+            base,
+            f"{m_var.group()}_{m_win.group()}{m_sfx.group()}.npy",
+        ))
+        if not fullpath.startswith(base + os.sep):
+            return 0
+        return _mtime(Path(fullpath))
     if layer_id in DERIVED_FROM_ELEVATION:
         return _mtime(LAYERS_DIR / "elevation.tif")
     if layer_id in DERIVED_FROM_SOIL:

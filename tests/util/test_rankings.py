@@ -5,11 +5,8 @@
 """Tests for util/rankings.py."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from unittest.mock import patch
 
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -67,55 +64,38 @@ _SUBSPECIES_A: dict = {
     "rank": "SUBSPECIES",
 }
 
-
-def _write_numerical_stats(taxon_dir: Path, variable: str, **metrics) -> None:
-    """Write a minimal numerical_stats.parquet for one variable."""
-    taxon_dir.mkdir(parents=True, exist_ok=True)
-    row = {"variable": variable, **metrics}
-    pq.write_table(pa.Table.from_pandas(pd.DataFrame([row]), preserve_index=False),
-                   taxon_dir / rk.NUMERICAL_STATS_FILE)
-
-
-def _write_nominal_stats(taxon_dir: Path, variable: str, entries: list[tuple[str, float]]) -> None:
-    """Write a minimal nominal_stats.parquet for one variable."""
-    taxon_dir.mkdir(parents=True, exist_ok=True)
-    rows = [{"variable": variable, "metric": m, "value": v} for m, v in entries]
-    pq.write_table(pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False),
-                   taxon_dir / rk.NOMINAL_STATS_FILE)
+_FAMILY: dict = {
+    "taxon_key": "50",
+    "path": "Root_1/Order_10/Family_50",
+    "scientific_name": "Testaceae",
+    "common_name": "",
+    "rank": "FAMILY",
+}
 
 
-def _write_rank_index(
-    index_path: Path,
-    entries: dict[str, list[tuple[str, float, int]]],  # col_name → [(taxon_key, value, sample_count)]
-) -> None:
-    """Write a minimal rank index parquet with column_lengths metadata."""
-    struct_type = pa.struct([
-        pa.field("taxonKey", pa.string()),
-        pa.field("value", pa.float64()),
-        pa.field("sampleCount", pa.int64()),
-    ])
-    max_len = max(len(v) for v in entries.values())
-    arrays: dict[str, pa.Array] = {}
-    column_lengths: dict[str, int] = {}
-    for col_name, rows in entries.items():
-        column_lengths[col_name] = len(rows)
-        arr = pa.StructArray.from_arrays(
-            [
-                pa.array([r[0] for r in rows], type=pa.string()),
-                pa.array([r[1] for r in rows], type=pa.float64()),
-                pa.array([r[2] for r in rows], type=pa.int64()),
-            ],
-            fields=[pa.field("taxonKey", pa.string()),
-                    pa.field("value", pa.float64()),
-                    pa.field("sampleCount", pa.int64())],
-        )
-        if len(arr) < max_len:
-            arr = pa.concat_arrays([arr, pa.nulls(max_len - len(arr), type=struct_type)])
-        arrays[col_name] = arr
-    table = pa.table(arrays)
-    metadata = {b"column_lengths": json.dumps(column_lengths).encode("utf-8")}
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table.replace_schema_metadata(metadata), index_path)
+def _seed_stats_cache(monkeypatch, tmp_path, layers, *, numerical=None, nominal=None, circular=None):
+    """Populate rk._stats_cache (+ vocab) via the real preload_stats_cache(),
+    same global-stats-file format scripts/process_tree.py::run_stats() writes.
+    _write_rank_positions/build_rank_indexes/compute_relative_ranks always
+    require _stats_cache to be populated (no per-taxon-directory disk fallback
+    exists any more), so this is the standard setup for testing them."""
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    monkeypatch.setattr(rk, "_CACHE_FILE", tmp_path / "stats_cache.pkl.gz")
+    if numerical is not None:
+        pq.write_table(pa.Table.from_pylist(numerical), tmp_path / rk.NUMERICAL_STATS_FILE)
+    if nominal is not None:
+        pq.write_table(pa.Table.from_pylist(nominal), tmp_path / rk.NOMINAL_STATS_FILE)
+    if circular is not None:
+        pq.write_table(pa.Table.from_pylist(circular), tmp_path / rk.CIRCULAR_STATS_FILE)
+    rk.preload_stats_cache(layers)
+
+
+def _fake_rank_positions(table: dict[tuple[str, str, str, str], list[dict]]):
+    """side_effect for patching rk._read_rank_positions with canned rows,
+    keyed by (context_id, rank, variable, metric)."""
+    def _read(context_id, rank, variable, metric):
+        return table.get((context_id, rank, variable, metric), [])
+    return _read
 
 
 # ---------------------------------------------------------------------------
@@ -205,22 +185,6 @@ def test_resolve_context_label_falls_back_to_key():
 
 
 # ---------------------------------------------------------------------------
-# _infer_sample_count
-# ---------------------------------------------------------------------------
-
-def test_infer_sample_count_from_numerical_stats(tmp_path):
-    _write_numerical_stats(tmp_path, "bio1", count=42, mean=5.0)
-    assert rk._infer_sample_count(tmp_path) == 42
-
-
-def test_infer_sample_count_from_nominal_stats(tmp_path):
-    _write_nominal_stats(tmp_path, "kg2", [("total_samples", 17.0), ("entropy", 1.5)])
-    assert rk._infer_sample_count(tmp_path) == 17
-def test_infer_sample_count_no_files(tmp_path):
-    assert rk._infer_sample_count(tmp_path) == 0
-
-
-# ---------------------------------------------------------------------------
 # _descendants_for_rank
 # ---------------------------------------------------------------------------
 
@@ -241,257 +205,562 @@ def test_descendants_for_rank_species_combines_subspecies_for_genus(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# _collect_entries_from_numerical_stats
+# _batch_sample_counts
 # ---------------------------------------------------------------------------
 
-def test_collect_entries_numerical_stats_ratio(tmp_path):
-    _write_numerical_stats(tmp_path, "bio1", count=20, mean=5.0, median=4.5)
-    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 20, [_RATIO_LAYER])
-    assert "bio1::mean" in entries
-    assert entries["bio1::mean"]["value"] == pytest.approx(5.0)
-    assert entries["bio1::mean"]["taxon_key"] == "100"
-    assert entries["bio1::mean"]["sample_count"] == 20
+def test_batch_sample_counts_from_numerical(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "200"],
+        "count": [42, 0],
+    }), tmp_path / rk.NUMERICAL_STATS_FILE)
+    result = rk._batch_sample_counts(["100", "200"])
+    assert result == {"100": 42}  # 200's count of 0 isn't usable, falls to nominal fallback (no file → absent)
 
 
-def test_collect_entries_numerical_stats_skips_unknown_layer(tmp_path):
-    _write_numerical_stats(tmp_path, "bio1", count=5, mean=1.0)
-    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [_NOMINAL_LAYER])
-    assert len(entries) == 0
+def test_batch_sample_counts_falls_back_to_nominal_total_samples(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["200"],
+        "metric": ["total_samples"],
+        "value": [17.0],
+    }), tmp_path / rk.NOMINAL_STATS_FILE)
+    result = rk._batch_sample_counts(["200"])
+    assert result == {"200": 17}
 
 
-def test_collect_entries_numerical_stats_skips_circular(tmp_path):
-    _write_numerical_stats(tmp_path, "aspect_deg", count=5, mean=90.0)
-    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [_CIRCULAR_LAYER])
-    assert len(entries) == 0
+def test_batch_sample_counts_empty_input():
+    assert rk._batch_sample_counts([]) == {}
 
 
-def test_collect_entries_numerical_stats_no_file(tmp_path):
-    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 0, [_RATIO_LAYER])
-    assert entries == {}
+def test_batch_sample_counts_no_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    assert rk._batch_sample_counts(["100"]) == {}
 
 
 # ---------------------------------------------------------------------------
-# _collect_entries_from_nominal_stats
+# _batch_metric_values
 # ---------------------------------------------------------------------------
 
-def test_collect_entries_nominal_stats(tmp_path):
-    _write_nominal_stats(tmp_path, "kg2", [
-        ("entropy", 1.5),
-        ("unique_classes", 3.0),
-        ("total_samples", 20.0),
-        ("mode", 5.0),
-        ("unique_samples", 18.0),
+def test_batch_metric_values_from_numerical(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "200"],
+        "variable": ["bio1", "bio1"],
+        "mean": [5.0, 7.0],
+    }), tmp_path / rk.NUMERICAL_STATS_FILE)
+    values, rbars = rk._batch_metric_values(["100", "200"], "bio1", "mean")
+    assert values == {"100": pytest.approx(5.0), "200": pytest.approx(7.0)}
+    assert rbars == {}
+
+
+def test_batch_metric_values_nominal_class_implicit_zero(tmp_path, monkeypatch):
+    """A taxon with total_samples but no class_1 row gets an implicit 0.0."""
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "100", "200"],
+        "variable": ["kg2", "kg2", "kg2"],
+        "metric": ["class_1", "total_samples", "total_samples"],
+        "value": [0.6, 50.0, 30.0],
+    }), tmp_path / rk.NOMINAL_STATS_FILE)
+    values, _ = rk._batch_metric_values(["100", "200"], "kg2", "class_1")
+    assert values["100"] == pytest.approx(0.6)
+    assert values["200"] == pytest.approx(0.0)
+
+
+def test_batch_metric_values_nominal_no_total_samples_excluded(tmp_path, monkeypatch):
+    """A taxon with no class_1 row and no total_samples row has no data for
+    the variable at all — genuinely absent, not implicit zero."""
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100"],
+        "variable": ["kg2"],
+        "metric": ["class_1"],
+        "value": [0.6],
+    }), tmp_path / rk.NOMINAL_STATS_FILE)
+    values, _ = rk._batch_metric_values(["100", "999"], "kg2", "class_1")
+    assert "999" not in values
+
+
+def test_batch_metric_values_circular_with_rbar(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100"],
+        "variable": ["aspect_deg"],
+        "circular_mean": [180.0],
+        "rbar": [0.9],
+    }), tmp_path / rk.CIRCULAR_STATS_FILE)
+    values, rbars = rk._batch_metric_values(["100"], "aspect_deg", "circular_mean", need_rbar=True)
+    assert values["100"] == pytest.approx(180.0)
+    assert rbars["100"] == pytest.approx(0.9)
+
+
+def test_batch_metric_values_empty_input():
+    values, rbars = rk._batch_metric_values([], "bio1", "mean")
+    assert values == {}
+    assert rbars == {}
+
+
+def test_batch_metric_values_no_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    values, rbars = rk._batch_metric_values(["100"], "bio1", "mean")
+    assert values == {}
+    assert rbars == {}
+
+
+# ---------------------------------------------------------------------------
+# RankingsSink
+# ---------------------------------------------------------------------------
+
+def test_rankings_sink_writes_rows(tmp_path):
+    sink = rk.RankingsSink(tmp_path, "level_0001")
+    sink.write(pa.table({"taxon_key": ["100"], "value": [1.0]}))
+    sink.write(pa.table({"taxon_key": ["200"], "value": [2.0]}))
+    sink.close()
+    chunk = tmp_path / "level_0001.parquet"
+    assert chunk.exists()
+    df = pq.read_table(chunk).to_pandas()
+    assert set(df["taxon_key"]) == {"100", "200"}
+
+
+def test_rankings_sink_skips_empty_write(tmp_path):
+    sink = rk.RankingsSink(tmp_path, "level_0001")
+    sink.write(pa.table({"taxon_key": pa.array([], type=pa.string())}))
+    sink.close()
+    assert not (tmp_path / "level_0001.parquet").exists()
+
+
+# ---------------------------------------------------------------------------
+# _write_rank_positions / build_rank_indexes / compute_relative_ranks
+# ---------------------------------------------------------------------------
+
+def test_write_rank_positions_sorts_by_value(tmp_path, monkeypatch):
+    _seed_stats_cache(monkeypatch, tmp_path, [_RATIO_LAYER], numerical=[
+        {"taxon_key": "200", "variable": "bio1", "count": 10, "mean": 3.0},
+        {"taxon_key": "201", "variable": "bio1", "count": 10, "mean": 7.0},
     ])
-    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 20, [_NOMINAL_LAYER])
-    assert "kg2::entropy" in entries
-    assert entries["kg2::entropy"]["value"] == pytest.approx(1.5)
-    assert entries["kg2::entropy"]["taxon_key"] == "50"
-    assert "kg2::total_samples" in entries
-
-
-def test_collect_entries_nominal_stats_skips_non_nominal_layers(tmp_path):
-    _write_nominal_stats(tmp_path, "kg2", [("entropy", 1.5)])
-    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 10, [_RATIO_LAYER])
-    assert len(entries) == 0
-
-
-def test_collect_entries_nominal_stats_no_file(tmp_path):
-    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
-    assert entries == {}
-
-
-# ---------------------------------------------------------------------------
-# _build_rank_index
-# ---------------------------------------------------------------------------
-
-def test_build_rank_index_sorts_by_value(tmp_path, monkeypatch):
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    index_path = tmp_path / "species_index.parquet"
-
-    sp_a_dir = tmp_path / _SPECIES_A["path"]
-    sp_b_dir = tmp_path / _SPECIES_B["path"]
-    _write_numerical_stats(sp_a_dir, "bio1", count=10, mean=3.0)
-    _write_numerical_stats(sp_b_dir, "bio1", count=10, mean=7.0)
-
+    sink = rk.RankingsSink(tmp_path, "level_0000")
     with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A, _SPECIES_B]):
-        rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
+        rk._write_rank_positions(_GENUS, "SPECIES", [_RATIO_LAYER], sink)
+    sink.close()
+    df = pq.read_table(tmp_path / "level_0000.parquet").to_pandas()
+    row = df[(df["variable"] == "bio1") & (df["metric"] == "mean")].sort_values("position")
+    assert list(row["taxon_key"]) == ["200", "201"]  # A (3.0) before B (7.0)
+    assert row.iloc[0]["contextTaxonId"] == _GENUS["taxon_key"]
+    assert row.iloc[0]["rank"] == "SPECIES"
 
-    assert index_path.exists()
-    assert "bio1::mean" in pq.read_schema(index_path).names
-    tbl = pq.read_table(index_path)
-    col = tbl.column("bio1::mean").combine_chunks()
-    keys = [col[i].as_py()["taxonKey"] for i in range(2)]
-    assert keys == ["200", "201"]  # A (3.0) before B (7.0)
 
-
-def test_build_rank_index_no_descendants_removes_index(tmp_path, monkeypatch):
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    index_path = tmp_path / "i.parquet"
-    index_path.touch()
+def test_write_rank_positions_no_descendants_writes_nothing(tmp_path, monkeypatch):
+    _seed_stats_cache(monkeypatch, tmp_path, [_RATIO_LAYER])
+    sink = rk.RankingsSink(tmp_path, "level_0000")
     with patch("util.rankings._descendants_for_rank", return_value=[]):
-        rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
-    assert not index_path.exists()
+        rk._write_rank_positions(_GENUS, "SPECIES", [_RATIO_LAYER], sink)
+    sink.close()
+    assert not (tmp_path / "level_0000.parquet").exists()
 
 
-def test_build_rank_index_no_stats_removes_index(tmp_path, monkeypatch):
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    index_path = tmp_path / "i.parquet"
-    index_path.touch()
-    # SPECIES_A has no stats file → no entries → index removed
+def test_write_rank_positions_no_stats_cache_is_noop(tmp_path, monkeypatch):
+    """No _stats_cache populated (e.g. never called preload_stats_cache) →
+    no per-taxon-directory disk fallback exists any more, just a no-op."""
+    monkeypatch.setattr(rk, "_stats_cache", None)
+    sink = rk.RankingsSink(tmp_path, "level_0000")
     with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A]):
-        rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
-    assert not index_path.exists()
+        rk._write_rank_positions(_GENUS, "SPECIES", [_RATIO_LAYER], sink)
+    sink.close()
+    assert not (tmp_path / "level_0000.parquet").exists()
 
 
-def test_build_rank_index_stores_column_lengths_metadata(tmp_path, monkeypatch):
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    index_path = tmp_path / "si.parquet"
-    sp_dir = tmp_path / _SPECIES_A["path"]
-    _write_numerical_stats(sp_dir, "bio1", count=10, mean=1.0)
+def test_write_rank_positions_no_matching_stats_writes_nothing(tmp_path, monkeypatch):
+    """Descendant has no entry in _stats_cache → no rows produced."""
+    _seed_stats_cache(monkeypatch, tmp_path, [_RATIO_LAYER])
+    sink = rk.RankingsSink(tmp_path, "level_0000")
     with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A]):
-        rk._build_rank_index(_GENUS, "SPECIES", index_path, [_RATIO_LAYER])
-    lengths = rk._load_column_lengths(index_path)
-    assert "bio1::mean" in lengths
-    assert lengths["bio1::mean"] == 1
+        rk._write_rank_positions(_GENUS, "SPECIES", [_RATIO_LAYER], sink)
+    sink.close()
+    assert not (tmp_path / "level_0000.parquet").exists()
+
+
+def test_write_rank_positions_class_metric_offset_by_implicit_zeros(tmp_path, monkeypatch):
+    """A class_ metric's position is offset by the count of taxa with
+    total_samples but no real (nonzero) entry for that class."""
+    _seed_stats_cache(monkeypatch, tmp_path, [_NOMINAL_LAYER], nominal=[
+        {"taxon_key": "200", "variable": "kg2", "metric": "class_1", "value": 0.6},
+        {"taxon_key": "200", "variable": "kg2", "metric": "total_samples", "value": 50.0},
+        {"taxon_key": "201", "variable": "kg2", "metric": "total_samples", "value": 30.0},
+    ])
+    sink = rk.RankingsSink(tmp_path, "level_0000")
+    with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A, _SPECIES_B]):
+        rk._write_rank_positions(_GENUS, "SPECIES", [_NOMINAL_LAYER], sink)
+    sink.close()
+    df = pq.read_table(tmp_path / "level_0000.parquet").to_pandas()
+    row = df[(df["variable"] == "kg2") & (df["metric"] == "class_1")].iloc[0]
+    assert row["taxon_key"] == "200"
+    assert row["position"] == 1  # one implicit-zero taxon (201) occupies position 0
+    assert row["count"] == 2  # full population = total_samples population
+
+
+def test_build_rank_indexes_no_targets_writes_nothing(tmp_path, monkeypatch):
+    """SUBSPECIES has no ranks below it → returns immediately, nothing written."""
+    _seed_stats_cache(monkeypatch, tmp_path, [_RATIO_LAYER])
+    sink = rk.RankingsSink(tmp_path, "level_0000")
+    rk.build_rank_indexes(_SUBSPECIES_A, [_RATIO_LAYER], sink)
+    sink.close()
+    assert not (tmp_path / "level_0000.parquet").exists()
+
+
+def test_compute_relative_ranks_streams_into_sink(tmp_path, monkeypatch):
+    _seed_stats_cache(monkeypatch, tmp_path, [_RATIO_LAYER], numerical=[
+        {"taxon_key": "200", "variable": "bio1", "count": 10, "mean": 3.0},
+    ])
+    sink = rk.RankingsSink(tmp_path, "level_0000")
+    with patch("util.rankings._descendants_for_rank", return_value=[_SPECIES_A]):
+        rk.compute_relative_ranks(_GENUS, [_RATIO_LAYER], sink)
+    sink.close()
+    assert (tmp_path / "level_0000.parquet").exists()
 
 
 # ---------------------------------------------------------------------------
-# Coverage-gap tests
+# _read_rank_positions
 # ---------------------------------------------------------------------------
 
-_FAMILY: dict = {
-    "taxon_key": "50",
-    "path": "Root_1/Order_10/Family_50",
-    "scientific_name": "Testaceae",
-    "common_name": "",
-    "rank": "FAMILY",
-}
+def test_read_rank_positions_filters_correctly(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["200", "999"],
+        "variable": ["bio1", "bio1"],
+        "metric": ["mean", "mean"],
+        "value": [3.0, 9.0],
+        "position": pa.array([0, 0], type=pa.int32()),
+        "count": pa.array([1, 1], type=pa.int32()),
+        "sampleCount": pa.array([10, 10], type=pa.int32()),
+        "contextTaxonId": ["100", "other"],
+        "rank": ["SPECIES", "SPECIES"],
+        "contextLabel": ["Testus", "Other"],
+    }), tmp_path / rk.RANKINGS_FILE)
+    rows = rk._read_rank_positions("100", "SPECIES", "bio1", "mean")
+    assert len(rows) == 1
+    assert rows[0]["taxon_key"] == "200"
 
 
-# _atomic_write — finally cleanup on write failure (line 77)
-def test_atomic_write_cleanup_on_write_failure(tmp_path):
-    with patch("util.rankings.pq.write_table", side_effect=OSError("disk full")):
-        with pytest.raises(OSError, match="disk full"):
-            rk._atomic_write(tmp_path / "out.parquet", pa.table({"x": [1]}))
-    # no stray temp files remain
-    assert list(tmp_path.glob("*.parquet")) == []
+def test_read_rank_positions_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    assert rk._read_rank_positions("100", "SPECIES", "bio1", "mean") == []
 
 
-# _infer_sample_count — bad int in count column (inner except, lines 131-132)
-def test_infer_sample_count_bad_count_value(tmp_path):
-    # Write numerical_stats with count = "bad" (not castable to int)
-    pq.write_table(
-        pa.table({"variable": ["bio1"], "count": ["bad"]}),
-        tmp_path / rk.NUMERICAL_STATS_FILE,
-    )
-    # Falls through to 0 since none of the count values are usable
-    assert rk._infer_sample_count(tmp_path) == 0
+# ---------------------------------------------------------------------------
+# _accepted_ranks
+# ---------------------------------------------------------------------------
+
+def test_accepted_ranks_non_species():
+    assert rk._accepted_ranks("GENUS", False) is None
+    assert rk._accepted_ranks("FAMILY", True) is None
 
 
-# _infer_sample_count — pq.read_table raises (outer except, lines 133-134)
-def test_infer_sample_count_numerical_stats_read_fails(tmp_path):
-    # Write a parquet with no "count" column → read_table(columns=["count"]) raises
-    pq.write_table(pa.table({"variable": ["bio1"]}), tmp_path / rk.NUMERICAL_STATS_FILE)
-    assert rk._infer_sample_count(tmp_path) == 0
+def test_accepted_ranks_species_no_flag():
+    result = rk._accepted_ranks("SPECIES", False)
+    assert result == frozenset({"SPECIES"})
 
 
-# _infer_sample_count — corrupt nominal stats (lines 142-143)
-def test_infer_sample_count_corrupt_nominal_stats(tmp_path):
-    (tmp_path / rk.NOMINAL_STATS_FILE).write_bytes(b"not a parquet")
-    assert rk._infer_sample_count(tmp_path) == 0
+def test_accepted_ranks_species_with_flag():
+    result = rk._accepted_ranks("SPECIES", True)
+    assert "SPECIES" in result
+    assert "SUBSPECIES" in result
 
 
-# _infer_sample_count — corrupt occurrence index (lines 148-149)
-def test_infer_sample_count_corrupt_occurrence_index(tmp_path):
-    (tmp_path / "occurrence_index.parquet").write_bytes(b"not a parquet")
-    assert rk._infer_sample_count(tmp_path) == 0
+# ---------------------------------------------------------------------------
+# _query_ranked_scoped
+# ---------------------------------------------------------------------------
+
+def test_query_ranked_scoped_no_column():
+    """No rows for this (context, rank, variable, metric) → no_column."""
+    with patch("util.rankings._read_rank_positions", return_value=[]):
+        result = rk._query_ranked_scoped(
+            q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
+            sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["empty_reason"] == "no_column"
 
 
-# _collect_entries_from_numerical_stats — corrupt stats file (lines 223-224)
-def test_collect_entries_numerical_stats_corrupt_file(tmp_path):
-    (tmp_path / rk.NUMERICAL_STATS_FILE).write_bytes(b"garbage")
-    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 0, [_RATIO_LAYER])
-    assert entries == {}
+def test_query_ranked_scoped_taxon_none_in_accepted_ranks():
+    """Entries whose get_taxon_by_id returns None are skipped in accepted_ranks filter."""
+    fake = _fake_rank_positions({
+        ("100", "SPECIES", "bio1", "mean"): [
+            {"taxon_key": "200", "value": 10.0, "position": 0, "count": 2, "sampleCount": 100},
+            {"taxon_key": "999", "value": 20.0, "position": 1, "count": 2, "sampleCount": 50},
+        ],
+    })
+    with patch("util.rankings._read_rank_positions", side_effect=fake), \
+         patch("util.rankings.get_taxon_by_id", side_effect=lambda k: _SPECIES_A if k == "200" else None):
+        result = rk._query_ranked_scoped(
+            q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
+            sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert len(result["results"]) == 1
+    assert result["results"][0]["taxon"]["taxon_key"] == "200"
 
 
-# _collect_entries_from_numerical_stats — bad value_type in layer (lines 236-237)
-def test_collect_entries_numerical_stats_bad_vtype(tmp_path):
-    _write_numerical_stats(tmp_path, "bio1", count=5, mean=1.0)
-    bad_layer = {"id": "bio1", "value_type": "not_a_real_type"}
-    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [bad_layer])
-    assert entries == {}
+def test_query_ranked_scoped_taxon_none_in_results():
+    """get_taxon_by_id returning None during result building skips the entry."""
+    fake = _fake_rank_positions({
+        ("50", "GENUS", "bio1", "mean"): [
+            {"taxon_key": "100", "value": 10.0, "position": 0, "count": 2, "sampleCount": 100},
+            {"taxon_key": "999", "value": 20.0, "position": 1, "count": 2, "sampleCount": 50},
+        ],
+    })
+
+    def _resolve(k):
+        return _GENUS if k == "100" else None
+
+    with patch("util.rankings._read_rank_positions", side_effect=fake), \
+         patch("util.rankings.get_taxon_by_id", side_effect=_resolve):
+        result = rk._query_ranked_scoped(
+            q=None, within_taxon=_FAMILY, descendant_rank="GENUS",
+            sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    valid_ids = {r["taxon"]["taxon_key"] for r in result["results"]}
+    assert "100" in valid_ids
+    assert "999" not in valid_ids
 
 
-# _collect_entries_from_numerical_stats — non-castable float (lines 248-249)
-def test_collect_entries_numerical_stats_nonfloat_metric(tmp_path):
-    # Write stats where mean is a string that can't be cast to float
-    pq.write_table(
-        pa.table({"variable": ["bio1"], "count": [5], "mean": ["N/A"]}),
-        tmp_path / rk.NUMERICAL_STATS_FILE,
-    )
-    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [_RATIO_LAYER])
-    assert "bio1::mean" not in entries
+def test_query_ranked_scoped_class_metric_implicit_zero():
+    """class_ metric: implicit-zero taxa (present in total_samples but not
+    the class) are synthesized as zero-value entries."""
+    fake = _fake_rank_positions({
+        ("100", "SPECIES", "kg2", "class_1"): [
+            {"taxon_key": "200", "value": 0.6, "position": 1, "count": 2, "sampleCount": 50},
+        ],
+        ("100", "SPECIES", "kg2", "total_samples"): [
+            {"taxon_key": "200", "value": 50.0, "position": 0, "count": 2, "sampleCount": 50},
+            {"taxon_key": "201", "value": 30.0, "position": 0, "count": 2, "sampleCount": 30},
+        ],
+    })
+    with patch("util.rankings._read_rank_positions", side_effect=fake), \
+         patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {"200": _SPECIES_A, "201": _SPECIES_B}.get(k)):
+        result = rk._query_ranked_scoped(
+            q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
+            sort_variable="kg2", sort_metric="class_1", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
+    assert ids == ["201", "200"]  # 201 implicit-zero sorts before 200's 0.6
+    assert result["eligible_total"] == 2
 
 
-# _collect_entries_from_numerical_stats — non-finite metric value (line 251)
-def test_collect_entries_numerical_stats_nonfinite_metric(tmp_path):
-    _write_numerical_stats(tmp_path, "bio1", count=5, mean=float("inf"))
-    entries = rk._collect_entries_from_numerical_stats("100", tmp_path, 5, [_RATIO_LAYER])
-    assert "bio1::mean" not in entries
+# ---------------------------------------------------------------------------
+# _query_ranked_text
+# ---------------------------------------------------------------------------
+
+def test_query_ranked_text_loc_keys_filter():
+    """location filter in ranked-text mode skips taxa not in loc_keys."""
+    with patch("util.rankings._batch_metric_values", return_value=({"200": 5.0, "201": 5.0}, {})), \
+         patch("util.rankings._batch_sample_counts", return_value={"200": 100, "201": 100}), \
+         patch("util.rankings.search_taxa_by_name",
+               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]):
+        result = rk._query_ranked_text(
+            q="testus", sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=frozenset({"200"}), loc_counts={},
+        )
+    assert len(result["results"]) == 1
+    assert result["results"][0]["taxon"]["taxon_key"] == "200"
 
 
-# _collect_entries_from_nominal_stats — corrupt stats file (lines 272-273)
-def test_collect_entries_nominal_stats_corrupt_file(tmp_path):
-    (tmp_path / rk.NOMINAL_STATS_FILE).write_bytes(b"garbage")
-    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
-    assert entries == {}
+def test_query_ranked_text_no_metric_value():
+    """Candidates with no metric value are excluded."""
+    with patch("util.rankings._batch_metric_values", return_value=({}, {})), \
+         patch("util.rankings._batch_sample_counts", return_value={}), \
+         patch("util.rankings.search_taxa_by_name", return_value=[(_SPECIES_A, 90.0, "")]):
+        result = rk._query_ranked_text(
+            q="testus", sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["empty_reason"] == "no_results"
 
 
-# _collect_entries_from_nominal_stats — non-castable value (lines 287-288)
-def test_collect_entries_nominal_stats_bad_value(tmp_path):
-    pq.write_table(
-        pa.table({"variable": ["kg2"], "metric": ["entropy"], "value": ["bad"]}),
-        tmp_path / rk.NOMINAL_STATS_FILE,
-    )
-    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
-    assert entries == {}
+def test_query_ranked_text_min_samples_filter():
+    """Candidates with too few samples are excluded."""
+    with patch("util.rankings._batch_metric_values", return_value=({"200": 5.0}, {})), \
+         patch("util.rankings._batch_sample_counts", return_value={"200": 3}), \
+         patch("util.rankings.search_taxa_by_name", return_value=[(_SPECIES_A, 90.0, "")]):
+        result = rk._query_ranked_text(
+            q="testus", sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=10, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["empty_reason"] == "no_results"
 
 
-# _collect_entries_from_nominal_stats — non-finite value (line 290)
-def test_collect_entries_nominal_stats_nonfinite_value(tmp_path):
-    pq.write_table(
-        pa.table({"variable": ["kg2"], "metric": ["entropy"], "value": [float("inf")]}),
-        tmp_path / rk.NOMINAL_STATS_FILE,
-    )
-    entries = rk._collect_entries_from_nominal_stats("50", tmp_path, 0, [_NOMINAL_LAYER])
-    assert "kg2::entropy" not in entries
+def test_query_ranked_text_min_rbar_filter():
+    """Circular bearing sort with min_rbar excludes low-concentration taxa."""
+    with patch("util.rankings._batch_metric_values",
+               return_value=({"200": 90.0, "201": 90.0}, {"200": 0.8, "201": 0.1})), \
+         patch("util.rankings._batch_sample_counts", return_value={"200": 50, "201": 50}), \
+         patch("util.rankings.search_taxa_by_name",
+               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]):
+        result = rk._query_ranked_text(
+            q="testus", sort_variable="aspect_deg", sort_metric="circular_mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={}, reference_value=0.0, min_rbar=0.5,
+        )
+    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
+    assert ids == ["200"]
 
 
+# ---------------------------------------------------------------------------
+# _query_text
+# ---------------------------------------------------------------------------
 
-# build_rank_indexes — no-targets branch (line 378)
-def test_build_rank_indexes_no_targets(tmp_path, monkeypatch):
-    """SUBSPECIES has no ranks below it → returns immediately."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    rk.build_rank_indexes(_SUBSPECIES_A, [_RATIO_LAYER])
-    # Nothing created
-    assert not (tmp_path / _SUBSPECIES_A["path"]).exists()
-
-
-# _load_column_lengths — no metadata (line 399)
-def test_load_column_lengths_no_metadata(tmp_path):
-    idx_path = tmp_path / "idx.parquet"
-    pq.write_table(pa.table({"x": [1]}), idx_path)
-    assert rk._load_column_lengths(idx_path) == {}
-
-
-# _load_column_lengths — corrupt schema (lines 401-402)
-def test_load_column_lengths_corrupt_file(tmp_path):
-    idx_path = tmp_path / "idx.parquet"
-    idx_path.write_bytes(b"garbage")
-    assert rk._load_column_lengths(idx_path) == {}
+def test_query_text_loc_keys_filter():
+    """Location filter excludes candidates not in loc_keys."""
+    with patch("util.rankings._batch_sample_counts", return_value={"200": 50, "201": 50}), \
+         patch("util.rankings.search_taxa_by_name",
+               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]):
+        result = rk._query_text(
+            q="testus", within_taxon=None, descendant_rank=None,
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=frozenset({"201"}), loc_counts={},
+        )
+    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
+    assert "201" in ids
+    assert "200" not in ids
 
 
-# _load_existing_positions — corrupt file (lines 411-412)
+def test_query_text_accepted_ranks_filter():
+    """Rank filter excludes non-matching ranks."""
+    subsp = {**_SUBSPECIES_A, "rank": "SUBSPECIES"}
+    with patch("util.rankings._batch_sample_counts", return_value={"200": 50, "300": 50}), \
+         patch("util.rankings.search_taxa_by_name",
+               return_value=[(_SPECIES_A, 90.0, ""), (subsp, 85.0, "")]):
+        result = rk._query_text(
+            q="testus", within_taxon=None, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
+    assert "200" in ids
+    assert "300" not in ids
+
+
+def test_query_text_min_samples_filter():
+    """min_samples filter excludes candidates with too few samples."""
+    with patch("util.rankings._batch_sample_counts", return_value={"200": 2}), \
+         patch("util.rankings.search_taxa_by_name", return_value=[(_SPECIES_A, 90.0, "")]):
+        result = rk._query_text(
+            q="testus", within_taxon=None, descendant_rank=None,
+            limit=10, offset=0, min_samples=10, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["empty_reason"] == "no_results"
+
+
+def test_query_text_scope_filter():
+    """within_taxon + descendant_rank restricts candidates to the scope."""
+    with patch("util.rankings._batch_sample_counts", return_value={"200": 50, "201": 50}), \
+         patch("util.rankings.search_taxa_by_name",
+               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]), \
+         patch("util.rankings.iter_descendants", return_value=[_SPECIES_A]):
+        result = rk._query_text(
+            q="testus", within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
+    assert ids == ["200"]
+
+
+# ---------------------------------------------------------------------------
+# _load_scope_keys
+# ---------------------------------------------------------------------------
+
+def test_load_scope_keys_excludes_subspecies_by_default():
+    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SUBSPECIES_A]):
+        keys = rk._load_scope_keys(_GENUS, "SPECIES", False)
+    assert "200" in keys
+    assert "300" not in keys  # SUBSPECIES excluded when include_species_like=False
+
+
+def test_load_scope_keys_include_species_like():
+    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SUBSPECIES_A]):
+        keys = rk._load_scope_keys(_GENUS, "SPECIES", True)
+    assert "200" in keys
+    assert "300" in keys
+
+
+def test_load_scope_keys_non_species_rank():
+    family = {**_FAMILY}
+    with patch("util.rankings.iter_descendants", return_value=[_GENUS, _SPECIES_A]):
+        keys = rk._load_scope_keys(family, "GENUS", False)
+    assert keys == frozenset({"100"})
+
+
+# ---------------------------------------------------------------------------
+# _query_catalog
+# ---------------------------------------------------------------------------
+
+def test_query_catalog_no_scope_members():
+    with patch("util.rankings.iter_descendants", return_value=[]):
+        result = rk._query_catalog(
+            within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["empty_reason"] == "no_catalog"
+
+
+def test_query_catalog_taxon_none_skipped():
+    """Entries whose get_taxon_by_id returns None are skipped."""
+    unknown = {**_SPECIES_A, "taxon_key": "999"}
+    with patch("util.rankings.iter_descendants", return_value=[unknown]), \
+         patch("util.rankings._batch_sample_counts", return_value={"999": 50}), \
+         patch("util.rankings.get_taxon_by_id", return_value=None):
+        result = rk._query_catalog(
+            within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["total"] == 0
+
+
+def test_query_catalog_returns_scope_members_sorted():
+    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SPECIES_B]), \
+         patch("util.rankings._batch_sample_counts", return_value={"200": 10, "201": 20}), \
+         patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {"200": _SPECIES_A, "201": _SPECIES_B}.get(k)):
+        result = rk._query_catalog(
+            within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    assert result["total"] == 2
+    assert result["eligible_total"] == 2
+    ids = {r["taxon"]["taxon_key"] for r in result["results"]}
+    assert ids == {"200", "201"}
+
+
+def test_query_catalog_min_samples_filter():
+    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SPECIES_B]), \
+         patch("util.rankings._batch_sample_counts", return_value={"200": 2, "201": 20}), \
+         patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {"200": _SPECIES_A, "201": _SPECIES_B}.get(k)):
+        result = rk._query_catalog(
+            within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=10, include_species_like=False,
+            loc_keys=None, loc_counts={},
+        )
+    ids = {r["taxon"]["taxon_key"] for r in result["results"]}
+    assert ids == {"201"}
+
+
+# ---------------------------------------------------------------------------
+# _load_gid_levels / _gid_to_scope / _location_taxon_keys
+# ---------------------------------------------------------------------------
+
 def test_load_gid_levels_reads_csv(tmp_path, monkeypatch):
     csv_path = tmp_path / "hierarchy.csv"
     csv_path.write_text("level,gid,name,parent_gid\n0,USA,United States,\n1,USA.1,Alabama,USA\n")
@@ -567,243 +836,6 @@ def test_location_taxon_keys_bad_parquet(tmp_path, monkeypatch):
     rk._location_taxon_keys.cache_clear()
 
 
-def test_read_index_entries_bad_file(tmp_path):
-    bad = tmp_path / "bad.parquet"
-    bad.write_bytes(b"garbage")
-    assert rk._read_index_entries(bad, "bio1::mean", 5) == []
-
-
-def test_taxon_metric_value_from_numerical(tmp_path):
-    _write_numerical_stats(tmp_path, "bio1", mean=12.5, count=100)
-    result = rk._taxon_metric_value(tmp_path, "bio1", "mean")
-    assert result == pytest.approx(12.5)
-
-
-def test_taxon_metric_value_from_nominal(tmp_path):
-    _write_nominal_stats(tmp_path, "kg2", [("total_samples", 50.0), ("unique_classes", 3.0)])
-    result = rk._taxon_metric_value(tmp_path, "kg2", "total_samples")
-    assert result == pytest.approx(50.0)
-
-
-def test_taxon_metric_value_missing_variable(tmp_path):
-    _write_numerical_stats(tmp_path, "bio1", mean=5.0)
-    assert rk._taxon_metric_value(tmp_path, "bio99", "mean") is None
-
-
-def test_taxon_metric_value_no_files(tmp_path):
-    assert rk._taxon_metric_value(tmp_path, "bio1", "mean") is None
-
-
-def test_accepted_ranks_non_species():
-    assert rk._accepted_ranks("GENUS", False) is None
-    assert rk._accepted_ranks("FAMILY", True) is None
-
-
-def test_accepted_ranks_species_no_flag():
-    result = rk._accepted_ranks("SPECIES", False)
-    assert result == frozenset({"SPECIES"})
-
-
-def test_accepted_ranks_species_with_flag():
-    result = rk._accepted_ranks("SPECIES", True)
-    assert "SPECIES" in result
-    assert "SUBSPECIES" in result
-
-
-def test_query_ranked_scoped_no_column(tmp_path, monkeypatch):
-    """Index exists but requested column is absent → no_column."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    ancestor_dir = tmp_path / _GENUS["path"]
-    ancestor_dir.mkdir(parents=True)
-    # Write index with a different column
-    _write_rank_index(ancestor_dir / "species_index.parquet", {"other::mean": [("200", 1.0, 10)]})
-    result = rk._query_ranked_scoped(
-        q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
-        sort_variable="bio1", sort_metric="mean", sort_order="asc",
-        limit=10, offset=0, min_samples=0, include_species_like=False,
-        loc_keys=None, loc_counts={},
-    )
-    assert result["empty_reason"] == "no_column"
-
-
-def test_query_ranked_scoped_taxon_none_in_accepted_ranks(tmp_path, monkeypatch):
-    """Entries whose get_taxon_by_id returns None are skipped in accepted_ranks filter."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    ancestor_dir = tmp_path / _GENUS["path"]
-    ancestor_dir.mkdir(parents=True)
-    _write_rank_index(ancestor_dir / "species_index.parquet", {
-        "bio1::mean": [("200", 10.0, 100), ("999", 20.0, 50)]  # 999 is unknown
-    })
-    with patch("util.rankings.get_taxon_by_id", side_effect=lambda k: _SPECIES_A if k == "200" else None):
-        result = rk._query_ranked_scoped(
-            q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
-            sort_variable="bio1", sort_metric="mean", sort_order="asc",
-            limit=10, offset=0, min_samples=0, include_species_like=False,
-            loc_keys=None, loc_counts={},
-        )
-    assert len(result["results"]) == 1
-    assert result["results"][0]["taxon"]["taxon_key"] == "200"
-
-
-def test_query_ranked_scoped_taxon_none_in_results(tmp_path, monkeypatch):
-    """get_taxon_by_id returning None during result building skips the entry."""
-    family: dict = {
-        "taxon_key": "50", "path": "Root_1/Order_10/Family_50",
-        "scientific_name": "Testaceae", "common_name": "", "rank": "FAMILY",
-    }
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    ancestor_dir = tmp_path / family["path"]
-    ancestor_dir.mkdir(parents=True)
-    # Use genus_index.parquet (descendant_rank=GENUS has no accepted_ranks filter)
-    _write_rank_index(ancestor_dir / "genus_index.parquet", {
-        "bio1::mean": [("100", 10.0, 100), ("999", 20.0, 50)]
-    })
-
-    def _resolve(k):
-        return _GENUS if k == "100" else None
-
-    with patch("util.rankings.get_taxon_by_id", side_effect=_resolve):
-        result = rk._query_ranked_scoped(
-            q=None, within_taxon=family, descendant_rank="GENUS",
-            sort_variable="bio1", sort_metric="mean", sort_order="asc",
-            limit=10, offset=0, min_samples=0, include_species_like=False,
-            loc_keys=None, loc_counts={},
-        )
-    valid_ids = {r["taxon"]["taxon_key"] for r in result["results"]}
-    assert "100" in valid_ids
-    assert "999" not in valid_ids
-
-
-def test_query_ranked_text_loc_keys_filter(tmp_path, monkeypatch):
-    """location filter in ranked-text mode skips taxa not in loc_keys."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    (tmp_path / _SPECIES_A["path"]).mkdir(parents=True)
-    (tmp_path / _SPECIES_B["path"]).mkdir(parents=True)
-
-    with patch("util.rankings._taxon_metric_value", return_value=5.0), \
-         patch("util.rankings._infer_sample_count", return_value=100), \
-         patch("util.rankings.search_taxa_by_name",
-               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]):
-        result = rk._query_ranked_text(
-            q="testus", sort_variable="bio1", sort_metric="mean", sort_order="asc",
-            limit=10, offset=0, min_samples=0, include_species_like=False,
-            loc_keys=frozenset({"200"}), loc_counts={},
-        )
-    assert len(result["results"]) == 1
-    assert result["results"][0]["taxon"]["taxon_key"] == "200"
-
-
-def test_query_ranked_text_no_metric_value(tmp_path, monkeypatch):
-    """Candidates with no metric value are excluded."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    with patch("util.rankings._taxon_metric_value", return_value=None), \
-         patch("util.rankings.search_taxa_by_name", return_value=[(_SPECIES_A, 90.0, "")]):
-        result = rk._query_ranked_text(
-            q="testus", sort_variable="bio1", sort_metric="mean", sort_order="asc",
-            limit=10, offset=0, min_samples=0, include_species_like=False,
-            loc_keys=None, loc_counts={},
-        )
-    assert result["empty_reason"] == "no_results"
-
-
-def test_query_ranked_text_min_samples_filter(tmp_path, monkeypatch):
-    """Candidates with too few samples are excluded."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    with patch("util.rankings._taxon_metric_value", return_value=5.0), \
-         patch("util.rankings._infer_sample_count", return_value=3), \
-         patch("util.rankings.search_taxa_by_name", return_value=[(_SPECIES_A, 90.0, "")]):
-        result = rk._query_ranked_text(
-            q="testus", sort_variable="bio1", sort_metric="mean", sort_order="asc",
-            limit=10, offset=0, min_samples=10, include_species_like=False,
-            loc_keys=None, loc_counts={},
-        )
-    assert result["empty_reason"] == "no_results"
-
-
-
-def test_query_text_loc_keys_filter(tmp_path, monkeypatch):
-    """Location filter excludes candidates not in loc_keys."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    with patch("util.rankings._infer_sample_count", return_value=50), \
-         patch("util.rankings.search_taxa_by_name",
-               return_value=[(_SPECIES_A, 90.0, ""), (_SPECIES_B, 80.0, "")]):
-        result = rk._query_text(
-            q="testus", within_taxon=None, descendant_rank=None,
-            limit=10, offset=0, min_samples=0, include_species_like=False,
-            loc_keys=frozenset({"201"}), loc_counts={},
-        )
-    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
-    assert "201" in ids
-    assert "200" not in ids
-
-
-def test_query_text_accepted_ranks_filter(tmp_path, monkeypatch):
-    """Rank filter excludes non-matching ranks."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    subsp = {**_SUBSPECIES_A, "rank": "SUBSPECIES"}
-    with patch("util.rankings._infer_sample_count", return_value=50), \
-         patch("util.rankings.search_taxa_by_name",
-               return_value=[(_SPECIES_A, 90.0, ""), (subsp, 85.0, "")]):
-        result = rk._query_text(
-            q="testus", within_taxon=None, descendant_rank="SPECIES",
-            limit=10, offset=0, min_samples=0, include_species_like=False,
-            loc_keys=None, loc_counts={},
-        )
-    ids = [r["taxon"]["taxon_key"] for r in result["results"]]
-    assert "200" in ids
-    assert "300" not in ids
-
-
-def test_query_text_min_samples_filter(tmp_path, monkeypatch):
-    """min_samples filter excludes candidates with too few samples."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    with patch("util.rankings._infer_sample_count", return_value=2), \
-         patch("util.rankings.search_taxa_by_name", return_value=[(_SPECIES_A, 90.0, "")]):
-        result = rk._query_text(
-            q="testus", within_taxon=None, descendant_rank=None,
-            limit=10, offset=0, min_samples=10, include_species_like=False,
-            loc_keys=None, loc_counts={},
-        )
-    assert result["empty_reason"] == "no_results"
-
-
-def test_load_scope_keys_dfs_fallback(tmp_path, monkeypatch):
-    """Falls back to DFS iteration when catalog parquet is absent."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    (tmp_path / _GENUS["path"]).mkdir(parents=True)
-    with patch("util.rankings.iter_descendants",
-               return_value=[_SPECIES_A, _SUBSPECIES_A]):
-        keys = rk._load_scope_keys(_GENUS, "SPECIES", False)
-    assert "200" in keys
-    assert "300" not in keys  # SUBSPECIES excluded when include_species_like=False
-
-
-def test_load_scope_keys_dfs_fallback_include_species_like(tmp_path, monkeypatch):
-    """DFS fallback with include_species_like includes subspecies equivalents."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    (tmp_path / _GENUS["path"]).mkdir(parents=True)
-    with patch("util.rankings.iter_descendants",
-               return_value=[_SPECIES_A, _SUBSPECIES_A]):
-        keys = rk._load_scope_keys(_GENUS, "SPECIES", True)
-    assert "200" in keys
-    assert "300" in keys
-
-
-def test_query_catalog_corrupt_parquet(tmp_path, monkeypatch):
-    """Corrupt catalog parquet returns no_catalog."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_dir = tmp_path / _GENUS["path"]
-    catalog_dir.mkdir(parents=True)
-    (catalog_dir / "species.parquet").write_bytes(b"garbage")
-    result = rk._query_catalog(
-        within_taxon=_GENUS, descendant_rank="SPECIES",
-        limit=10, offset=0, min_samples=0, include_species_like=False,
-        loc_keys=None, loc_counts={},
-    )
-    assert result["empty_reason"] == "no_catalog"
-
-
-
 def test_load_gid_levels_bad_level_value(tmp_path, monkeypatch):
     """Rows with non-integer level values are skipped."""
     csv_path = tmp_path / "hierarchy.csv"
@@ -814,80 +846,6 @@ def test_load_gid_levels_bad_level_value(tmp_path, monkeypatch):
     assert "USA" not in levels  # bad level skipped
     assert levels["USA.1"] == 1
     rk._load_gid_levels.cache_clear()
-
-
-def test_taxon_metric_value_corrupt_numerical_stats(tmp_path):
-    """Corrupt numerical stats parquet falls through to nominal stats check."""
-    from util.stats import NUMERICAL_STATS_FILE
-    (tmp_path / NUMERICAL_STATS_FILE).write_bytes(b"garbage")
-    _write_nominal_stats(tmp_path, "kg2", [("total_samples", 25.0)])
-    result = rk._taxon_metric_value(tmp_path, "kg2", "total_samples")
-    assert result == pytest.approx(25.0)
-
-
-def test_taxon_metric_value_corrupt_nominal_stats(tmp_path):
-    """Corrupt nominal stats parquet returns None."""
-    from util.stats import NOMINAL_STATS_FILE
-    (tmp_path / NOMINAL_STATS_FILE).write_bytes(b"garbage")
-    assert rk._taxon_metric_value(tmp_path, "kg2", "total_samples") is None
-
-
-def test_query_ranked_scoped_all_null_entries(tmp_path, monkeypatch):
-    """Index column where all entries are null → no_column."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    ancestor_dir = tmp_path / _GENUS["path"]
-    ancestor_dir.mkdir(parents=True)
-    # Write an index with a null-only column
-    struct_type = pa.struct([
-        pa.field("taxonKey", pa.string()),
-        pa.field("value", pa.float64()),
-        pa.field("sampleCount", pa.int64()),
-    ])
-    null_arr = pa.nulls(2, type=struct_type)
-    import json
-    table = pa.table({"bio1::mean": null_arr}).replace_schema_metadata(
-        {b"column_lengths": json.dumps({"bio1::mean": 2}).encode()}
-    )
-    pq.write_table(table, ancestor_dir / "species_index.parquet")
-    result = rk._query_ranked_scoped(
-        q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
-        sort_variable="bio1", sort_metric="mean", sort_order="asc",
-        limit=10, offset=0, min_samples=0, include_species_like=False,
-        loc_keys=None, loc_counts={},
-    )
-    assert result["empty_reason"] == "no_column"
-
-
-def test_load_scope_keys_corrupt_catalog(tmp_path, monkeypatch):
-    """Corrupt catalog parquet in _load_scope_keys falls through to DFS."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_dir = tmp_path / _GENUS["path"]
-    catalog_dir.mkdir(parents=True)
-    (catalog_dir / "species.parquet").write_bytes(b"garbage")
-    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A]):
-        keys = rk._load_scope_keys(_GENUS, "SPECIES", False)
-    assert "200" in keys
-
-
-def test_query_catalog_taxon_none_skipped(tmp_path, monkeypatch):
-    """Entries whose get_taxon_by_id returns None are skipped."""
-    monkeypatch.setattr(rk, "TREE_ROOT", tmp_path)
-    catalog_dir = tmp_path / _GENUS["path"]
-    catalog_dir.mkdir(parents=True)
-    pq.write_table(
-        pa.Table.from_pylist([
-            {"taxon_key": "999", "path": "x/999", "scientific_name": "",
-             "common_name": "", "rank": "SPECIES", "sample_count": 50},
-        ]),
-        catalog_dir / "species.parquet",
-    )
-    with patch("util.rankings.get_taxon_by_id", return_value=None):
-        result = rk._query_catalog(
-            within_taxon=_GENUS, descendant_rank="SPECIES",
-            limit=10, offset=0, min_samples=0, include_species_like=False,
-            loc_keys=None, loc_counts={},
-        )
-    assert result["total"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1009,3 +967,191 @@ def test_preload_stats_cache_missing_files_yields_empty_cache(tmp_path, monkeypa
     monkeypatch.setattr(rk, "_CACHE_FILE", tmp_path / "stats_cache.pkl.gz")
     rk.preload_stats_cache([_RATIO_LAYER])
     assert rk._stats_cache == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_stat_filter
+# ---------------------------------------------------------------------------
+
+def test_parse_stat_filter_basic():
+    f = rk.parse_stat_filter("bio1:mean:gte:10")
+    assert f == rk.StatFilter(variable="bio1", metric="mean", op="gte", value=10.0, as_count=False)
+
+
+def test_parse_stat_filter_count_modifier():
+    f = rk.parse_stat_filter("ecoregions:class_356:gte:10:count")
+    assert f.as_count is True
+    assert f.value == pytest.approx(10.0)
+
+
+def test_parse_stat_filter_bad_operator():
+    with pytest.raises(ValueError, match="unknown filter operator"):
+        rk.parse_stat_filter("bio1:mean:xyz:10")
+
+
+def test_parse_stat_filter_bad_value():
+    with pytest.raises(ValueError, match="non-numeric"):
+        rk.parse_stat_filter("bio1:mean:gte:abc")
+
+
+def test_parse_stat_filter_wrong_part_count():
+    with pytest.raises(ValueError, match="malformed filter"):
+        rk.parse_stat_filter("bio1:mean:gte")
+
+
+def test_parse_stat_filter_unknown_modifier():
+    with pytest.raises(ValueError, match="unknown filter modifier"):
+        rk.parse_stat_filter("bio1:mean:gte:10:bogus")
+
+
+# ---------------------------------------------------------------------------
+# _filter_wide / _filter_tall / _apply_stat_filters
+# ---------------------------------------------------------------------------
+
+def test_filter_wide_numerical(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "200", "300"],
+        "variable": ["bio1", "bio1", "bio1"],
+        "mean": [5.0, 15.0, 25.0],
+    }), tmp_path / rk.NUMERICAL_STATS_FILE)
+    f = rk.StatFilter(variable="bio1", metric="mean", op="lt", value=20.0)
+    result = rk._filter_wide(tmp_path / rk.NUMERICAL_STATS_FILE, frozenset({"100", "200", "300"}), f)
+    assert result == frozenset({"100", "200"})
+
+
+def test_filter_wide_missing_file(tmp_path):
+    f = rk.StatFilter(variable="bio1", metric="mean", op="lt", value=20.0)
+    assert rk._filter_wide(tmp_path / "nope.parquet", frozenset({"100"}), f) == frozenset()
+
+
+def test_filter_wide_empty_keys(tmp_path):
+    f = rk.StatFilter(variable="bio1", metric="mean", op="lt", value=20.0)
+    assert rk._filter_wide(tmp_path / "nope.parquet", frozenset(), f) == frozenset()
+
+
+def test_filter_tall_nominal_value_comparison(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "200"],
+        "variable": ["kg2", "kg2"],
+        "metric": ["entropy", "entropy"],
+        "value": [1.0, 3.0],
+    }), tmp_path / rk.NOMINAL_STATS_FILE)
+    f = rk.StatFilter(variable="kg2", metric="entropy", op="lt", value=2.0)
+    result = rk._filter_tall(tmp_path / rk.NOMINAL_STATS_FILE, frozenset({"100", "200"}), f)
+    assert result == frozenset({"100"})
+
+
+def test_filter_tall_class_count_reconstruction(tmp_path, monkeypatch):
+    """class_356 fraction * total_samples reconstructs the raw observation count."""
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "100", "200"],
+        "variable": ["ecoregions", "ecoregions", "ecoregions"],
+        "metric": ["class_356", "total_samples", "total_samples"],
+        "value": [0.5, 20.0, 30.0],
+    }), tmp_path / rk.NOMINAL_STATS_FILE)
+    # taxon 100: 0.5 * 20 = 10 observations in class_356 -> passes gte 10
+    # taxon 200: no class_356 row (implicit 0.0) * 30 = 0 -> fails gte 10
+    f = rk.StatFilter(variable="ecoregions", metric="class_356", op="gte", value=10.0, as_count=True)
+    result = rk._filter_tall(tmp_path / rk.NOMINAL_STATS_FILE, frozenset({"100", "200"}), f)
+    assert result == frozenset({"100"})
+
+
+def test_filter_tall_implicit_zero_passes_lt_filter(tmp_path, monkeypatch):
+    """A taxon with total_samples but no class row has an implicit 0.0 —
+    that should satisfy a 'less than' filter, not be silently excluded."""
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100"],
+        "variable": ["ecoregions"],
+        "metric": ["total_samples"],
+        "value": [30.0],
+    }), tmp_path / rk.NOMINAL_STATS_FILE)
+    f = rk.StatFilter(variable="ecoregions", metric="class_356", op="lt", value=0.5)
+    result = rk._filter_tall(tmp_path / rk.NOMINAL_STATS_FILE, frozenset({"100"}), f)
+    assert result == frozenset({"100"})
+
+
+def test_filter_tall_no_data_excluded(tmp_path, monkeypatch):
+    """A taxon with no total_samples and no class row for the variable at all
+    has no data for it — excluded regardless of operator."""
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100"],
+        "variable": ["ecoregions"],
+        "metric": ["total_samples"],
+        "value": [30.0],
+    }), tmp_path / rk.NOMINAL_STATS_FILE)
+    f = rk.StatFilter(variable="ecoregions", metric="class_356", op="lt", value=0.5)
+    result = rk._filter_tall(tmp_path / rk.NOMINAL_STATS_FILE, frozenset({"100", "999"}), f)
+    assert "999" not in result
+
+
+def test_apply_stat_filters_chains_multiple(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "200", "300"],
+        "variable": ["bio1", "bio1", "bio1"],
+        "mean": [5.0, 15.0, 25.0],
+        "std": [1.0, 2.0, 3.0],
+    }), tmp_path / rk.NUMERICAL_STATS_FILE)
+    filters = [
+        rk.StatFilter(variable="bio1", metric="mean", op="lt", value=20.0),
+        rk.StatFilter(variable="bio1", metric="std", op="gte", value=2.0),
+    ]
+    result = rk._apply_stat_filters(frozenset({"100", "200", "300"}), filters, [_RATIO_LAYER])
+    assert result == frozenset({"200"})
+
+
+def test_apply_stat_filters_unknown_variable_excludes_all():
+    filters = [rk.StatFilter(variable="not_a_layer", metric="mean", op="gte", value=0.0)]
+    result = rk._apply_stat_filters(frozenset({"100"}), filters, [_RATIO_LAYER])
+    assert result == frozenset()
+
+
+def test_apply_stat_filters_empty_list_returns_input():
+    result = rk._apply_stat_filters(frozenset({"100", "200"}), [], [_RATIO_LAYER])
+    assert result == frozenset({"100", "200"})
+
+
+# ---------------------------------------------------------------------------
+# stat_filters integration with query modes
+# ---------------------------------------------------------------------------
+
+def test_query_catalog_stat_filter_narrows_results():
+    with patch("util.rankings.iter_descendants", return_value=[_SPECIES_A, _SPECIES_B]), \
+         patch("util.rankings._batch_sample_counts", return_value={"200": 10, "201": 20}), \
+         patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {"200": _SPECIES_A, "201": _SPECIES_B}.get(k)), \
+         patch("util.rankings._apply_stat_filters", return_value=frozenset({"201"})):
+        result = rk._query_catalog(
+            within_taxon=_GENUS, descendant_rank="SPECIES",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+            stat_filters=[rk.StatFilter(variable="bio1", metric="mean", op="gte", value=0.0)],
+            layers=[_RATIO_LAYER],
+        )
+    ids = {r["taxon"]["taxon_key"] for r in result["results"]}
+    assert ids == {"201"}
+
+
+def test_query_ranked_scoped_stat_filter_narrows_results():
+    rows = [
+        {"taxon_key": "200", "value": 10.0, "position": 0, "count": 2, "sampleCount": 100},
+        {"taxon_key": "201", "value": 20.0, "position": 1, "count": 2, "sampleCount": 200},
+    ]
+    fake = _fake_rank_positions({("100", "SPECIES", "bio1", "mean"): rows})
+    with patch("util.rankings._read_rank_positions", side_effect=fake), \
+         patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {"200": _SPECIES_A, "201": _SPECIES_B}.get(k)), \
+         patch("util.rankings._apply_stat_filters", return_value=frozenset({"201"})):
+        result = rk._query_ranked_scoped(
+            q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
+            sort_variable="bio1", sort_metric="mean", sort_order="asc",
+            limit=10, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+            stat_filters=[rk.StatFilter(variable="kg2", metric="entropy", op="lt", value=2.0)],
+            layers=[_RATIO_LAYER],
+        )
+    ids = {r["taxon"]["taxon_key"] for r in result["results"]}
+    assert ids == {"201"}

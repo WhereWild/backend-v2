@@ -27,7 +27,7 @@ from starlette.concurrency import run_in_threadpool
 import util.rankings as rankings
 from config.config import load_config
 from util import citations, descriptions, gis, taxa, tiles, units, upload
-from util.rankings import POSITION_FILE
+from util.rankings import POSITION_FILE, RANKINGS_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -1657,13 +1657,25 @@ def list_taxa_ranking_options(
         raise HTTPException(status_code=404, detail=f"Taxon not found: {within_taxon}")
 
     norm_rank = descendant_rank.upper()
-    rank_lower = "subspecies" if norm_rank in _CONFIG.subspecies_equivalents else norm_rank.lower()
-    index_path = rankings.TREE_ROOT / resolved["path"] / f"{rank_lower}_index.parquet"
+    rank_key = "SUBSPECIES" if norm_rank in _CONFIG.subspecies_equivalents else norm_rank
 
     try:
-        schema = _storage.read_schema(index_path)
-        raw_lengths = (schema.metadata or {}).get(b"column_lengths")
-        column_lengths = {k: int(v) for k, v in json.loads(raw_lengths).items() if int(v) > 0} if raw_lengths else {}
+        rows = _storage.read_table(
+            GLOBAL_STATS_DIR / RANKINGS_FILE,
+            columns=["variable", "metric", "count"],
+            filters=[
+                ("contextTaxonId", "=", str(resolved["taxon_key"])),
+                ("rank", "=", rank_key),
+            ],
+        ).to_pandas()
+        # `count` is the same for every row in a (variable, metric) group (the
+        # sort's full eligible population, computed once at build time — see
+        # util/rankings.py::_write_rank_positions) — group just to get one
+        # (variable, metric) -> count entry per option.
+        column_counts = {
+            (variable, metric): int(count)
+            for variable, metric, count in rows.groupby(["variable", "metric"], as_index=False)["count"].max().itertuples(index=False)
+        }
     except Exception:
         return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": []}
 
@@ -1687,13 +1699,9 @@ def list_taxa_ranking_options(
         return legend_cache[variable].get(class_id, metric)
 
     options = []
-    for col in schema.names:
-        if "::" not in col:
-            continue
-        count = int(column_lengths.get(col, 0) or 0)
+    for (variable, metric), count in column_counts.items():
         if count <= 0:
             continue
-        variable, metric = col.split("::", 1)
         if metric == "mode" and layer_value_types.get(variable) == "nominal":
             continue
         if metric.startswith("class_"):
@@ -1706,7 +1714,7 @@ def list_taxa_ranking_options(
             "variable": variable,
             "metric": metric,
             "label": label,
-            "column": col,
+            "column": f"{variable}::{metric}",
             "count": count,
         })
 
@@ -1736,6 +1744,7 @@ def query_taxa(
     unit_system: str | None = Query(None),
     sort_reference: float | None = Query(None),
     min_rbar: float | None = Query(None, ge=0.0, le=1.0),
+    filter_params: list[str] = Query([], alias="filter"),
 ):
     normalized_q = normalize_name(q or "") or None
 
@@ -1749,6 +1758,33 @@ def query_taxa(
 
     norm_rank = descendant_rank.upper() if descendant_rank else None
     norm_sort_variable = _resolve_variable_id(sort_variable) if sort_variable else None
+
+    all_layers = tiles.load_layers()
+    layer_by_id = {lyr["id"]: lyr for lyr in all_layers}
+    # Each ?filter=variable:metric:op:value[:count] chains an extra summary-stat
+    # predicate on top of scope/sort/text/location (e.g. "avg temp < 25C AND
+    # at least 10 observations in ecoregion X") — never raw SQL from the
+    # client, just a strict tuple validated against the known layer catalog.
+    parsed_filters: list[rankings.StatFilter] = []
+    for raw in filter_params:
+        try:
+            parsed = rankings.parse_stat_filter(raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        resolved_variable = _resolve_variable_id(parsed.variable)
+        value = parsed.value
+        # class_* filters compare a percentage/count, not a physical unit —
+        # only scalar stat metrics (e.g. bio1 mean) need the same
+        # display-unit-to-raw conversion /slice's min/max range already does.
+        if not parsed.metric.startswith("class_"):
+            layer = layer_by_id.get(resolved_variable)
+            if layer is not None:
+                value = units.convert_value_from_display(
+                    value, layer, unit_system, metric=parsed.metric,
+                )
+        parsed_filters.append(
+            parsed._replace(variable=resolved_variable, value=value)
+        )
 
     result = rankings.query_taxa(
         q=normalized_q,
@@ -1764,9 +1800,11 @@ def query_taxa(
         location_gid=location,
         reference_value=sort_reference,
         min_rbar=min_rbar,
+        stat_filters=parsed_filters or None,
+        layers=all_layers,
     )
 
-    sort_layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == norm_sort_variable), None) if norm_sort_variable else None
+    sort_layer = next((lyr for lyr in all_layers if lyr["id"] == norm_sort_variable), None) if norm_sort_variable else None
     is_class_metric = bool(sort_metric and sort_metric.startswith("class_"))
     serialized: list[dict] = []
     for item in result["results"]:
@@ -1812,6 +1850,7 @@ def query_taxa(
             "location": location,
             "min_samples": min_samples,
             "include_species_like": include_species_like,
+            "filters": filter_params,
         },
         "sort": {
             "variable": sort_variable,

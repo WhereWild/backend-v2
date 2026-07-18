@@ -429,6 +429,35 @@ def get_layer_render_range(layer: dict, forecast_suffix: str = "") -> tuple[floa
     return rmin, rmax
 
 
+def _mtime(path: Path) -> int:
+    try:
+        return int(path.stat().st_mtime)
+    except OSError:
+        return 0
+
+
+def get_layer_version(layer: dict, forecast_suffix: str = "") -> int:
+    """Return an mtime-derived integer that changes exactly when a layer's source data does.
+
+    Used as a cache-busting token: URLs built with this value can be cached
+    indefinitely, since a new version only appears once the underlying file
+    is actually rebuilt.
+    """
+    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, _SOIL_TEXTURE_INPUT_FILES
+
+    layer_id = layer["id"]
+    if layer.get("window_hours") is not None:
+        npy_path = TEMPORAL_RASTERS_DIR / f"{layer['var_id']}_{layer['window_label']}{forecast_suffix}.npy"
+        return _mtime(npy_path)
+    if layer_id in DERIVED_FROM_ELEVATION:
+        return _mtime(LAYERS_DIR / "elevation.tif")
+    if layer_id in DERIVED_FROM_SOIL:
+        return max((_mtime(LAYERS_DIR / fname) for fname in _SOIL_TEXTURE_INPUT_FILES.values()), default=0)
+    if layer.get("filename"):
+        return _mtime(LAYERS_DIR / layer["filename"])
+    return 0
+
+
 def render_temporal_tile_bytes(
     layer_id: str,
     z: int,

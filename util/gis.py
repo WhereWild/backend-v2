@@ -445,6 +445,14 @@ def derive_soil_texture_array(sand: np.ndarray, silt: np.ndarray, clay: np.ndarr
     return result
 
 
+# Maps a catalog `composition_group` id (see config/gis/catalog.json) to the
+# classifier function used to build its ternary classification overlay (see
+# util.ternary.build_ternary_classification_overlay). A compositional
+# variable with no entry here just gets a density blob, no class ids/legend —
+# this is the only soil-specific line in that path.
+COMPOSITION_CLASSIFIERS = {"soil_texture": derive_soil_texture_array}
+
+
 def sample_soil_texture_batch(lats: np.ndarray, lons: np.ndarray) -> list[int | None]:
     """Compute the USDA texture class id for many points.
 

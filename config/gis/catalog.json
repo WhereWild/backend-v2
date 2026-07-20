@@ -1411,7 +1411,10 @@
           "resampling": "bilinear",
           "render_min": 2.3,
           "render_max": 63.3,
-          "domain": "continuous"
+          "domain": "continuous",
+          "composition_group": "soil_texture",
+          "composition_axis": "top",
+          "composition_label": "Clay"
         },
         {
           "id": "sand",
@@ -1426,7 +1429,10 @@
           "resampling": "bilinear",
           "render_min": 0.9,
           "render_max": 94.5,
-          "domain": "continuous"
+          "domain": "continuous",
+          "composition_group": "soil_texture",
+          "composition_axis": "bottom_left",
+          "composition_label": "Sand"
         },
         {
           "id": "silt",
@@ -1441,7 +1447,10 @@
           "resampling": "bilinear",
           "render_min": 2.9,
           "render_max": 73.5,
-          "domain": "continuous"
+          "domain": "continuous",
+          "composition_group": "soil_texture",
+          "composition_axis": "bottom_right",
+          "composition_label": "Silt"
         },
         {
           "id": "soil_texture",
@@ -1456,7 +1465,8 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 1.0,
-          "render_max": 12.0
+          "render_max": 12.0,
+          "composition_group": "soil_texture"
         },
         {
           "id": "cfvo",

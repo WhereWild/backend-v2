@@ -38,6 +38,7 @@ from util.rankings import POSITION_CTX_GLOB, POSITION_FILE, compute_relative_ran
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
+    DENSITY_GRID_FILE,
     GLOBAL_STATS_DIR,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
@@ -141,6 +142,7 @@ _STATS_FILES = [
     ("ordinal_stats",   ORDINAL_STATS_FILE),
     ("circular_stats",  CIRCULAR_STATS_FILE),
     ("density",         DENSITY_FILE),
+    ("density_grid",    DENSITY_GRID_FILE),
     # positions handled separately — built inline during rank index pass, merged at consolidation
 ]
 

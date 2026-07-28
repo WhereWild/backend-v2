@@ -20,9 +20,9 @@ jobs:
       - name: Deploy API
         run: |
           cd ~/wherewild/backend-v2
-          git pull origin main
+          git fetch origin main && git reset --hard origin/main
           docker compose -f docker-compose.optiplex.yml build api
           docker compose -f docker-compose.optiplex.yml rm -sf api
           docker compose -f docker-compose.optiplex.yml up -d api
           docker image prune -f
-          docker builder prune -f --keep-storage 500mb
+          docker builder prune -f --reserved-space 500mb

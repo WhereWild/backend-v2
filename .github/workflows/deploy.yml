@@ -24,4 +24,5 @@ jobs:
           docker compose -f docker-compose.optiplex.yml build api
           docker compose -f docker-compose.optiplex.yml rm -sf api
           docker compose -f docker-compose.optiplex.yml up -d api
-          docker builder prune -f --keep-storage 2gb
+          docker image prune -f
+          docker builder prune -f --keep-storage 500mb

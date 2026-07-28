@@ -2787,7 +2787,10 @@ def compute_raster_final(
         combined = combined + arr
 
     if agg == "avg":
-        return (combined / n_total).astype(np.float32)
+        result = combined / n_total
+        if var_id == "cloud_cover":
+            result = np.clip(result, 0.0, 100.0)
+        return result.astype(np.float32)
     return combined.astype(np.float32)
 
 

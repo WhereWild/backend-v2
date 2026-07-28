@@ -165,10 +165,28 @@ def _push_stage() -> None:
     dest = os.environ.get("WW_SYNC_DEST")
     if not dest:
         raise RuntimeError("WW_SYNC_DEST env var must be set (e.g. gambaby:/path/to/data)")
+
+    min_free_gb = float(os.environ.get("WW_PUSH_MIN_FREE_GB", "50"))
+    check = subprocess.run(
+        ["rclone", "about", "--json", dest.split(":")[0] + ":"],
+        capture_output=True, text=True,
+    )
+    if check.returncode == 0:
+        import json as _json
+        info = _json.loads(check.stdout)
+        free_gb = info.get("free", 0) / 1024 ** 3
+        if free_gb < min_free_gb:
+            raise RuntimeError(
+                f"Destination has only {free_gb:.1f} GB free (minimum {min_free_gb} GB). "
+                "Free up space before pushing."
+            )
+        print(f"  Destination free space: {free_gb:.1f} GB")
+
     transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
     flags = [
         "--exclude", "taxonomy/cache/**",
         "--exclude", "gis/temporal/rasters/**",
+        "--delete-excluded",
         "--transfers", transfers,
         "--stats-one-line", "--stats", "1m",
     ]

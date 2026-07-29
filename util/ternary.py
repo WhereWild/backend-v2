@@ -42,7 +42,7 @@ DEFAULT_TERNARY_RESOLUTION = 24  # grid points per triangle edge, for the densit
 # finer grid than the density KDE — this is what actually makes boundary
 # lines look like straight lines instead of a coarse, kinked approximation.
 DEFAULT_CLASSIFICATION_RESOLUTION = 300
-_MIN_SAMPLES = 8
+_MIN_SAMPLES = 2
 _SAMPLE_CAP = 200  # capped raw-composition sample for a scatter overlay
 
 _AXIS_ORDER = {"top": 0, "bottom_left": 1, "bottom_right": 2}

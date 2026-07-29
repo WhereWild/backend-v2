@@ -1108,10 +1108,11 @@ def get_species_environment(
     if (location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None) and layer is not None:
         filter_col = _location_filter_col(location) if location is not None else None
         if location is None or filter_col is not None:
+            all_layers_by_id = {lyr["id"]: lyr for lyr in tiles.load_layers()}
             result = compute_location_filtered_stats(
                 taxon, variable_id, filter_col, location, layer,
                 phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
-                storage=_storage,
+                storage=_storage, layer_meta=all_layers_by_id,
             )
             if result is not None:
                 if result["type"] == "continuous":
@@ -1178,6 +1179,19 @@ def get_species_environment(
                     }
                     for item in result["distribution"]
                 ]
+                ternary_composition_density = result.get("ternary_composition_density")
+                if ternary_composition_density is not None:
+                    classifier = gis.COMPOSITION_CLASSIFIERS.get(variable_id)
+                    group = (layer or {}).get("composition_group")
+                    if classifier is not None and group:
+                        axis_columns = tuple(composition_group_members(all_layers_by_id).get(group, ()))
+                        if len(axis_columns) == 3:
+                            overlay = build_ternary_classification_overlay(
+                                ternary_composition_density["resolution"], classifier, axis_columns,
+                            )
+                            ternary_composition_density["class_ids"] = overlay["class_ids"]
+                            ternary_composition_density["class_boundary_a"] = overlay["boundary_a"]
+                            ternary_composition_density["class_boundary_b"] = overlay["boundary_b"]
                 return {
                     "species_id": taxon.get("taxon_key"),
                     "variable": variable_id,
@@ -1194,6 +1208,7 @@ def get_species_environment(
                     },
                     "density_curve": None,
                     "categorical_distribution": categorical_distribution,
+                    "ternary_composition_density": ternary_composition_density,
                     "relative_ranks": [],
                 }
             else:
@@ -1265,10 +1280,12 @@ def get_species_environment(
         # classifier just gets the density blob with no classes, which is a
         # valid, supported shape.
         ternary_composition_density = None
-        dg_rows = _storage.read_table(
-            GLOBAL_STATS_DIR / DENSITY_GRID_FILE,
-            filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)],
-        ).to_pylist()
+        dg_rows = []
+        if _storage.exists(GLOBAL_STATS_DIR / DENSITY_GRID_FILE):
+            dg_rows = _storage.read_table(
+                GLOBAL_STATS_DIR / DENSITY_GRID_FILE,
+                filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)],
+            ).to_pylist()
         if dg_rows:
             dg_row = dg_rows[0]
             ternary_composition_density = {

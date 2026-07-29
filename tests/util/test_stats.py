@@ -649,12 +649,24 @@ def test_process_leaf_nominal_series_empty_after_dropna(tmp_path):
     assert not (taxon_dir / st.NOMINAL_STATS_FILE).exists()
 
 
-def test_collect_taxon_df_species_deduplicates(tmp_path, monkeypatch):
+def test_collect_taxon_df_species_combines_self_and_subspecies(tmp_path, monkeypatch):
+    # catalogNumber is GBIF's unique record identifier and populate_tree.py
+    # routes each raw row to exactly one leaf file, so combining a species'
+    # own file with its subspecies' files should never need deduping — this
+    # covers the (distinct-catalogNumber) combine path.
     monkeypatch.setattr(st, "TREE_ROOT", tmp_path)
     species_dir = tmp_path / SPECIES_TAXON["path"]
     sub_dir = tmp_path / SUBSPECIES_TAXON["path"]
-    shared = {
-        "catalogNumber": [f"obs{i}" for i in range(10)],
+    species_rows = {
+        "catalogNumber": [f"species-obs{i}" for i in range(10)],
+        "decimalLatitude": [40.0] * 10,
+        "decimalLongitude": [-75.0] * 10,
+        "obscured": ["No"] * 10,
+        "coordinateUncertaintyInMeters": [100.0] * 10,
+        "bio1": [1.0] * 10,
+    }
+    sub_rows = {
+        "catalogNumber": [f"sub-obs{i}" for i in range(10)],
         "decimalLatitude": [40.0] * 10,
         "decimalLongitude": [-75.0] * 10,
         "obscured": ["No"] * 10,
@@ -663,12 +675,12 @@ def test_collect_taxon_df_species_deduplicates(tmp_path, monkeypatch):
     }
     species_dir.mkdir(parents=True, exist_ok=True)
     sub_dir.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pandas(pd.DataFrame(shared), preserve_index=False), species_dir / st.OCCURRENCE_FILE)
-    pq.write_table(pa.Table.from_pandas(pd.DataFrame(shared), preserve_index=False), sub_dir / st.OCCURRENCE_FILE)
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(species_rows), preserve_index=False), species_dir / st.OCCURRENCE_FILE)
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(sub_rows), preserve_index=False), sub_dir / st.OCCURRENCE_FILE)
     monkeypatch.setattr(st, "iter_descendants", _make_fake_descendants(SPECIES_TAXON, [SUBSPECIES_TAXON]))
     df = st.collect_taxon_df(SPECIES_TAXON)
     assert df is not None
-    assert len(df) == 10
+    assert len(df) == 20
 
 
 def test_collect_taxon_df_nonleaf_excludes_self_but_reads_descendants(tmp_path, monkeypatch):

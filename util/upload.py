@@ -762,6 +762,132 @@ def _add_ternary_classification_overlay(work_dir: Path, layer_meta: dict[str, di
 # Archive building
 # ---------------------------------------------------------------------------
 
+def _package_archive(
+    work_dir: Path,
+    df: pd.DataFrame,
+    layer_meta: dict[str, dict],
+    archive_name: str,
+    include_csv: bool = True,
+) -> Path:
+    """Write occurrence.parquet + categorical_value_lookup/variable_metadata/
+    locations, then zip them alongside whatever stats files the caller has
+    already written into ``work_dir`` (numerical/nominal/ordinal/circular
+    stats, density, density_grid) into one archive.
+
+    Shared by the upload path (stats computed fresh via
+    process_observations_df) and the taxon-download path (stats copied from
+    the tree's precomputed GLOBAL_STATS_DIR) — this function only cares that
+    the stats files already exist in work_dir under their standard names,
+    not how they got there.
+
+    ``include_csv`` also zips a .csv alongside every .parquet member — cheap
+    for upload-sized data, but pandas' to_csv() on a real taxon's full
+    occurrence table (hundreds of thousands of rows) costs real seconds for
+    a duplicate export nobody asked for, so the download path disables it.
+    """
+    occ_path = work_dir / "occurrence.parquet"
+    df.to_parquet(occ_path, index=False)
+
+    lookup_rows: list[dict] = []
+    for col in df.columns:
+        layer = layer_meta.get(col)
+        if not layer or layer.get("value_type") not in ("nominal", "ordinal"):
+            continue
+        legend_id = layer.get("_legend_key", col)
+        classes = _load_legend(legend_id)
+        for cls in classes:
+            lookup_rows.append({
+                "variable": col,
+                "code": str(cls["id"]),
+                "metric": f"class_{cls['id']}",
+                "label": cls.get("name", str(cls["id"])),
+                "group": cls.get("group", ""),
+                "groupLabel": cls.get("group_label", ""),
+            })
+    lookup_path = work_dir / "categorical_value_lookup.parquet"
+    if lookup_rows:
+        pq.write_table(pa.Table.from_pylist(lookup_rows), lookup_path)
+
+    meta_rows = []
+    for idx, layer in enumerate(layer_meta.values()):
+        # Temporal rows already carry pre-built legend_classes and _legend_key.
+        # Static rows need to load the legend by base layer id.
+        if "legend_classes" in layer and layer["legend_classes"] is not None:
+            legend_json = layer["legend_classes"]
+        else:
+            legend_id = layer.get("_legend_key", layer["id"])
+            raw_classes = _load_legend(legend_id)
+            legend_json = None
+            if raw_classes:
+                legend_json = json.dumps([
+                    {
+                        "id": cls["id"],
+                        "name": cls.get("name", str(cls["id"])),
+                        "color": cls.get("traits", {}).get("color") or None,
+                    }
+                    for cls in raw_classes
+                ])
+        meta_rows.append({
+            "id":            layer["id"],
+            "name":          layer.get("name") or layer.get("display_name") or layer["id"],
+            "units":         layer.get("units") or None,
+            "imperial_unit": layer.get("imperial_unit") or None,
+            "value_type":    layer.get("value_type") or None,
+            "domain":        layer.get("domain") or None,
+            "category":      layer.get("category") or layer.get("category_display_name") or None,
+            "group":         layer.get("group") or None,
+            "group_label":   layer.get("group_label") or None,
+            "sort_order":    idx,
+            "render_min":    layer.get("render_min"),
+            "render_max":    layer.get("render_max"),
+            "legend_classes": legend_json,
+            "composition_group": layer.get("composition_group") or None,
+            "composition_axis":  layer.get("composition_axis") or None,
+            "composition_label": layer.get("composition_label") or None,
+        })
+    meta_path = work_dir / "variable_metadata.parquet"
+    if meta_rows:
+        pq.write_table(pa.Table.from_pylist(meta_rows), meta_path)
+
+    locations_path = work_dir / "locations.parquet"
+    locations_table = build_locations_table(df)
+    if locations_table is not None:
+        pq.write_table(locations_table, locations_path)
+
+    archive_path = work_dir / archive_name
+    files_to_zip = [
+        (occ_path,                              "occurrence.parquet"),
+        (work_dir / NUMERICAL_STATS_FILE,       NUMERICAL_STATS_FILE),
+        (work_dir / NOMINAL_STATS_FILE,         NOMINAL_STATS_FILE),
+        (work_dir / ORDINAL_STATS_FILE,         ORDINAL_STATS_FILE),
+        (work_dir / CIRCULAR_STATS_FILE,        CIRCULAR_STATS_FILE),
+        (work_dir / DENSITY_FILE,               DENSITY_FILE),
+        (work_dir / DENSITY_GRID_FILE,          DENSITY_GRID_FILE),
+        (lookup_path,                           "categorical_value_lookup.parquet"),
+        (meta_path,                             "variable_metadata.parquet"),
+        (locations_path,                        "locations.parquet"),
+    ]
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for parquet_path, arcname in files_to_zip:
+            if not parquet_path.exists():
+                continue
+            try:
+                table = pq.read_table(parquet_path)
+                buf = io.BytesIO()
+                pq.write_table(table, buf, compression="snappy")
+                zf.writestr(arcname, buf.getvalue())
+                if include_csv:
+                    try:
+                        csv_bytes = table.to_pandas().to_csv(index=False).encode()
+                        zf.writestr(arcname.replace(".parquet", ".csv"), csv_bytes)
+                    except Exception:
+                        pass
+            except Exception:
+                zf.write(parquet_path, arcname=arcname)
+
+    return archive_path
+
+
 def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
     """Compute stats and package all outputs into a ZIP archive.
 
@@ -773,111 +899,12 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
         layer_meta[row["id"]] = row
 
     work_dir = Path(tempfile.mkdtemp(prefix="wherewild-upload-"))
+    archive_name = "processed_observations.zip"
     try:
         filtered = _filter_df(df.copy())
         process_observations_df(work_dir, filtered, layer_meta)
         _add_ternary_classification_overlay(work_dir, layer_meta)
-
-        occ_path = work_dir / "occurrence.parquet"
-        df.to_parquet(occ_path, index=False)
-
-        lookup_rows: list[dict] = []
-        for col in df.columns:
-            layer = layer_meta.get(col)
-            if not layer or layer.get("value_type") not in ("nominal", "ordinal"):
-                continue
-            legend_id = layer.get("_legend_key", col)
-            classes = _load_legend(legend_id)
-            for cls in classes:
-                lookup_rows.append({
-                    "variable": col,
-                    "code": str(cls["id"]),
-                    "metric": f"class_{cls['id']}",
-                    "label": cls.get("name", str(cls["id"])),
-                    "group": cls.get("group", ""),
-                    "groupLabel": cls.get("group_label", ""),
-                })
-        lookup_path = work_dir / "categorical_value_lookup.parquet"
-        if lookup_rows:
-            pq.write_table(pa.Table.from_pylist(lookup_rows), lookup_path)
-
-        meta_rows = []
-        for idx, layer in enumerate(layer_meta.values()):
-            # Temporal rows already carry pre-built legend_classes and _legend_key.
-            # Static rows need to load the legend by base layer id.
-            if "legend_classes" in layer and layer["legend_classes"] is not None:
-                legend_json = layer["legend_classes"]
-            else:
-                legend_id = layer.get("_legend_key", layer["id"])
-                raw_classes = _load_legend(legend_id)
-                legend_json = None
-                if raw_classes:
-                    legend_json = json.dumps([
-                        {
-                            "id": cls["id"],
-                            "name": cls.get("name", str(cls["id"])),
-                            "color": cls.get("traits", {}).get("color") or None,
-                        }
-                        for cls in raw_classes
-                    ])
-            meta_rows.append({
-                "id":            layer["id"],
-                "name":          layer.get("name") or layer.get("display_name") or layer["id"],
-                "units":         layer.get("units") or None,
-                "imperial_unit": layer.get("imperial_unit") or None,
-                "value_type":    layer.get("value_type") or None,
-                "domain":        layer.get("domain") or None,
-                "category":      layer.get("category") or layer.get("category_display_name") or None,
-                "group":         layer.get("group") or None,
-                "group_label":   layer.get("group_label") or None,
-                "sort_order":    idx,
-                "render_min":    layer.get("render_min"),
-                "render_max":    layer.get("render_max"),
-                "legend_classes": legend_json,
-                "composition_group": layer.get("composition_group") or None,
-                "composition_axis":  layer.get("composition_axis") or None,
-                "composition_label": layer.get("composition_label") or None,
-            })
-        meta_path = work_dir / "variable_metadata.parquet"
-        if meta_rows:
-            pq.write_table(pa.Table.from_pylist(meta_rows), meta_path)
-
-        locations_path = work_dir / "locations.parquet"
-        locations_table = build_locations_table(df)
-        if locations_table is not None:
-            pq.write_table(locations_table, locations_path)
-
-        archive_name = "processed_observations.zip"
-        archive_path = work_dir / archive_name
-        files_to_zip = [
-            (occ_path,                              "occurrence.parquet"),
-            (work_dir / NUMERICAL_STATS_FILE,       NUMERICAL_STATS_FILE),
-            (work_dir / NOMINAL_STATS_FILE,         NOMINAL_STATS_FILE),
-            (work_dir / ORDINAL_STATS_FILE,         ORDINAL_STATS_FILE),
-            (work_dir / CIRCULAR_STATS_FILE,        CIRCULAR_STATS_FILE),
-            (work_dir / DENSITY_FILE,               DENSITY_FILE),
-            (work_dir / DENSITY_GRID_FILE,          DENSITY_GRID_FILE),
-            (lookup_path,                           "categorical_value_lookup.parquet"),
-            (meta_path,                             "variable_metadata.parquet"),
-            (locations_path,                        "locations.parquet"),
-        ]
-        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for parquet_path, arcname in files_to_zip:
-                if not parquet_path.exists():
-                    continue
-                try:
-                    table = pq.read_table(parquet_path)
-                    buf = io.BytesIO()
-                    pq.write_table(table, buf, compression="snappy")
-                    zf.writestr(arcname, buf.getvalue())
-                    try:
-                        csv_bytes = table.to_pandas().to_csv(index=False).encode()
-                        zf.writestr(arcname.replace(".parquet", ".csv"), csv_bytes)
-                    except Exception:
-                        pass
-                except Exception:
-                    zf.write(parquet_path, arcname=arcname)
-
+        archive_path = _package_archive(work_dir, df, layer_meta, archive_name)
     except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise

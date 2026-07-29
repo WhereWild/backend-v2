@@ -222,7 +222,13 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"], expose_headers=["X-Nominal-Classes", "Content-Disposition"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+    expose_headers=["X-Nominal-Classes", "Content-Disposition"],
+)
 
 
 def _license_label(url: str | None) -> str | None:

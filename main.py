@@ -31,6 +31,7 @@ from util.rankings import TREE_ROOT as RANKINGS_TREE_ROOT
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
+    DENSITY_GRID_FILE,
     GLOBAL_STATS_DIR,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
@@ -45,6 +46,7 @@ from util.stats import (
 )
 from util.storage import ParquetStorageProxy
 from util.taxa import format_common_name, iter_descendants, normalize_name, reload_catalog, taxon_slug
+from util.ternary import build_ternary_classification_overlay, composition_group_members
 
 _CONFIG = load_config("global")
 _SYNC_STATE_PATH = Path("data/sync_state.json")
@@ -299,6 +301,7 @@ async def reload_data():
     _load_hierarchy.cache_clear()
     tiles._catalog.cache_clear()
     tiles._load_nominal_colormap.cache_clear()
+    build_ternary_classification_overlay.cache_clear()
     return {"ok": True}
 
 
@@ -482,6 +485,9 @@ def list_variables(unit_system: str | None = Query(None), forecast_h: int = Quer
             "group_label": layer.get("group_label") or None,
             "agg": layer.get("agg") or None,
             "version": tiles.get_layer_version(layer, forecast_suffix),
+            "composition_group": layer.get("composition_group") or None,
+            "composition_axis": layer.get("composition_axis") or None,
+            "composition_label": layer.get("composition_label") or None,
         })
     return result
 
@@ -716,7 +722,7 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
         eco_class_fractions=eco_class_fractions or None,
         eco_legend_classes=_load_legend("ecoregions") or None,
         biome_class_fractions=biome_class_fractions or None,
-        biome_legend_classes=_load_legend("biome") or None,
+        biome_legend=_load_legend_full("biome") or None,
         salinity_median=salinity_median,
         salinity_legend_classes=_load_legend("salinity") or None,
         numerical_stats=numerical_stats or None,
@@ -1247,6 +1253,44 @@ def get_species_environment(
                     summary[key] = float(metrics[key])
         else:
             summary.update({"min": None, "mean": None, "max": None})
+
+        # Any variable id may have an associated compositional (ternary) density
+        # blob — the density_grid table is keyed by whichever composition_group
+        # id the catalog tags a variable's members with (see
+        # util.ternary.composition_group_members), not just "soil_texture".
+        # Classification (class ids + exact boundary lines) is static per
+        # classifier — identical for every taxon — so it's computed once and
+        # cached (util.ternary.build_ternary_classification_overlay) rather
+        # than read from storage; a compositional variable with no registered
+        # classifier just gets the density blob with no classes, which is a
+        # valid, supported shape.
+        ternary_composition_density = None
+        dg_rows = _storage.read_table(
+            GLOBAL_STATS_DIR / DENSITY_GRID_FILE,
+            filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)],
+        ).to_pylist()
+        if dg_rows:
+            dg_row = dg_rows[0]
+            ternary_composition_density = {
+                "resolution": dg_row["resolution"],
+                "density": dg_row["density"],
+                "sample_a": dg_row.get("sample_a"),
+                "sample_b": dg_row.get("sample_b"),
+                "sample_c": dg_row.get("sample_c"),
+            }
+            classifier = gis.COMPOSITION_CLASSIFIERS.get(variable_id)
+            group = (layer or {}).get("composition_group")
+            if classifier is not None and group:
+                all_layers_by_id = {lyr["id"]: lyr for lyr in tiles.load_layers()}
+                axis_columns = tuple(composition_group_members(all_layers_by_id).get(group, ()))
+                if len(axis_columns) == 3:
+                    overlay = build_ternary_classification_overlay(
+                        dg_row["resolution"], classifier, axis_columns,
+                    )
+                    ternary_composition_density["class_ids"] = overlay["class_ids"]
+                    ternary_composition_density["class_boundary_a"] = overlay["boundary_a"]
+                    ternary_composition_density["class_boundary_b"] = overlay["boundary_b"]
+
         return {
             "species_id": taxon.get("taxon_key"),
             "variable": variable_id,
@@ -1255,6 +1299,7 @@ def get_species_environment(
             "summary": summary,
             "density_curve": None,
             "categorical_distribution": categorical_distribution,
+            "ternary_composition_density": ternary_composition_density,
             "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id),
         }
 

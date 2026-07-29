@@ -41,6 +41,7 @@ from scipy.stats import entropy as _scipy_entropy
 from config.config import ValueType, load_config
 from util.storage import ParquetStorage, atomic_write_parquet
 from util.taxa import TaxonRecord, get_children, iter_descendants
+from util.ternary import build_ternary_density_grid, composition_group_members
 
 CONFIG = load_config("global")
 
@@ -52,6 +53,7 @@ NOMINAL_STATS_FILE = "nominal_stats.parquet"
 ORDINAL_STATS_FILE = "ordinal_stats.parquet"
 CIRCULAR_STATS_FILE = "circular_stats.parquet"
 DENSITY_FILE = "density.parquet"
+DENSITY_GRID_FILE = "density_grid.parquet"
 PHENOLOGY_COUNTS_FILE = "phenology_counts.json"
 
 _KDE_MAX_SAMPLES = 100_000
@@ -228,7 +230,7 @@ _ACC_FILE = ".acc"
 
 def _df_to_acc(df: pd.DataFrame, layer_meta: dict[str, dict]) -> dict:
     """Build an in-memory accumulator dict from a filtered DataFrame."""
-    acc: dict = {"continuous": {}, "circular": {}, "nominal": {}, "ordinal": {}, "pheno": {}}
+    acc: dict = {"continuous": {}, "circular": {}, "nominal": {}, "ordinal": {}, "pheno": {}, "joint": {}}
     _total_unique: int | None = None
 
     def _col_unique(col: str) -> int:
@@ -300,6 +302,21 @@ def _df_to_acc(df: pd.DataFrame, layer_meta: dict[str, dict]) -> dict:
                     "n": len(values), "reservoir": reservoir,
                     "n_seen": n_seen, "unique": _col_unique(col),
                 }
+
+    for group, cols in composition_group_members(layer_meta).items():
+        if not set(cols) <= set(df.columns):
+            continue
+        triples = df[cols].dropna().to_numpy(dtype=np.float64)
+        if triples.size:
+            # Reservoir-sample whole composition rows, not columns —
+            # _reservoir_update is agnostic to scalar vs. row values, so the
+            # same Algorithm R logic used for every other reservoir here keeps
+            # the 3 components paired per occurrence instead of destroying the
+            # row alignment a joint density needs.
+            joint_reservoir: list = []
+            joint_n_seen = _reservoir_update(joint_reservoir, 0, triples)
+            acc["joint"][group] = {"reservoir": joint_reservoir, "n_seen": joint_n_seen}
+
     acc["pheno"] = dict(compute_phenology_counts(df))
     return acc
 
@@ -330,11 +347,12 @@ def _reservoir_batch_merge(parts: list[tuple[list, int]]) -> tuple[list, int]:
 
 def _merge_accs_batch(accs: list[dict]) -> dict:
     """Merge a list of accumulators efficiently — single proportional reservoir draw per column."""
-    merged: dict = {"continuous": {}, "circular": {}, "nominal": {}, "ordinal": {}, "pheno": {}}
+    merged: dict = {"continuous": {}, "circular": {}, "nominal": {}, "ordinal": {}, "pheno": {}, "joint": {}}
 
     # Gather all per-column contributions, then merge in one shot.
     cont_parts: dict[str, list] = {}
     circ_parts: dict[str, list] = {}
+    joint_parts: dict[str, list] = {}
 
     for acc in accs:
         for col, s in acc.get("continuous", {}).items():
@@ -346,6 +364,11 @@ def _merge_accs_batch(accs: list[dict]) -> dict:
             if col not in circ_parts:
                 circ_parts[col] = []
             circ_parts[col].append(s)
+
+        for key, s in acc.get("joint", {}).items():
+            if key not in joint_parts:
+                joint_parts[key] = []
+            joint_parts[key].append(s)
 
         for col, s in acc.get("nominal", {}).items():
             if col not in merged["nominal"]:
@@ -388,6 +411,10 @@ def _merge_accs_batch(accs: list[dict]) -> dict:
             "n_seen": n_seen,
             "unique": sum(p["unique"] for p in parts),
         }
+
+    for key, parts in joint_parts.items():
+        reservoir, n_seen = _reservoir_batch_merge([(p["reservoir"], p["n_seen"]) for p in parts])
+        merged["joint"][key] = {"reservoir": reservoir, "n_seen": n_seen}
 
     return merged
 
@@ -461,6 +488,7 @@ def _save_acc(taxon_dir: Path, acc: dict) -> None:
         "ordinal": {col: {"counts": dict(a["counts"]), "unique": a["unique"]}
                     for col, a in acc["ordinal"].items()},
         "pheno": acc["pheno"],
+        "joint": {key: dict(a) for key, a in acc.get("joint", {}).items()},
     }
     with open(taxon_dir / _ACC_FILE, "wb") as f:
         pickle.dump(data, f, protocol=4)
@@ -493,6 +521,7 @@ def _load_acc(taxon_dir: Path) -> dict | None:
             for col, a in data.get("ordinal", {}).items()
         },
         "pheno": dict(data["pheno"]),
+        "joint": {key: dict(a) for key, a in data.get("joint", {}).items()},
     }
 
 
@@ -600,7 +629,17 @@ def _write_stats_from_acc(taxon_dir: Path, acc: dict, layer_meta: dict[str, dict
             continue
         ordinal_entries.extend(_ordinal_stat_entries(col, layer, counts, stats))
 
-    if not numerical_stats and not nominal_entries and not circular_stats and not ordinal_entries:
+    density_grid_rows: list[dict] = []
+    for group in composition_group_members(layer_meta):
+        joint_reservoir = acc.get("joint", {}).get(group, {}).get("reservoir")
+        if not joint_reservoir:
+            continue
+        grid = build_ternary_density_grid(np.asarray(joint_reservoir, dtype=np.float64))
+        if grid is not None:
+            density_grid_rows.append({"variable": group, **grid})
+
+    if (not numerical_stats and not nominal_entries and not circular_stats
+            and not ordinal_entries and not density_grid_rows):
         return
     pheno_acc = Counter(acc.get("pheno", {}))
     pheno_meta = {"phenology_counts": json.dumps(dict(pheno_acc))} if pheno_acc else None
@@ -610,6 +649,7 @@ def _write_stats_from_acc(taxon_dir: Path, acc: dict, layer_meta: dict[str, dict
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_ordinal_stats(taxon_dir, ordinal_entries)
     _write_density(taxon_dir, density_rows)
+    _write_density_grid(taxon_dir, density_grid_rows)
 
 
 def _atomic_write(path: Path, table: pa.Table, custom_metadata: dict[str, str] | None = None) -> None:
@@ -1030,6 +1070,13 @@ def _write_density(directory: Path, rows: list[dict]) -> None:
     _atomic_write(directory / DENSITY_FILE, table)
 
 
+def _write_density_grid(directory: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    table = pa.Table.from_pylist(rows)
+    _atomic_write(directory / DENSITY_GRID_FILE, table)
+
+
 # ---------------------------------------------------------------------------
 # Leaf (exact) processing
 # ---------------------------------------------------------------------------
@@ -1163,6 +1210,15 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
             case _:
                 raise NotImplementedError(f"Stats not implemented for value type {vtype!r}")
 
+    density_grid_rows: list[dict] = []
+    for group, cols in composition_group_members(layer_meta).items():
+        if not set(cols) <= set(gis_cols):
+            continue
+        triples = df[cols].dropna().to_numpy(dtype=np.float64)
+        grid = build_ternary_density_grid(triples)
+        if grid is not None:
+            density_grid_rows.append({"variable": group, **grid})
+
     pheno_counts = compute_phenology_counts(df)
     pheno_meta = {"phenology_counts": json.dumps(dict(pheno_counts))} if pheno_counts else None
     taxon_dir.mkdir(parents=True, exist_ok=True)
@@ -1171,6 +1227,7 @@ def _process_leaf_df(taxon_dir: Path, df: pd.DataFrame, layer_meta: dict[str, di
     _write_nominal_stats(taxon_dir, nominal_entries)
     _write_ordinal_stats(taxon_dir, ordinal_entries)
     _write_density(taxon_dir, density_rows)
+    _write_density_grid(taxon_dir, density_grid_rows)
 
 
 def process_observations_df(directory: Path, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:

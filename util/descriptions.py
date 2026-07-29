@@ -352,8 +352,16 @@ def _frequency_verb(frac: float) -> str | None:
 def _join_labels(labels: list[str]) -> str:
     if len(labels) == 1:
         return labels[0]
+    # Some legend names (e.g. WWF biomes like "Grasslands, Savannas &
+    # Shrublands") — or, since clustering, a whole factored phrase like
+    # "grasslands, shrublands, and savannas" — already contain a comma, so a
+    # plain "X and Y" becomes ambiguous (reads as one run-on list with two
+    # "and"s). Fall back to semicolons whenever any candidate label has one.
     if len(labels) == 2:
-        return f"{labels[0]} and {labels[1]}"
+        sep = "; and " if any("," in label for label in labels) else " and "
+        return f"{labels[0]}{sep}{labels[1]}"
+    if any("," in label for label in labels):
+        return "; ".join(labels[:-1]) + f"; and {labels[-1]}"
     return ", ".join(labels[:-1]) + f", and {labels[-1]}"
 
 
@@ -491,8 +499,15 @@ def _build_nominal_lines(
     *,
     attribute_axes: dict[str, list[dict]] | None = None,
     body_suffix: str = "",
+    factor_shared_modifiers: bool = False,
 ) -> list[dict]:
     agg: dict[tuple, dict] = {}
+    # True once any class fans its fraction out to more than one group (see
+    # below) — the moment that happens, group totals can overlap (the same
+    # underlying occurrences get full credit in more than one group), so
+    # re-summing fractions *across* groups to sharpen a combined verb (done
+    # below in _build_from_band) would double-count and must be skipped.
+    has_fanout = False
     for cls in legend_classes:
         cid = cls.get("id")
         if cid is None:
@@ -500,15 +515,42 @@ def _build_nominal_lines(
         frac = float(class_fractions.get(cid, 0.0))
         if frac <= 0:
             continue
-        group = str(cls.get("group") or "").strip().lower()
-        if not group:
-            continue
-        group_label = str(cls.get("group_label") or group).strip().lower()
-        attrs = sorted(str(a).strip().lower() for a in (cls.get("attributes") or []) if str(a).strip())
-        key = (group, tuple(attrs))
-        if key not in agg:
-            agg[key] = {"group": group, "group_label": group_label, "attrs": attrs, "fraction": 0.0}
-        agg[key]["fraction"] += frac
+        # Normally one class belongs to exactly one group (a plain
+        # group/group_label/attributes triple). A few source schemes bundle
+        # multiple conceptually distinct things into one compound class (e.g.
+        # a WWF biome like "Grasslands, Savannas & Shrublands" isn't really
+        # one land-cover type — it's three, inseparable in the source pixel
+        # data). "memberships" lets such a class fan its full fraction out to
+        # several groups at once (each gets full credit, not a split share) —
+        # see biome_legend.json for the concrete case.
+        memberships = cls.get("memberships") or [
+            {
+                "group": cls.get("group"),
+                "group_label": cls.get("group_label"),
+                "solo_group_label": cls.get("solo_group_label"),
+                "attributes": cls.get("attributes"),
+            }
+        ]
+        if len(memberships) > 1:
+            has_fanout = True
+        for m in memberships:
+            group = str(m.get("group") or "").strip().lower()
+            if not group:
+                continue
+            group_label = str(m.get("group_label") or group).strip().lower()
+            solo_group_label = m.get("solo_group_label")
+            solo_group_label = str(solo_group_label).strip().lower() if solo_group_label else None
+            attrs = sorted(str(a).strip().lower() for a in (m.get("attributes") or []) if str(a).strip())
+            key = (group, tuple(attrs))
+            if key not in agg:
+                agg[key] = {
+                    "group": group,
+                    "group_label": group_label,
+                    "solo_group_label": solo_group_label,
+                    "attrs": attrs,
+                    "fraction": 0.0,
+                }
+            agg[key]["fraction"] += frac
 
     if not agg:
         return []
@@ -522,7 +564,11 @@ def _build_nominal_lines(
     def _entry_key(e: dict) -> tuple:
         return (e["group"], tuple(e["attrs"]))
 
-    def _make_stem(g: str, g_entries: list, group_label: str) -> str:
+    def _group_modifier(g: str, g_entries: list) -> str:
+        """The adjective phrase for group g's currently-active entries, e.g.
+        "temperate and montane" — without the group_label attached, so
+        sibling groups' modifiers can be compared for exact equality (see
+        factor_shared_modifiers below) before the label gets glued on."""
         axes = (attribute_axes or {}).get(g)
         if axes:
             kept: list[str] = []
@@ -534,13 +580,30 @@ def _build_nominal_lines(
                     val = next(iter(distinct))
                     if val is not None:
                         kept.append(val)
-            return f"{' '.join(kept)} {group_label}" if kept else group_label
+            return " ".join(kept)
         else:
             all_attrs = [a for e in g_entries for a in e["attrs"]]
             all_variants_present = len(g_entries) == group_key_count[g] and len(g_entries) > 1
             if all_attrs and not all_variants_present:
-                return f"{_join_labels(all_attrs)} {group_label}"
-            return group_label
+                return _join_labels(all_attrs)
+            return ""
+
+    def _stem_parts(g: str, g_entries: list) -> tuple[str, str]:
+        """(label, modifier) for group g's currently-active entries. A
+        group's label is usually fixed, but a member can register a distinct
+        "solo_group_label" (e.g. "Taiga") to use only when it's the sole
+        representative of its group in this output — the moment a sibling
+        entry (e.g. another conifer forest) joins it, the generic
+        group_label takes over instead. The solo label already carries
+        whatever specificity the modifier would add (Taiga *is* boreal), so
+        the modifier is suppressed whenever the solo label is used."""
+        if len(g_entries) == 1 and g_entries[0].get("solo_group_label"):
+            return g_entries[0]["solo_group_label"], ""
+        return g_entries[0]["group_label"], _group_modifier(g, g_entries)
+
+    def _make_stem(g: str, g_entries: list) -> str:
+        label, modifier = _stem_parts(g, g_entries)
+        return f"{modifier} {label}" if modifier else label
 
     def _build_from_band(band: list) -> tuple[str, str]:
         by_group: dict[str, list] = {}
@@ -551,12 +614,36 @@ def _build_nominal_lines(
             key=lambda g: sum(e["fraction"] for e in by_group[g]),
             reverse=True,
         )
-        stems = [
-            _make_stem(g, sorted(by_group[g], key=lambda e: e["fraction"], reverse=True), by_group[g][0]["group_label"])
-            for g in group_order
-        ]
-        combined_frac = sum(e["fraction"] for e in band)
-        verb = _frequency_verb(combined_frac) or top_verb
+        sorted_entries = {
+            g: sorted(by_group[g], key=lambda e: e["fraction"], reverse=True) for g in group_order
+        }
+
+        if factor_shared_modifiers:
+            # Two or more sibling groups landing on the exact same modifier
+            # (e.g. grassland and shrubland both "temperate and montane")
+            # only need to say it once — cluster by modifier equality and
+            # hoist it in front of the joined bare labels, instead of each
+            # group repeating it independently.
+            clusters: dict[str, list[str]] = {}
+            for g in group_order:
+                label, modifier = _stem_parts(g, sorted_entries[g])
+                clusters.setdefault(modifier, []).append(label)
+            stems = [
+                f"{modifier} {_join_labels(labels)}" if modifier else _join_labels(labels)
+                for modifier, labels in clusters.items()
+            ]
+        else:
+            stems = [_make_stem(g, sorted_entries[g]) for g in group_order]
+
+        if has_fanout:
+            # Bandmates' fractions may share underlying occurrences (fanned
+            # out from the same class into different groups), so summing
+            # them would overstate prevalence — the shared tier that put
+            # them in this band together is the only sound label.
+            verb = top_verb
+        else:
+            combined_frac = sum(e["fraction"] for e in band)
+            verb = _frequency_verb(combined_frac) or top_verb
         return verb, _join_labels(stems) + body_suffix
 
     result: list[dict] = []
@@ -596,11 +683,25 @@ def build_climate_lines(
 def build_biome_lines(
     class_fractions: dict[int, float],
     legend_classes: list[dict],
+    attribute_axes: dict[str, list[dict]] | None = None,
 ) -> list[dict]:
     # No suffix — unlike kg2's short climate labels, biome names already end
     # in their own descriptive noun ("...grasslands, savannas & shrublands"),
     # so appending anything reads redundant.
-    return _build_nominal_lines(class_fractions, legend_classes)
+    #
+    # factor_shared_modifiers=True is biome-specific: several biomes fan out
+    # into sibling concept groups (grassland/savanna/shrubland — see
+    # biome_legend.json's "memberships") that often end up sharing the exact
+    # same climate-zone modifier in the same sentence, which reads as
+    # redundant repetition ("tropical & subtropical grasslands, tropical &
+    # subtropical savannas..."). Climate (build_climate_lines) deliberately
+    # keeps its own per-group repetition (e.g. "cold desert and cold steppe")
+    # since that distinction was an intentional design choice there, not a
+    # side effect of decomposing one compound noun — so this flag must NOT
+    # default to on in _build_nominal_lines.
+    return _build_nominal_lines(
+        class_fractions, legend_classes, attribute_axes=attribute_axes, factor_shared_modifiers=True,
+    )
 
 
 def build_habitat_lines(
@@ -758,7 +859,7 @@ def build_description_profile(
     eco_class_fractions: dict[int, float] | None = None,
     eco_legend_classes: list[dict] | None = None,
     biome_class_fractions: dict[int, float] | None = None,
-    biome_legend_classes: list[dict] | None = None,
+    biome_legend: dict | None = None,
     salinity_median: float | None = None,
     salinity_legend_classes: list[dict] | None = None,
     numerical_stats: dict[str, dict] | None = None,
@@ -792,8 +893,10 @@ def build_description_profile(
         if climate_lines:
             sections.append({"id": "climate", "title": "Climates", "lines": climate_lines})
 
-    if biome_class_fractions and biome_legend_classes:
-        biome_lines = build_biome_lines(biome_class_fractions, biome_legend_classes)
+    if biome_class_fractions and biome_legend:
+        biome_classes = biome_legend.get("classes") or []
+        biome_axes = biome_legend.get("attribute_axes") or {}
+        biome_lines = build_biome_lines(biome_class_fractions, biome_classes, biome_axes)
         if biome_lines:
             sections.append({"id": "biomes", "title": "Biomes", "lines": biome_lines})
 

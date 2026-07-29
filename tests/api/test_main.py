@@ -747,7 +747,7 @@ def test_get_species_environment_nominal_success():
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]), \
          patch("pathlib.Path.exists", return_value=True), \
-         patch.object(pq, "read_table", return_value=_NOM_STATS_TABLE), \
+         patch.object(pq, "read_table", side_effect=_env_stats_read), \
          patch("main._load_legend", return_value=legend):
         r = client.get("/species/2923970/environment/kg2")
     assert r.status_code == 200

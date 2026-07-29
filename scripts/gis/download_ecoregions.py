@@ -189,6 +189,104 @@ def _slug(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
 
 
+# Biomes that map to a single concept group (no fan-out needed) but still
+# need a group/attributes override instead of the default singleton — either
+# because they share a group with a sibling biome (e.g. all three conifer
+# forest variants), or because a member needs a "solo_group_label" (a name —
+# "Taiga" — to use only when it's the sole representative of its group in a
+# given description; the moment a sibling conifer forest joins it, the
+# generic "Conifer Forests" label takes over instead — see
+# util/descriptions.py's _build_nominal_lines "solo_group_label" handling).
+# name -> {group, group_label, attributes, solo_group_label?}.
+_BIOME_GROUP_OVERRIDES: dict[str, dict] = {
+    "Tropical & Subtropical Moist Broadleaf Forests": {
+        "group": "broadleaf_forest",
+        "group_label": "Broadleaf Forests",
+        "attributes": ["moist", "tropical & subtropical"],
+    },
+    "Tropical & Subtropical Dry Broadleaf Forests": {
+        "group": "broadleaf_forest",
+        "group_label": "Broadleaf Forests",
+        "attributes": ["dry", "tropical & subtropical"],
+    },
+    "Tropical & Subtropical Coniferous Forests": {
+        "group": "conifer_forest",
+        "group_label": "Conifer Forests",
+        "attributes": ["tropical & subtropical"],
+    },
+    "Temperate Broadleaf & Mixed Forests": {
+        "group": "broadleaf_and_mixed_forest",
+        "group_label": "Broadleaf & Mixed Forests",
+        "attributes": ["temperate"],
+    },
+    "Temperate Conifer Forests": {
+        "group": "conifer_forest",
+        "group_label": "Conifer Forests",
+        "attributes": ["temperate"],
+    },
+    "Boreal Forests/Taiga": {
+        "group": "conifer_forest",
+        "group_label": "Conifer Forests",
+        "solo_group_label": "Boreal Forests/Taiga",
+        "attributes": ["boreal"],
+    },
+}
+
+# broadleaf_forest varies along two independent dimensions at once (zone and
+# moisture) rather than the single dimension every other biome group varies
+# along, so it needs the axis system (each axis independently collapses to
+# nothing if its members disagree) instead of the plain attribute list — see
+# util/descriptions.py's _build_nominal_lines attribute_axes handling. The
+# "zone" axis has only one member (all broadleaf_forest entries are
+# tropical & subtropical) but still needs to be declared so it's exposed as
+# a comparable modifier — otherwise it would only ever appear glued to
+# "moist"/"dry" and could never match e.g. grassland's own "tropical &
+# subtropical" modifier when both land in the same sentence.
+_BIOME_ATTRIBUTE_AXES: dict[str, list[dict]] = {
+    "broadleaf_forest": [
+        {"name": "moisture", "values": ["moist", "dry"]},
+        {"name": "zone", "values": ["tropical & subtropical"]},
+    ],
+}
+
+# A harder case: several biomes bundle multiple conceptually *distinct*
+# land-cover types into one compound name (e.g. "Grasslands, Savannas &
+# Shrublands") because RESOLVE's source pixels can't tell them apart. A
+# straight group-by-name-match (like the override above) can't split those
+# back into separate concepts — describing "how often is this species in
+# grassland" vs. "in shrubland" independently requires the SAME biome
+# fraction to count fully toward more than one group at once. name -> list
+# of {group, group_label, attributes} the class's full fraction fans out to
+# — see util/descriptions.py's _build_nominal_lines "memberships" handling.
+_BIOME_GROUP_FANOUT: dict[str, list[dict]] = {
+    "Tropical & Subtropical Grasslands, Savannas & Shrublands": [
+        {"group": "grassland", "group_label": "Grasslands", "attributes": ["tropical & subtropical"]},
+        {"group": "savanna", "group_label": "Savannas", "attributes": ["tropical & subtropical"]},
+        {"group": "shrubland", "group_label": "Shrublands", "attributes": ["tropical & subtropical"]},
+    ],
+    "Temperate Grasslands, Savannas & Shrublands": [
+        {"group": "grassland", "group_label": "Grasslands", "attributes": ["temperate"]},
+        {"group": "savanna", "group_label": "Savannas", "attributes": ["temperate"]},
+        {"group": "shrubland", "group_label": "Shrublands", "attributes": ["temperate"]},
+    ],
+    "Flooded Grasslands & Savannas": [
+        {"group": "grassland", "group_label": "Grasslands", "attributes": ["flooded"]},
+        {"group": "savanna", "group_label": "Savannas", "attributes": ["flooded"]},
+    ],
+    "Montane Grasslands & Shrublands": [
+        {"group": "grassland", "group_label": "Grasslands", "attributes": ["montane"]},
+        {"group": "shrubland", "group_label": "Shrublands", "attributes": ["montane"]},
+    ],
+    "Deserts & Xeric Shrublands": [
+        {"group": "shrubland", "group_label": "Shrublands", "attributes": ["desert"]},
+    ],
+    "Mediterranean Forests, Woodlands & Scrub": [
+        {"group": "forest", "group_label": "Forests", "attributes": ["mediterranean"]},
+        {"group": "shrubland", "group_label": "Shrublands", "attributes": ["mediterranean"]},
+    ],
+}
+
+
 def _write_json(path: Path, payload: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
@@ -235,18 +333,36 @@ def _build_legends(shp_path: Path) -> None:
         biome_rows[int(r["BIOME_NUM"])] = (r["BIOME_NAME"], r["COLOR_BIO"])
 
     # Biome is already the coarse tier (no finer sub-structure in the source
-    # data to group by), so each biome is its own singleton group — same
+    # data to group by), so most biomes are their own singleton group — same
     # group id/label a matching ecoregion would carry, keeping the two
-    # legends' grouping consistent.
+    # legends' grouping consistent — except the handful overridden above
+    # (same-noun variant merge, or fanned out into several concept groups).
     biome_classes = []
     for bnum, (name, color) in sorted(biome_rows.items()):
-        biome_classes.append({
-            "id": bnum,
-            "name": name,
-            "group": _slug(name),
-            "group_label": name,
-            "traits": {"color": color},
-        })
+        override = _BIOME_GROUP_OVERRIDES.get(name)
+        fanout = _BIOME_GROUP_FANOUT.get(name)
+        if fanout:
+            biome_classes.append({
+                "id": bnum,
+                "name": name,
+                "memberships": fanout,
+                "traits": {"color": color},
+            })
+        elif override:
+            biome_classes.append({
+                "id": bnum,
+                "name": name,
+                **override,
+                "traits": {"color": color},
+            })
+        else:
+            biome_classes.append({
+                "id": bnum,
+                "name": name,
+                "group": _slug(name),
+                "group_label": name,
+                "traits": {"color": color},
+            })
     biome_classes.append({
         "id": ROCK_AND_ICE_BIOME_ID,
         "name": "Rock and Ice",
@@ -258,7 +374,12 @@ def _build_legends(shp_path: Path) -> None:
     eco_path = LEGENDS_DIR / "ecoregions_legend.json"
     biome_path = LEGENDS_DIR / "biome_legend.json"
     _write_json(eco_path, {"layer_id": "ecoregions", "source": CITATION, "classes": eco_classes})
-    _write_json(biome_path, {"layer_id": "biome", "source": CITATION, "classes": biome_classes})
+    _write_json(biome_path, {
+        "layer_id": "biome",
+        "source": CITATION,
+        "classes": biome_classes,
+        "attribute_axes": _BIOME_ATTRIBUTE_AXES,
+    })
     _write_license(eco_path)
     _write_license(biome_path)
     print(f"  Wrote {eco_path} ({len(eco_classes)} classes)")

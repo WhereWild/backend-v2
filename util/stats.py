@@ -1345,8 +1345,17 @@ def compute_location_filtered_stats(
     start_ts: int | None = None,
     end_ts: int | None = None,
     storage: ParquetStorage | None = None,
+    layer_meta: dict[str, dict] | None = None,
 ) -> dict | None:
-    """Compute stats on the fly for variable_id, restricted by location, phenology, and/or timestamp."""
+    """Compute stats on the fly for variable_id, restricted by location, phenology, and/or timestamp.
+
+    `layer_meta` (full catalog, {layer_id: layer}) is optional and only used to
+    resolve `variable_id` against `composition_group_members` — when the requested
+    variable is a ternary composition's classifier, the density grid (normally
+    precomputed and read from density_grid.parquet) is instead fit on the fly
+    over the same filtered sample, since the precomputed grid reflects the
+    unfiltered population and would misrepresent the active filter otherwise.
+    """
     df = collect_taxon_df(taxon, storage=storage)
     if df is None:
         return None
@@ -1400,7 +1409,15 @@ def compute_location_filtered_stats(
             return None
         raw_counts: Counter = Counter(int(float(v)) for v in series)
         summary, distribution = _nominal_stats(raw_counts, unique)
-        return {"type": "nominal", "observation_count": summary["total_samples"], "summary": summary, "distribution": distribution}
+        result = {"type": "nominal", "observation_count": summary["total_samples"], "summary": summary, "distribution": distribution}
+        if layer_meta is not None:
+            cols = composition_group_members(layer_meta).get(variable_id)
+            if cols and set(cols) <= set(df.columns):
+                triples = df[cols].dropna().to_numpy(dtype=np.float64)
+                grid = build_ternary_density_grid(triples)
+                if grid is not None:
+                    result["ternary_composition_density"] = grid
+        return result
     if vtype == ValueType.ORDINAL:
         series = df[variable_id].dropna()
         if series.empty:

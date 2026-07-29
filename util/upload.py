@@ -35,6 +35,7 @@ from fastapi import HTTPException
 
 from config.config import ZERO_NODATA_LAYERS
 from util.gis import (
+    COMPOSITION_CLASSIFIERS,
     DERIVED_FROM_ELEVATION,
     DERIVED_FROM_SOIL,
     hilbert_index,
@@ -46,12 +47,14 @@ from util.gis import (
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
+    DENSITY_GRID_FILE,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
     ORDINAL_STATS_FILE,
     _filter_df,
     process_observations_df,
 )
+from util.ternary import build_ternary_classification_overlay, composition_group_members
 from util.temporal import (
     TailBuffer,
     build_chunk_index,
@@ -724,6 +727,37 @@ def _build_temporal_var_meta(df: pd.DataFrame) -> list[dict]:
     return rows
 
 
+def _add_ternary_classification_overlay(work_dir: Path, layer_meta: dict[str, dict]) -> None:
+    """Augment density_grid.parquet with each compositional group's classification
+    overlay (class ids + boundary lines), when a classifier is registered for it.
+
+    Classification is static per classifier — identical for every taxon/dataset,
+    since it doesn't depend on occurrence data at all (see
+    util.ternary.build_ternary_classification_overlay) — so it's cheap to compute
+    once here and ship it in the archive, rather than requiring the client to
+    port the classification rules (e.g. USDA soil texture) and boundary-bisection
+    logic itself.
+    """
+    path = work_dir / DENSITY_GRID_FILE
+    if not path.exists():
+        return
+    rows = pq.read_table(path).to_pylist()
+    group_members = composition_group_members(layer_meta)
+    changed = False
+    for row in rows:
+        classifier = COMPOSITION_CLASSIFIERS.get(row.get("variable"))
+        axis_columns = tuple(group_members.get(row.get("variable"), ()))
+        if classifier is None or len(axis_columns) != 3:
+            continue
+        overlay = build_ternary_classification_overlay(row["resolution"], classifier, axis_columns)
+        row["class_ids"] = overlay["class_ids"]
+        row["class_boundary_a"] = overlay["boundary_a"]
+        row["class_boundary_b"] = overlay["boundary_b"]
+        changed = True
+    if changed:
+        pq.write_table(pa.Table.from_pylist(rows), path)
+
+
 # ---------------------------------------------------------------------------
 # Archive building
 # ---------------------------------------------------------------------------
@@ -742,6 +776,7 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
     try:
         filtered = _filter_df(df.copy())
         process_observations_df(work_dir, filtered, layer_meta)
+        _add_ternary_classification_overlay(work_dir, layer_meta)
 
         occ_path = work_dir / "occurrence.parquet"
         df.to_parquet(occ_path, index=False)
@@ -799,6 +834,9 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
                 "render_min":    layer.get("render_min"),
                 "render_max":    layer.get("render_max"),
                 "legend_classes": legend_json,
+                "composition_group": layer.get("composition_group") or None,
+                "composition_axis":  layer.get("composition_axis") or None,
+                "composition_label": layer.get("composition_label") or None,
             })
         meta_path = work_dir / "variable_metadata.parquet"
         if meta_rows:
@@ -818,6 +856,7 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
             (work_dir / ORDINAL_STATS_FILE,         ORDINAL_STATS_FILE),
             (work_dir / CIRCULAR_STATS_FILE,        CIRCULAR_STATS_FILE),
             (work_dir / DENSITY_FILE,               DENSITY_FILE),
+            (work_dir / DENSITY_GRID_FILE,          DENSITY_GRID_FILE),
             (lookup_path,                           "categorical_value_lookup.parquet"),
             (meta_path,                             "variable_metadata.parquet"),
             (locations_path,                        "locations.parquet"),

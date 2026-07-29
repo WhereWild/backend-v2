@@ -186,6 +186,7 @@ def _push_stage() -> None:
     flags = [
         "--exclude", "taxonomy/cache/**",
         "--exclude", "gis/temporal/rasters/**",
+        "--exclude", "gis/layers/elevation.tif",
         "--delete-excluded",
         "--transfers", transfers,
         "--stats-one-line", "--stats", "1m",

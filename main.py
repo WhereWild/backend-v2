@@ -26,7 +26,7 @@ from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
 from config.config import load_config
-from util import citations, descriptions, gis, taxa, tiles, units, upload
+from util import citations, descriptions, download, gis, taxa, tiles, units, upload
 from util.rankings import TREE_ROOT as RANKINGS_TREE_ROOT
 from util.stats import (
     CIRCULAR_STATS_FILE,
@@ -63,6 +63,22 @@ _PHENOLOGY_VALUES: frozenset[str] = frozenset(_CONFIG.phenology_values)
 _LARGE_TAXON_THRESHOLD = 500_000
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
+
+
+def _reject_if_large_taxon(taxon: dict) -> None:
+    """Block per-observation aggregation (filtering, slicing, raw sample/value
+    listing, downloading) for taxa too large to do it live — matches the
+    frontend's large-taxon map/filter/download disable threshold."""
+    try:
+        _num_rows = _storage.read_table(
+            GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
+            filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
+        ).to_pylist()
+        _obs_count = max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
+    except Exception:
+        _obs_count = 0
+    if _obs_count >= _LARGE_TAXON_THRESHOLD:
+        raise HTTPException(status_code=400, detail="large_taxon")
 
 
 def _resolve_variable_id(variable_id: str) -> str:
@@ -206,7 +222,7 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"], expose_headers=["X-Nominal-Classes"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"], expose_headers=["X-Nominal-Classes", "Content-Disposition"])
 
 
 def _license_label(url: str | None) -> str | None:
@@ -1106,6 +1122,7 @@ def get_species_environment(
     value_type = layer.get("value_type") if layer else None
 
     if (location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None) and layer is not None:
+        _reject_if_large_taxon(taxon)
         filter_col = _location_filter_col(location) if location is not None else None
         if location is None or filter_col is not None:
             all_layers_by_id = {lyr["id"]: lyr for lyr in tiles.load_layers()}
@@ -1409,16 +1426,7 @@ def get_species_occurrences(
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
 
-    try:
-        _num_rows = _storage.read_table(
-            GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
-            filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
-        ).to_pylist()
-        _obs_count = max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
-    except Exception:
-        _obs_count = 0
-    if _obs_count >= _LARGE_TAXON_THRESHOLD:
-        raise HTTPException(status_code=400, detail="large_taxon")
+    _reject_if_large_taxon(taxon)
 
     is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
     filter_col = _location_filter_col(location) if location is not None else None
@@ -1616,6 +1624,33 @@ def get_species_locations(taxon_id: str, level: int | None = None, parent: str |
     return results[:limit]
 
 
+@app.get("/species/{taxon_id}/download")
+async def download_species_data(background_tasks: BackgroundTasks, taxon_id: str) -> FileResponse:
+    """Download a taxon's occurrence data + stats as a ZIP, same shape as the
+    custom-upload archive so it can be mounted offline the same way.
+
+    Works for any rank — non-leaf taxa aggregate every descendant leaf's
+    observations (see util.download.build_species_archive), which can be
+    slow for high ranks with many descendants.
+    """
+    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+    if taxon is None:
+        raise HTTPException(status_code=404, detail="Taxon not found")
+
+    _reject_if_large_taxon(taxon)
+
+    result = await run_in_threadpool(download.build_species_archive, taxon, _storage)
+    if result is None:
+        raise HTTPException(status_code=404, detail="No observations available for this taxon")
+    archive_path, archive_name, work_dir = result
+
+    background_tasks.add_task(shutil.rmtree, work_dir, True)
+    return FileResponse(
+        path=archive_path,
+        media_type="application/zip",
+        filename=archive_name,
+    )
+
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/observation-values")
 def get_observation_variable_values(
@@ -1627,6 +1662,7 @@ def get_observation_variable_values(
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
+    _reject_if_large_taxon(taxon)
 
     variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
@@ -1705,16 +1741,7 @@ def get_species_environment_slice(
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    try:
-        _num_rows = _storage.read_table(
-            GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
-            filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
-        ).to_pylist()
-        _obs_count = max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
-    except Exception:
-        _obs_count = 0
-    if _obs_count >= _LARGE_TAXON_THRESHOLD:
-        raise HTTPException(status_code=400, detail="large_taxon")
+    _reject_if_large_taxon(taxon)
     phenology_norm = phenology.strip().lower() if phenology else None
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
@@ -1767,6 +1794,7 @@ def get_species_environment_class_samples(
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
+    _reject_if_large_taxon(taxon)
     phenology_norm = phenology.strip().lower() if phenology else None
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")

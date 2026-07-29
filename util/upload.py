@@ -54,7 +54,6 @@ from util.stats import (
     _filter_df,
     process_observations_df,
 )
-from util.ternary import build_ternary_classification_overlay, composition_group_members
 from util.temporal import (
     TailBuffer,
     build_chunk_index,
@@ -65,6 +64,7 @@ from util.temporal import (
     process_chunk_vpd,
     window_steps,
 )
+from util.ternary import build_ternary_classification_overlay, composition_group_members
 from util.tiles import LAYERS_DIR, load_layers_with_category
 
 _LEGEND_DIR = Path("config/gis/legends")

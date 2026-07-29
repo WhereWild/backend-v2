@@ -5,8 +5,12 @@
     {
       "id": 1,
       "name": "Tropical & Subtropical Moist Broadleaf Forests",
-      "group": "tropical_and_subtropical_moist_broadleaf_forests",
-      "group_label": "Tropical & Subtropical Moist Broadleaf Forests",
+      "group": "broadleaf_forest",
+      "group_label": "Broadleaf Forests",
+      "attributes": [
+        "moist",
+        "tropical & subtropical"
+      ],
       "traits": {
         "color": "#38A700"
       }
@@ -14,8 +18,12 @@
     {
       "id": 2,
       "name": "Tropical & Subtropical Dry Broadleaf Forests",
-      "group": "tropical_and_subtropical_dry_broadleaf_forests",
-      "group_label": "Tropical & Subtropical Dry Broadleaf Forests",
+      "group": "broadleaf_forest",
+      "group_label": "Broadleaf Forests",
+      "attributes": [
+        "dry",
+        "tropical & subtropical"
+      ],
       "traits": {
         "color": "#CCCD65"
       }
@@ -23,8 +31,11 @@
     {
       "id": 3,
       "name": "Tropical & Subtropical Coniferous Forests",
-      "group": "tropical_and_subtropical_coniferous_forests",
-      "group_label": "Tropical & Subtropical Coniferous Forests",
+      "group": "conifer_forest",
+      "group_label": "Conifer Forests",
+      "attributes": [
+        "tropical & subtropical"
+      ],
       "traits": {
         "color": "#88CE66"
       }
@@ -32,8 +43,11 @@
     {
       "id": 4,
       "name": "Temperate Broadleaf & Mixed Forests",
-      "group": "temperate_broadleaf_and_mixed_forests",
-      "group_label": "Temperate Broadleaf & Mixed Forests",
+      "group": "broadleaf_and_mixed_forest",
+      "group_label": "Broadleaf & Mixed Forests",
+      "attributes": [
+        "temperate"
+      ],
       "traits": {
         "color": "#00734C"
       }
@@ -41,8 +55,11 @@
     {
       "id": 5,
       "name": "Temperate Conifer Forests",
-      "group": "temperate_conifer_forests",
-      "group_label": "Temperate Conifer Forests",
+      "group": "conifer_forest",
+      "group_label": "Conifer Forests",
+      "attributes": [
+        "temperate"
+      ],
       "traits": {
         "color": "#458970"
       }
@@ -50,8 +67,12 @@
     {
       "id": 6,
       "name": "Boreal Forests/Taiga",
-      "group": "boreal_forests_taiga",
-      "group_label": "Boreal Forests/Taiga",
+      "group": "conifer_forest",
+      "group_label": "Conifer Forests",
+      "solo_group_label": "Boreal Forests/Taiga",
+      "attributes": [
+        "boreal"
+      ],
       "traits": {
         "color": "#7AB6F5"
       }
@@ -59,8 +80,11 @@
     {
       "id": 7,
       "name": "Tropical & Subtropical Grasslands, Savannas & Shrublands",
-      "group": "tropical_and_subtropical_grasslands_savannas_and_shrublands",
-      "group_label": "Tropical & Subtropical Grasslands, Savannas & Shrublands",
+      "memberships": [
+        { "group": "grassland", "group_label": "Grasslands", "attributes": ["tropical & subtropical"] },
+        { "group": "savanna", "group_label": "Savannas", "attributes": ["tropical & subtropical"] },
+        { "group": "shrubland", "group_label": "Shrublands", "attributes": ["tropical & subtropical"] }
+      ],
       "traits": {
         "color": "#FEAA01"
       }
@@ -68,8 +92,11 @@
     {
       "id": 8,
       "name": "Temperate Grasslands, Savannas & Shrublands",
-      "group": "temperate_grasslands_savannas_and_shrublands",
-      "group_label": "Temperate Grasslands, Savannas & Shrublands",
+      "memberships": [
+        { "group": "grassland", "group_label": "Grasslands", "attributes": ["temperate"] },
+        { "group": "savanna", "group_label": "Savannas", "attributes": ["temperate"] },
+        { "group": "shrubland", "group_label": "Shrublands", "attributes": ["temperate"] }
+      ],
       "traits": {
         "color": "#FEFF73"
       }
@@ -77,8 +104,10 @@
     {
       "id": 9,
       "name": "Flooded Grasslands & Savannas",
-      "group": "flooded_grasslands_and_savannas",
-      "group_label": "Flooded Grasslands & Savannas",
+      "memberships": [
+        { "group": "grassland", "group_label": "Grasslands", "attributes": ["flooded"] },
+        { "group": "savanna", "group_label": "Savannas", "attributes": ["flooded"] }
+      ],
       "traits": {
         "color": "#BEE7FF"
       }
@@ -86,8 +115,10 @@
     {
       "id": 10,
       "name": "Montane Grasslands & Shrublands",
-      "group": "montane_grasslands_and_shrublands",
-      "group_label": "Montane Grasslands & Shrublands",
+      "memberships": [
+        { "group": "grassland", "group_label": "Grasslands", "attributes": ["montane"] },
+        { "group": "shrubland", "group_label": "Shrublands", "attributes": ["montane"] }
+      ],
       "traits": {
         "color": "#D6C39D"
       }
@@ -104,8 +135,10 @@
     {
       "id": 12,
       "name": "Mediterranean Forests, Woodlands & Scrub",
-      "group": "mediterranean_forests_woodlands_and_scrub",
-      "group_label": "Mediterranean Forests, Woodlands & Scrub",
+      "memberships": [
+        { "group": "forest", "group_label": "Forests", "attributes": ["mediterranean"] },
+        { "group": "shrubland", "group_label": "Shrublands", "attributes": ["mediterranean"] }
+      ],
       "traits": {
         "color": "#FE0000"
       }
@@ -113,8 +146,9 @@
     {
       "id": 13,
       "name": "Deserts & Xeric Shrublands",
-      "group": "deserts_and_xeric_shrublands",
-      "group_label": "Deserts & Xeric Shrublands",
+      "memberships": [
+        { "group": "shrubland", "group_label": "Shrublands", "attributes": ["desert"] }
+      ],
       "traits": {
         "color": "#CC6767"
       }
@@ -137,5 +171,11 @@
         "color": "#FFEAAF"
       }
     }
-  ]
+  ],
+  "attribute_axes": {
+    "broadleaf_forest": [
+      { "name": "moisture", "values": ["moist", "dry"] },
+      { "name": "zone", "values": ["tropical & subtropical"] }
+    ]
+  }
 }

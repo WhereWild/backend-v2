@@ -261,6 +261,85 @@ def test_colorize_mixed_nan():
     assert rgba[0, 1, 3] > 0
 
 
+def test_colorize_value_mask_min_max():
+    values = np.array([[0.0, 0.5, 1.0]], dtype=np.float32)
+    rgba = tiles._colorize(values, 0.0, 1.0, mask_min=0.4, mask_max=0.6)
+    assert rgba[0, 0, 3] == 0
+    assert rgba[0, 1, 3] == 255
+    assert rgba[0, 2, 3] == 0
+
+
+def test_colorize_value_mask_min_only():
+    values = np.array([[0.0, 1.0]], dtype=np.float32)
+    rgba = tiles._colorize(values, 0.0, 1.0, mask_min=0.5)
+    assert rgba[0, 0, 3] == 0
+    assert rgba[0, 1, 3] == 255
+
+
+def test_colorize_value_mask_ignores_nan():
+    values = np.array([[np.nan, 0.5]], dtype=np.float32)
+    rgba = tiles._colorize(values, 0.0, 1.0, mask_min=0.0, mask_max=1.0)
+    assert rgba[0, 0, 3] == 0
+    assert rgba[0, 1, 3] == 255
+
+
+def test_colorize_circular_mask_simple_range():
+    values = np.array([[10.0, 45.0, 90.0]], dtype=np.float32)
+    rgba = tiles._colorize_circular(values, mask_min=0.0, mask_max=45.0)
+    assert rgba[0, 0, 3] > 0
+    assert rgba[0, 1, 3] > 0
+    assert rgba[0, 2, 3] == 0
+
+
+def test_colorize_circular_mask_wraps_across_zero():
+    values = np.array([[0.0, 10.0, 180.0, 350.0]], dtype=np.float32)
+    rgba = tiles._colorize_circular(values, mask_min=350.0, mask_max=20.0)
+    assert rgba[0, 0, 3] > 0
+    assert rgba[0, 1, 3] > 0
+    assert rgba[0, 2, 3] == 0
+    assert rgba[0, 3, 3] > 0
+
+
+def test_colorize_circular_no_mask_when_only_one_bound_given():
+    values = np.array([[10.0, 200.0]], dtype=np.float32)
+    rgba = tiles._colorize_circular(values, mask_min=0.0, mask_max=None)
+    assert rgba[0, 0, 3] > 0
+    assert rgba[0, 1, 3] > 0
+
+
+def test_colorize_nominal_no_filter_colors_all_known_classes():
+    values = np.array([[1.0, 2.0]], dtype=np.float32)
+    colormap = {1: (255, 0, 0), 2: (0, 255, 0)}
+    rgba = tiles._colorize_nominal(values, colormap)
+    assert rgba[0, 0, 3] == 255
+    assert rgba[0, 1, 3] == 255
+
+
+def test_colorize_nominal_single_class_filter():
+    values = np.array([[1.0, 2.0]], dtype=np.float32)
+    colormap = {1: (255, 0, 0), 2: (0, 255, 0)}
+    rgba = tiles._colorize_nominal(values, colormap, class_filter=[1])
+    assert rgba[0, 0, 3] == 255
+    assert rgba[0, 1, 3] == 0
+
+
+def test_colorize_nominal_multi_class_filter():
+    values = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
+    colormap = {1: (255, 0, 0), 2: (0, 255, 0), 3: (0, 0, 255)}
+    rgba = tiles._colorize_nominal(values, colormap, class_filter=[1, 3])
+    assert rgba[0, 0, 3] == 255
+    assert rgba[0, 1, 3] == 0
+    assert rgba[0, 2, 3] == 255
+
+
+def test_colorize_nominal_empty_class_filter_hides_everything():
+    values = np.array([[1.0, 2.0]], dtype=np.float32)
+    colormap = {1: (255, 0, 0), 2: (0, 255, 0)}
+    rgba = tiles._colorize_nominal(values, colormap, class_filter=[])
+    assert rgba[0, 0, 3] == 0
+    assert rgba[0, 1, 3] == 0
+
+
 # ---------------------------------------------------------------------------
 # render_layer_tile_bytes
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import Collection
 
 import numpy as np
 import rasterio
@@ -238,11 +239,22 @@ def tile_bounds_wgs84(z: int, x: int, y: int) -> tuple[float, float, float, floa
 # Colorization
 # ---------------------------------------------------------------------------
 
-def _colorize_circular(values: np.ndarray, colormap: str = _DEFAULT_CIRCULAR_COLORMAP) -> np.ndarray:
+def _colorize_circular(
+    values: np.ndarray,
+    colormap: str = _DEFAULT_CIRCULAR_COLORMAP,
+    mask_min: float | None = None,
+    mask_max: float | None = None,
+) -> np.ndarray:
     """Colorize angular values (0–360°) using a twilight circular colormap.
 
     Maps degrees cyclically to the LUT so 0° and 360° return the same color.
     NaN pixels (nodata) are fully transparent.
+
+    mask_min/mask_max (both 0-360, both required together) select an angular
+    slice of the ring rather than a linear range — e.g. a slice from 350° to
+    20° wraps through 0° rather than being empty, since on a compass "350 to
+    20" is a real, non-empty 30° arc facing roughly north. Pixels outside the
+    slice are dropped to alpha 0, same convention as _colorize's mask.
     """
     rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
     finite = np.isfinite(values)
@@ -259,6 +271,16 @@ def _colorize_circular(values: np.ndarray, colormap: str = _DEFAULT_CIRCULAR_COL
     rgba[finite, 1] = lut[indices, 1].astype(np.uint8)
     rgba[finite, 2] = lut[indices, 2].astype(np.uint8)
     rgba[finite, 3] = 200
+
+    if mask_min is not None and mask_max is not None:
+        deg = values % 360.0
+        lo = mask_min % 360.0
+        hi = mask_max % 360.0
+        if lo <= hi:
+            in_range = finite & (deg >= lo) & (deg <= hi)
+        else:
+            in_range = finite & ((deg >= lo) | (deg <= hi))
+        rgba[~in_range, 3] = 0
     return rgba
 
 
@@ -326,27 +348,28 @@ def _nominal_fallback_color(class_id: int) -> tuple[int, int, int]:
 def _colorize_nominal(
     values: np.ndarray,
     colormap: dict[int, tuple[int, int, int]],
-    class_filter: int | None = None,
+    class_filter: Collection[int] | None = None,
 ) -> np.ndarray:
     """Map integer class IDs to RGBA using legend colors (fully opaque).
 
-    If class_filter is set, only pixels matching that class ID are rendered;
-    all others are left transparent.
+    If class_filter is set, only pixels matching one of those class IDs are
+    rendered; all others are left transparent.
     """
     rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
     if not colormap:
         return rgba
+    class_filter_set = set(class_filter) if class_filter is not None else None
     max_id = max(colormap.keys()) + 1
     lut = np.zeros((max_id, 4), dtype=np.uint8)
     for cid, (r, g, b) in colormap.items():
-        if 0 <= cid < max_id and (class_filter is None or cid == class_filter):
+        if 0 <= cid < max_id and (class_filter_set is None or cid in class_filter_set):
             lut[cid] = [r, g, b, 255]
     finite = np.isfinite(values)
     ids    = np.where(finite, np.round(values).astype(np.int32), -1)
     known  = finite & (ids >= 0) & (ids < max_id)
     rgba[known] = lut[ids[known]]
     # Fall back to generated colors for any finite class ID not in the legend
-    if class_filter is None:
+    if class_filter_set is None:
         unknown = finite & ~known
         if np.any(unknown):
             for cid in np.unique(ids[unknown]):
@@ -356,7 +379,14 @@ def _colorize_nominal(
     return rgba
 
 
-def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEFAULT_COLORMAP) -> np.ndarray:
+def _colorize(
+    values: np.ndarray,
+    vmin: float,
+    vmax: float,
+    colormap: str = _DEFAULT_COLORMAP,
+    mask_min: float | None = None,
+    mask_max: float | None = None,
+) -> np.ndarray:
     rgba   = np.zeros((*values.shape, 4), dtype=np.uint8)
     finite = np.isfinite(values)
     if not np.any(finite):
@@ -372,6 +402,20 @@ def _colorize(values: np.ndarray, vmin: float, vmax: float, colormap: str = _DEF
     rgba[finite, 1] = lut[indices, 1].astype(np.uint8)
     rgba[finite, 2] = lut[indices, 2].astype(np.uint8)
     rgba[finite, 3] = 255
+
+    # Same "leave it transparent" masking _colorize_nominal uses for
+    # class_filter, applied to a continuous value range instead of a
+    # discrete class id — pixels outside [mask_min, mask_max] are dropped
+    # to alpha 0 rather than colored, so the legend "slice" selection filters
+    # rendered pixels the same way class_filter already does for nominal
+    # variables.
+    if mask_min is not None or mask_max is not None:
+        in_range = finite.copy()
+        if mask_min is not None:
+            in_range &= values >= mask_min
+        if mask_max is not None:
+            in_range &= values <= mask_max
+        rgba[~in_range, 3] = 0
     return rgba
 
 
@@ -478,7 +522,9 @@ def render_temporal_tile_bytes(
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
     forecast_suffix: str = "",
-    class_filter: int | None = None,
+    class_filter: Collection[int] | None = None,
+    value_min: float | None = None,
+    value_max: float | None = None,
 ) -> bytes:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
@@ -546,11 +592,11 @@ def render_temporal_tile_bytes(
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap)
+        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap, value_min, value_max)
     elif str(layer.get("value_type") or "").lower() == "circular":
-        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP)
+        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_min, value_max)
     else:
-        rgba = _colorize(dest, vmin, vmax, colormap)
+        rgba = _colorize(dest, vmin, vmax, colormap, value_min, value_max)
     img = Image.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -712,6 +758,8 @@ def _render_derived_elevation_tile_bytes(
     tile_size: int,
     derive_fn,
     colormap: str = _DEFAULT_COLORMAP,
+    value_min: float | None = None,
+    value_max: float | None = None,
 ) -> bytes:
     """Render a tile for a layer derived on-the-fly from elevation.tif."""
     elev_path = LAYERS_DIR / "elevation.tif"
@@ -784,9 +832,9 @@ def _render_derived_elevation_tile_bytes(
         pass
 
     if layer["id"] == "aspect":
-        rgba = _colorize_circular(dest, colormap)
+        rgba = _colorize_circular(dest, colormap, value_min, value_max)
     else:
-        rgba = _colorize(dest, vmin or 0.0, vmax or 90.0, colormap)
+        rgba = _colorize(dest, vmin or 0.0, vmax or 90.0, colormap, value_min, value_max)
     img  = Image.fromarray(rgba, mode="RGBA")
     buf  = io.BytesIO()
     img.save(buf, format="PNG")
@@ -861,7 +909,7 @@ def _render_derived_soil_texture_tile_bytes(
     tile_size: int,
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
-    class_filter: int | None = None,
+    class_filter: Collection[int] | None = None,
 ) -> bytes:
     """Render a soil_texture tile derived on-the-fly from sand/silt/clay COGs."""
     from util.gis import _SOIL_TEXTURE_INPUT_FILES, derive_soil_texture_array
@@ -897,15 +945,17 @@ def render_layer_tile_bytes(
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
     forecast_suffix: str = "",
-    class_filter: int | None = None,
+    class_filter: Collection[int] | None = None,
+    value_min: float | None = None,
+    value_max: float | None = None,
 ) -> bytes:
     from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
-        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter)
+        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter, value_min, value_max)
     if layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
-        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap)
+        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap, value_min, value_max)
     if layer_id in DERIVED_FROM_SOIL:
         return _render_derived_soil_texture_tile_bytes(layer, z, x, y, tile_size, colormap, cb_mode, class_filter)
     path    = LAYERS_DIR / layer["filename"]
@@ -1008,11 +1058,11 @@ def render_layer_tile_bytes(
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
+        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap, value_min, value_max)
     elif str(layer.get("value_type") or "").lower() == "circular":
-        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP)
+        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_min, value_max)
     else:
-        rgba = _colorize(dest, vmin, vmax, colormap)
+        rgba = _colorize(dest, vmin, vmax, colormap, value_min, value_max)
     img  = Image.fromarray(rgba, mode="RGBA")
     buf  = io.BytesIO()
     img.save(buf, format="PNG")

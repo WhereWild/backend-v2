@@ -18,9 +18,9 @@ import json
 import math
 import os
 import re
+from collections.abc import Collection
 from functools import lru_cache
 from pathlib import Path
-from typing import Collection
 
 import numpy as np
 import rasterio
@@ -592,9 +592,16 @@ def render_temporal_tile_bytes(
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap, value_min, value_max)
+        rgba = (
+            _colorize_nominal(dest, nominal_cmap, class_filter)
+            if nominal_cmap
+            else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap, value_min, value_max)
+        )
     elif str(layer.get("value_type") or "").lower() == "circular":
-        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_min, value_max)
+        circular_colormap = (
+            colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP
+        )
+        rgba = _colorize_circular(dest, circular_colormap, value_min, value_max)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap, value_min, value_max)
     img = Image.fromarray(rgba, mode="RGBA")

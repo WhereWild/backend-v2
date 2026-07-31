@@ -2790,7 +2790,11 @@ def compute_raster_final(
         result = combined / n_total
         if var_id == "cloud_cover":
             result = np.clip(result, 0.0, 100.0)
+        elif var_id in ("soil_moisture_0_to_7cm", "shortwave_radiation"):
+            result = np.maximum(result, 0.0)
         return result.astype(np.float32)
+    if var_id in ("precipitation", "snowfall_water_equivalent"):
+        combined = np.maximum(combined, 0.0)
     return combined.astype(np.float32)
 
 

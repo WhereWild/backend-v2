@@ -599,11 +599,14 @@ async def variable_tile_compat(
     variable_id: str, z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis"),
     cb_mode: str = Query(""), forecast_h: int = Query(0, ge=0),
-    class_filter: int | None = Query(None),
+    class_filter: list[int] | None = Query(None),
+    value_min: float | None = Query(None),
+    value_max: float | None = Query(None),
+    unit_system: str | None = Query(None),
 ):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter)
+    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter, value_min, value_max, unit_system)
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
@@ -613,7 +616,10 @@ async def layer_tile(
     colormap: str = Query("viridis"),
     cb_mode: str = Query(""),
     forecast_h: int = Query(0, ge=0),
-    class_filter: int | None = Query(None),
+    class_filter: list[int] | None = Query(None),
+    value_min: float | None = Query(None),
+    value_max: float | None = Query(None),
+    unit_system: str | None = Query(None),
 ):
     if colormap not in tiles.SUPPORTED_COLORMAPS and colormap not in tiles.SUPPORTED_CIRCULAR_COLORMAPS:
         colormap = "viridis"
@@ -626,10 +632,23 @@ async def layer_tile(
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Layer '{layer_id}' not found")
 
+    # The legend's slice-selection UI displays value_min/value_max in the
+    # user's current unit system (imperial converts e.g. °C -> °F), same as
+    # render_min/render_max in the variable metadata response — but tile
+    # pixels (and the layer's own render_min/render_max used for coloring)
+    # are always raw/metric. Without this, an imperial-unit selection gets
+    # applied as if it were already metric (see the /observation-values
+    # slicing endpoint, which converts back the same way).
+    if value_min is not None:
+        value_min = units.convert_value_from_display(value_min, layer, unit_system)
+    if value_max is not None:
+        value_max = units.convert_value_from_display(value_max, layer, unit_system)
+
     forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h > 0 else ""
     payload = await run_in_threadpool(
         tiles.render_layer_tile_bytes,
         layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter,
+        value_min, value_max,
     )
     is_temporal = layer.get("window_hours") is not None
     # URLs are versioned client-side with the layer's mtime-derived version token

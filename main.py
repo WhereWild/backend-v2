@@ -37,11 +37,13 @@ from util.stats import (
     NUMERICAL_STATS_FILE,
     ORDINAL_STATS_FILE,
     TREE_ROOT,
+    apply_chained_filters,
     apply_phenology_filter,
     apply_timestamp_filter,
     collect_taxon_df,
     compute_location_filtered_stats,
     compute_phenology_counts,
+    numeric_range_mask,
     read_phenology_counts,
 )
 from util.storage import ParquetStorageProxy
@@ -1050,6 +1052,7 @@ def _slice_from_raw_occ(
     phenology: str | None = None,
     start_ts: int | None = None,
     end_ts: int | None = None,
+    extra_filters: list[dict] | None = None,
 ) -> list[dict]:
     df = collect_taxon_df(taxon, storage=_storage)
     if df is None or variable_id not in df.columns:
@@ -1065,11 +1068,10 @@ def _slice_from_raw_occ(
     if df.empty:
         return []
     col = pd.to_numeric(df[variable_id], errors="coerce")
-    if circular_wrap:
-        mask = col.between(value_min, 360.0, inclusive="both") | col.between(0.0, value_max, inclusive="both")
-    else:
-        mask = col.between(value_min, value_max, inclusive="both")
-    df = df[mask].dropna(subset=["decimalLatitude", "decimalLongitude"])
+    mask = numeric_range_mask(col, value_min, value_max, circular_wrap)
+    df = df[mask]
+    df = apply_chained_filters(df, extra_filters)
+    df = df.dropna(subset=["decimalLatitude", "decimalLongitude"])
     if limit is not None:
         df = df.head(limit)
     return [
@@ -1093,6 +1095,7 @@ def _class_samples_from_raw_occ(
     phenology: str | None = None,
     start_ts: int | None = None,
     end_ts: int | None = None,
+    extra_filters: list[dict] | None = None,
 ) -> list[dict]:
     df = collect_taxon_df(taxon, storage=_storage)
     if df is None or variable_id not in df.columns:
@@ -1108,7 +1111,9 @@ def _class_samples_from_raw_occ(
     if df.empty:
         return []
     col = pd.to_numeric(df[variable_id], errors="coerce")
-    df = df[col == class_value].dropna(subset=["decimalLatitude", "decimalLongitude"])
+    df = df[col == class_value]
+    df = apply_chained_filters(df, extra_filters)
+    df = df.dropna(subset=["decimalLatitude", "decimalLongitude"])
     if limit is not None:
         df = df.head(limit)
     return [
@@ -1127,6 +1132,7 @@ def get_species_environment(
     taxon_id: str, variable_id: str, unit_system: str | None = None,
     location: str | None = None, phenology: str | None = None,
     start_ts: int | None = None, end_ts: int | None = None,
+    extra: str | None = None,
 ):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
@@ -1145,8 +1151,12 @@ def get_species_environment(
         "domain": (layer.get("domain") or None) if layer else None,
     }
     value_type = layer.get("value_type") if layer else None
+    extra_filters = _parse_extra_variable_filters(extra, unit_system)
 
-    if (location is not None or phenology_norm is not None or start_ts is not None or end_ts is not None) and layer is not None:
+    if (
+        location is not None or phenology_norm is not None or start_ts is not None
+        or end_ts is not None or extra_filters
+    ) and layer is not None:
         _reject_if_large_taxon(taxon)
         filter_col = _location_filter_col(location) if location is not None else None
         if location is None or filter_col is not None:
@@ -1155,6 +1165,7 @@ def get_species_environment(
                 taxon, variable_id, filter_col, location, layer,
                 phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
                 storage=_storage, layer_meta=all_layers_by_id,
+                extra_filters=extra_filters,
             )
             if result is not None:
                 if result["type"] == "continuous":
@@ -1748,6 +1759,63 @@ def get_observation_variable_values(
     }
 
 
+def _parse_extra_variable_filters(extra: str | None, unit_system: str | None) -> list[dict]:
+    """Parses the `extra` query param — a JSON array of chained per-variable
+    filters carried by the numeric-slice, categorical-samples, and plain
+    environment-stats endpoints — into the filter-dict shape
+    util.stats.apply_chained_filters expects. Each entry is either
+    {"variable": id, "min": x, "max": y} for a
+    continuous/circular range (in DISPLAY units, converted to raw here same
+    as the primary variable) or {"variable": id, "classValue": n} for an
+    exact categorical match. This is what lets a client hold a slice from
+    one variable active while switching to and slicing a second one."""
+    if not extra:
+        return []
+    try:
+        raw_entries = json.loads(extra)
+    except (json.JSONDecodeError, TypeError):
+        raise HTTPException(status_code=400, detail="extra must be a JSON array")
+    if not isinstance(raw_entries, list):
+        raise HTTPException(status_code=400, detail="extra must be a JSON array")
+    layers_by_id = {lyr["id"]: lyr for lyr in tiles.load_layers()}
+    filters: list[dict] = []
+    for entry in raw_entries:
+        if not isinstance(entry, dict) or "variable" not in entry:
+            raise HTTPException(status_code=400, detail="Each extra filter needs a 'variable'")
+        variable_id = _resolve_variable_id(str(entry["variable"]))
+        layer = layers_by_id.get(variable_id)
+        if layer is None:
+            raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
+        if "classValue" in entry:
+            if layer.get("value_type") not in ("nominal", "ordinal"):
+                raise HTTPException(status_code=400, detail=f"'{variable_id}' is not categorical")
+            filters.append({"variable": variable_id, "class_value": float(entry["classValue"])})
+            continue
+        if "min" not in entry or "max" not in entry:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Extra filter for '{variable_id}' needs min/max or classValue",
+            )
+        if layer.get("value_type") == "nominal":
+            raise HTTPException(status_code=400, detail=f"'{variable_id}' is categorical — use classValue")
+        value_min = float(entry["min"])
+        value_max = float(entry["max"])
+        if not math.isfinite(value_min) or not math.isfinite(value_max):
+            raise HTTPException(status_code=400, detail=f"Extra filter for '{variable_id}' must be finite")
+        circular_wrap = variable_id == "aspect" and value_max < value_min
+        if value_max < value_min and not circular_wrap:
+            value_min, value_max = value_max, value_min
+        raw_min = units.convert_value_from_display(value_min, layer, unit_system) - 1e-9
+        raw_max = units.convert_value_from_display(value_max, layer, unit_system) + 1e-9
+        filters.append({
+            "variable": variable_id,
+            "min": raw_min,
+            "max": raw_max,
+            "circular_wrap": circular_wrap,
+        })
+    return filters
+
+
 @app.get("/species/{taxon_id}/environment/{variable_id}/slice")
 def get_species_environment_slice(
     taxon_id: str,
@@ -1760,6 +1828,7 @@ def get_species_environment_slice(
     start_ts: int | None = None,
     end_ts: int | None = None,
     unit_system: str | None = None,
+    extra: str | None = None,
 ):
     if not math.isfinite(min_value) or not math.isfinite(max_value):
         raise HTTPException(status_code=400, detail="min and max must be finite numbers")
@@ -1783,12 +1852,14 @@ def get_species_environment_slice(
     # Add a tiny epsilon buffer to absorb float round-trip error (ft→m→ft→m loses ~1e-13).
     raw_min = units.convert_value_from_display(min_value, layer, unit_system) - 1e-9
     raw_max = units.convert_value_from_display(max_value, layer, unit_system) + 1e-9
+    extra_filters = _parse_extra_variable_filters(extra, unit_system)
     filter_col = _location_filter_col(location) if location is not None else None
     if location is None or filter_col is not None:
         observations = _slice_from_raw_occ(
             taxon, variable_id, filter_col, location,
             raw_min, raw_max, circular_wrap, limit,
             phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+            extra_filters=extra_filters,
         )
         observations = [
             {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
@@ -1815,6 +1886,8 @@ def get_species_environment_class_samples(
     phenology: str | None = None,
     start_ts: int | None = None,
     end_ts: int | None = None,
+    unit_system: str | None = None,
+    extra: str | None = None,
 ):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
@@ -1835,10 +1908,13 @@ def get_species_environment_class_samples(
             parsed = int(parsed)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid class value: {class_value!r}")
+    extra_filters = _parse_extra_variable_filters(extra, unit_system)
     filter_col = _location_filter_col(location) if location is not None else None
     if location is None or filter_col is not None:
         observations = _class_samples_from_raw_occ(
-            taxon, variable_id, filter_col, location, float(parsed), limit, phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+            taxon, variable_id, filter_col, location, float(parsed), limit,
+            phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+            extra_filters=extra_filters,
         )
     else:
         observations = []

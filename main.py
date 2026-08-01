@@ -1763,12 +1763,14 @@ def _parse_extra_variable_filters(extra: str | None, unit_system: str | None) ->
     """Parses the `extra` query param — a JSON array of chained per-variable
     filters carried by the numeric-slice, categorical-samples, and plain
     environment-stats endpoints — into the filter-dict shape
-    util.stats.apply_chained_filters expects. Each entry is either
-    {"variable": id, "min": x, "max": y} for a
-    continuous/circular range (in DISPLAY units, converted to raw here same
-    as the primary variable) or {"variable": id, "classValue": n} for an
-    exact categorical match. This is what lets a client hold a slice from
-    one variable active while switching to and slicing a second one."""
+    util.stats.apply_chained_filters expects. Each entry is one of:
+    {"variable": id, "min": x, "max": y} for a continuous/circular range (in
+    DISPLAY units, converted to raw here same as the primary variable);
+    {"variable": id, "classValue": n} for an exact categorical match; or
+    {"variable": id, "classValues": [n, ...]} for a categorical OR-match
+    against multiple classes of that one variable (e.g. Forest OR
+    Grassland). This is what lets a client hold a slice from one variable
+    active while switching to and slicing a second one."""
     if not extra:
         return []
     try:
@@ -1791,10 +1793,20 @@ def _parse_extra_variable_filters(extra: str | None, unit_system: str | None) ->
                 raise HTTPException(status_code=400, detail=f"'{variable_id}' is not categorical")
             filters.append({"variable": variable_id, "class_value": float(entry["classValue"])})
             continue
+        if "classValues" in entry:
+            if layer.get("value_type") not in ("nominal", "ordinal"):
+                raise HTTPException(status_code=400, detail=f"'{variable_id}' is not categorical")
+            if not isinstance(entry["classValues"], list) or not entry["classValues"]:
+                raise HTTPException(status_code=400, detail=f"'classValues' for '{variable_id}' must be a non-empty list")
+            filters.append({
+                "variable": variable_id,
+                "class_values": [float(v) for v in entry["classValues"]],
+            })
+            continue
         if "min" not in entry or "max" not in entry:
             raise HTTPException(
                 status_code=400,
-                detail=f"Extra filter for '{variable_id}' needs min/max or classValue",
+                detail=f"Extra filter for '{variable_id}' needs min/max, classValue, or classValues",
             )
         if layer.get("value_type") == "nominal":
             raise HTTPException(status_code=400, detail=f"'{variable_id}' is categorical — use classValue")

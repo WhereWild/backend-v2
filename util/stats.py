@@ -116,14 +116,17 @@ def numeric_range_mask(col: pd.Series, value_min: float, value_max: float, circu
 def apply_chained_filters(df: pd.DataFrame, filters: list[dict] | None) -> pd.DataFrame:
     """ANDs additional per-variable filters onto df, on top of whatever
     primary-variable/location/phenology/timestamp filtering the caller
-    already applied. Each filter dict is either {'variable', 'class_value'}
-    for an exact categorical match or {'variable', 'min', 'max',
-    'circular_wrap'} for a numeric range — see main.py's
-    _parse_extra_variable_filters, which builds these from the `extra`
-    query param shared by the /slice, /class/:value/samples, and plain
-    /environment/:variable_id (stats) endpoints. Supports chaining slices
-    across multiple variables (e.g. elevation range AND a landcover class)
-    without each variable needing its own dedicated endpoint."""
+    already applied. Each filter dict is one of:
+      {'variable', 'class_value'} — exact categorical match (single class)
+      {'variable', 'class_values'} — categorical match against ANY of a list
+        of classes (OR within that one variable, e.g. Forest OR Grassland),
+        ANDed against everything else same as the single-value case
+      {'variable', 'min', 'max', 'circular_wrap'} — numeric range
+    See main.py's _parse_extra_variable_filters, which builds these from the
+    `extra` query param shared by the /slice, /class/:value/samples, and
+    plain /environment/:variable_id (stats) endpoints. Supports chaining
+    slices across multiple variables (e.g. elevation range AND a landcover
+    class) without each variable needing its own dedicated endpoint."""
     for f in filters or []:
         variable_id = f["variable"]
         if variable_id not in df.columns:
@@ -131,6 +134,8 @@ def apply_chained_filters(df: pd.DataFrame, filters: list[dict] | None) -> pd.Da
         col = pd.to_numeric(df[variable_id], errors="coerce")
         if "class_value" in f:
             df = df[col == f["class_value"]]
+        elif "class_values" in f:
+            df = df[col.isin(f["class_values"])]
         else:
             df = df[numeric_range_mask(col, f["min"], f["max"], f.get("circular_wrap", False))]
         if df.empty:

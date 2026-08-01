@@ -1569,6 +1569,61 @@ def test_class_samples_with_extra_range_filter_chains_numeric_onto_categorical(t
     assert catalogs == {"B"}
 
 
+def _write_multi_class_occ(tmp_path):
+    """4 rows spanning bio1 (numeric) and kg2 (3 distinct classes), for
+    testing OR-matching against multiple classValues of one variable:
+    A: bio1=10, kg2=1   B: bio1=20, kg2=1   C: bio1=30, kg2=2   D: bio1=40, kg2=3
+    """
+    occ_dir = tmp_path / TAXON["path"]
+    occ_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "catalogNumber": ["A", "B", "C", "D"],
+        "decimalLatitude": [40.0, 41.0, 42.0, 43.0],
+        "decimalLongitude": [-75.0, -74.0, -73.0, -72.0],
+        "bio1": [10.0, 20.0, 30.0, 40.0],
+        "kg2": [1.0, 1.0, 2.0, 3.0],
+    }
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False),
+        occ_dir / "occurrence.parquet",
+    )
+
+
+def test_slice_with_extra_class_values_filter_ors_within_one_variable(tmp_path, monkeypatch):
+    """Slicing bio1 (0-100, matches all 4) with an extra kg2 classValues=[1,3]
+    filter chained on should keep A, B (kg2=1) and D (kg2=3), excluding C (kg2=2)."""
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
+    _write_multi_class_occ(tmp_path)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):
+        extra = json.dumps([{"variable": "kg2", "classValues": [1, 3]}])
+        r = client.get(f"/species/2923970/environment/bio1/slice?min=0&max=100&extra={extra}")
+    assert r.status_code == 200
+    body = r.json()
+    catalogs = {obs["catalogNumber"] for obs in body["observations"]}
+    assert catalogs == {"A", "B", "D"}
+
+
+def test_extra_filter_class_values_must_be_a_non_empty_list():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):
+        extra = json.dumps([{"variable": "kg2", "classValues": []}])
+        r = client.get(f"/species/2923970/environment/bio1/slice?min=0&max=30&extra={extra}")
+    assert r.status_code == 400
+
+
+def test_extra_filter_class_values_rejected_for_non_categorical_variable():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):
+        extra = json.dumps([{"variable": "bio1", "classValues": [1, 2]}])
+        r = client.get(f"/species/2923970/environment/bio1/slice?min=0&max=30&extra={extra}")
+    assert r.status_code == 400
+
+
 def test_slice_extra_filter_malformed_json_rejected():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \

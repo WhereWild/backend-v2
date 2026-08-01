@@ -596,6 +596,43 @@ async def gis_point_value(
 _VALID_FORECAST_HOURS = {0, 1, 8, 24, 72, 168}
 
 
+def _parse_and_convert_chain(chain: str | None, unit_system: str | None) -> list[dict] | None:
+    """Parse the `chain` query param (JSON list of {layer_id, class_filter?, value_min?, value_max?})
+    and convert each entry's value_min/value_max from the display unit system to
+    raw/metric using THAT entry's own layer — each chained layer can have its own
+    units/scale, distinct from the primary layer's.
+    """
+    if not chain:
+        return None
+    try:
+        entries = json.loads(chain)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(entries, list):
+        return None
+    parsed: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("layer_id"):
+            continue
+        try:
+            chain_layer = tiles.get_layer(entry["layer_id"])
+        except KeyError:
+            continue
+        value_min = entry.get("value_min")
+        value_max = entry.get("value_max")
+        if value_min is not None:
+            value_min = units.convert_value_from_display(value_min, chain_layer, unit_system)
+        if value_max is not None:
+            value_max = units.convert_value_from_display(value_max, chain_layer, unit_system)
+        parsed.append({
+            "layer_id": entry["layer_id"],
+            "class_filter": entry.get("class_filter"),
+            "value_min": value_min,
+            "value_max": value_max,
+        })
+    return parsed or None
+
+
 @app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
 async def variable_tile_compat(
     variable_id: str, z: int, x: int, y: int,
@@ -605,10 +642,11 @@ async def variable_tile_compat(
     value_min: float | None = Query(None),
     value_max: float | None = Query(None),
     unit_system: str | None = Query(None),
+    chain: str | None = Query(None),
 ):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter, value_min, value_max, unit_system)
+    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter, value_min, value_max, unit_system, chain)
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
@@ -622,6 +660,7 @@ async def layer_tile(
     value_min: float | None = Query(None),
     value_max: float | None = Query(None),
     unit_system: str | None = Query(None),
+    chain: str | None = Query(None),
 ):
     if colormap not in tiles.SUPPORTED_COLORMAPS and colormap not in tiles.SUPPORTED_CIRCULAR_COLORMAPS:
         colormap = "viridis"
@@ -646,11 +685,13 @@ async def layer_tile(
     if value_max is not None:
         value_max = units.convert_value_from_display(value_max, layer, unit_system)
 
+    parsed_chain = _parse_and_convert_chain(chain, unit_system)
+
     forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h > 0 else ""
     payload = await run_in_threadpool(
         tiles.render_layer_tile_bytes,
         layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter,
-        value_min, value_max,
+        value_min, value_max, parsed_chain,
     )
     is_temporal = layer.get("window_hours") is not None
     # URLs are versioned client-side with the layer's mtime-derived version token

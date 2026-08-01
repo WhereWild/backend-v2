@@ -239,6 +239,13 @@ def tile_bounds_wgs84(z: int, x: int, y: int) -> tuple[float, float, float, floa
 # Colorization
 # ---------------------------------------------------------------------------
 
+def _encode_png(rgba: np.ndarray) -> bytes:
+    img = Image.fromarray(rgba, mode="RGBA")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _colorize_circular(
     values: np.ndarray,
     colormap: str = _DEFAULT_CIRCULAR_COLORMAP,
@@ -513,7 +520,45 @@ def get_layer_version(layer: dict, forecast_suffix: str = "") -> int:
     return 0
 
 
-def render_temporal_tile_bytes(
+def _reproject_temporal_array(
+    arr: np.ndarray, dst_transform, tile_size: int, model: str,
+) -> np.ndarray:
+    """Reproject a lat-ascending global ERA5-grid array onto a tile's Web Mercator grid.
+
+    Shared by render_temporal_tile_bytes (primary layer) and
+    _sample_layer_to_tile (chain-mask sampling of a temporal layer) — same
+    grid-detection-from-shape + warp_reproject logic either way.
+    """
+    dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+    # Detect grid from array shape (more reliable than catalog model field)
+    shape_to_model = {(721, 1440): "copernicus_era5", (1801, 3600): "copernicus_era5_land"}
+    detected = shape_to_model.get(arr.shape, model)
+    grid = _MODEL_GRID_PARAMS.get(detected, _MODEL_GRID_PARAMS["copernicus_era5"])
+    # arr is lat-ascending (row 0 = south); flipud for rasterio north-up convention
+    arr_nu = np.flipud(arr)
+    _cell_lon = (grid["lon_max"] - grid["lon_min"]) / (grid["nx"] - 1)
+    _cell_lat = (grid["lat_max"] - grid["lat_min"]) / (grid["ny"] - 1)
+    src_transform = from_origin(
+        grid["lon_min"] - _cell_lon / 2,
+        grid["lat_max"] + _cell_lat / 2,
+        _cell_lon,
+        _cell_lat,
+    )
+    warp_reproject(
+        source=arr_nu,
+        destination=dest,
+        src_transform=src_transform,
+        src_crs=WGS84,
+        src_nodata=np.nan,
+        dst_transform=dst_transform,
+        dst_crs=WEB_MERCATOR,
+        dst_nodata=np.nan,
+        resampling=Resampling.nearest,
+    )
+    return dest
+
+
+def _render_temporal_tile_rgba(
     layer_id: str,
     z: int,
     x: int,
@@ -525,7 +570,7 @@ def render_temporal_tile_bytes(
     class_filter: Collection[int] | None = None,
     value_min: float | None = None,
     value_max: float | None = None,
-) -> bytes:
+) -> np.ndarray:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
     window_label = layer["window_label"]
@@ -555,34 +600,9 @@ def render_temporal_tile_bytes(
             if vmax is None:
                 vmax = float(np.nanpercentile(arr[finite], 98)) if finite.any() else 1.0
 
-        # Detect grid from array shape (more reliable than catalog model field)
-        shape_to_model = {(721, 1440): "copernicus_era5", (1801, 3600): "copernicus_era5_land"}
-        detected = shape_to_model.get(arr.shape, model)
-        grid = _MODEL_GRID_PARAMS.get(detected, _MODEL_GRID_PARAMS["copernicus_era5"])
-        # arr is lat-ascending (row 0 = south); flipud for rasterio north-up convention
-        arr_nu = np.flipud(arr)
-        _cell_lon = (grid["lon_max"] - grid["lon_min"]) / (grid["nx"] - 1)
-        _cell_lat = (grid["lat_max"] - grid["lat_min"]) / (grid["ny"] - 1)
-        src_transform = from_origin(
-            grid["lon_min"] - _cell_lon / 2,
-            grid["lat_max"] + _cell_lat / 2,
-            _cell_lon,
-            _cell_lat,
-        )
         mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
         dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
-        resample = Resampling.nearest
-        warp_reproject(
-            source=arr_nu,
-            destination=dest,
-            src_transform=src_transform,
-            src_crs=WGS84,
-            src_nodata=np.nan,
-            dst_transform=dst_transform,
-            dst_crs=WEB_MERCATOR,
-            dst_nodata=np.nan,
-            resampling=resample,
-        )
+        dest = _reproject_temporal_array(arr, dst_transform, tile_size, model)
     else:
         vmin = vmin if vmin is not None else 0.0
         vmax = vmax if vmax is not None else 1.0
@@ -604,10 +624,27 @@ def render_temporal_tile_bytes(
         rgba = _colorize_circular(dest, circular_colormap, value_min, value_max)
     else:
         rgba = _colorize(dest, vmin, vmax, colormap, value_min, value_max)
-    img = Image.fromarray(rgba, mode="RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    return rgba
+
+
+def render_temporal_tile_bytes(
+    layer_id: str,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = 256,
+    colormap: str = _DEFAULT_COLORMAP,
+    cb_mode: str = "",
+    forecast_suffix: str = "",
+    class_filter: Collection[int] | None = None,
+    value_min: float | None = None,
+    value_max: float | None = None,
+) -> bytes:
+    rgba = _render_temporal_tile_rgba(
+        layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix,
+        class_filter, value_min, value_max,
+    )
+    return _encode_png(rgba)
 
 
 def _nominal_tile_range_classes_temporal(
@@ -757,25 +794,16 @@ def nominal_tile_range_classes(
     return counts
 
 
-def _render_derived_elevation_tile_bytes(
-    layer: dict,
-    z: int,
-    x: int,
-    y: int,
-    tile_size: int,
-    derive_fn,
-    colormap: str = _DEFAULT_COLORMAP,
-    value_min: float | None = None,
-    value_max: float | None = None,
-) -> bytes:
-    """Render a tile for a layer derived on-the-fly from elevation.tif."""
-    elev_path = LAYERS_DIR / "elevation.tif"
-    vmin = layer.get("render_min", 0.0)
-    vmax = layer.get("render_max", 90.0)
+def _sample_elevation_derived_to_tile(
+    z: int, x: int, y: int, tile_size: int, derive_fn, dst_transform,
+) -> np.ndarray:
+    """Read elevation.tif, run `derive_fn` (slope/aspect), reproject onto a tile grid.
 
+    Shared by _render_derived_elevation_tile_bytes (primary layer) and
+    _sample_layer_to_tile (chain-mask sampling of slope/aspect as a chained layer).
+    """
+    elev_path = LAYERS_DIR / "elevation.tif"
     lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
-    mx0,  my0,  mx1,  my1  = tile_bounds_mercator(z, x, y)
-    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
     dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
 
     try:
@@ -837,15 +865,48 @@ def _render_derived_elevation_tile_bytes(
                 )
     except Exception:
         pass
+    return dest
+
+
+def _render_derived_elevation_tile_rgba(
+    layer: dict,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    derive_fn,
+    colormap: str = _DEFAULT_COLORMAP,
+    value_min: float | None = None,
+    value_max: float | None = None,
+) -> np.ndarray:
+    vmin = layer.get("render_min", 0.0)
+    vmax = layer.get("render_max", 90.0)
+
+    mx0,  my0,  mx1,  my1  = tile_bounds_mercator(z, x, y)
+    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+    dest = _sample_elevation_derived_to_tile(z, x, y, tile_size, derive_fn, dst_transform)
 
     if layer["id"] == "aspect":
-        rgba = _colorize_circular(dest, colormap, value_min, value_max)
-    else:
-        rgba = _colorize(dest, vmin or 0.0, vmax or 90.0, colormap, value_min, value_max)
-    img  = Image.fromarray(rgba, mode="RGBA")
-    buf  = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+        return _colorize_circular(dest, colormap, value_min, value_max)
+    return _colorize(dest, vmin or 0.0, vmax or 90.0, colormap, value_min, value_max)
+
+
+def _render_derived_elevation_tile_bytes(
+    layer: dict,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    derive_fn,
+    colormap: str = _DEFAULT_COLORMAP,
+    value_min: float | None = None,
+    value_max: float | None = None,
+) -> bytes:
+    """Render a tile for a layer derived on-the-fly from elevation.tif."""
+    rgba = _render_derived_elevation_tile_rgba(
+        layer, z, x, y, tile_size, derive_fn, colormap, value_min, value_max,
+    )
+    return _encode_png(rgba)
 
 
 def _sample_soil_band_to_tile(
@@ -908,6 +969,44 @@ def _sample_soil_band_to_tile(
     return dest
 
 
+def _sample_soil_texture_to_tile(z: int, x: int, y: int, tile_size: int, dst_transform) -> np.ndarray:
+    """Derive the soil_texture class-id array for a tile from sand/silt/clay COGs.
+
+    Shared by _render_derived_soil_texture_tile_bytes (primary layer) and
+    _sample_layer_to_tile (chain-mask sampling of soil_texture as a chained layer).
+    """
+    from util.gis import _SOIL_TEXTURE_INPUT_FILES, derive_soil_texture_array
+
+    lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
+    bands = {
+        key: _sample_soil_band_to_tile(LAYERS_DIR / filename, lon0, lat0, lon1, lat1, dst_transform, tile_size)
+        for key, filename in _SOIL_TEXTURE_INPUT_FILES.items()
+    }
+    return derive_soil_texture_array(bands["sand"], bands["silt"], bands["clay"])
+
+
+def _render_derived_soil_texture_tile_rgba(
+    layer: dict,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    colormap: str = _DEFAULT_COLORMAP,
+    cb_mode: str = "",
+    class_filter: Collection[int] | None = None,
+) -> np.ndarray:
+    mx0,  my0,  mx1,  my1  = tile_bounds_mercator(z, x, y)
+    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+    dest = _sample_soil_texture_to_tile(z, x, y, tile_size, dst_transform)
+
+    if cb_mode in SUPPORTED_CB_MODES:
+        nominal_cmap = _cb_colormap_for_layer(layer["id"], cb_mode) or _load_nominal_colormap(layer["id"])
+    else:
+        nominal_cmap = _load_nominal_colormap(layer["id"])
+    vmin, vmax = layer.get("render_min", 1.0), layer.get("render_max", 12.0)
+    return _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
+
+
 def _render_derived_soil_texture_tile_bytes(
     layer: dict,
     z: int,
@@ -919,52 +1018,22 @@ def _render_derived_soil_texture_tile_bytes(
     class_filter: Collection[int] | None = None,
 ) -> bytes:
     """Render a soil_texture tile derived on-the-fly from sand/silt/clay COGs."""
-    from util.gis import _SOIL_TEXTURE_INPUT_FILES, derive_soil_texture_array
-
-    lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
-    mx0,  my0,  mx1,  my1  = tile_bounds_mercator(z, x, y)
-    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
-
-    bands = {
-        key: _sample_soil_band_to_tile(LAYERS_DIR / filename, lon0, lat0, lon1, lat1, dst_transform, tile_size)
-        for key, filename in _SOIL_TEXTURE_INPUT_FILES.items()
-    }
-    dest = derive_soil_texture_array(bands["sand"], bands["silt"], bands["clay"])
-
-    if cb_mode in SUPPORTED_CB_MODES:
-        nominal_cmap = _cb_colormap_for_layer(layer["id"], cb_mode) or _load_nominal_colormap(layer["id"])
-    else:
-        nominal_cmap = _load_nominal_colormap(layer["id"])
-    vmin, vmax = layer.get("render_min", 1.0), layer.get("render_max", 12.0)
-    rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap)
-    img  = Image.fromarray(rgba, mode="RGBA")
-    buf  = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    rgba = _render_derived_soil_texture_tile_rgba(
+        layer, z, x, y, tile_size, colormap, cb_mode, class_filter,
+    )
+    return _encode_png(rgba)
 
 
-def render_layer_tile_bytes(
-    layer_id: str,
-    z: int,
-    x: int,
-    y: int,
-    tile_size: int = 256,
-    colormap: str = _DEFAULT_COLORMAP,
-    cb_mode: str = "",
-    forecast_suffix: str = "",
-    class_filter: Collection[int] | None = None,
-    value_min: float | None = None,
-    value_max: float | None = None,
-) -> bytes:
-    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, derive_aspect_array, derive_slope_array
-    layer = get_layer(layer_id)
-    if layer.get("window_hours") is not None:
-        return render_temporal_tile_bytes(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter, value_min, value_max)
-    if layer_id in DERIVED_FROM_ELEVATION:
-        derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
-        return _render_derived_elevation_tile_bytes(layer, z, x, y, tile_size, derive_fn, colormap, value_min, value_max)
-    if layer_id in DERIVED_FROM_SOIL:
-        return _render_derived_soil_texture_tile_bytes(layer, z, x, y, tile_size, colormap, cb_mode, class_filter)
+def _sample_static_cog_to_tile(
+    layer: dict, z: int, x: int, y: int, tile_size: int, dst_transform,
+) -> tuple[np.ndarray, float | None, float | None]:
+    """Read+reproject a static COG layer onto a tile grid; return (dest, vmin, vmax).
+
+    vmin/vmax fall back to a min/max computed from the native-resolution read
+    when the catalog doesn't provide render_min/render_max — only meaningful
+    for the primary rendered layer's colorizing, chain-mask sampling ignores
+    them. Shared by _render_static_layer_tile_rgba and _sample_layer_to_tile.
+    """
     path    = LAYERS_DIR / layer["filename"]
     scale   = layer.get("scale_factor") or 1.0
     offset  = layer.get("add_offset")   or 0.0
@@ -972,11 +1041,9 @@ def render_layer_tile_bytes(
     vmin    = layer.get("render_min")
     vmax    = layer.get("render_max")
 
-    resampling   = Resampling.nearest
+    resampling = Resampling.nearest
     lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
-    mx0,  my0,  mx1,  my1  = tile_bounds_mercator(z, x, y)
-    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
-    dest          = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+    dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
 
     with _open_raster(path) as ds:
         db = ds.bounds
@@ -1057,6 +1124,26 @@ def render_layer_tile_bytes(
                 resampling=resampling,
             )
 
+    return dest, vmin, vmax
+
+
+def _render_static_layer_tile_rgba(
+    layer: dict,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    colormap: str = _DEFAULT_COLORMAP,
+    cb_mode: str = "",
+    class_filter: Collection[int] | None = None,
+    value_min: float | None = None,
+    value_max: float | None = None,
+) -> np.ndarray:
+    layer_id = layer["id"]
+    nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
+    mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
+    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+    dest, vmin, vmax = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
     vmin = vmin if vmin is not None else 0.0
     vmax = vmax if vmax is not None else 1.0
 
@@ -1065,12 +1152,115 @@ def render_layer_tile_bytes(
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
-        rgba = _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap, value_min, value_max)
-    elif str(layer.get("value_type") or "").lower() == "circular":
-        rgba = _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_min, value_max)
+        return _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap, value_min, value_max)
+    if str(layer.get("value_type") or "").lower() == "circular":
+        return _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_min, value_max)
+    return _colorize(dest, vmin, vmax, colormap, value_min, value_max)
+
+
+def _sample_layer_to_tile(
+    layer: dict, z: int, x: int, y: int, tile_size: int, forecast_suffix: str = "",
+) -> np.ndarray:
+    """Return `layer`'s raw values reprojected onto this tile's Web Mercator
+    grid, regardless of what kind of layer it is (static COG, temporal,
+    elevation-derived, or soil-derived) — the one thing chain masking needs
+    from ANY layer, primary or chained. Mirrors the dispatch
+    render_layer_tile_bytes does for the primary layer, minus colorizing.
+    """
+    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, derive_aspect_array, derive_slope_array
+
+    layer_id = layer["id"]
+    mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
+    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+
+    if layer.get("window_hours") is not None:
+        var_id = layer["var_id"]
+        window_label = layer["window_label"]
+        model = layer.get("model", "copernicus_era5")
+        npy_path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{forecast_suffix}.npy"
+        arr = _load_temporal_npy(npy_path)
+        if arr is None:
+            return np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+        return _reproject_temporal_array(arr, dst_transform, tile_size, model)
+    if layer_id in DERIVED_FROM_ELEVATION:
+        derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
+        return _sample_elevation_derived_to_tile(z, x, y, tile_size, derive_fn, dst_transform)
+    if layer_id in DERIVED_FROM_SOIL:
+        return _sample_soil_texture_to_tile(z, x, y, tile_size, dst_transform)
+    dest, _vmin, _vmax = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
+    return dest
+
+
+def _apply_chain_mask(
+    rgba: np.ndarray,
+    chain: list[dict],
+    z: int, x: int, y: int, tile_size: int,
+    forecast_suffix: str = "",
+) -> None:
+    """Zero alpha for pixels that fail any chained layer's filter (in place).
+
+    Each chain entry names another layer plus a filter on it — a class list
+    (nominal), a linear value range, or (for circular layers) a wraparound
+    angular range. A pixel only stays visible if it passes every entry, same
+    "AND across layers" idea as _render_derived_soil_texture_tile_rgba
+    combining 3 bands, just as a boolean mask instead of a classifier.
+    """
+    combined_mask = np.ones((tile_size, tile_size), dtype=bool)
+    for entry in chain:
+        try:
+            chain_layer = get_layer(entry["layer_id"])
+        except KeyError:
+            continue
+        values = _sample_layer_to_tile(chain_layer, z, x, y, tile_size, forecast_suffix)
+        value_type = str(chain_layer.get("value_type") or "").lower()
+        class_filter = entry.get("class_filter")
+        value_min = entry.get("value_min")
+        value_max = entry.get("value_max")
+        if class_filter:
+            pass_mask = np.isin(np.round(values), class_filter)
+        elif value_type == "circular" and value_min is not None and value_max is not None:
+            # Same wraparound comparison as _colorize_circular — a chain
+            # entry only needs the boolean version of that same logic.
+            deg = values % 360.0
+            lo, hi = value_min % 360.0, value_max % 360.0
+            pass_mask = (deg >= lo) & (deg <= hi) if lo <= hi else (deg >= lo) | (deg <= hi)
+        elif value_min is not None or value_max is not None:
+            lo = value_min if value_min is not None else -np.inf
+            hi = value_max if value_max is not None else np.inf
+            pass_mask = (values >= lo) & (values <= hi)
+        else:
+            continue
+        combined_mask &= np.nan_to_num(pass_mask, nan=False)
+    rgba[~combined_mask, 3] = 0
+
+
+def render_layer_tile_bytes(
+    layer_id: str,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = 256,
+    colormap: str = _DEFAULT_COLORMAP,
+    cb_mode: str = "",
+    forecast_suffix: str = "",
+    class_filter: Collection[int] | None = None,
+    value_min: float | None = None,
+    value_max: float | None = None,
+    chain: list[dict] | None = None,
+) -> bytes:
+    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, derive_aspect_array, derive_slope_array
+    layer = get_layer(layer_id)
+    if layer.get("window_hours") is not None:
+        rgba = _render_temporal_tile_rgba(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter, value_min, value_max)
+    elif layer_id in DERIVED_FROM_ELEVATION:
+        derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
+        rgba = _render_derived_elevation_tile_rgba(layer, z, x, y, tile_size, derive_fn, colormap, value_min, value_max)
+    elif layer_id in DERIVED_FROM_SOIL:
+        rgba = _render_derived_soil_texture_tile_rgba(layer, z, x, y, tile_size, colormap, cb_mode, class_filter)
     else:
-        rgba = _colorize(dest, vmin, vmax, colormap, value_min, value_max)
-    img  = Image.fromarray(rgba, mode="RGBA")
-    buf  = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+        rgba = _render_static_layer_tile_rgba(layer, z, x, y, tile_size, colormap, cb_mode, class_filter, value_min, value_max)
+
+    if chain:
+        _apply_chain_mask(rgba, chain, z, x, y, tile_size, forecast_suffix)
+
+    return _encode_png(rgba)

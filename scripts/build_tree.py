@@ -72,6 +72,21 @@ NAME_MATCH_RANKS = MAPPING_RANKS | frozenset({"GENUS", "FAMILY", "ORDER", "CLASS
 INFRA_RANKS = frozenset({"SUBSPECIES", "VARIETY", "FORM"})
 INFRA_MARKERS = frozenset({"var.", "subsp.", "f.", "nothosubsp.", "nothovar."})
 
+# Immediate-parent rank whose name is checked alongside (rank, name) to reject
+# homonyms across unrelated lineages (e.g. genus Townsendia in Asteraceae vs.
+# genus Townsendia in Asilidae — same name, same rank, different ancestry).
+# Deliberately excludes SUBSPECIES/VARIETY/FORM/KINGDOM: infraspecific ranks
+# already carry their genus+epithet in the name itself (a same-trinomial
+# cross-kingdom collision is not a realistic risk), and KINGDOM has no parent.
+RANK_PARENT_FIELD = {
+    "PHYLUM": "kingdom",
+    "CLASS": "phylum",
+    "ORDER": "class",
+    "FAMILY": "order",
+    "GENUS": "family",
+    "SPECIES": "genus",
+}
+
 _UA = "wherewild-build-tree/1.0"
 
 csv.field_size_limit(sys.maxsize)
@@ -313,6 +328,22 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
 # iNat DWC-A download (shared by Phases 2 and 3)
 # ---------------------------------------------------------------------------
 
+def _dwca_zip_is_valid(path: Path) -> bool:
+    """True if `path` is a readable zip with an uncorrupted INAT_TAXA_FILENAME.
+
+    unzip -l style listing only reads the central directory, which can be
+    self-consistent even when a file's *local* header offset is wrong (e.g.
+    from a byte dropped mid-transfer) — only actually opening the member
+    catches that.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf, zf.open(INAT_TAXA_FILENAME) as f:
+            f.read(1)
+        return True
+    except (zipfile.BadZipFile, KeyError, OSError):
+        return False
+
+
 def fetch_inat_dwca() -> bytes:
     state = _load_state()
     cached_etag = state.get("inat_taxonomy", {}).get("etag", "")
@@ -323,26 +354,41 @@ def fetch_inat_dwca() -> bytes:
         remote_etag = r.headers.get("ETag", "")
 
     if remote_etag and remote_etag == cached_etag and INAT_DWCA_CACHE.exists():
-        print("  iNat DWC-A: cache up to date")
-        return INAT_DWCA_CACHE.read_bytes()
+        if _dwca_zip_is_valid(INAT_DWCA_CACHE):
+            print("  iNat DWC-A: cache up to date")
+            return INAT_DWCA_CACHE.read_bytes()
+        print("  iNat DWC-A: cached file failed validation — re-downloading")
 
     print(f"Downloading {INAT_DWCA_URL} ...")
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "aria2c",
-            "--split=8",
-            "--max-connection-per-server=8",
-            "--continue=true",
-            "--max-tries=12",
-            "--retry-wait=15",
-            "--connect-timeout=60",
-            f"--dir={INAT_DWCA_CACHE.parent}",
-            f"--out={INAT_DWCA_CACHE.name}",
-            INAT_DWCA_URL,
-        ],
-        check=True,
-    )
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        # Delete first: --continue=true would otherwise resume onto (and
+        # perpetuate corruption in) a torn leftover file from a prior attempt.
+        INAT_DWCA_CACHE.unlink(missing_ok=True)
+        subprocess.run(
+            [
+                "aria2c",
+                "--split=8",
+                "--max-connection-per-server=8",
+                "--continue=true",
+                "--max-tries=12",
+                "--retry-wait=15",
+                "--connect-timeout=60",
+                f"--dir={INAT_DWCA_CACHE.parent}",
+                f"--out={INAT_DWCA_CACHE.name}",
+                INAT_DWCA_URL,
+            ],
+            check=True,
+        )
+        if _dwca_zip_is_valid(INAT_DWCA_CACHE):
+            break
+        print(f"  Downloaded file failed validation (attempt {attempt}/{max_attempts})")
+    else:
+        raise RuntimeError(
+            f"iNat DWC-A download repeatedly corrupt after {max_attempts} attempts: {INAT_DWCA_URL}"
+        )
+
     data = INAT_DWCA_CACHE.read_bytes()
     print(f"  Downloaded {len(data) / 1_048_576:.1f} MB")
 
@@ -362,17 +408,31 @@ def strip_infra_markers(value: str) -> str:
     return " ".join(tokens)
 
 
+def _immediate_parent_name(path: str) -> str:
+    """Name of the path segment directly above the last one, normalized.
+
+    Path segments are "Cleaned_Name_taxonKey" (taxonKey is numeric), so the
+    parent's name is everything before the final "_<digits>".
+    """
+    parts = path.split("/")
+    if len(parts) < 2:
+        return ""
+    parent_name, _, _key = parts[-2].rpartition("_")
+    return normalize_name(parent_name.replace("_", " "))
+
+
 def build_gbif_indexes(
     catalog: dict,
-) -> tuple[dict[tuple[str, str], list[str]], dict[tuple[str, str], list[str]]]:
-    exact: dict[tuple[str, str], list[str]] = defaultdict(list)
+) -> tuple[dict[tuple[str, str, str], list[str]], dict[tuple[str, str], list[str]]]:
+    exact: dict[tuple[str, str, str], list[str]] = defaultdict(list)
     stripped: dict[tuple[str, str], list[str]] = defaultdict(list)
     for taxon_key, taxon in catalog.items():
         rank = (taxon.get("rank") or "").strip().upper()
         name = normalize_name(taxon.get("scientific_name") or "")
         if not name or not rank:
             continue
-        exact[(rank, name)].append(taxon_key)
+        parent_name = _immediate_parent_name(taxon.get("path") or "") if rank in RANK_PARENT_FIELD else ""
+        exact[(rank, name, parent_name)].append(taxon_key)
         s = strip_infra_markers(name)
         if s:
             stripped[(rank, s)].append(taxon_key)
@@ -418,7 +478,10 @@ def build_mapping(catalog: dict, dwca_bytes: bytes) -> None:
             if not name:
                 continue
 
-            gbif_keys = exact_index.get((rank, name), [])
+            parent_field = RANK_PARENT_FIELD.get(rank)
+            parent_name = normalize_name(row.get(parent_field) or "") if parent_field else ""
+
+            gbif_keys = exact_index.get((rank, name, parent_name), [])
             match_type = "exact"
 
             if not gbif_keys and rank in INFRA_RANKS:
@@ -1235,7 +1298,6 @@ def main() -> None:
     with open(CATALOG_PATH, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"Wrote {len(catalog)} taxa to {CATALOG_PATH}")
-    csv_path.unlink(missing_ok=True)
 
     # Phase 2: ID mapping — download DWC-A once, reuse in Phase 3
     print("\nBuilding iNat ID mapping...")
@@ -1290,6 +1352,10 @@ def main() -> None:
         f"Updated {names_n:,} preferred common names, "
         f"{images_n:,} preferred images, {backup_n:,} GBIF backup images."
     )
+    # Deferred until everything above succeeds — deleting it right after Phase 1
+    # meant any crash in Phase 2/3 stranded a re-run with no way to resume
+    # without re-fetching the species list from sync_gbif.
+    csv_path.unlink(missing_ok=True)
 
 
 def rebuild_index() -> None:

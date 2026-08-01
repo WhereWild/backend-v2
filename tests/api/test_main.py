@@ -535,6 +535,34 @@ def test_variable_tile_compat():
     assert response.status_code == 200
 
 
+def test_layer_tile_with_chain_param():
+    """The `chain` query param (JSON) is parsed and forwarded to render_layer_tile_bytes."""
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    chain_json = json.dumps([
+        {"layer_id": "kg2", "class_filter": [3, 4]},
+        {"layer_id": "bio2", "value_min": 1.0, "value_max": 2.0},
+    ])
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "render_layer_tile_bytes", return_value=png) as mock_render:
+        response = client.get(f"/api/layers/bio1/tiles/4/8/5.png?chain={chain_json}")
+    assert response.status_code == 200
+    call_args = mock_render.call_args
+    passed_chain = call_args.args[-1]
+    assert passed_chain == [
+        {"layer_id": "kg2", "class_filter": [3, 4], "value_min": None, "value_max": None},
+        {"layer_id": "bio2", "class_filter": None, "value_min": 1.0, "value_max": 2.0},
+    ]
+
+
+def test_layer_tile_no_chain_param_passes_none():
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "render_layer_tile_bytes", return_value=png) as mock_render:
+        response = client.get("/api/layers/bio1/tiles/4/8/5.png")
+    assert response.status_code == 200
+    assert mock_render.call_args.args[-1] is None
+
+
 # ---------------------------------------------------------------------------
 # Shared fixtures for new tests
 # ---------------------------------------------------------------------------

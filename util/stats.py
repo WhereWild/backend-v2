@@ -107,6 +107,51 @@ def apply_timestamp_filter(
     return df
 
 
+def numeric_range_mask(col: pd.Series, value_min: float, value_max: float, circular_wrap: bool) -> pd.Series:
+    if circular_wrap:
+        return col.between(value_min, 360.0, inclusive="both") | col.between(0.0, value_max, inclusive="both")
+    return col.between(value_min, value_max, inclusive="both")
+
+
+def apply_chained_filters(df: pd.DataFrame, filters: list[dict] | None) -> pd.DataFrame:
+    """ANDs additional per-variable filters onto df, on top of whatever
+    primary-variable/location/phenology/timestamp filtering the caller
+    already applied. Each filter dict is one of:
+      {'variable', 'class_value'} — exact categorical match (single class)
+      {'variable', 'class_values'} — categorical match against ANY of a list
+        of classes (OR within that one variable, e.g. Forest OR Grassland),
+        ANDed against everything else same as the single-value case
+      {'variable', 'min', 'max', 'circular_wrap'} — a single numeric range
+      {'variable', 'ranges'} — numeric match against ANY of a list of
+        {'min', 'max', 'circular_wrap'} ranges (OR within that one variable,
+        e.g. a multi-selected histogram/KDE with two disjoint slices),
+        ANDed against everything else same as the single-range case
+    See main.py's _parse_extra_variable_filters, which builds these from the
+    `extra` query param shared by the /slice, /class/:value/samples, and
+    plain /environment/:variable_id (stats) endpoints. Supports chaining
+    slices across multiple variables (e.g. elevation range AND a landcover
+    class) without each variable needing its own dedicated endpoint."""
+    for f in filters or []:
+        variable_id = f["variable"]
+        if variable_id not in df.columns:
+            return df.iloc[0:0]
+        col = pd.to_numeric(df[variable_id], errors="coerce")
+        if "class_value" in f:
+            df = df[col == f["class_value"]]
+        elif "class_values" in f:
+            df = df[col.isin(f["class_values"])]
+        elif "ranges" in f:
+            mask = pd.Series(False, index=df.index)
+            for r in f["ranges"]:
+                mask = mask | numeric_range_mask(col, r["min"], r["max"], r.get("circular_wrap", False))
+            df = df[mask]
+        else:
+            df = df[numeric_range_mask(col, f["min"], f["max"], f.get("circular_wrap", False))]
+        if df.empty:
+            return df
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1349,8 +1394,9 @@ def compute_location_filtered_stats(
     end_ts: int | None = None,
     storage: ParquetStorage | None = None,
     layer_meta: dict[str, dict] | None = None,
+    extra_filters: list[dict] | None = None,
 ) -> dict | None:
-    """Compute stats on the fly for variable_id, restricted by location, phenology, and/or timestamp.
+    """Compute stats on the fly for variable_id, restricted by location, phenology, timestamp, and/or chained filters from other variables.
 
     `layer_meta` (full catalog, {layer_id: layer}) is optional and only used to
     resolve `variable_id` against `composition_group_members` — when the requested
@@ -1358,6 +1404,13 @@ def compute_location_filtered_stats(
     precomputed and read from density_grid.parquet) is instead fit on the fly
     over the same filtered sample, since the precomputed grid reflects the
     unfiltered population and would misrepresent the active filter otherwise.
+
+    `extra_filters` (see apply_chained_filters) restricts the sample further
+    by other variables' active slices/class selections — the same mechanism
+    behind /slice and /class/:value/samples, applied here too so the
+    density curve / histogram / categorical distribution this returns
+    reflect a chained filter exactly like they already do for location/
+    phenology/timestamp, instead of only the highlighted map markers doing so.
     """
     df = collect_taxon_df(taxon, storage=storage)
     if df is None:
@@ -1374,6 +1427,10 @@ def compute_location_filtered_stats(
             return None
     if start_ts is not None or end_ts is not None:
         df = apply_timestamp_filter(df, start_ts, end_ts)
+        if df.empty:
+            return None
+    if extra_filters:
+        df = apply_chained_filters(df, extra_filters)
         if df.empty:
             return None
     if variable_id not in df.columns:

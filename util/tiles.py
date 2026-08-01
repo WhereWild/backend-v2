@@ -249,19 +249,21 @@ def _encode_png(rgba: np.ndarray) -> bytes:
 def _colorize_circular(
     values: np.ndarray,
     colormap: str = _DEFAULT_CIRCULAR_COLORMAP,
-    mask_min: float | None = None,
-    mask_max: float | None = None,
+    mask_ranges: list[tuple[float | None, float | None]] | None = None,
 ) -> np.ndarray:
     """Colorize angular values (0–360°) using a twilight circular colormap.
 
     Maps degrees cyclically to the LUT so 0° and 360° return the same color.
     NaN pixels (nodata) are fully transparent.
 
-    mask_min/mask_max (both 0-360, both required together) select an angular
-    slice of the ring rather than a linear range — e.g. a slice from 350° to
-    20° wraps through 0° rather than being empty, since on a compass "350 to
-    20" is a real, non-empty 30° arc facing roughly north. Pixels outside the
-    slice are dropped to alpha 0, same convention as _colorize's mask.
+    mask_ranges is a list of (mask_min, mask_max) pairs (both 0-360, both
+    required together — an entry missing either bound is skipped) — a pixel
+    is visible if it falls in ANY of them (multi-select OR), not just one.
+    Each pair selects an angular slice of the ring rather than a linear
+    range — e.g. a slice from 350° to 20° wraps through 0° rather than being
+    empty, since on a compass "350 to 20" is a real, non-empty 30° arc
+    facing roughly north. Pixels outside every slice are dropped to alpha 0,
+    same convention as _colorize's mask.
     """
     rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
     finite = np.isfinite(values)
@@ -279,15 +281,24 @@ def _colorize_circular(
     rgba[finite, 2] = lut[indices, 2].astype(np.uint8)
     rgba[finite, 3] = 200
 
-    if mask_min is not None and mask_max is not None:
+    # Ranges missing either bound (only ever produced by a single-sided
+    # legend selection, which doesn't make sense for a circular slice) are
+    # dropped rather than treated as "match nothing" — matches the original
+    # single-range behavior, where mask_min/mask_max only applied together.
+    valid_ranges = [
+        (lo, hi) for lo, hi in (mask_ranges or []) if lo is not None and hi is not None
+    ]
+    if valid_ranges:
         deg = values % 360.0
-        lo = mask_min % 360.0
-        hi = mask_max % 360.0
-        if lo <= hi:
-            in_range = finite & (deg >= lo) & (deg <= hi)
-        else:
-            in_range = finite & ((deg >= lo) | (deg <= hi))
-        rgba[~in_range, 3] = 0
+        in_any_range = np.zeros_like(finite)
+        for mask_min, mask_max in valid_ranges:
+            lo = mask_min % 360.0
+            hi = mask_max % 360.0
+            if lo <= hi:
+                in_any_range |= finite & (deg >= lo) & (deg <= hi)
+            else:
+                in_any_range |= finite & ((deg >= lo) | (deg <= hi))
+        rgba[~in_any_range, 3] = 0
     return rgba
 
 
@@ -391,8 +402,7 @@ def _colorize(
     vmin: float,
     vmax: float,
     colormap: str = _DEFAULT_COLORMAP,
-    mask_min: float | None = None,
-    mask_max: float | None = None,
+    mask_ranges: list[tuple[float | None, float | None]] | None = None,
 ) -> np.ndarray:
     rgba   = np.zeros((*values.shape, 4), dtype=np.uint8)
     finite = np.isfinite(values)
@@ -411,18 +421,22 @@ def _colorize(
     rgba[finite, 3] = 255
 
     # Same "leave it transparent" masking _colorize_nominal uses for
-    # class_filter, applied to a continuous value range instead of a
-    # discrete class id — pixels outside [mask_min, mask_max] are dropped
-    # to alpha 0 rather than colored, so the legend "slice" selection filters
-    # rendered pixels the same way class_filter already does for nominal
-    # variables.
-    if mask_min is not None or mask_max is not None:
-        in_range = finite.copy()
-        if mask_min is not None:
-            in_range &= values >= mask_min
-        if mask_max is not None:
-            in_range &= values <= mask_max
-        rgba[~in_range, 3] = 0
+    # class_filter, applied to continuous value range(s) instead of a
+    # discrete class id — pixels outside every given [mask_min, mask_max]
+    # pair are dropped to alpha 0 rather than colored (a pixel inside ANY
+    # one of multiple ranges counts, same multi-select-OR idea as
+    # class_filter), so the legend "slice" selection filters rendered
+    # pixels the same way class_filter already does for nominal variables.
+    if mask_ranges:
+        in_any_range = np.zeros_like(finite)
+        for mask_min, mask_max in mask_ranges:
+            in_range = finite.copy()
+            if mask_min is not None:
+                in_range &= values >= mask_min
+            if mask_max is not None:
+                in_range &= values <= mask_max
+            in_any_range |= in_range
+        rgba[~in_any_range, 3] = 0
     return rgba
 
 
@@ -568,8 +582,7 @@ def _render_temporal_tile_rgba(
     cb_mode: str = "",
     forecast_suffix: str = "",
     class_filter: Collection[int] | None = None,
-    value_min: float | None = None,
-    value_max: float | None = None,
+    value_ranges: list[tuple[float | None, float | None]] | None = None,
 ) -> np.ndarray:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
@@ -615,15 +628,15 @@ def _render_temporal_tile_rgba(
         rgba = (
             _colorize_nominal(dest, nominal_cmap, class_filter)
             if nominal_cmap
-            else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap, value_min, value_max)
+            else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap, value_ranges)
         )
     elif str(layer.get("value_type") or "").lower() == "circular":
         circular_colormap = (
             colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP
         )
-        rgba = _colorize_circular(dest, circular_colormap, value_min, value_max)
+        rgba = _colorize_circular(dest, circular_colormap, value_ranges)
     else:
-        rgba = _colorize(dest, vmin, vmax, colormap, value_min, value_max)
+        rgba = _colorize(dest, vmin, vmax, colormap, value_ranges)
     return rgba
 
 
@@ -637,12 +650,11 @@ def render_temporal_tile_bytes(
     cb_mode: str = "",
     forecast_suffix: str = "",
     class_filter: Collection[int] | None = None,
-    value_min: float | None = None,
-    value_max: float | None = None,
+    value_ranges: list[tuple[float | None, float | None]] | None = None,
 ) -> bytes:
     rgba = _render_temporal_tile_rgba(
         layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix,
-        class_filter, value_min, value_max,
+        class_filter, value_ranges,
     )
     return _encode_png(rgba)
 
@@ -876,8 +888,7 @@ def _render_derived_elevation_tile_rgba(
     tile_size: int,
     derive_fn,
     colormap: str = _DEFAULT_COLORMAP,
-    value_min: float | None = None,
-    value_max: float | None = None,
+    value_ranges: list[tuple[float | None, float | None]] | None = None,
 ) -> np.ndarray:
     vmin = layer.get("render_min", 0.0)
     vmax = layer.get("render_max", 90.0)
@@ -887,8 +898,8 @@ def _render_derived_elevation_tile_rgba(
     dest = _sample_elevation_derived_to_tile(z, x, y, tile_size, derive_fn, dst_transform)
 
     if layer["id"] == "aspect":
-        return _colorize_circular(dest, colormap, value_min, value_max)
-    return _colorize(dest, vmin or 0.0, vmax or 90.0, colormap, value_min, value_max)
+        return _colorize_circular(dest, colormap, value_ranges)
+    return _colorize(dest, vmin or 0.0, vmax or 90.0, colormap, value_ranges)
 
 
 def _render_derived_elevation_tile_bytes(
@@ -899,12 +910,11 @@ def _render_derived_elevation_tile_bytes(
     tile_size: int,
     derive_fn,
     colormap: str = _DEFAULT_COLORMAP,
-    value_min: float | None = None,
-    value_max: float | None = None,
+    value_ranges: list[tuple[float | None, float | None]] | None = None,
 ) -> bytes:
     """Render a tile for a layer derived on-the-fly from elevation.tif."""
     rgba = _render_derived_elevation_tile_rgba(
-        layer, z, x, y, tile_size, derive_fn, colormap, value_min, value_max,
+        layer, z, x, y, tile_size, derive_fn, colormap, value_ranges,
     )
     return _encode_png(rgba)
 
@@ -1136,8 +1146,7 @@ def _render_static_layer_tile_rgba(
     colormap: str = _DEFAULT_COLORMAP,
     cb_mode: str = "",
     class_filter: Collection[int] | None = None,
-    value_min: float | None = None,
-    value_max: float | None = None,
+    value_ranges: list[tuple[float | None, float | None]] | None = None,
 ) -> np.ndarray:
     layer_id = layer["id"]
     nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
@@ -1152,10 +1161,10 @@ def _render_static_layer_tile_rgba(
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
-        return _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap, value_min, value_max)
+        return _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap, value_ranges)
     if str(layer.get("value_type") or "").lower() == "circular":
-        return _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_min, value_max)
-    return _colorize(dest, vmin, vmax, colormap, value_min, value_max)
+        return _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_ranges)
+    return _colorize(dest, vmin, vmax, colormap, value_ranges)
 
 
 def _sample_layer_to_tile(
@@ -1200,10 +1209,12 @@ def _apply_chain_mask(
     """Zero alpha for pixels that fail any chained layer's filter (in place).
 
     Each chain entry names another layer plus a filter on it — a class list
-    (nominal), a linear value range, or (for circular layers) a wraparound
-    angular range. A pixel only stays visible if it passes every entry, same
-    "AND across layers" idea as _render_derived_soil_texture_tile_rgba
-    combining 3 bands, just as a boolean mask instead of a classifier.
+    (nominal), one or more linear value ranges, or (for circular layers) one
+    or more wraparound angular ranges (a layer's own filter can itself be a
+    multi-select — pixel passes if ANY of that layer's ranges match). A
+    pixel only stays visible if it passes every chain entry, same "AND
+    across layers" idea as _render_derived_soil_texture_tile_rgba combining
+    3 bands, just as a boolean mask instead of a classifier.
     """
     combined_mask = np.ones((tile_size, tile_size), dtype=bool)
     for entry in chain:
@@ -1214,20 +1225,23 @@ def _apply_chain_mask(
         values = _sample_layer_to_tile(chain_layer, z, x, y, tile_size, forecast_suffix)
         value_type = str(chain_layer.get("value_type") or "").lower()
         class_filter = entry.get("class_filter")
-        value_min = entry.get("value_min")
-        value_max = entry.get("value_max")
+        value_ranges = entry.get("value_ranges")
         if class_filter:
             pass_mask = np.isin(np.round(values), class_filter)
-        elif value_type == "circular" and value_min is not None and value_max is not None:
-            # Same wraparound comparison as _colorize_circular — a chain
-            # entry only needs the boolean version of that same logic.
+        elif value_ranges:
+            pass_mask = np.zeros(values.shape, dtype=bool)
             deg = values % 360.0
-            lo, hi = value_min % 360.0, value_max % 360.0
-            pass_mask = (deg >= lo) & (deg <= hi) if lo <= hi else (deg >= lo) | (deg <= hi)
-        elif value_min is not None or value_max is not None:
-            lo = value_min if value_min is not None else -np.inf
-            hi = value_max if value_max is not None else np.inf
-            pass_mask = (values >= lo) & (values <= hi)
+            for value_min, value_max in value_ranges:
+                if value_type == "circular" and value_min is not None and value_max is not None:
+                    # Same wraparound comparison as _colorize_circular — a
+                    # chain entry only needs the boolean version of that
+                    # same logic.
+                    lo, hi = value_min % 360.0, value_max % 360.0
+                    pass_mask |= (deg >= lo) & (deg <= hi) if lo <= hi else (deg >= lo) | (deg <= hi)
+                elif value_min is not None or value_max is not None:
+                    lo = value_min if value_min is not None else -np.inf
+                    hi = value_max if value_max is not None else np.inf
+                    pass_mask |= (values >= lo) & (values <= hi)
         else:
             continue
         combined_mask &= np.nan_to_num(pass_mask, nan=False)
@@ -1244,21 +1258,20 @@ def render_layer_tile_bytes(
     cb_mode: str = "",
     forecast_suffix: str = "",
     class_filter: Collection[int] | None = None,
-    value_min: float | None = None,
-    value_max: float | None = None,
+    value_ranges: list[tuple[float | None, float | None]] | None = None,
     chain: list[dict] | None = None,
 ) -> bytes:
     from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
-        rgba = _render_temporal_tile_rgba(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter, value_min, value_max)
+        rgba = _render_temporal_tile_rgba(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter, value_ranges)
     elif layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
-        rgba = _render_derived_elevation_tile_rgba(layer, z, x, y, tile_size, derive_fn, colormap, value_min, value_max)
+        rgba = _render_derived_elevation_tile_rgba(layer, z, x, y, tile_size, derive_fn, colormap, value_ranges)
     elif layer_id in DERIVED_FROM_SOIL:
         rgba = _render_derived_soil_texture_tile_rgba(layer, z, x, y, tile_size, colormap, cb_mode, class_filter)
     else:
-        rgba = _render_static_layer_tile_rgba(layer, z, x, y, tile_size, colormap, cb_mode, class_filter, value_min, value_max)
+        rgba = _render_static_layer_tile_rgba(layer, z, x, y, tile_size, colormap, cb_mode, class_filter, value_ranges)
 
     if chain:
         _apply_chain_mask(rgba, chain, z, x, y, tile_size, forecast_suffix)

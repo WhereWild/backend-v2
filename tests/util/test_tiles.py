@@ -684,3 +684,128 @@ def test_render_layer_tile_dispatches_temporal(patch_temporal_render_catalog, tm
     tiles._npy_cache.clear()
     result = tiles.render_layer_tile_bytes("temperature_2m_avg_24h", z=2, x=2, y=1)
     assert result[:4] == b"\x89PNG"
+
+
+# ---------------------------------------------------------------------------
+# Chain masking
+# ---------------------------------------------------------------------------
+
+def test_apply_chain_mask_and_logic():
+    """Two chain entries AND together — a pixel needs to pass both.
+
+    A 2x2 tile: cell (0,0) is the only one where both layers' class_filter
+    match, so it should be the only one left opaque.
+    """
+    rgba = np.zeros((2, 2, 4), dtype=np.uint8)
+    rgba[:] = [10, 20, 30, 255]  # all opaque to start
+
+    layer_a_values = np.array([[1.0, 1.0], [5.0, 5.0]], dtype=np.float32)
+    layer_b_values = np.array([[1.0, 5.0], [1.0, 5.0]], dtype=np.float32)
+
+    def fake_sample(layer, z, x, y, tile_size, forecast_suffix=""):
+        return {"a": layer_a_values, "b": layer_b_values}[layer["id"]]
+
+    with patch.object(tiles, "get_layer", side_effect=lambda lid: {"id": lid, "value_type": "nominal"}), \
+         patch.object(tiles, "_sample_layer_to_tile", side_effect=fake_sample):
+        chain = [
+            {"layer_id": "a", "class_filter": [1], "value_min": None, "value_max": None},
+            {"layer_id": "b", "class_filter": [1], "value_min": None, "value_max": None},
+        ]
+        tiles._apply_chain_mask(rgba, chain, z=0, x=0, y=0, tile_size=2)
+
+    assert rgba[0, 0, 3] == 255  # a==1, b==1
+    assert rgba[0, 1, 3] == 0    # a==1, b==5
+    assert rgba[1, 0, 3] == 0    # a==5, b==1
+    assert rgba[1, 1, 3] == 0    # a==5, b==5
+
+
+def test_apply_chain_mask_linear_range():
+    rgba = np.zeros((2, 2, 4), dtype=np.uint8)
+    rgba[:] = [10, 20, 30, 255]
+    values = np.array([[0.0, 5.0], [10.0, 10.0]], dtype=np.float32)
+
+    with patch.object(tiles, "get_layer", return_value={"id": "x", "value_type": "interval"}), \
+         patch.object(tiles, "_sample_layer_to_tile", return_value=values):
+        chain = [{"layer_id": "x", "class_filter": None, "value_min": 2.0, "value_max": 8.0}]
+        tiles._apply_chain_mask(rgba, chain, z=0, x=0, y=0, tile_size=2)
+
+    assert rgba[0, 0, 3] == 0    # 0.0 below range
+    assert rgba[0, 1, 3] == 255  # 5.0 inside range
+    assert rgba[1, 0, 3] == 0    # 10.0 above range
+    assert rgba[1, 1, 3] == 0    # 10.0 above range
+
+
+def test_apply_chain_mask_circular_wraparound():
+    """A chain entry on a circular layer uses wraparound comparison, matching _colorize_circular."""
+    rgba = np.zeros((2, 2, 4), dtype=np.uint8)
+    rgba[:] = [10, 20, 30, 255]
+    values = np.array([[0.0, 10.0], [180.0, 350.0]], dtype=np.float32)
+
+    with patch.object(tiles, "get_layer", return_value={"id": "aspect", "value_type": "circular"}), \
+         patch.object(tiles, "_sample_layer_to_tile", return_value=values):
+        chain = [{"layer_id": "aspect", "class_filter": None, "value_min": 350.0, "value_max": 20.0}]
+        tiles._apply_chain_mask(rgba, chain, z=0, x=0, y=0, tile_size=2)
+
+    assert rgba[0, 0, 3] > 0   # 0deg is inside 350->20 wrap
+    assert rgba[0, 1, 3] > 0   # 10deg is inside
+    assert rgba[1, 0, 3] == 0  # 180deg is outside
+    assert rgba[1, 1, 3] > 0   # 350deg is inside
+
+
+def test_apply_chain_mask_unknown_layer_skipped():
+    """An entry naming a layer that no longer exists is skipped, not fatal."""
+    rgba = np.zeros((2, 2, 4), dtype=np.uint8)
+    rgba[:] = [10, 20, 30, 255]
+
+    with patch.object(tiles, "get_layer", side_effect=KeyError("gone")):
+        chain = [{"layer_id": "gone", "class_filter": [1], "value_min": None, "value_max": None}]
+        tiles._apply_chain_mask(rgba, chain, z=0, x=0, y=0, tile_size=2)
+
+    assert np.all(rgba[:, :, 3] == 255)
+
+
+def test_render_tile_chain_masks_pixels_from_second_layer():
+    """Integration: bio1 (primary, continuous) chained against kg2 (nominal class_filter)
+    — same mocked raster backs both reads, only pixels matching kg2's class survive.
+    """
+    raw = np.array([[2731, 2731, 3231, 3231]], dtype=np.uint16)
+    mock_ds = _make_mock_ds(raw)
+    with patch("rasterio.open", return_value=mock_ds):
+        no_chain = tiles.render_layer_tile_bytes("bio1", z=2, x=2, y=1, tile_size=4)
+        chained = tiles.render_layer_tile_bytes(
+            "bio1", z=2, x=2, y=1, tile_size=4,
+            chain=[{"layer_id": "kg2", "class_filter": [3231], "value_min": None, "value_max": None}],
+        )
+    assert no_chain[:4] == b"\x89PNG"
+    assert chained[:4] == b"\x89PNG"
+    assert no_chain != chained  # chaining actually changed the output
+
+
+def test_render_tile_chain_none_matches_chain_omitted():
+    raw = np.full((4, 4), 2731, dtype=np.uint16)
+    mock_ds = _make_mock_ds(raw)
+    with patch("rasterio.open", return_value=mock_ds):
+        omitted = tiles.render_layer_tile_bytes("bio1", z=2, x=2, y=1, tile_size=16)
+        explicit_none = tiles.render_layer_tile_bytes("bio1", z=2, x=2, y=1, tile_size=16, chain=None)
+    assert omitted == explicit_none
+
+
+def test_sample_layer_to_tile_dispatches_temporal(patch_temporal_render_catalog, tmp_path, monkeypatch):
+    """_sample_layer_to_tile (used for chain-mask sampling) handles temporal layers too."""
+    monkeypatch.setattr(tiles, "TEMPORAL_RASTERS_DIR", tmp_path)
+    tiles._npy_cache.clear()
+    arr = np.linspace(-10.0, 30.0, 721 * 1440, dtype=np.float32).reshape(721, 1440)
+    np.save(tmp_path / "temperature_2m_24h.npy", arr)
+    layer = tiles.get_layer("temperature_2m_avg_24h")
+    dest = tiles._sample_layer_to_tile(layer, z=2, x=2, y=1, tile_size=32)
+    assert dest.shape == (32, 32)
+    assert np.any(np.isfinite(dest))
+
+
+def test_sample_layer_to_tile_temporal_missing_npy_returns_nan(patch_temporal_render_catalog, tmp_path, monkeypatch):
+    monkeypatch.setattr(tiles, "TEMPORAL_RASTERS_DIR", tmp_path)
+    tiles._npy_cache.clear()
+    layer = tiles.get_layer("temperature_2m_avg_24h")
+    dest = tiles._sample_layer_to_tile(layer, z=2, x=2, y=1, tile_size=8)
+    assert dest.shape == (8, 8)
+    assert np.all(np.isnan(dest))

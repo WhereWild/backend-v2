@@ -395,7 +395,8 @@ def test_save_state_creates_parents(tmp_path, monkeypatch):
 
 def test_fetch_inat_dwca_cache_hit(tmp_path, monkeypatch):
     cache = tmp_path / "inat_dwca.zip"
-    cache.write_bytes(b"fake-zip")
+    valid_zip = _make_dwca_bytes([])
+    cache.write_bytes(valid_zip)
     state_path = tmp_path / "sync_state.json"
     state_path.write_text(json.dumps({"inat_taxonomy": {"etag": "etag-abc"}}))
     monkeypatch.setattr(build_tree, "INAT_DWCA_CACHE", cache)
@@ -405,7 +406,7 @@ def test_fetch_inat_dwca_cache_hit(tmp_path, monkeypatch):
     with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("etag-abc")):
         result = build_tree.fetch_inat_dwca()
 
-    assert result == b"fake-zip"
+    assert result == valid_zip
 
 
 def test_fetch_inat_dwca_download(tmp_path, monkeypatch):
@@ -416,14 +417,16 @@ def test_fetch_inat_dwca_download(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "CACHE_DIR", tmp_path)
     monkeypatch.setattr(build_tree, "SYNC_STATE_PATH", state_path)
 
+    valid_zip = _make_dwca_bytes([])
+
     def fake_run(cmd, **kw):
-        cache.write_bytes(b"downloaded")
+        cache.write_bytes(valid_zip)
 
     with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("etag-new")), \
          patch("scripts.build_tree.subprocess.run", side_effect=fake_run):
         result = build_tree.fetch_inat_dwca()
 
-    assert result == b"downloaded"
+    assert result == valid_zip
     assert json.loads(state_path.read_text())["inat_taxonomy"]["etag"] == "etag-new"
 
 
@@ -436,7 +439,7 @@ def test_fetch_inat_dwca_no_etag_saved(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "SYNC_STATE_PATH", state_path)
 
     def fake_run(cmd, **kw):
-        cache.write_bytes(b"downloaded")
+        cache.write_bytes(_make_dwca_bytes([]))
 
     with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("")), \
          patch("scripts.build_tree.subprocess.run", side_effect=fake_run):
@@ -464,8 +467,18 @@ def test_strip_infra_markers_no_markers():
 def test_build_gbif_indexes_exact():
     catalog = {"123": {"rank": "SPECIES", "scientific_name": "Opuntia_humifusa"}}
     exact, _ = build_tree.build_gbif_indexes(catalog)
-    assert ("SPECIES", "opuntia humifusa") in exact
-    assert exact[("SPECIES", "opuntia humifusa")] == ["123"]
+    assert ("SPECIES", "opuntia humifusa", "") in exact
+    assert exact[("SPECIES", "opuntia humifusa", "")] == ["123"]
+
+
+def test_build_gbif_indexes_parent_disambiguates_homonym():
+    catalog = {
+        "1": {"rank": "GENUS", "scientific_name": "Townsendia", "path": "Plantae_1/Asteraceae_2/Townsendia_1"},
+        "2": {"rank": "GENUS", "scientific_name": "Townsendia", "path": "Animalia_9/Asilidae_8/Townsendia_2"},
+    }
+    exact, _ = build_tree.build_gbif_indexes(catalog)
+    assert exact[("GENUS", "townsendia", "asteraceae")] == ["1"]
+    assert exact[("GENUS", "townsendia", "asilidae")] == ["2"]
 
 
 def test_build_gbif_indexes_stripped_for_variety():
@@ -556,6 +569,32 @@ def test_build_mapping_conflict_skipped(tmp_path, monkeypatch):
         rows = list(csv.DictReader(f))
     assert len(rows) == 1
     assert rows[0]["inat_id"] == "11"
+
+
+def test_build_mapping_genus_homonym_disambiguated_by_family(tmp_path, monkeypatch):
+    """Regression test for #111: plant genus Townsendia (Asteraceae) must not
+    match the unrelated robberfly genus Townsendia (Asilidae) just because
+    both share a rank+name — the immediate parent (family) must agree too."""
+    monkeypatch.setattr(build_tree, "CATALOG_DIR", tmp_path)
+    monkeypatch.setattr(build_tree, "MAPPING_PATH", tmp_path / "mapping.csv")
+    catalog = {
+        "1": {
+            "taxon_key": "1", "rank": "GENUS", "scientific_name": "Townsendia", "common_name": "",
+            "path": "Plantae_100/Asteraceae_200/Townsendia_1",
+        },
+    }
+    dwca = _make_dwca_bytes(
+        [
+            {"id": "501", "taxonID": "", "taxonRank": "GENUS", "scientificName": "Townsendia", "family": "Asilidae"},
+            {"id": "502", "taxonID": "", "taxonRank": "GENUS", "scientificName": "Townsendia", "family": "Asteraceae"},
+        ],
+        fieldnames=["id", "taxonID", "taxonRank", "scientificName", "family"],
+    )
+    build_tree.build_mapping(catalog, dwca)
+    with open(tmp_path / "mapping.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 1
+    assert rows[0]["inat_id"] == "502"
 
 
 def test_build_mapping_skips_unmapped_rank(tmp_path, monkeypatch):

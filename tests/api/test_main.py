@@ -540,7 +540,7 @@ def test_layer_tile_with_chain_param():
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
     chain_json = json.dumps([
         {"layer_id": "kg2", "class_filter": [3, 4]},
-        {"layer_id": "bio2", "value_min": 1.0, "value_max": 2.0},
+        {"layer_id": "bio2", "value_ranges": [[1.0, 2.0], [5.0, 6.0]]},
     ])
     with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
          patch.object(tiles, "render_layer_tile_bytes", return_value=png) as mock_render:
@@ -549,8 +549,8 @@ def test_layer_tile_with_chain_param():
     call_args = mock_render.call_args
     passed_chain = call_args.args[-1]
     assert passed_chain == [
-        {"layer_id": "kg2", "class_filter": [3, 4], "value_min": None, "value_max": None},
-        {"layer_id": "bio2", "class_filter": None, "value_min": 1.0, "value_max": 2.0},
+        {"layer_id": "kg2", "class_filter": [3, 4], "value_ranges": None},
+        {"layer_id": "bio2", "class_filter": None, "value_ranges": [(1.0, 2.0), (5.0, 6.0)]},
     ]
 
 
@@ -561,6 +561,31 @@ def test_layer_tile_no_chain_param_passes_none():
         response = client.get("/api/layers/bio1/tiles/4/8/5.png")
     assert response.status_code == 200
     assert mock_render.call_args.args[-1] is None
+
+
+def test_layer_tile_with_value_ranges_param():
+    """The `value_ranges` query param (JSON list of [min,max] pairs) is parsed,
+    unit-converted, and forwarded to render_layer_tile_bytes as a list of tuples."""
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    ranges_json = json.dumps([[1.0, 2.0], [5.0, 6.0]])
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "render_layer_tile_bytes", return_value=png) as mock_render:
+        response = client.get(
+            f"/api/layers/bio1/tiles/4/8/5.png?value_ranges={ranges_json}&unit_system=metric",
+        )
+    assert response.status_code == 200
+    call_args = mock_render.call_args
+    passed_value_ranges = call_args.args[9]
+    assert passed_value_ranges == [(1.0, 2.0), (5.0, 6.0)]
+
+
+def test_layer_tile_no_value_ranges_param_passes_none():
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "render_layer_tile_bytes", return_value=png) as mock_render:
+        response = client.get("/api/layers/bio1/tiles/4/8/5.png")
+    assert response.status_code == 200
+    assert mock_render.call_args.args[9] is None
 
 
 # ---------------------------------------------------------------------------

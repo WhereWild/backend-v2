@@ -263,7 +263,7 @@ def test_colorize_mixed_nan():
 
 def test_colorize_value_mask_min_max():
     values = np.array([[0.0, 0.5, 1.0]], dtype=np.float32)
-    rgba = tiles._colorize(values, 0.0, 1.0, mask_min=0.4, mask_max=0.6)
+    rgba = tiles._colorize(values, 0.0, 1.0, mask_ranges=[(0.4, 0.6)])
     assert rgba[0, 0, 3] == 0
     assert rgba[0, 1, 3] == 255
     assert rgba[0, 2, 3] == 0
@@ -271,21 +271,30 @@ def test_colorize_value_mask_min_max():
 
 def test_colorize_value_mask_min_only():
     values = np.array([[0.0, 1.0]], dtype=np.float32)
-    rgba = tiles._colorize(values, 0.0, 1.0, mask_min=0.5)
+    rgba = tiles._colorize(values, 0.0, 1.0, mask_ranges=[(0.5, None)])
     assert rgba[0, 0, 3] == 0
     assert rgba[0, 1, 3] == 255
 
 
 def test_colorize_value_mask_ignores_nan():
     values = np.array([[np.nan, 0.5]], dtype=np.float32)
-    rgba = tiles._colorize(values, 0.0, 1.0, mask_min=0.0, mask_max=1.0)
+    rgba = tiles._colorize(values, 0.0, 1.0, mask_ranges=[(0.0, 1.0)])
     assert rgba[0, 0, 3] == 0
     assert rgba[0, 1, 3] == 255
 
 
+def test_colorize_value_mask_multiple_ranges_are_ored():
+    """Two disjoint mask ranges — a pixel in EITHER one stays visible."""
+    values = np.array([[0.05, 0.5, 0.95]], dtype=np.float32)
+    rgba = tiles._colorize(values, 0.0, 1.0, mask_ranges=[(0.0, 0.1), (0.9, 1.0)])
+    assert rgba[0, 0, 3] == 255
+    assert rgba[0, 1, 3] == 0
+    assert rgba[0, 2, 3] == 255
+
+
 def test_colorize_circular_mask_simple_range():
     values = np.array([[10.0, 45.0, 90.0]], dtype=np.float32)
-    rgba = tiles._colorize_circular(values, mask_min=0.0, mask_max=45.0)
+    rgba = tiles._colorize_circular(values, mask_ranges=[(0.0, 45.0)])
     assert rgba[0, 0, 3] > 0
     assert rgba[0, 1, 3] > 0
     assert rgba[0, 2, 3] == 0
@@ -293,7 +302,7 @@ def test_colorize_circular_mask_simple_range():
 
 def test_colorize_circular_mask_wraps_across_zero():
     values = np.array([[0.0, 10.0, 180.0, 350.0]], dtype=np.float32)
-    rgba = tiles._colorize_circular(values, mask_min=350.0, mask_max=20.0)
+    rgba = tiles._colorize_circular(values, mask_ranges=[(350.0, 20.0)])
     assert rgba[0, 0, 3] > 0
     assert rgba[0, 1, 3] > 0
     assert rgba[0, 2, 3] == 0
@@ -302,9 +311,17 @@ def test_colorize_circular_mask_wraps_across_zero():
 
 def test_colorize_circular_no_mask_when_only_one_bound_given():
     values = np.array([[10.0, 200.0]], dtype=np.float32)
-    rgba = tiles._colorize_circular(values, mask_min=0.0, mask_max=None)
+    rgba = tiles._colorize_circular(values, mask_ranges=[(0.0, None)])
     assert rgba[0, 0, 3] > 0
     assert rgba[0, 1, 3] > 0
+
+
+def test_colorize_circular_mask_multiple_ranges_are_ored():
+    values = np.array([[10.0, 90.0, 200.0]], dtype=np.float32)
+    rgba = tiles._colorize_circular(values, mask_ranges=[(0.0, 45.0), (350.0, 20.0)])
+    assert rgba[0, 0, 3] > 0   # 10deg inside first range
+    assert rgba[0, 1, 3] == 0  # 90deg inside neither
+    assert rgba[0, 2, 3] == 0  # 200deg inside neither
 
 
 def test_colorize_nominal_no_filter_colors_all_known_classes():
@@ -708,8 +725,8 @@ def test_apply_chain_mask_and_logic():
     with patch.object(tiles, "get_layer", side_effect=lambda lid: {"id": lid, "value_type": "nominal"}), \
          patch.object(tiles, "_sample_layer_to_tile", side_effect=fake_sample):
         chain = [
-            {"layer_id": "a", "class_filter": [1], "value_min": None, "value_max": None},
-            {"layer_id": "b", "class_filter": [1], "value_min": None, "value_max": None},
+            {"layer_id": "a", "class_filter": [1], "value_ranges": None},
+            {"layer_id": "b", "class_filter": [1], "value_ranges": None},
         ]
         tiles._apply_chain_mask(rgba, chain, z=0, x=0, y=0, tile_size=2)
 
@@ -726,7 +743,7 @@ def test_apply_chain_mask_linear_range():
 
     with patch.object(tiles, "get_layer", return_value={"id": "x", "value_type": "interval"}), \
          patch.object(tiles, "_sample_layer_to_tile", return_value=values):
-        chain = [{"layer_id": "x", "class_filter": None, "value_min": 2.0, "value_max": 8.0}]
+        chain = [{"layer_id": "x", "class_filter": None, "value_ranges": [(2.0, 8.0)]}]
         tiles._apply_chain_mask(rgba, chain, z=0, x=0, y=0, tile_size=2)
 
     assert rgba[0, 0, 3] == 0    # 0.0 below range
@@ -743,7 +760,7 @@ def test_apply_chain_mask_circular_wraparound():
 
     with patch.object(tiles, "get_layer", return_value={"id": "aspect", "value_type": "circular"}), \
          patch.object(tiles, "_sample_layer_to_tile", return_value=values):
-        chain = [{"layer_id": "aspect", "class_filter": None, "value_min": 350.0, "value_max": 20.0}]
+        chain = [{"layer_id": "aspect", "class_filter": None, "value_ranges": [(350.0, 20.0)]}]
         tiles._apply_chain_mask(rgba, chain, z=0, x=0, y=0, tile_size=2)
 
     assert rgba[0, 0, 3] > 0   # 0deg is inside 350->20 wrap
@@ -758,7 +775,7 @@ def test_apply_chain_mask_unknown_layer_skipped():
     rgba[:] = [10, 20, 30, 255]
 
     with patch.object(tiles, "get_layer", side_effect=KeyError("gone")):
-        chain = [{"layer_id": "gone", "class_filter": [1], "value_min": None, "value_max": None}]
+        chain = [{"layer_id": "gone", "class_filter": [1], "value_ranges": None}]
         tiles._apply_chain_mask(rgba, chain, z=0, x=0, y=0, tile_size=2)
 
     assert np.all(rgba[:, :, 3] == 255)
@@ -774,7 +791,7 @@ def test_render_tile_chain_masks_pixels_from_second_layer():
         no_chain = tiles.render_layer_tile_bytes("bio1", z=2, x=2, y=1, tile_size=4)
         chained = tiles.render_layer_tile_bytes(
             "bio1", z=2, x=2, y=1, tile_size=4,
-            chain=[{"layer_id": "kg2", "class_filter": [3231], "value_min": None, "value_max": None}],
+            chain=[{"layer_id": "kg2", "class_filter": [3231], "value_ranges": None}],
         )
     assert no_chain[:4] == b"\x89PNG"
     assert chained[:4] == b"\x89PNG"

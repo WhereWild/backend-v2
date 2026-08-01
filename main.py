@@ -596,9 +596,39 @@ async def gis_point_value(
 _VALID_FORECAST_HOURS = {0, 1, 8, 24, 72, 168}
 
 
+def _parse_value_ranges(
+    value_ranges: str | None, layer: dict, unit_system: str | None,
+) -> list[tuple[float | None, float | None]] | None:
+    """Parse a `value_ranges` query param (JSON list of [min, max] pairs) and
+    convert each bound from the display unit system to raw/metric using
+    `layer` — a layer's own filter can itself be multiple disjoint ranges
+    (OR'd), not just one pair. Same per-value conversion the single
+    value_min/value_max params used to get, just applied per-pair.
+    """
+    if not value_ranges:
+        return None
+    try:
+        pairs = json.loads(value_ranges)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(pairs, list):
+        return None
+    parsed: list[tuple[float | None, float | None]] = []
+    for pair in pairs:
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        value_min, value_max = pair
+        if value_min is not None:
+            value_min = units.convert_value_from_display(value_min, layer, unit_system)
+        if value_max is not None:
+            value_max = units.convert_value_from_display(value_max, layer, unit_system)
+        parsed.append((value_min, value_max))
+    return parsed or None
+
+
 def _parse_and_convert_chain(chain: str | None, unit_system: str | None) -> list[dict] | None:
-    """Parse the `chain` query param (JSON list of {layer_id, class_filter?, value_min?, value_max?})
-    and convert each entry's value_min/value_max from the display unit system to
+    """Parse the `chain` query param (JSON list of {layer_id, class_filter?, value_ranges?})
+    and convert each entry's value_ranges from the display unit system to
     raw/metric using THAT entry's own layer — each chained layer can have its own
     units/scale, distinct from the primary layer's.
     """
@@ -618,17 +648,20 @@ def _parse_and_convert_chain(chain: str | None, unit_system: str | None) -> list
             chain_layer = tiles.get_layer(entry["layer_id"])
         except KeyError:
             continue
-        value_min = entry.get("value_min")
-        value_max = entry.get("value_max")
-        if value_min is not None:
-            value_min = units.convert_value_from_display(value_min, chain_layer, unit_system)
-        if value_max is not None:
-            value_max = units.convert_value_from_display(value_max, chain_layer, unit_system)
+        value_ranges = []
+        for pair in entry.get("value_ranges") or []:
+            if not isinstance(pair, list) or len(pair) != 2:
+                continue
+            value_min, value_max = pair
+            if value_min is not None:
+                value_min = units.convert_value_from_display(value_min, chain_layer, unit_system)
+            if value_max is not None:
+                value_max = units.convert_value_from_display(value_max, chain_layer, unit_system)
+            value_ranges.append((value_min, value_max))
         parsed.append({
             "layer_id": entry["layer_id"],
             "class_filter": entry.get("class_filter"),
-            "value_min": value_min,
-            "value_max": value_max,
+            "value_ranges": value_ranges or None,
         })
     return parsed or None
 
@@ -639,14 +672,13 @@ async def variable_tile_compat(
     tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis"),
     cb_mode: str = Query(""), forecast_h: int = Query(0, ge=0),
     class_filter: list[int] | None = Query(None),
-    value_min: float | None = Query(None),
-    value_max: float | None = Query(None),
+    value_ranges: str | None = Query(None),
     unit_system: str | None = Query(None),
     chain: str | None = Query(None),
 ):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter, value_min, value_max, unit_system, chain)
+    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter, value_ranges, unit_system, chain)
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
@@ -657,8 +689,7 @@ async def layer_tile(
     cb_mode: str = Query(""),
     forecast_h: int = Query(0, ge=0),
     class_filter: list[int] | None = Query(None),
-    value_min: float | None = Query(None),
-    value_max: float | None = Query(None),
+    value_ranges: str | None = Query(None),
     unit_system: str | None = Query(None),
     chain: str | None = Query(None),
 ):
@@ -673,17 +704,14 @@ async def layer_tile(
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Layer '{layer_id}' not found")
 
-    # The legend's slice-selection UI displays value_min/value_max in the
-    # user's current unit system (imperial converts e.g. °C -> °F), same as
+    # The legend's slice-selection UI displays value ranges in the user's
+    # current unit system (imperial converts e.g. °C -> °F), same as
     # render_min/render_max in the variable metadata response — but tile
     # pixels (and the layer's own render_min/render_max used for coloring)
     # are always raw/metric. Without this, an imperial-unit selection gets
     # applied as if it were already metric (see the /observation-values
     # slicing endpoint, which converts back the same way).
-    if value_min is not None:
-        value_min = units.convert_value_from_display(value_min, layer, unit_system)
-    if value_max is not None:
-        value_max = units.convert_value_from_display(value_max, layer, unit_system)
+    parsed_value_ranges = _parse_value_ranges(value_ranges, layer, unit_system)
 
     parsed_chain = _parse_and_convert_chain(chain, unit_system)
 
@@ -691,7 +719,7 @@ async def layer_tile(
     payload = await run_in_threadpool(
         tiles.render_layer_tile_bytes,
         layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter,
-        value_min, value_max, parsed_chain,
+        parsed_value_ranges, parsed_chain,
     )
     is_temporal = layer.get("window_hours") is not None
     # URLs are versioned client-side with the layer's mtime-derived version token

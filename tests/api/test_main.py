@@ -1624,6 +1624,70 @@ def test_extra_filter_class_values_rejected_for_non_categorical_variable():
     assert r.status_code == 400
 
 
+def test_get_species_environment_with_extra_ranges_filter_ors_within_one_variable(tmp_path, monkeypatch):
+    """kg2 (categorical primary) chained with an extra bio1 `ranges` filter
+    OR-matching [5,15] and [35,45] should keep A (bio1=10) and D (bio1=40),
+    excluding B (bio1=20) and C (bio1=30) — same OR-within-one-variable
+    shape as classValues, but for a numeric variable's multi-select."""
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
+    _write_multi_class_occ(tmp_path)
+    legend = [{"id": 1, "name": "ClassA", "description": None, "traits": None},
+              {"id": 2, "name": "ClassB", "description": None, "traits": None},
+              {"id": 3, "name": "ClassC", "description": None, "traits": None}]
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]), \
+         patch("main._load_legend", return_value=legend):
+        extra = json.dumps([{
+            "variable": "bio1",
+            "ranges": [{"min": 5, "max": 15}, {"min": 35, "max": 45}],
+        }])
+        r = client.get(f"/species/2923970/environment/kg2?extra={extra}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["observation_count"] == 2
+
+
+def test_slice_with_extra_ranges_filter_ors_within_one_variable(tmp_path, monkeypatch):
+    """Slicing kg2 class 1 samples (A, B) with an extra bio1 ranges filter
+    OR-matching [5,15] and [35,45] should keep only A (bio1=10); B (bio1=20)
+    falls outside both ranges."""
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
+    _write_multi_class_occ(tmp_path)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):
+        extra = json.dumps([{
+            "variable": "bio1",
+            "ranges": [{"min": 5, "max": 15}, {"min": 35, "max": 45}],
+        }])
+        r = client.get(f"/species/2923970/environment/kg2/class/1/samples?extra={extra}")
+    assert r.status_code == 200
+    body = r.json()
+    catalogs = {obs["catalogNumber"] for obs in body["observations"]}
+    assert catalogs == {"A"}
+
+
+def test_extra_filter_ranges_must_be_a_non_empty_list():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):
+        extra = json.dumps([{"variable": "bio1", "ranges": []}])
+        r = client.get(f"/species/2923970/environment/bio1/slice?min=0&max=30&extra={extra}")
+    assert r.status_code == 400
+
+
+def test_extra_filter_ranges_rejected_for_categorical_variable():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):
+        extra = json.dumps([{"variable": "kg2", "ranges": [{"min": 0, "max": 1}]}])
+        r = client.get(f"/species/2923970/environment/bio1/slice?min=0&max=30&extra={extra}")
+    assert r.status_code == 400
+
+
 def test_slice_extra_filter_malformed_json_rejected():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \

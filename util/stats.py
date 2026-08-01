@@ -121,7 +121,11 @@ def apply_chained_filters(df: pd.DataFrame, filters: list[dict] | None) -> pd.Da
       {'variable', 'class_values'} — categorical match against ANY of a list
         of classes (OR within that one variable, e.g. Forest OR Grassland),
         ANDed against everything else same as the single-value case
-      {'variable', 'min', 'max', 'circular_wrap'} — numeric range
+      {'variable', 'min', 'max', 'circular_wrap'} — a single numeric range
+      {'variable', 'ranges'} — numeric match against ANY of a list of
+        {'min', 'max', 'circular_wrap'} ranges (OR within that one variable,
+        e.g. a multi-selected histogram/KDE with two disjoint slices),
+        ANDed against everything else same as the single-range case
     See main.py's _parse_extra_variable_filters, which builds these from the
     `extra` query param shared by the /slice, /class/:value/samples, and
     plain /environment/:variable_id (stats) endpoints. Supports chaining
@@ -136,6 +140,11 @@ def apply_chained_filters(df: pd.DataFrame, filters: list[dict] | None) -> pd.Da
             df = df[col == f["class_value"]]
         elif "class_values" in f:
             df = df[col.isin(f["class_values"])]
+        elif "ranges" in f:
+            mask = pd.Series(False, index=df.index)
+            for r in f["ranges"]:
+                mask = mask | numeric_range_mask(col, r["min"], r["max"], r.get("circular_wrap", False))
+            df = df[mask]
         else:
             df = df[numeric_range_mask(col, f["min"], f["max"], f.get("circular_wrap", False))]
         if df.empty:

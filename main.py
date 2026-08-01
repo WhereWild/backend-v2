@@ -1766,6 +1766,9 @@ def _parse_extra_variable_filters(extra: str | None, unit_system: str | None) ->
     util.stats.apply_chained_filters expects. Each entry is one of:
     {"variable": id, "min": x, "max": y} for a continuous/circular range (in
     DISPLAY units, converted to raw here same as the primary variable);
+    {"variable": id, "ranges": [{"min": x, "max": y}, ...]} for a numeric
+    OR-match against multiple disjoint ranges of that one variable (e.g. two
+    separately-selected slices of a histogram/KDE);
     {"variable": id, "classValue": n} for an exact categorical match; or
     {"variable": id, "classValues": [n, ...]} for a categorical OR-match
     against multiple classes of that one variable (e.g. Forest OR
@@ -1803,29 +1806,49 @@ def _parse_extra_variable_filters(extra: str | None, unit_system: str | None) ->
                 "class_values": [float(v) for v in entry["classValues"]],
             })
             continue
+        if "ranges" in entry:
+            if layer.get("value_type") == "nominal":
+                raise HTTPException(status_code=400, detail=f"'{variable_id}' is categorical — use classValue")
+            if not isinstance(entry["ranges"], list) or not entry["ranges"]:
+                raise HTTPException(status_code=400, detail=f"'ranges' for '{variable_id}' must be a non-empty list")
+            filters.append({
+                "variable": variable_id,
+                "ranges": [
+                    _parse_display_range(variable_id, layer, r, unit_system)
+                    for r in entry["ranges"]
+                ],
+            })
+            continue
         if "min" not in entry or "max" not in entry:
             raise HTTPException(
                 status_code=400,
-                detail=f"Extra filter for '{variable_id}' needs min/max, classValue, or classValues",
+                detail=f"Extra filter for '{variable_id}' needs min/max, ranges, classValue, or classValues",
             )
         if layer.get("value_type") == "nominal":
             raise HTTPException(status_code=400, detail=f"'{variable_id}' is categorical — use classValue")
-        value_min = float(entry["min"])
-        value_max = float(entry["max"])
-        if not math.isfinite(value_min) or not math.isfinite(value_max):
-            raise HTTPException(status_code=400, detail=f"Extra filter for '{variable_id}' must be finite")
-        circular_wrap = variable_id == "aspect" and value_max < value_min
-        if value_max < value_min and not circular_wrap:
-            value_min, value_max = value_max, value_min
-        raw_min = units.convert_value_from_display(value_min, layer, unit_system) - 1e-9
-        raw_max = units.convert_value_from_display(value_max, layer, unit_system) + 1e-9
         filters.append({
             "variable": variable_id,
-            "min": raw_min,
-            "max": raw_max,
-            "circular_wrap": circular_wrap,
+            **_parse_display_range(variable_id, layer, entry, unit_system),
         })
     return filters
+
+
+def _parse_display_range(variable_id: str, layer: dict, entry: dict, unit_system: str | None) -> dict:
+    """Parses one {'min','max'} display-unit range entry (a single range, or
+    one entry of an extra filter's 'ranges' list) into raw units, with the
+    same aspect-wraparound detection as the top-level min/max case."""
+    if "min" not in entry or "max" not in entry:
+        raise HTTPException(status_code=400, detail=f"Range for '{variable_id}' needs min and max")
+    value_min = float(entry["min"])
+    value_max = float(entry["max"])
+    if not math.isfinite(value_min) or not math.isfinite(value_max):
+        raise HTTPException(status_code=400, detail=f"Range for '{variable_id}' must be finite")
+    circular_wrap = variable_id == "aspect" and value_max < value_min
+    if value_max < value_min and not circular_wrap:
+        value_min, value_max = value_max, value_min
+    raw_min = units.convert_value_from_display(value_min, layer, unit_system) - 1e-9
+    raw_max = units.convert_value_from_display(value_max, layer, unit_system) + 1e-9
+    return {"min": raw_min, "max": raw_max, "circular_wrap": circular_wrap}
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/slice")

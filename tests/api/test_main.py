@@ -1339,9 +1339,9 @@ def test_get_species_environment_with_extra_filter_reflects_chained_slice(tmp_pa
     """The density curve/summary for bio1 should be computed over just the
     extra-filtered subset (kg2==1), the same on-the-fly recompute path
     location/phenology filters already use — not the full occurrence set."""
-    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
-    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _write_multi_var_occ(tmp_path)
+    occurrences_file = tmp_path / "occurrences.parquet"
+    _patch_occ_source(monkeypatch, occurrences_file)
+    _write_multi_var_occ(occurrences_file)
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_LAYER, FAKE_NOM_LAYER]):
@@ -1357,9 +1357,9 @@ def test_get_species_environment_with_extra_filter_reflects_chained_slice_catego
     """Same recompute path, but for a categorical primary variable (kg2)
     chained with a numeric extra filter on bio1 — the class distribution
     should be computed over just the bio1-filtered subset."""
-    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
-    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _write_multi_var_occ(tmp_path)
+    occurrences_file = tmp_path / "occurrences.parquet"
+    _patch_occ_source(monkeypatch, occurrences_file)
+    _write_multi_var_occ(occurrences_file)
     legend = [{"id": 1, "name": "ClassA", "description": None, "traits": None},
               {"id": 2, "name": "ClassB", "description": None, "traits": None}]
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
@@ -1564,32 +1564,37 @@ def test_class_samples_with_location_limit(tmp_path, monkeypatch):
 # Chained multi-variable filters (`extra` query param)
 # ---------------------------------------------------------------------------
 
-def _write_multi_var_occ(tmp_path):
+def _patch_occ_source(monkeypatch, occurrences_file):
+    monkeypatch.setattr(st_module, "OCCURRENCES_FILE", occurrences_file)
+    monkeypatch.setattr(st_module, "load_catalog", lambda: {TAXON["taxon_key"]: TAXON})
+
+
+def _write_multi_var_occ(occurrences_file):
     """3 rows spanning a numeric (bio1) and categorical (kg2) variable, so
     tests can chain a filter on one while slicing/sampling the other:
     A: bio1=10, kg2=1   B: bio1=20, kg2=1   C: bio1=30, kg2=2
     """
-    occ_dir = tmp_path / TAXON["path"]
-    occ_dir.mkdir(parents=True, exist_ok=True)
     data = {
         "catalogNumber": ["A", "B", "C"],
         "decimalLatitude": [40.0, 41.0, 42.0],
         "decimalLongitude": [-75.0, -74.0, -73.0],
         "bio1": [10.0, 20.0, 30.0],
         "kg2": [1.0, 1.0, 2.0],
+        "taxon_key": [TAXON["taxon_key"]] * 3,
     }
+    occurrences_file.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(
         pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False),
-        occ_dir / "occurrence.parquet",
+        occurrences_file,
     )
 
 
 def test_slice_with_extra_class_filter_chains_categorical_onto_numeric(tmp_path, monkeypatch):
     """Slicing bio1 (0-100, matches all 3) with an extra kg2 classValue=1
     filter chained on should exclude C (kg2=2), leaving only A and B."""
-    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
-    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _write_multi_var_occ(tmp_path)
+    occurrences_file = tmp_path / "occurrences.parquet"
+    _patch_occ_source(monkeypatch, occurrences_file)
+    _write_multi_var_occ(occurrences_file)
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):
@@ -1604,9 +1609,9 @@ def test_slice_with_extra_class_filter_chains_categorical_onto_numeric(tmp_path,
 def test_class_samples_with_extra_range_filter_chains_numeric_onto_categorical(tmp_path, monkeypatch):
     """Sampling kg2==1 (matches A and B) with an extra bio1 15-100 range
     chained on should exclude A (bio1=10), leaving only B."""
-    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
-    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _write_multi_var_occ(tmp_path)
+    occurrences_file = tmp_path / "occurrences.parquet"
+    _patch_occ_source(monkeypatch, occurrences_file)
+    _write_multi_var_occ(occurrences_file)
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):
@@ -1618,32 +1623,32 @@ def test_class_samples_with_extra_range_filter_chains_numeric_onto_categorical(t
     assert catalogs == {"B"}
 
 
-def _write_multi_class_occ(tmp_path):
+def _write_multi_class_occ(occurrences_file):
     """4 rows spanning bio1 (numeric) and kg2 (3 distinct classes), for
     testing OR-matching against multiple classValues of one variable:
     A: bio1=10, kg2=1   B: bio1=20, kg2=1   C: bio1=30, kg2=2   D: bio1=40, kg2=3
     """
-    occ_dir = tmp_path / TAXON["path"]
-    occ_dir.mkdir(parents=True, exist_ok=True)
     data = {
         "catalogNumber": ["A", "B", "C", "D"],
         "decimalLatitude": [40.0, 41.0, 42.0, 43.0],
         "decimalLongitude": [-75.0, -74.0, -73.0, -72.0],
         "bio1": [10.0, 20.0, 30.0, 40.0],
         "kg2": [1.0, 1.0, 2.0, 3.0],
+        "taxon_key": [TAXON["taxon_key"]] * 4,
     }
+    occurrences_file.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(
         pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False),
-        occ_dir / "occurrence.parquet",
+        occurrences_file,
     )
 
 
 def test_slice_with_extra_class_values_filter_ors_within_one_variable(tmp_path, monkeypatch):
     """Slicing bio1 (0-100, matches all 4) with an extra kg2 classValues=[1,3]
     filter chained on should keep A, B (kg2=1) and D (kg2=3), excluding C (kg2=2)."""
-    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
-    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _write_multi_class_occ(tmp_path)
+    occurrences_file = tmp_path / "occurrences.parquet"
+    _patch_occ_source(monkeypatch, occurrences_file)
+    _write_multi_class_occ(occurrences_file)
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):
@@ -1678,9 +1683,9 @@ def test_get_species_environment_with_extra_ranges_filter_ors_within_one_variabl
     OR-matching [5,15] and [35,45] should keep A (bio1=10) and D (bio1=40),
     excluding B (bio1=20) and C (bio1=30) — same OR-within-one-variable
     shape as classValues, but for a numeric variable's multi-select."""
-    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
-    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _write_multi_class_occ(tmp_path)
+    occurrences_file = tmp_path / "occurrences.parquet"
+    _patch_occ_source(monkeypatch, occurrences_file)
+    _write_multi_class_occ(occurrences_file)
     legend = [{"id": 1, "name": "ClassA", "description": None, "traits": None},
               {"id": 2, "name": "ClassB", "description": None, "traits": None},
               {"id": 3, "name": "ClassC", "description": None, "traits": None}]
@@ -1702,9 +1707,9 @@ def test_slice_with_extra_ranges_filter_ors_within_one_variable(tmp_path, monkey
     """Slicing kg2 class 1 samples (A, B) with an extra bio1 ranges filter
     OR-matching [5,15] and [35,45] should keep only A (bio1=10); B (bio1=20)
     falls outside both ranges."""
-    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
-    monkeypatch.setattr(st_module, "iter_descendants", lambda t, **kw: [t])
-    _write_multi_class_occ(tmp_path)
+    occurrences_file = tmp_path / "occurrences.parquet"
+    _patch_occ_source(monkeypatch, occurrences_file)
+    _write_multi_class_occ(occurrences_file)
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER, FAKE_NOM_LAYER]):

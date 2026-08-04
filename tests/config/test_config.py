@@ -14,16 +14,16 @@ def test_load_config_global(monkeypatch):
     clear_config_cache()
     cfg = load_config("global")
     assert isinstance(cfg, GlobalConfig)
-    assert cfg.plantae_key == 6
+    assert cfg.plantae_key == "P"
     assert cfg.species_rank == "SPECIES"
     assert "SUBSPECIES" in cfg.leaf_rank_set
     assert "SPECIES" in cfg.leaf_ranks
 
 
 def test_env_override(monkeypatch):
-    monkeypatch.setenv("PLANTAE_KEY", "2519")
+    monkeypatch.setenv("PLANTAE_KEY", "7HS")
     clear_config_cache()
-    assert load_config("global").plantae_key == 2519
+    assert load_config("global").plantae_key == "7HS"
 
 
 def test_load_config_cached():

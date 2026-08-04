@@ -29,6 +29,11 @@ GBIF_EMAIL = os.environ.get("GBIF_EMAIL", "")
 
 BASE_URL = "https://api.gbif.org/v1"
 INAT_DATASET_KEY = "50c9509d-22c7-4a22-a47d-8c48425ef4a7"
+# Catalogue of Life Extended Release — required on TAXON_KEY predicates since
+# plantae_key is now a COL XR id (e.g. "7HS"), not a legacy numeric GBIF
+# Backbone key. Without this, GBIF resolves TAXON_KEY against the obsolete
+# Backbone by default, where the value doesn't exist.
+COL_XR_CHECKLIST_KEY = "7ddf754f-d193-4cc9-b351-99906754a03b"
 
 CONFIG = load_config("global")
 
@@ -73,7 +78,10 @@ def request_download() -> str:
             "type": "and",
             "predicates": [
                 {"type": "equals", "key": "DATASET_KEY", "value": INAT_DATASET_KEY},
-                {"type": "equals", "key": "TAXON_KEY", "value": str(CONFIG.plantae_key)},
+                {
+                    "type": "equals", "key": "TAXON_KEY", "value": str(CONFIG.plantae_key),
+                    "checklistKey": COL_XR_CHECKLIST_KEY,
+                },
                 {"type": "equals", "key": "OCCURRENCE_STATUS", "value": "PRESENT"},
             ],
         },
@@ -183,7 +191,10 @@ def request_occurrence_download() -> str:
             "type": "and",
             "predicates": [
                 {"type": "equals", "key": "DATASET_KEY", "value": INAT_DATASET_KEY},
-                {"type": "equals", "key": "TAXON_KEY", "value": str(CONFIG.plantae_key)},
+                {
+                    "type": "equals", "key": "TAXON_KEY", "value": str(CONFIG.plantae_key),
+                    "checklistKey": COL_XR_CHECKLIST_KEY,
+                },
                 {"type": "equals", "key": "OCCURRENCE_STATUS", "value": "PRESENT"},
                 {"type": "equals", "key": "HAS_COORDINATE", "value": "true"},
             ],

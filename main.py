@@ -1494,6 +1494,7 @@ def get_species_occurrences(
     # Always read rcs so we can fall back to live phenology counts if precomputed is missing
     extra_cols.append("rcs")
     extra_cols.append("eventTimestamp")
+    extra_cols.extend(["mediaUrl", "mediaAttribution", "mediaLicense"])
     occ_columns = list(_OCC_COLUMNS) + extra_cols
 
     ts_min: int | None = None
@@ -1517,12 +1518,28 @@ def get_species_occurrences(
             df = apply_timestamp_filter(df, start_ts, end_ts)
         if not use_precomputed_pheno and "rcs" in df.columns:
             pheno_acc.update(compute_phenology_counts(df))
-        df = df[["catalogNumber", "decimalLatitude", "decimalLongitude"]].dropna()
+        media_cols = [c for c in ("mediaUrl", "mediaAttribution", "mediaLicense") if c in df.columns]
+        df = df[["catalogNumber", "decimalLatitude", "decimalLongitude", *media_cols]]
+        df = df.dropna(subset=["catalogNumber", "decimalLatitude", "decimalLongitude"])
         df = df.drop_duplicates(subset="catalogNumber")
-        collected = [
-            {"catalogNumber": str(r["catalogNumber"]), "latitude": r["decimalLatitude"], "longitude": r["decimalLongitude"]}
-            for r in df.to_dict("records")
-        ]
+        collected = []
+        for r in df.to_dict("records"):
+            entry = {
+                "catalogNumber": str(r["catalogNumber"]),
+                "latitude": r["decimalLatitude"],
+                "longitude": r["decimalLongitude"],
+            }
+            media_url = r.get("mediaUrl")
+            if isinstance(media_url, str) and media_url:
+                entry["media_url"] = media_url
+                attribution = r.get("mediaAttribution")
+                if isinstance(attribution, str) and attribution:
+                    entry["media_attribution"] = attribution
+                license_url = r.get("mediaLicense")
+                if isinstance(license_url, str) and license_url:
+                    entry["media_license_url"] = license_url
+                    entry["media_license"] = _license_label(license_url)
+            collected.append(entry)
 
     if use_precomputed_pheno:
         pheno_counts = read_phenology_counts(TREE_ROOT / taxon["path"]) or dict(

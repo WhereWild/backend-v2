@@ -992,6 +992,36 @@ def test_get_species_occurrences_deduplication():
     assert len(r.json()["occurrences"]) == 1
 
 
+def test_get_species_occurrences_includes_media():
+    media_table = pa.table({
+        "catalogNumber": ["OCC001", "OCC002"],
+        "decimalLatitude": [40.5, 41.0],
+        "decimalLongitude": [-75.0, -74.5],
+        "obscured": ["No", "No"],
+        "coordinateUncertaintyInMeters": [100.0, 200.0],
+        "mediaUrl": ["https://example.com/1.jpg", None],
+        "mediaAttribution": ["Jane Doe", None],
+        "mediaLicense": ["https://creativecommons.org/licenses/by-nc/4.0/", None],
+    })
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(pq, "read_schema", return_value=media_table.schema), \
+         patch.object(pq, "read_table", return_value=media_table):
+        r = client.get("/species/2923970/occurrences")
+    assert r.status_code == 200
+    occs = {o["catalogNumber"]: o for o in r.json()["occurrences"]}
+    with_media = occs["OCC001"]
+    assert with_media["media_url"] == "https://example.com/1.jpg"
+    assert with_media["media_attribution"] == "Jane Doe"
+    assert with_media["media_license_url"] == "https://creativecommons.org/licenses/by-nc/4.0/"
+    assert with_media["media_license"] == "CC BY-NC 4.0"
+    without_media = occs["OCC002"]
+    assert "media_url" not in without_media
+    assert "media_attribution" not in without_media
+    assert "media_license" not in without_media
+
+
 # ---------------------------------------------------------------------------
 # /species/{id}/locations
 # ---------------------------------------------------------------------------

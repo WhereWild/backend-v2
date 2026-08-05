@@ -45,7 +45,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from config.config import load_config
-from scripts.build_tree import clean_name
+from scripts.build_tree import _is_usable_license, _normalize_license_url, clean_name
 from util.gis import hilbert_index
 from util.taxa import load_catalog, load_name_index, normalize_name
 
@@ -54,6 +54,7 @@ csv.field_size_limit(sys.maxsize)
 CONFIG = load_config("global")
 
 OCCURRENCE_PATH = Path("data/occurrences/occurrence.txt")
+MULTIMEDIA_PATH = Path("data/occurrences/multimedia.txt")
 OCCURRENCES_FILE = Path("data/taxonomy/occurrences.parquet")
 
 # Rows buffered in memory before a streaming flush to the unsorted temp file.
@@ -80,6 +81,9 @@ SCHEMA = pa.schema([
     ("vitality",                      pa.string()),
     ("rcs",                           pa.string()),
     ("taxon_key",                     pa.string()),
+    ("mediaUrl",                      pa.string()),
+    ("mediaAttribution",              pa.string()),
+    ("mediaLicense",                  pa.string()),
     ("_seq",                          pa.int64()),
 ])
 
@@ -117,6 +121,55 @@ def _parse_obscured(info_withheld: str) -> str:
     if not info_withheld:
         return "No"
     return "Hidden" if info_withheld.split(" ")[-1] == "taxon" else "Obscured"
+
+
+def _load_media_map(path: Path) -> dict[str, tuple[str, str, str]]:
+    """Build gbifID -> (url, attribution, license_url) from multimedia.txt.
+
+    A gbifID can have several media rows; only the first one encountered is
+    considered (no scanning ahead for a "better" one), and it's kept only if
+    _is_usable_license accepts its license — the same permissive-license bar
+    build_tree.py already applies to GBIF backup images, so callers don't
+    need to reason about two different license policies.
+
+    Uses csv.reader (not DictReader) with precomputed column indices since
+    this streams ~1.2M rows and dict construction per row is measurably
+    slower at that volume.
+    """
+    media_map: dict[str, tuple[str, str, str]] = {}
+    if not path.exists():
+        return media_map
+
+    seen: set[str] = set()
+    with open(path, encoding="utf-8", newline="") as f:
+        reader = csv.reader(f, delimiter="\t")
+        header = next(reader)
+        col = {name: i for i, name in enumerate(header)}
+        gbif_i = col["gbifID"]
+        ident_i = col["identifier"]
+        license_i = col["license"]
+        rights_i = col["rightsHolder"]
+        creator_i = col["creator"]
+        width = len(header)
+
+        for fields in reader:
+            if len(fields) != width:
+                continue
+            gbif_id = fields[gbif_i]
+            if gbif_id in seen:
+                continue
+            seen.add(gbif_id)
+
+            license_raw = fields[license_i]
+            if not _is_usable_license(license_raw):
+                continue
+            identifier = fields[ident_i].strip()
+            if not identifier:
+                continue
+            attribution = fields[rights_i].strip() or fields[creator_i].strip()
+            media_map[gbif_id] = (identifier, attribution, _normalize_license_url(license_raw))
+
+    return media_map
 
 
 def _flush(writer_holder: dict, tmp_path: Path, rows: list[dict]) -> None:
@@ -169,6 +222,8 @@ def main() -> None:
     # docstring for why matching goes through names instead of
     # occurrence.txt's own taxonKey column.
     name_index = load_name_index()
+    media_map = _load_media_map(MULTIMEDIA_PATH)
+    print(f"  Loaded {len(media_map):,} usable-license media links.", flush=True)
 
     rows_read = 0
     rows_written = 0
@@ -221,6 +276,8 @@ def main() -> None:
             except ValueError:
                 uncertainty = None
 
+            media = media_map.get((row.get("gbifID") or "").strip())
+
             buffer.append({
                 "decimalLatitude":               lat,
                 "decimalLongitude":              lon,
@@ -237,6 +294,9 @@ def main() -> None:
                 "vitality":                      (row.get("vitality") or "").strip().lower(),
                 "rcs":                           (row.get("reproductiveCondition") or "").strip(),
                 "taxon_key":                     taxon["taxon_key"],
+                "mediaUrl":                      media[0] if media else None,
+                "mediaAttribution":              media[1] if media else None,
+                "mediaLicense":                  media[2] if media else None,
                 "_seq":                          seq,
             })
             seq += 1

@@ -94,6 +94,7 @@ _BASE_COLS = frozenset([
     "decimalLatitude", "decimalLongitude", "catalogNumber", "hilbertIdx",
     "eventTimestamp", "coordinateUncertaintyInMeters", "obscured",
     "gbifRegion", "level0Gid", "level1Gid", "level2Gid", "dp", "vitality", "rcs",
+    "mediaUrl", "mediaAttribution", "mediaLicense",
 ])
 _REQUIRED_COLS = ("decimalLatitude", "decimalLongitude", "catalogNumber", "hilbertIdx")
 

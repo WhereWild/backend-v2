@@ -75,10 +75,40 @@ def _make_tsv(rows: list[dict]) -> str:
     return buf.getvalue()
 
 
-def _run_main(tsv: str, tmp_path: Path) -> Path:
-    """Run pt.main() against a tmp occurrence.txt and return the output parquet path."""
+MULTIMEDIA_COLUMNS = [
+    "gbifID", "type", "format", "identifier", "references", "title",
+    "description", "source", "audience", "created", "creator",
+    "contributor", "publisher", "license", "rightsHolder",
+]
+
+BASE_MEDIA_ROW = {
+    "gbifID": "1",
+    "type": "StillImage",
+    "format": "image/jpeg",
+    "identifier": "https://inaturalist-open-data.s3.amazonaws.com/photos/1/original.jpg",
+    "license": "http://creativecommons.org/licenses/by-nc/4.0/",
+    "rightsHolder": "Jane Doe",
+    "creator": "Jane Doe",
+}
+
+
+def _make_media_tsv(rows: list[dict]) -> str:
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=MULTIMEDIA_COLUMNS, delimiter="\t", extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({**BASE_MEDIA_ROW, **row})
+    return buf.getvalue()
+
+
+def _run_main(tsv: str, tmp_path: Path, media_tsv: str | None = None) -> Path:
+    """Run pt.main() against a tmp occurrence.txt (+ optional multimedia.txt)."""
     occurrences_file = tmp_path / "taxonomy" / "occurrences.parquet"
+    multimedia_path = tmp_path / "multimedia.txt"
+    if media_tsv is not None:
+        multimedia_path.write_text(media_tsv)
     with patch.object(pt, "OCCURRENCE_PATH", tmp_path / "occurrence.txt"), \
+         patch.object(pt, "MULTIMEDIA_PATH", multimedia_path), \
          patch.object(pt, "OCCURRENCES_FILE", occurrences_file), \
          patch.object(pt, "load_catalog", return_value=CATALOG), \
          patch.object(pt, "load_name_index", return_value=NAME_INDEX):
@@ -159,6 +189,55 @@ def test_parse_obscured_user():
     assert pt._parse_obscured("Location obscured by user") == "Obscured"
 
 
+# --- _load_media_map ---
+
+def test_load_media_map_missing_file_returns_empty(tmp_path):
+    assert pt._load_media_map(tmp_path / "nope.txt") == {}
+
+
+def test_load_media_map_permissive_license(tmp_path):
+    path = tmp_path / "multimedia.txt"
+    path.write_text(_make_media_tsv([{}]))
+    media_map = pt._load_media_map(path)
+    assert media_map == {
+        "1": (
+            "https://inaturalist-open-data.s3.amazonaws.com/photos/1/original.jpg",
+            "Jane Doe",
+            "https://creativecommons.org/licenses/by-nc/4.0/",
+        )
+    }
+
+
+def test_load_media_map_skips_unusable_license(tmp_path):
+    path = tmp_path / "multimedia.txt"
+    path.write_text(_make_media_tsv([{"license": "all rights reserved"}]))
+    assert pt._load_media_map(path) == {}
+
+
+def test_load_media_map_skips_empty_identifier(tmp_path):
+    path = tmp_path / "multimedia.txt"
+    path.write_text(_make_media_tsv([{"identifier": ""}]))
+    assert pt._load_media_map(path) == {}
+
+
+def test_load_media_map_falls_back_to_creator_when_no_rights_holder(tmp_path):
+    path = tmp_path / "multimedia.txt"
+    path.write_text(_make_media_tsv([{"rightsHolder": "", "creator": "John Smith"}]))
+    media_map = pt._load_media_map(path)
+    assert media_map["1"][1] == "John Smith"
+
+
+def test_load_media_map_first_row_per_gbif_id_wins(tmp_path):
+    # Second row for gbifID "1" is a usable license too, but the first row
+    # seen (rejected for its license) should still "consume" the slot.
+    path = tmp_path / "multimedia.txt"
+    path.write_text(_make_media_tsv([
+        {"gbifID": "1", "license": "all rights reserved"},
+        {"gbifID": "1", "license": "cc0", "identifier": "https://example.com/second.jpg"},
+    ]))
+    assert pt._load_media_map(path) == {}
+
+
 # --- _flush ---
 
 def _sample_row(**overrides) -> dict:
@@ -170,6 +249,7 @@ def _sample_row(**overrides) -> dict:
         "level1Gid": None, "level2Gid": None,
         "dp": "organism", "vitality": "alive", "rcs": "flowers",
         "taxon_key": "2923970",
+        "mediaUrl": None, "mediaAttribution": None, "mediaLicense": None,
         "_seq": 0,
     }
     row.update(overrides)
@@ -313,6 +393,44 @@ def test_main_no_rows_written_skips_consolidate(tmp_path):
     # All rows filtered out (non-leaf rank) — occurrences.parquet should never be created.
     occurrences_file = _run_main(_make_tsv([{"taxonRank": "GENUS"}]), tmp_path)
     assert not occurrences_file.exists()
+
+
+# --- main: media join ---
+
+def test_main_attaches_media_with_permissive_license(tmp_path):
+    occurrences_file = _run_main(
+        _make_tsv([{"gbifID": "1"}]), tmp_path, _make_media_tsv([{"gbifID": "1"}]),
+    )
+    row = _read_rows(occurrences_file)[0]
+    assert row["mediaUrl"] == "https://inaturalist-open-data.s3.amazonaws.com/photos/1/original.jpg"
+    assert row["mediaAttribution"] == "Jane Doe"
+    assert row["mediaLicense"] == "https://creativecommons.org/licenses/by-nc/4.0/"
+
+
+def test_main_omits_media_with_unusable_license(tmp_path):
+    occurrences_file = _run_main(
+        _make_tsv([{"gbifID": "1"}]),
+        tmp_path,
+        _make_media_tsv([{"gbifID": "1", "license": "all rights reserved"}]),
+    )
+    row = _read_rows(occurrences_file)[0]
+    assert row["mediaUrl"] is None
+    assert row["mediaAttribution"] is None
+    assert row["mediaLicense"] is None
+
+
+def test_main_no_media_file_leaves_media_null(tmp_path):
+    occurrences_file = _run_main(_make_tsv([{"gbifID": "1"}]), tmp_path, media_tsv=None)
+    row = _read_rows(occurrences_file)[0]
+    assert row["mediaUrl"] is None
+
+
+def test_main_no_matching_gbif_id_leaves_media_null(tmp_path):
+    occurrences_file = _run_main(
+        _make_tsv([{"gbifID": "1"}]), tmp_path, _make_media_tsv([{"gbifID": "999"}]),
+    )
+    row = _read_rows(occurrences_file)[0]
+    assert row["mediaUrl"] is None
 
 
 def test_main_dedupes_duplicate_catalog_number_across_taxa(tmp_path):

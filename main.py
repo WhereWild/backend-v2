@@ -15,6 +15,7 @@ import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
 from config.config import load_config
+from scripts.build_tree import _is_usable_license, _normalize_license_url
 from util import citations, descriptions, download, gis, taxa, tiles, units, upload
 from util.rankings import POSITION_FILE, RANKINGS_FILE
 from util.stats import (
@@ -51,6 +53,7 @@ from util.stats import (
 )
 from util.storage import ParquetStorageProxy
 from util.taxa import format_common_name, iter_descendants, normalize_name, reload_catalog, taxon_slug
+from util.temporal import load_temporal_layers
 from util.ternary import build_ternary_classification_overlay, composition_group_members
 
 _CONFIG = load_config("global")
@@ -560,6 +563,56 @@ def list_phenology_values():
     ]
 
 
+def _lookup_temporal_value_at_timestamp(
+    variable: str, lat: float, lon: float, event_ts: int,
+) -> float | None:
+    """Live single-point historical lookup for a temporal variable at a known
+    observation timestamp.
+
+    Reuses the upload flow's per-layer processing (util.upload's
+    _process_one_layer + _df_to_occ_table) with a one-row occ table — same
+    HTTP-range-request path against the ERA5 .om chunks, just for one point
+    instead of a batch. This is what makes "highlight this exact observation"
+    show the value AT THE TIME it was made rather than gis.sample_point's
+    current/live window, which is what a plain map click means.
+
+    Scoped to base window-aggregate layers (derived temporal layers are
+    computed from other already-processed columns, not fetched directly —
+    see load_temporal_layers/TemporalLayer.derived) — returns None for
+    anything else so the caller falls back to gis.sample_point.
+    """
+    try:
+        layers = load_temporal_layers(tiles.CATALOG_PATH)
+    except Exception:
+        return None
+    candidates = [lyr for lyr in layers if not lyr.derived and variable.startswith(f"{lyr.id}_")]
+    if not candidates:
+        return None
+
+    occ_table = upload._df_to_occ_table(pd.DataFrame({
+        "decimalLatitude": [lat],
+        "decimalLongitude": [lon],
+        "eventTimestamp": [float(event_ts)],
+    }))
+
+    for layer in candidates:
+        try:
+            updates = upload._process_one_layer(layer, occ_table)
+        except Exception:
+            continue
+        pairs = updates.get("__upload__", {}).get(variable)
+        if not pairs:
+            continue
+        _, values = pairs[0]
+        if len(values) == 0:
+            continue
+        val = values[0]
+        if val is None or not math.isfinite(float(val)):
+            return None
+        return float(val)
+    return None
+
+
 @app.get("/gis/point")
 async def gis_point_value(
     lat: float = Query(...),
@@ -569,6 +622,7 @@ async def gis_point_value(
     catalog_number: str | None = Query(None),
     unit_system: str | None = Query(None),
     forecast_h: int = Query(0, ge=0),
+    event_ts: int | None = Query(None),
 ):
     """Return the raster value for a variable at a lat/lon coordinate.
 
@@ -577,6 +631,12 @@ async def gis_point_value(
     is identical to what the stats were computed from, and for temporal variables
     returns the historical aggregate at observation time rather than the current
     live window. Falls back to raster sampling when the index row is missing.
+
+    event_ts covers the same "value at observation time, not now" case for a
+    temporal variable when there's no index row to read (e.g. an observation
+    not yet ingested by GBIF — see GET /occurrence/{id}'s "ingested": false):
+    a live single-point historical lookup at that exact timestamp, computed
+    before falling all the way through to the current/live raster.
     """
     if not math.isfinite(lat) or not math.isfinite(lon):
         raise HTTPException(status_code=400, detail="lat and lon must be finite numbers")
@@ -597,6 +657,11 @@ async def gis_point_value(
         taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
         if taxon is not None:
             value = _lookup_index_value(taxon, variable, catalog_number)
+
+    if value is None and event_ts is not None:
+        value = await run_in_threadpool(
+            _lookup_temporal_value_at_timestamp, variable, lat, lon, event_ts,
+        )
 
     if value is None:
         value = await run_in_threadpool(gis.sample_point, layer, lat, lon, forecast_suffix)
@@ -1469,9 +1534,14 @@ def get_species_environment(
 
 
 def _occurrence_response(
-    catalog_number: str, taxon: dict, latitude: float | None, longitude: float | None, ingested: bool,
+    catalog_number: str,
+    taxon: dict,
+    latitude: float | None,
+    longitude: float | None,
+    ingested: bool,
+    extra: dict | None = None,
 ) -> dict:
-    return {
+    response = {
         "catalog_number": catalog_number,
         "taxon_id": taxon["taxon_key"],
         "scientific_name": (taxon.get("scientific_name") or "").replace("_", " "),
@@ -1481,6 +1551,65 @@ def _occurrence_response(
         "longitude": longitude,
         "ingested": ingested,
     }
+    if extra:
+        response.update(extra)
+    return response
+
+
+def _parse_inat_timestamp(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+_INAT_ATTRIBUTION_NAME_RE = re.compile(
+    r"^\(c\)\s*(.+?),\s*(?:some|no) rights reserved", re.IGNORECASE,
+)
+
+
+def _clean_inat_attribution(raw: str) -> str:
+    """Reduce iNat's "(c) Name, some rights reserved (LICENSE)" to just Name.
+
+    The ingested path's mediaAttribution (multimedia.txt's rightsHolder) is
+    already a bare name — iNat's own attribution field bakes the license
+    mention into the string, which would visually duplicate the separately
+    rendered license line (see the map popup / ObservationCard credit row).
+    Falls back to the raw string if it doesn't match this format, rather
+    than dropping it, since iNat's wording isn't 100% guaranteed uniform.
+    """
+    match = _INAT_ATTRIBUTION_NAME_RE.match(raw)
+    return match.group(1).strip() if match else raw
+
+
+def _inat_observation_photo(obs: dict) -> dict:
+    """Extract the first usable-license photo from an iNat observation payload.
+
+    Same permissive-license bar as build_tree.py's GBIF backup images and
+    populate_tree.py's multimedia join (_is_usable_license), so display
+    logic never has to reason about three different license policies.
+    """
+    for photo in obs.get("photos") or []:
+        license_code = photo.get("license_code") or ""
+        if not _is_usable_license(license_code):
+            continue
+        raw_url = photo.get("url") or ""
+        if not raw_url:
+            continue
+        license_url = _normalize_license_url(license_code)
+        raw_attribution = photo.get("attribution") or ""
+        return {
+            "media_url": re.sub(r"/square\.", "/original.", raw_url, count=1),
+            "media_attribution": _clean_inat_attribution(raw_attribution) or None,
+            "media_license_url": license_url or None,
+            "media_license": _license_label(license_url) if license_url else None,
+        }
+    return {"media_url": None, "media_attribution": None, "media_license_url": None, "media_license": None}
 
 
 def _lookup_inat_observation(catalog_number: str) -> dict | None:
@@ -1493,6 +1622,11 @@ def _lookup_inat_observation(catalog_number: str) -> dict | None:
     taxon, network error, or a taxon iNat has that our own catalog doesn't
     map — see util.taxa.get_taxon_by_inat_id) so the caller can fall back
     to a plain 404 uniformly.
+
+    Also returns event_timestamp and media fields — unlike the ingested
+    path, there's no other source for these (the observation isn't part of
+    the taxon's normal /occurrences fetch at all), so this is the only
+    place they're worth carrying.
     """
     try:
         resp = httpx.get(
@@ -1504,16 +1638,25 @@ def _lookup_inat_observation(catalog_number: str) -> dict | None:
         return None
     if not results:
         return None
+    obs = results[0]
 
-    inat_taxon = results[0].get("taxon") or {}
+    inat_taxon = obs.get("taxon") or {}
     taxon = taxa.get_taxon_by_inat_id(inat_taxon.get("id"))
     if taxon is None:
         return None
 
-    coords = (results[0].get("geojson") or {}).get("coordinates")
+    coords = (obs.get("geojson") or {}).get("coordinates")
     latitude = coords[1] if isinstance(coords, list) and len(coords) == 2 else None
     longitude = coords[0] if isinstance(coords, list) and len(coords) == 2 else None
-    return {"taxon": taxon, "latitude": latitude, "longitude": longitude}
+    event_timestamp = _parse_inat_timestamp(obs.get("time_observed_at") or obs.get("observed_on"))
+
+    return {
+        "taxon": taxon,
+        "latitude": latitude,
+        "longitude": longitude,
+        "event_timestamp": event_timestamp,
+        **_inat_observation_photo(obs),
+    }
 
 
 @app.get("/occurrence/{catalog_number}")
@@ -1557,6 +1700,13 @@ def get_occurrence(catalog_number: str):
         raise HTTPException(status_code=404, detail="Observation not found")
     return _occurrence_response(
         catalog_number, fallback["taxon"], fallback["latitude"], fallback["longitude"], ingested=False,
+        extra={
+            "event_timestamp": fallback["event_timestamp"],
+            "media_url": fallback["media_url"],
+            "media_attribution": fallback["media_attribution"],
+            "media_license": fallback["media_license"],
+            "media_license_url": fallback["media_license_url"],
+        },
     )
 
 

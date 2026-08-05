@@ -225,7 +225,10 @@ def _build_catalog_number_index() -> None:
     full scan. This is a narrow, catalogNumber-sorted copy so a point lookup
     gets row-group pruning instead. lat/lon are carried along so that one
     lookup is enough to place the highlighted point on the map — no second
-    read against occurrences.parquet needed.
+    read against occurrences.parquet needed. Media/timestamp deliberately
+    aren't carried here: for an ingested observation, the frontend already
+    has those from its normal /species/{id}/occurrences fetch once it lands
+    on the species page, so returning them again here would be redundant.
     """
     dest = CATALOG_NUMBER_INDEX_FILE
     dest.parent.mkdir(parents=True, exist_ok=True)

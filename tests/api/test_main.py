@@ -16,7 +16,9 @@ import main as main_module
 import util.rankings as rankings_module
 import util.stats as st_module
 import util.taxa as taxa
+import util.temporal as temporal_module
 import util.tiles as tiles
+import util.upload as upload_module
 from main import app
 
 client = TestClient(app)
@@ -1056,6 +1058,11 @@ def test_get_occurrence_found():
     assert body["latitude"] == pytest.approx(40.5)
     assert body["longitude"] == pytest.approx(-75.0)
     assert body["ingested"] is True
+    # No media/timestamp fields on the ingested path — the frontend already
+    # has those from the taxon's normal /occurrences fetch once it lands on
+    # the species page; only the not-ingested fallback needs to carry them.
+    assert "media_url" not in body
+    assert "event_timestamp" not in body
 
 
 def test_get_occurrence_taxon_not_found():
@@ -1070,11 +1077,16 @@ def test_get_occurrence_taxon_not_found():
     mock_fallback.assert_not_called()
 
 
-def _inat_observation_response(taxon_id: int = 48815, lat: float = 41.0, lon: float = -76.0):
+def _inat_observation_response(
+    taxon_id: int = 48815, lat: float = 41.0, lon: float = -76.0,
+    time_observed_at: str | None = None, photos: list | None = None,
+):
     return {
         "results": [{
             "taxon": {"id": taxon_id},
             "geojson": {"type": "Point", "coordinates": [lon, lat]},
+            "time_observed_at": time_observed_at,
+            "photos": photos or [],
         }],
     }
 
@@ -1093,8 +1105,106 @@ def test_get_occurrence_not_in_index_falls_back_to_inat():
     assert body["ingested"] is False
     assert body["latitude"] == pytest.approx(41.0)
     assert body["longitude"] == pytest.approx(-76.0)
+    assert body["event_timestamp"] is None
+    assert body["media_url"] is None
     mock_get.assert_called_once()
     assert mock_get.call_args.kwargs["params"] == {"id": "999888777"}
+
+
+def test_get_occurrence_fallback_parses_timestamp():
+    with patch.object(pq, "read_table", return_value=_EMPTY_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(main_module.httpx, "get") as mock_get, \
+         patch.object(taxa, "get_taxon_by_inat_id", return_value=TAXON):
+        mock_get.return_value = MagicMock(
+            json=lambda: _inat_observation_response(time_observed_at="2018-09-05T14:06:00+02:00"),
+            raise_for_status=lambda: None,
+        )
+        r = client.get("/occurrence/999888777")
+    assert r.status_code == 200
+    assert r.json()["event_timestamp"] == 1536149160
+
+
+def test_get_occurrence_fallback_includes_usable_license_photo():
+    photos = [{
+        "url": "https://static.inaturalist.org/photos/61482854/square.jpg?1581761020",
+        "attribution": "(c) Andrew Harvey, some rights reserved (CC BY)",
+        "license_code": "cc-by",
+    }]
+    with patch.object(pq, "read_table", return_value=_EMPTY_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(main_module.httpx, "get") as mock_get, \
+         patch.object(taxa, "get_taxon_by_inat_id", return_value=TAXON):
+        mock_get.return_value = MagicMock(
+            json=lambda: _inat_observation_response(photos=photos), raise_for_status=lambda: None,
+        )
+        r = client.get("/occurrence/999888777")
+    body = r.json()
+    assert body["media_url"] == "https://static.inaturalist.org/photos/61482854/original.jpg?1581761020"
+    # Reduced to the bare name — matches the ingested path's mediaAttribution
+    # shape (multimedia.txt's rightsHolder), not iNat's own boilerplate
+    # wording, since the license is already shown separately.
+    assert body["media_attribution"] == "Andrew Harvey"
+    assert body["media_license_url"] == "https://creativecommons.org/licenses/by/4.0/"
+    assert body["media_license"] == "CC BY 4.0"
+
+
+def test_get_occurrence_fallback_attribution_falls_back_to_raw_on_unrecognized_format():
+    photos = [{
+        "url": "https://static.inaturalist.org/photos/1/square.jpg",
+        "attribution": "Photo by Lucas Pearce",
+        "license_code": "cc-by-nc",
+    }]
+    with patch.object(pq, "read_table", return_value=_EMPTY_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(main_module.httpx, "get") as mock_get, \
+         patch.object(taxa, "get_taxon_by_inat_id", return_value=TAXON):
+        mock_get.return_value = MagicMock(
+            json=lambda: _inat_observation_response(photos=photos), raise_for_status=lambda: None,
+        )
+        r = client.get("/occurrence/999888777")
+    assert r.json()["media_attribution"] == "Photo by Lucas Pearce"
+
+
+def test_get_occurrence_fallback_skips_unusable_license_photo_for_next():
+    photos = [
+        {
+            "url": "https://static.inaturalist.org/photos/1/square.jpg",
+            "attribution": "all rights reserved",
+            "license_code": "",
+        },
+        {
+            "url": "https://static.inaturalist.org/photos/2/square.jpg",
+            "attribution": "(c) Jane Doe, some rights reserved (CC0)",
+            "license_code": "cc0",
+        },
+    ]
+    with patch.object(pq, "read_table", return_value=_EMPTY_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(main_module.httpx, "get") as mock_get, \
+         patch.object(taxa, "get_taxon_by_inat_id", return_value=TAXON):
+        mock_get.return_value = MagicMock(
+            json=lambda: _inat_observation_response(photos=photos), raise_for_status=lambda: None,
+        )
+        r = client.get("/occurrence/999888777")
+    body = r.json()
+    assert body["media_url"] == "https://static.inaturalist.org/photos/2/original.jpg"
+
+
+def test_get_occurrence_fallback_no_usable_photos():
+    photos = [{
+        "url": "https://static.inaturalist.org/photos/1/square.jpg",
+        "attribution": "all rights reserved",
+        "license_code": "",
+    }]
+    with patch.object(pq, "read_table", return_value=_EMPTY_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(main_module.httpx, "get") as mock_get, \
+         patch.object(taxa, "get_taxon_by_inat_id", return_value=TAXON):
+        mock_get.return_value = MagicMock(
+            json=lambda: _inat_observation_response(photos=photos), raise_for_status=lambda: None,
+        )
+        r = client.get("/occurrence/999888777")
+    body = r.json()
+    assert body["media_url"] is None
+    assert body["media_attribution"] is None
+    assert body["media_license"] is None
+    assert body["media_license_url"] is None
 
 
 def test_get_occurrence_index_file_missing_falls_back_to_inat():
@@ -2300,6 +2410,154 @@ def test_gis_point_nodata_returns_null_value():
     assert r.status_code == 200
     assert r.json()["value"] is None
     assert r.json()["class_name"] is None
+
+
+def test_gis_point_event_ts_used_when_no_index_lookup():
+    """No taxon_id/catalog_number given (e.g. a not-yet-ingested observation
+    pin) but event_ts is — the live historical-at-timestamp lookup should be
+    tried before falling to the current/live raster."""
+    import util.gis as gis_module
+    with patch.object(tiles, "get_layer", return_value=_TEMPORAL_LAYER), \
+         patch.object(main_module, "_lookup_temporal_value_at_timestamp", return_value=12.5) as mock_temporal, \
+         patch.object(gis_module, "sample_point", return_value=999.0) as mock_sample:
+        r = client.get(
+            "/gis/point?lat=40&lon=-105&variable=temperature_2m_avg_1h&event_ts=1700000000",
+        )
+    assert r.status_code == 200
+    assert r.json()["value"] == pytest.approx(12.5)
+    mock_temporal.assert_called_once_with("temperature_2m_avg_1h", 40.0, -105.0, 1700000000)
+    mock_sample.assert_not_called()
+
+
+def test_gis_point_event_ts_ignored_when_index_hits():
+    """A precomputed index hit (real ingested observation) wins even if
+    event_ts is also supplied — no need for a live lookup."""
+    import util.gis as gis_module
+    with patch.object(tiles, "get_layer", return_value=_TEMPORAL_LAYER), \
+         patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(main_module, "_lookup_index_value", return_value=14.35), \
+         patch.object(main_module, "_lookup_temporal_value_at_timestamp") as mock_temporal, \
+         patch.object(gis_module, "sample_point") as mock_sample:
+        r = client.get(
+            "/gis/point?lat=40&lon=-105&variable=temperature_2m_avg_1h"
+            "&taxon_id=2923970&catalog_number=12345&event_ts=1700000000",
+        )
+    assert r.status_code == 200
+    assert r.json()["value"] == pytest.approx(14.35)
+    mock_temporal.assert_not_called()
+    mock_sample.assert_not_called()
+
+
+def test_gis_point_no_event_ts_skips_temporal_lookup():
+    """Existing behavior preserved: without event_ts, go straight to raster."""
+    import util.gis as gis_module
+    with patch.object(tiles, "get_layer", return_value=_TEMPORAL_LAYER), \
+         patch.object(main_module, "_lookup_temporal_value_at_timestamp") as mock_temporal, \
+         patch.object(gis_module, "sample_point", return_value=8.1):
+        r = client.get("/gis/point?lat=40&lon=-105&variable=temperature_2m_avg_1h")
+    assert r.status_code == 200
+    assert r.json()["value"] == pytest.approx(8.1)
+    mock_temporal.assert_not_called()
+
+
+def test_gis_point_event_ts_miss_falls_back_to_raster():
+    import util.gis as gis_module
+    with patch.object(tiles, "get_layer", return_value=_TEMPORAL_LAYER), \
+         patch.object(main_module, "_lookup_temporal_value_at_timestamp", return_value=None), \
+         patch.object(gis_module, "sample_point", return_value=8.1):
+        r = client.get(
+            "/gis/point?lat=40&lon=-105&variable=temperature_2m_avg_1h&event_ts=1700000000",
+        )
+    assert r.status_code == 200
+    assert r.json()["value"] == pytest.approx(8.1)
+
+
+# ---------------------------------------------------------------------------
+# _lookup_temporal_value_at_timestamp
+# ---------------------------------------------------------------------------
+
+def _fake_temporal_layer(**overrides):
+    defaults = dict(
+        id="temperature_2m", model="copernicus_era5", grid_mode="lat_asc_lon_pm180",
+        agg="avg", windows=[1, 24], derived=False, sources=[],
+    )
+    defaults.update(overrides)
+    return temporal_module.TemporalLayer(**defaults)
+
+
+def test_lookup_temporal_value_no_matching_layer():
+    with patch.object(main_module, "load_temporal_layers", return_value=[_fake_temporal_layer()]):
+        result = main_module._lookup_temporal_value_at_timestamp(
+            "precipitation_sum_24h", 40.0, -105.0, 1700000000,
+        )
+    assert result is None
+
+
+def test_lookup_temporal_value_skips_derived_layers():
+    layer = _fake_temporal_layer(derived=True)
+    with patch.object(main_module, "load_temporal_layers", return_value=[layer]):
+        result = main_module._lookup_temporal_value_at_timestamp(
+            "temperature_2m_avg_24h", 40.0, -105.0, 1700000000,
+        )
+    assert result is None
+
+
+def test_lookup_temporal_value_returns_matching_column():
+    layer = _fake_temporal_layer()
+    fake_occ_table = object()
+    updates = {"__upload__": {"temperature_2m_avg_24h": [(pd.array([0]), pd.array([21.5]))]}}
+    with patch.object(main_module, "load_temporal_layers", return_value=[layer]), \
+         patch.object(upload_module, "_df_to_occ_table", return_value=fake_occ_table) as mock_df, \
+         patch.object(upload_module, "_process_one_layer", return_value=updates) as mock_process:
+        result = main_module._lookup_temporal_value_at_timestamp(
+            "temperature_2m_avg_24h", 40.0, -105.0, 1700000000,
+        )
+    assert result == pytest.approx(21.5)
+    mock_df.assert_called_once()
+    mock_process.assert_called_once_with(layer, fake_occ_table)
+
+
+def test_lookup_temporal_value_no_column_produced():
+    layer = _fake_temporal_layer()
+    with patch.object(main_module, "load_temporal_layers", return_value=[layer]), \
+         patch.object(upload_module, "_df_to_occ_table", return_value=object()), \
+         patch.object(upload_module, "_process_one_layer", return_value={"__upload__": {}}):
+        result = main_module._lookup_temporal_value_at_timestamp(
+            "temperature_2m_avg_24h", 40.0, -105.0, 1700000000,
+        )
+    assert result is None
+
+
+def test_lookup_temporal_value_nan_returns_none():
+    layer = _fake_temporal_layer()
+    updates = {"__upload__": {"temperature_2m_avg_24h": [(pd.array([0]), [float("nan")])]}}
+    with patch.object(main_module, "load_temporal_layers", return_value=[layer]), \
+         patch.object(upload_module, "_df_to_occ_table", return_value=object()), \
+         patch.object(upload_module, "_process_one_layer", return_value=updates):
+        result = main_module._lookup_temporal_value_at_timestamp(
+            "temperature_2m_avg_24h", 40.0, -105.0, 1700000000,
+        )
+    assert result is None
+
+
+def test_lookup_temporal_value_layer_exception_is_swallowed():
+    layer = _fake_temporal_layer()
+    with patch.object(main_module, "load_temporal_layers", return_value=[layer]), \
+         patch.object(upload_module, "_df_to_occ_table", return_value=object()), \
+         patch.object(upload_module, "_process_one_layer", side_effect=Exception("boom")):
+        result = main_module._lookup_temporal_value_at_timestamp(
+            "temperature_2m_avg_24h", 40.0, -105.0, 1700000000,
+        )
+    assert result is None
+
+
+def test_lookup_temporal_value_catalog_load_failure_returns_none():
+    with patch.object(main_module, "load_temporal_layers", side_effect=Exception("boom")):
+        result = main_module._lookup_temporal_value_at_timestamp(
+            "temperature_2m_avg_24h", 40.0, -105.0, 1700000000,
+        )
+    assert result is None
 
 
 # ---------------------------------------------------------------------------

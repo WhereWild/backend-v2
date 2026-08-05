@@ -852,14 +852,15 @@ pl() {
 }
 
 pp() {
-  local lint_only=() shared=()
+  local lint_only=() test_only=() shared=()
   for arg in "$@"; do
     case "$arg" in
       --fix|--unsafe-fixes) lint_only+=("$arg") ;;
+      --temporal) test_only+=("$arg") ;;
       *) shared+=("$arg") ;;
     esac
   done
-  pl "${lint_only[@]}" "${shared[@]}" && pt "${shared[@]}"
+  pl "${lint_only[@]}" "${shared[@]}" && pt "${shared[@]}" "${test_only[@]}"
 }
 
 _resolve_script() {
@@ -1050,8 +1051,8 @@ b2-help   show B2 storage commands
 
 sync-gis-layers          copy gis/layers/ to prod server in background
 
-pt                   run tests with coverage
-pt --temporal        run live S3 end-to-end tests
+pt                   run tests with coverage (skips tests/temporal/ entirely)
+pt --temporal        also run tests/temporal/ (fixture-fetching + live S3 end-to-end tests)
 pl                   lint (ruff)
 pp                   lint + test (pipeline approximation)
 

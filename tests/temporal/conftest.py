@@ -26,7 +26,30 @@ from typing import Any
 import httpx
 import pytest
 
-FIXTURE_DIR = Path(__file__).parent / "fixtures"
+TEMPORAL_ROOT = Path(__file__).parent
+FIXTURE_DIR = TEMPORAL_ROOT / "fixtures"
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Skip the whole tests/temporal/ tree unless --live (pt --temporal) is passed.
+
+    These tests are either genuinely slow (raster/incremental fixture builds)
+    or hit the Open-Meteo API to auto-fetch fixtures on first run (~20
+    requests, ~30s) — neither belongs in the default `pt` loop.
+    """
+    if config.getoption("--live"):
+        return
+    skip_temporal = pytest.mark.skip(
+        reason="temporal tests skipped by default — run with: pt --temporal"
+    )
+    for item in items:
+        try:
+            item.path.relative_to(TEMPORAL_ROOT)
+        except ValueError:
+            continue
+        item.add_marker(skip_temporal)
 
 # Variables fetched from Open-Meteo Historical API (excludes derived vars)
 HOURLY_VARS = [

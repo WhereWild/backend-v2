@@ -12,6 +12,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import shapely
 
 import util.stats as st
 from config.config import ValueType
@@ -733,3 +734,110 @@ def test_compute_loc_stats_no_data(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", tmp_path / "nonexistent.parquet")
     result = st.compute_location_filtered_stats(SPECIES_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# decode_polyline / parse_polygon_param / apply_polygon_filter
+# ---------------------------------------------------------------------------
+
+def _encode_polyline(points: list[tuple[float, float]], precision: int = 5) -> str:
+    """Test-only mirror of the frontend's encoder (speciesOccurrenceMapHelpers.ts
+    encodePolyline) — production code only ever needs to decode, since the
+    frontend is the one building the `polygon` query param."""
+    factor = 10**precision
+    out: list[str] = []
+    prev_lat = prev_lon = 0
+    for lat, lon in points:
+        lat_i = round(lat * factor)
+        lon_i = round(lon * factor)
+        for delta in (lat_i - prev_lat, lon_i - prev_lon):
+            v = ~(delta << 1) if delta < 0 else (delta << 1)
+            while v >= 0x20:
+                out.append(chr((0x20 | (v & 0x1F)) + 63))
+                v >>= 5
+            out.append(chr(v + 63))
+        prev_lat, prev_lon = lat_i, lon_i
+    return "".join(out)
+
+
+def test_decode_polyline_roundtrip():
+    points = [(38.5, -120.2), (40.7, -120.95), (43.252, -126.453), (-1.234, 179.9999)]
+    decoded = st.decode_polyline(_encode_polyline(points))
+    assert len(decoded) == len(points)
+    for (lat, lon), (dlat, dlon) in zip(points, decoded):
+        assert abs(lat - dlat) < 1e-4
+        assert abs(lon - dlon) < 1e-4
+
+
+def test_decode_polyline_truncated_raises():
+    with pytest.raises(ValueError):
+        st.decode_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq")
+
+
+def test_parse_polygon_param_none_and_empty():
+    assert st.parse_polygon_param(None) is None
+    assert st.parse_polygon_param("") is None
+
+
+def test_parse_polygon_param_fewer_than_three_points_dropped():
+    # A 2-point "ring" can't form a polygon — dropped, leaving nothing.
+    two_points = _encode_polyline([(0.0, 0.0), (1.0, 1.0)])
+    assert st.parse_polygon_param(two_points) is None
+
+
+def test_parse_polygon_param_single_ring():
+    ring = [(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)]
+    geom = st.parse_polygon_param(_encode_polyline(ring))
+    assert geom is not None
+    assert geom.contains(st.ShapelyPolygon([(4, 4), (4, 5), (5, 5), (5, 4)]).centroid)
+
+
+def test_parse_polygon_param_unions_multiple_rings():
+    ring1 = [(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)]
+    ring2 = [(20.0, 20.0), (20.0, 30.0), (30.0, 30.0), (30.0, 20.0)]
+    param = _encode_polyline(ring1) + ";" + _encode_polyline(ring2)
+    geom = st.parse_polygon_param(param)
+    assert geom is not None
+    assert shapely.contains_xy(geom, np.array([5.0, 25.0, 100.0]), np.array([5.0, 25.0, 100.0])).tolist() == [
+        True,
+        True,
+        False,
+    ]
+
+
+def test_parse_polygon_param_too_long_raises():
+    huge = "a" * (st._MAX_POLYGON_PARAM_LENGTH + 1)
+    with pytest.raises(ValueError):
+        st.parse_polygon_param(huge)
+
+
+def test_parse_polygon_param_too_many_rings_raises():
+    ring = _encode_polyline([(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)])
+    param = ";".join([ring] * (st._MAX_POLYGON_RINGS + 1))
+    with pytest.raises(ValueError):
+        st.parse_polygon_param(param)
+
+
+def test_parse_polygon_param_invalid_encoding_raises():
+    with pytest.raises(ValueError):
+        st.parse_polygon_param("!!!not-a-valid-polyline")
+
+
+def test_apply_polygon_filter_basic():
+    ring = [(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)]
+    geom = st.parse_polygon_param(_encode_polyline(ring))
+    df = pd.DataFrame({
+        "catalogNumber": ["inside", "outside", "nan_coord"],
+        "decimalLatitude": [5.0, 50.0, np.nan],
+        "decimalLongitude": [5.0, 50.0, 5.0],
+    })
+    result = st.apply_polygon_filter(df, geom)
+    assert list(result["catalogNumber"]) == ["inside"]
+
+
+def test_apply_polygon_filter_missing_columns_returns_empty():
+    df = pd.DataFrame({"catalogNumber": ["a", "b"]})
+    ring = [(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)]
+    geom = st.parse_polygon_param(_encode_polyline(ring))
+    result = st.apply_polygon_filter(df, geom)
+    assert result.empty

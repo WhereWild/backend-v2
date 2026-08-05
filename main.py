@@ -24,6 +24,7 @@ import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from shapely.geometry.base import BaseGeometry
 from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
@@ -44,11 +45,13 @@ from util.stats import (
     TREE_ROOT,
     apply_chained_filters,
     apply_phenology_filter,
+    apply_polygon_filter,
     apply_timestamp_filter,
     collect_taxon_df,
     compute_location_filtered_stats,
     compute_phenology_counts,
     numeric_range_mask,
+    parse_polygon_param,
     read_phenology_counts,
 )
 from util.storage import ParquetStorageProxy
@@ -1158,6 +1161,7 @@ def _slice_from_raw_occ(
     start_ts: int | None = None,
     end_ts: int | None = None,
     extra_filters: list[dict] | None = None,
+    polygon: BaseGeometry | None = None,
 ) -> list[dict]:
     df = collect_taxon_df(taxon, storage=_storage)
     if df is None or variable_id not in df.columns:
@@ -1170,6 +1174,8 @@ def _slice_from_raw_occ(
         df = apply_phenology_filter(df, phenology)
     if start_ts is not None or end_ts is not None:
         df = apply_timestamp_filter(df, start_ts, end_ts)
+    if polygon is not None:
+        df = apply_polygon_filter(df, polygon)
     if df.empty:
         return []
     col = pd.to_numeric(df[variable_id], errors="coerce")
@@ -1201,6 +1207,7 @@ def _class_samples_from_raw_occ(
     start_ts: int | None = None,
     end_ts: int | None = None,
     extra_filters: list[dict] | None = None,
+    polygon: BaseGeometry | None = None,
 ) -> list[dict]:
     df = collect_taxon_df(taxon, storage=_storage)
     if df is None or variable_id not in df.columns:
@@ -1213,6 +1220,8 @@ def _class_samples_from_raw_occ(
         df = apply_phenology_filter(df, phenology)
     if start_ts is not None or end_ts is not None:
         df = apply_timestamp_filter(df, start_ts, end_ts)
+    if polygon is not None:
+        df = apply_polygon_filter(df, polygon)
     if df.empty:
         return []
     col = pd.to_numeric(df[variable_id], errors="coerce")
@@ -1237,7 +1246,7 @@ def get_species_environment(
     taxon_id: str, variable_id: str, unit_system: str | None = None,
     location: str | None = None, phenology: str | None = None,
     start_ts: int | None = None, end_ts: int | None = None,
-    extra: str | None = None,
+    extra: str | None = None, polygon: str | None = None,
 ):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
@@ -1246,6 +1255,10 @@ def get_species_environment(
     phenology_norm = phenology.strip().lower() if phenology else None
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+    try:
+        polygon_geom = parse_polygon_param(polygon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid polygon: {exc}") from exc
 
     variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
@@ -1260,7 +1273,7 @@ def get_species_environment(
 
     if (
         location is not None or phenology_norm is not None or start_ts is not None
-        or end_ts is not None or extra_filters
+        or end_ts is not None or extra_filters or polygon_geom is not None
     ) and layer is not None:
         _reject_if_large_taxon(taxon)
         filter_col = _location_filter_col(location) if location is not None else None
@@ -1270,7 +1283,7 @@ def get_species_environment(
                 taxon, variable_id, filter_col, location, layer,
                 phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
                 storage=_storage, layer_meta=all_layers_by_id,
-                extra_filters=extra_filters,
+                extra_filters=extra_filters, polygon=polygon_geom,
             )
             if result is not None:
                 if result["type"] == "continuous":
@@ -2113,6 +2126,7 @@ def get_species_environment_slice(
     end_ts: int | None = None,
     unit_system: str | None = None,
     extra: str | None = None,
+    polygon: str | None = None,
 ):
     if not math.isfinite(min_value) or not math.isfinite(max_value):
         raise HTTPException(status_code=400, detail="min and max must be finite numbers")
@@ -2123,6 +2137,10 @@ def get_species_environment_slice(
     phenology_norm = phenology.strip().lower() if phenology else None
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+    try:
+        polygon_geom = parse_polygon_param(polygon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid polygon: {exc}") from exc
     variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
@@ -2143,7 +2161,7 @@ def get_species_environment_slice(
             taxon, variable_id, filter_col, location,
             raw_min, raw_max, circular_wrap, limit,
             phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
-            extra_filters=extra_filters,
+            extra_filters=extra_filters, polygon=polygon_geom,
         )
         observations = [
             {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
@@ -2172,6 +2190,7 @@ def get_species_environment_class_samples(
     end_ts: int | None = None,
     unit_system: str | None = None,
     extra: str | None = None,
+    polygon: str | None = None,
 ):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
@@ -2180,6 +2199,10 @@ def get_species_environment_class_samples(
     phenology_norm = phenology.strip().lower() if phenology else None
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+    try:
+        polygon_geom = parse_polygon_param(polygon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid polygon: {exc}") from exc
     variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
@@ -2198,7 +2221,7 @@ def get_species_environment_class_samples(
         observations = _class_samples_from_raw_occ(
             taxon, variable_id, filter_col, location, float(parsed), limit,
             phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
-            extra_filters=extra_filters,
+            extra_filters=extra_filters, polygon=polygon_geom,
         )
     else:
         observations = []

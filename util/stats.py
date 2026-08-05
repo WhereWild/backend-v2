@@ -34,12 +34,16 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import shapely
 from fastdigest import TDigest
 from KDEpy import FFTKDE
 from scipy.optimize import brentq as _brentq
 from scipy.special import ive as _bessel_ive
 from scipy.stats import circmean, circstd, circvar
 from scipy.stats import entropy as _scipy_entropy
+from shapely.geometry import Polygon as ShapelyPolygon
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import unary_union
 
 from config.config import ValueType, load_config
 from util.storage import ParquetStorage, atomic_write_parquet
@@ -278,6 +282,105 @@ def apply_timestamp_filter(
     if end_ts is not None:
         df = df[col <= end_ts]
     return df
+
+
+# Same algorithm Google Maps/Mapbox use for compactly transmitting a
+# sequence of coordinates — ~5 bytes per point at 5-decimal precision
+# (~1.1m accuracy, plenty for filtering occurrence rows), versus ~20-40
+# bytes for a raw JSON [lat, lon] pair. A drawn/uploaded region's vertices
+# travel as a single query-string parameter (see the frontend's
+# encodePolygonsParam), so this matters for request-size reasons the way
+# it wouldn't for a POST body.
+def decode_polyline(encoded: str, precision: int = 5) -> list[tuple[float, float]]:
+    """Decodes one encoded-polyline ring into a list of (lat, lon) pairs."""
+    factor = 10**precision
+    coordinates: list[tuple[float, float]] = []
+    index = lat = lon = 0
+    length = len(encoded)
+    while index < length:
+        for is_lat in (True, False):
+            shift = result = 0
+            while True:
+                if index >= length:
+                    raise ValueError("truncated polyline")
+                byte = ord(encoded[index]) - 63
+                index += 1
+                result |= (byte & 0x1F) << shift
+                shift += 5
+                if byte < 0x20:
+                    break
+            delta = ~(result >> 1) if result & 1 else (result >> 1)
+            if is_lat:
+                lat += delta
+            else:
+                lon += delta
+        coordinates.append((lat / factor, lon / factor))
+    return coordinates
+
+
+_MAX_POLYGON_RINGS = 50
+_MAX_POLYGON_RING_VERTICES = 2000
+_MAX_POLYGON_PARAM_LENGTH = 40_000
+
+
+def parse_polygon_param(polygon: str | None) -> BaseGeometry | None:
+    """Parses the `polygon` query param — ';'-joined encoded-polyline rings,
+    one per drawn/uploaded region (see the frontend's encodePolygonsParam)
+    — into a single shapely geometry: the union of every ring, so multiple
+    regions filter as "inside ANY of them", matching the client-side map
+    filter's semantics (isPointInPolygon in speciesOccurrenceMapHelpers.ts).
+
+    Only the outer ring of each region is used, same limitation as the
+    client-side filter — there's no hole/subtraction support.
+
+    Raises ValueError on malformed input or excessive size, so callers can
+    turn that into a 400 instead of a 500.
+    """
+    if not polygon:
+        return None
+    if len(polygon) > _MAX_POLYGON_PARAM_LENGTH:
+        raise ValueError("polygon parameter too long")
+    encoded_rings = [r for r in polygon.split(";") if r]
+    if not encoded_rings:
+        return None
+    if len(encoded_rings) > _MAX_POLYGON_RINGS:
+        raise ValueError("too many polygon rings")
+    polygons: list[ShapelyPolygon] = []
+    for encoded_ring in encoded_rings:
+        try:
+            points = decode_polyline(encoded_ring)
+        except (ValueError, IndexError) as exc:
+            raise ValueError(f"invalid polygon encoding: {exc}") from exc
+        if len(points) > _MAX_POLYGON_RING_VERTICES:
+            raise ValueError("too many vertices in a polygon ring")
+        if len(points) < 3:
+            continue
+        # decode_polyline returns (lat, lon); shapely wants (x, y) = (lon, lat).
+        polygons.append(ShapelyPolygon([(lon, lat) for lat, lon in points]))
+    if not polygons:
+        return None
+    return unary_union(polygons) if len(polygons) > 1 else polygons[0]
+
+
+def apply_polygon_filter(df: pd.DataFrame, geometry: BaseGeometry) -> pd.DataFrame:
+    """Keep rows whose (decimalLatitude, decimalLongitude) fall inside geometry.
+
+    Vectorized (shapely.contains_xy over the full lat/lon arrays at once)
+    rather than a per-row .apply — this runs on every request, same cost
+    profile as the location/phenology/timestamp filters it's chained
+    alongside.
+    """
+    if "decimalLatitude" not in df.columns or "decimalLongitude" not in df.columns:
+        return df.iloc[0:0]
+    lat = pd.to_numeric(df["decimalLatitude"], errors="coerce")
+    lon = pd.to_numeric(df["decimalLongitude"], errors="coerce")
+    valid = lat.notna() & lon.notna()
+    mask = pd.Series(False, index=df.index)
+    if valid.any():
+        mask.loc[valid] = shapely.contains_xy(
+            geometry, lon[valid].to_numpy(), lat[valid].to_numpy()
+        )
+    return df.loc[mask]
 
 
 def numeric_range_mask(col: pd.Series, value_min: float, value_max: float, circular_wrap: bool) -> pd.Series:
@@ -1685,8 +1788,9 @@ def compute_location_filtered_stats(
     storage: ParquetStorage | None = None,
     layer_meta: dict[str, dict] | None = None,
     extra_filters: list[dict] | None = None,
+    polygon: BaseGeometry | None = None,
 ) -> dict | None:
-    """Compute stats on the fly for variable_id, restricted by location, phenology, timestamp, and/or chained filters from other variables.
+    """Compute stats on the fly for variable_id, restricted by location, phenology, timestamp, polygon, and/or chained filters from other variables.
 
     `layer_meta` (full catalog, {layer_id: layer}) is optional and only used to
     resolve `variable_id` against `composition_group_members` — when the requested
@@ -1717,6 +1821,10 @@ def compute_location_filtered_stats(
             return None
     if start_ts is not None or end_ts is not None:
         df = apply_timestamp_filter(df, start_ts, end_ts)
+        if df.empty:
+            return None
+    if polygon is not None:
+        df = apply_polygon_filter(df, polygon)
         if df.empty:
             return None
     if extra_filters:

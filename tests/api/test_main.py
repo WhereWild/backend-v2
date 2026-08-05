@@ -2630,3 +2630,132 @@ def test_upload_parquet_parsed_correctly():
                         files=[("file", ("obs.parquet", parquet_bytes, "application/octet-stream"))])
     assert r.status_code == 202
     assert r.json()["status"] == "queued"
+
+
+# ---------------------------------------------------------------------------
+# `polygon` param on /environment/{var}, /slice, /class/{value}/samples
+# ---------------------------------------------------------------------------
+
+def _encode_polyline(points: list[tuple[float, float]], precision: int = 5) -> str:
+    """Test-only mirror of the frontend's encoder (speciesOccurrenceMapHelpers.ts
+    encodePolyline) — production code only ever needs to decode."""
+    factor = 10**precision
+    out: list[str] = []
+    prev_lat = prev_lon = 0
+    for lat, lon in points:
+        lat_i = round(lat * factor)
+        lon_i = round(lon * factor)
+        for delta in (lat_i - prev_lat, lon_i - prev_lon):
+            v = ~(delta << 1) if delta < 0 else (delta << 1)
+            while v >= 0x20:
+                out.append(chr((0x20 | (v & 0x1F)) + 63))
+                v >>= 5
+            out.append(chr(v + 63))
+        prev_lat, prev_lon = lat_i, lon_i
+    return "".join(out)
+
+
+# A 10x10 degree box straddling nothing in particular — used across the
+# polygon tests below alongside points explicitly inside/outside it.
+_POLYGON_BOX = [(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)]
+_POLYGON_PARAM = _encode_polyline(_POLYGON_BOX)
+
+
+def _make_occ_with_coords(
+    tmp_path: Path, taxon_key: str, var_col: str, values: list, lats: list[float], lons: list[float],
+) -> Path:
+    occ_dir = tmp_path / "taxonomy"
+    occ_dir.mkdir(parents=True, exist_ok=True)
+    n = len(values)
+    data = {
+        "catalogNumber": [f"obs{i}" for i in range(n)],
+        "decimalLatitude": lats,
+        "decimalLongitude": lons,
+        "obscured": ["No"] * n,
+        "coordinateUncertaintyInMeters": [100.0] * n,
+        "taxon_key": [taxon_key] * n,
+        var_col: values,
+    }
+    occ_path = occ_dir / "occurrences.parquet"
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False), occ_path)
+    return occ_path
+
+
+def test_slice_with_polygon_filters_points(tmp_path, monkeypatch):
+    _patch_stats_storage(monkeypatch, tmp_path)
+    _make_occ_with_coords(
+        tmp_path, TAXON["taxon_key"], "bio1",
+        values=[10.0, 20.0],
+        lats=[5.0, 50.0],
+        lons=[5.0, 50.0],
+    )
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]):
+        r = client.get(f"/species/2923970/environment/bio1/slice?min=0&max=30&polygon={_POLYGON_PARAM}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 1
+    assert body["observations"][0]["catalogNumber"] == "obs0"
+
+
+def test_class_samples_with_polygon_filters_points(tmp_path, monkeypatch):
+    _patch_stats_storage(monkeypatch, tmp_path)
+    _make_occ_with_coords(
+        tmp_path, TAXON["taxon_key"], "kg2",
+        values=[1.0, 1.0],
+        lats=[5.0, 50.0],
+        lons=[5.0, 50.0],
+    )
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
+        r = client.get(f"/species/2923970/environment/kg2/class/1/samples?polygon={_POLYGON_PARAM}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 1
+    assert body["observations"][0]["catalogNumber"] == "obs0"
+
+
+def test_environment_with_polygon_filters_stats(tmp_path, monkeypatch):
+    import numpy as np
+
+    _patch_stats_storage(monkeypatch, tmp_path)
+    # 20 points inside the box, 5 well outside — only the 20 should count.
+    inside_lats = list(np.linspace(1.0, 9.0, 20))
+    inside_lons = list(np.linspace(1.0, 9.0, 20))
+    outside_lats = [50.0] * 5
+    outside_lons = [50.0] * 5
+    _make_occ_with_coords(
+        tmp_path, TAXON["taxon_key"], "bio1",
+        values=list(np.linspace(5.0, 25.0, 20)) + [999.0] * 5,
+        lats=inside_lats + outside_lats,
+        lons=inside_lons + outside_lons,
+    )
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]):
+        r = client.get(f"/species/2923970/environment/bio1?polygon={_POLYGON_PARAM}")
+    assert r.status_code == 200
+    assert r.json()["observation_count"] == 20
+
+
+def test_slice_with_invalid_polygon_returns_400():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]):
+        r = client.get("/species/2923970/environment/bio1/slice?min=0&max=30&polygon=!!!not-valid")
+    assert r.status_code == 400
+
+
+def test_class_samples_with_invalid_polygon_returns_400():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_NOM_LAYER]):
+        r = client.get("/species/2923970/environment/kg2/class/1/samples?polygon=!!!not-valid")
+    assert r.status_code == 400
+
+
+def test_environment_with_invalid_polygon_returns_400():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]):
+        r = client.get("/species/2923970/environment/bio1?polygon=!!!not-valid")
+    assert r.status_code == 400

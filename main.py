@@ -832,6 +832,24 @@ async def layer_tile(
     return Response(content=payload, media_type="image/png", headers=headers)
 
 
+@app.get("/api/layers/elevation/terrain-tiles/{z}/{x}/{y}.png")
+async def elevation_terrain_tile(
+    z: int, x: int, y: int,
+    tile_size: int = Query(256, ge=32, le=1024),
+):
+    """Terrarium-encoded raster-dem tiles for MapLibre's setTerrain()/hillshade —
+    separate from /api/layers/elevation/tiles, which colorizes the same COG
+    for on-map display rather than encoding it for GPU elevation sampling.
+    """
+    payload = await run_in_threadpool(
+        tiles.render_elevation_terrain_rgb_tile_bytes, z, x, y, tile_size,
+    )
+    return Response(
+        content=payload, media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
 @app.get("/api/layers/{layer_id}/tile-range/classes")
 async def layer_tile_range_classes(
     layer_id: str,

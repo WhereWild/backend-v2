@@ -440,6 +440,25 @@ def _colorize(
     return rgba
 
 
+def _encode_terrain_rgb(values: np.ndarray) -> np.ndarray:
+    """Encode elevation (meters) as Mapzen Terrarium RGB for MapLibre's
+    raster-dem terrain/hillshade sources: elevation = (R*256 + G + B/256) - 32768.
+
+    Unlike _colorize, this isn't for human viewing — MapLibre decodes these
+    pixels back into elevation on the GPU. Nodata is encoded as 0m rather
+    than left transparent (raster-dem sampling ignores alpha), so missing
+    data reads as sea level instead of punching a hole in the terrain mesh.
+    """
+    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+    safe = np.where(np.isfinite(values), values, 0.0)
+    encoded = np.clip(np.round((safe + 32768.0) * 256.0), 0, 256 ** 3 - 1).astype(np.uint32)
+    rgba[..., 0] = (encoded >> 16) & 0xFF
+    rgba[..., 1] = (encoded >> 8) & 0xFF
+    rgba[..., 2] = encoded & 0xFF
+    rgba[..., 3] = 255
+    return rgba
+
+
 # ---------------------------------------------------------------------------
 # Tile renderer
 # ---------------------------------------------------------------------------
@@ -1277,3 +1296,18 @@ def render_layer_tile_bytes(
         _apply_chain_mask(rgba, chain, z, x, y, tile_size, forecast_suffix)
 
     return _encode_png(rgba)
+
+
+def render_elevation_terrain_rgb_tile_bytes(z: int, x: int, y: int, tile_size: int = 256) -> bytes:
+    """Render the global elevation COG as a Terrarium-encoded raster-dem tile.
+
+    Separate from the "elevation" layer's own /tiles endpoint (which
+    colorizes the same COG with a viridis-style ramp for display) — this
+    encodes raw elevation for MapLibre's setTerrain()/hillshade to decode on
+    the GPU instead.
+    """
+    layer = get_layer("elevation")
+    mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
+    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+    dest, _, _ = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
+    return _encode_png(_encode_terrain_rgb(dest))

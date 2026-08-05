@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import io
 import json
 import math
 import tempfile
@@ -10,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from PIL import Image
 
 import util.tiles as tiles
 
@@ -63,6 +65,18 @@ FAKE_CATALOG = {
                     "render_min": 1.0,
                     "render_max": 31.0,
                 },
+                {
+                    "id": "elevation",
+                    "display_name": "Elevation",
+                    "filename": "elevation.tif",
+                    "source": "fabdem",
+                    "units": "m",
+                    "value_type": "interval",
+                    "scale_factor": None,
+                    "add_offset": None,
+                    "render_min": -430.0,
+                    "render_max": 8849.0,
+                },
             ],
         }
     ]
@@ -88,14 +102,14 @@ def _auto_patch_catalog(patch_catalog):
 
 def test_load_layers_returns_all():
     layers = tiles.load_layers()
-    assert len(layers) == 3
+    assert len(layers) == 4
     assert layers[0]["id"] == "bio1"
-    assert layers[-1]["id"] == "kg2"
+    assert layers[-1]["id"] == "elevation"
 
 
 def test_load_layers_with_category():
     pairs = tiles.load_layers_with_category()
-    assert len(pairs) == 3
+    assert len(pairs) == 4
     layer, category = pairs[0]
     assert layer["id"] == "bio1"
     assert category["id"] == "bioclimate"
@@ -358,6 +372,39 @@ def test_colorize_nominal_empty_class_filter_hides_everything():
 
 
 # ---------------------------------------------------------------------------
+# _encode_terrain_rgb
+# ---------------------------------------------------------------------------
+
+def _decode_terrarium(rgba: np.ndarray) -> np.ndarray:
+    r = rgba[..., 0].astype(np.float64)
+    g = rgba[..., 1].astype(np.float64)
+    b = rgba[..., 2].astype(np.float64)
+    return r * 256.0 + g + b / 256.0 - 32768.0
+
+
+def test_encode_terrain_rgb_roundtrip():
+    values = np.array([[0.0, 8849.0, -430.0, 1234.5]], dtype=np.float32)
+    rgba = tiles._encode_terrain_rgb(values)
+    assert rgba.shape == (1, 4, 4)
+    decoded = _decode_terrarium(rgba)
+    assert np.allclose(decoded, values, atol=1.0 / 256.0 + 1e-6)
+
+
+def test_encode_terrain_rgb_nan_encodes_as_zero():
+    values = np.array([[np.nan, 100.0]], dtype=np.float32)
+    rgba = tiles._encode_terrain_rgb(values)
+    decoded = _decode_terrarium(rgba)
+    assert decoded[0, 0] == pytest.approx(0.0, abs=1.0 / 256.0)
+    assert decoded[0, 1] == pytest.approx(100.0, abs=1.0 / 256.0)
+
+
+def test_encode_terrain_rgb_alpha_always_opaque():
+    values = np.array([[np.nan, 5000.0]], dtype=np.float32)
+    rgba = tiles._encode_terrain_rgb(values)
+    assert np.all(rgba[..., 3] == 255)
+
+
+# ---------------------------------------------------------------------------
 # render_layer_tile_bytes
 # ---------------------------------------------------------------------------
 
@@ -467,6 +514,31 @@ def test_render_tile_overview_path():
     with patch("rasterio.open", return_value=mock_ds):
         result = tiles.render_layer_tile_bytes("bio1", z=2, x=2, y=1, tile_size=64)
     assert result[:4] == b"\x89PNG"
+
+
+# ---------------------------------------------------------------------------
+# render_elevation_terrain_rgb_tile_bytes
+# ---------------------------------------------------------------------------
+
+def test_render_elevation_terrain_rgb_tile_returns_png():
+    raw = np.array([[100.0, 2500.0, -50.0, 8000.0]], dtype=np.float32)
+    mock_ds = _make_mock_ds(raw, nodata=-32768.0, scales=(1.0,), offsets=(0.0,))
+    mock_ds.dtypes = ["float32"]
+    with patch("rasterio.open", return_value=mock_ds):
+        result = tiles.render_elevation_terrain_rgb_tile_bytes(z=2, x=2, y=1, tile_size=64)
+    assert result[:4] == b"\x89PNG"
+
+
+def test_render_elevation_terrain_rgb_tile_nodata_encodes_as_zero():
+    raw = np.full((4, 4), -32768.0, dtype=np.float32)
+    mock_ds = _make_mock_ds(raw, nodata=-32768.0, scales=(1.0,), offsets=(0.0,))
+    mock_ds.dtypes = ["float32"]
+    with patch("rasterio.open", return_value=mock_ds):
+        result = tiles.render_elevation_terrain_rgb_tile_bytes(z=2, x=2, y=1, tile_size=64)
+    img = Image.open(io.BytesIO(result))
+    rgba = np.array(img)
+    decoded = _decode_terrarium(rgba)
+    assert np.allclose(decoded, 0.0, atol=1.0 / 256.0)
 
 
 # ---------------------------------------------------------------------------

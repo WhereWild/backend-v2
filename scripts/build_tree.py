@@ -34,6 +34,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import pickle
 import subprocess
 import sys
@@ -41,6 +42,7 @@ import time
 import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -710,19 +712,51 @@ def _resolve_obs_inat_ids(catalog: dict, obs_by_taxon: dict[str, str]) -> int:
 # COL XR vernacular names, fetched live and pre-matched to our own taxon_key
 # ---------------------------------------------------------------------------
 
+# Fetching this live (rather than from a static COL XR dump) is a slow,
+# somewhat-adjacent-to-the-core-pipeline step (~700 requests, ~15 min, plus
+# GBIF's offset cap and transient network drops to work around) — set this
+# to skip it entirely until a COL XR dump keyed to match our current catalog
+# is available to source vernacular names from instead.
+SKIP_COL_VERNACULAR_FETCH = os.environ.get("SKIP_COL_VERNACULAR_FETCH", "").lower() in ("1", "true", "yes")
+
 # Same checklist as scripts/sync_gbif.py's COL_XR_CHECKLIST_KEY — this
 # catalog's taxon_key values are COL XR's own alphanumeric taxonIDs.
 COL_XR_CHECKLIST_KEY = "7ddf754f-d193-4cc9-b351-99906754a03b"
 GBIF_SPECIES_SEARCH_URL = "https://api.gbif.org/v1/species/search"
 COL_VERNACULAR_PAGE_SIZE = 1000
 COL_API_RATE_LIMIT = 1.0  # requests per second
+# GBIF's /v1/species/search hard-rejects offset > 100,000 ("Max offset of
+# 100000 exceeded", HTTP 400) — confirmed directly against the live API.
+# Any highertaxonKey subtree with more accepted usages than this needs to be
+# split into per-child requests (see _fetch_col_vernacular_subtree) instead
+# of paginated as one flat scan.
+COL_SAFE_SUBTREE_LIMIT = 90_000
+# A full-Plantae vernacular fetch is ~700 requests over ~15 min — long enough
+# that a single transient connection drop (seen in practice: SSLEOFError mid-
+# handshake) shouldn't kill the whole run. HTTPError (a real response, e.g.
+# our own 400s) is not retried; only network-level failures are.
+COL_API_MAX_RETRIES = 5
+COL_API_RETRY_BACKOFF_S = 3.0
 
 
 def _gbif_species_search(params: dict) -> dict:
     url = f"{GBIF_SPECIES_SEARCH_URL}?{urlencode(params)}"
     req = Request(url, headers={"User-Agent": _UA})
-    with urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+    for attempt in range(COL_API_MAX_RETRIES):
+        try:
+            with urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except HTTPError:
+            # A real response (e.g. our own 400 from exceeding the offset
+            # cap) — not transient, retrying won't help.
+            raise
+        except URLError:
+            if attempt == COL_API_MAX_RETRIES - 1:
+                raise
+            wait = COL_API_RETRY_BACKOFF_S * (2 ** attempt)
+            print(f"  GBIF request failed (attempt {attempt + 1}/{COL_API_MAX_RETRIES}), retrying in {wait:.0f}s...", flush=True)
+            time.sleep(wait)
+    raise AssertionError("unreachable")  # loop always returns or raises
 
 
 def _resolve_col_highertaxon_key(name: str, taxon_id: str) -> int | None:
@@ -743,6 +777,85 @@ def _resolve_col_highertaxon_key(name: str, taxon_id: str) -> int | None:
     return None
 
 
+def _build_catalog_children_index(catalog: dict) -> dict[str, list[str]]:
+    """taxon_key -> direct child taxon_keys, derived from each entry's
+    "path" (an ancestor chain of Name_Key segments set by build_catalog)
+    since catalog entries don't carry an explicit parent pointer."""
+    children: dict[str, list[str]] = defaultdict(list)
+    for key, entry in catalog.items():
+        segments = entry.get("path", "").split("/")
+        if len(segments) < 2:
+            continue
+        parent_key = segments[-2].rsplit("_", 1)[-1]
+        children[parent_key].append(key)
+    return children
+
+
+def _fetch_col_vernacular_subtree(
+    name: str,
+    taxon_id: str,
+    catalog: dict,
+    children_index: dict[str, list[str]],
+    result: dict[str, list[str]],
+) -> None:
+    """Page through one highertaxonKey subtree into result, splitting into
+    per-child subtrees (via our own catalog tree) whenever a subtree's
+    accepted-usage count exceeds COL_SAFE_SUBTREE_LIMIT — GBIF's
+    /v1/species/search rejects offset > 100,000 outright, so a single flat
+    scan only works up to that ceiling. Most subtrees never come close and
+    resolve in one pass; only oversized branches (e.g. Tracheophyta) recurse.
+    """
+    highertaxon_key = _resolve_col_highertaxon_key(name, taxon_id)
+    if highertaxon_key is None:
+        print(f"  Could not resolve a GBIF/COL XR usage key for {name!r}, skipping.")
+        return
+
+    offset = 0
+    total = None
+    while total is None or offset < total:
+        payload = _gbif_species_search({
+            "highertaxonKey": highertaxon_key,
+            "datasetKey": COL_XR_CHECKLIST_KEY,
+            "status": "ACCEPTED",
+            "limit": COL_VERNACULAR_PAGE_SIZE,
+            "offset": offset,
+        })
+        total = payload.get("count", 0)
+
+        if offset == 0 and total > COL_SAFE_SUBTREE_LIMIT:
+            children = children_index.get(taxon_id, [])
+            if not children:
+                print(
+                    f"  {name!r} has {total:,} accepted usages and no catalog "
+                    "children to split by — scanning anyway, may hit GBIF's offset cap."
+                )
+            else:
+                print(f"  {name!r} has {total:,} accepted usages — splitting into {len(children):,} children")
+                for child_key in children:
+                    child = catalog[child_key]
+                    child_name = str(child.get("scientific_name") or "").replace("_", " ")
+                    time.sleep(1.0 / COL_API_RATE_LIMIT)
+                    _fetch_col_vernacular_subtree(child_name, child_key, catalog, children_index, result)
+                return
+
+        for entry in payload.get("results", []):
+            taxon_id_result = entry.get("taxonID")
+            if not taxon_id_result:
+                continue
+            names = [
+                v["vernacularName"]
+                for v in (entry.get("vernacularNames") or [])
+                if (v.get("language") or "").strip().lower() in ("en", "eng")
+            ]
+            if names:
+                result[taxon_id_result] = names
+        offset += COL_VERNACULAR_PAGE_SIZE
+        print(f"  [{name}] [{min(offset, total):,}/{total:,}] scanned, {len(result):,} taxa with vernacular names total...", flush=True)
+        if payload.get("endOfRecords"):
+            break
+        time.sleep(1.0 / COL_API_RATE_LIMIT)
+
+
 def fetch_col_vernacular(catalog: dict) -> dict[str, list[str]]:
     """Return taxon_key -> all English vernacular names, fetched live from
     GBIF's COL XR-backed species search, scoped to CONFIG.plantae_key's
@@ -761,6 +874,8 @@ def fetch_col_vernacular(catalog: dict) -> dict[str, list[str]]:
     whole configured subtree, ~5 requests for the current Cactaceae-only
     catalog, ~660 requests (~11 min at COL_API_RATE_LIMIT) for a full-Plantae
     catalog — vs. one request per taxon (thousands) or per genus (hundreds).
+    Subtrees over GBIF's 100,000-offset cap are split further; see
+    _fetch_col_vernacular_subtree.
     """
     root = catalog.get(CONFIG.plantae_key)
     if root is None:
@@ -768,39 +883,9 @@ def fetch_col_vernacular(catalog: dict) -> dict[str, list[str]]:
         return {}
 
     root_name = str(root.get("scientific_name") or "").replace("_", " ")
-    highertaxon_key = _resolve_col_highertaxon_key(root_name, CONFIG.plantae_key)
-    if highertaxon_key is None:
-        print(f"  Could not resolve a GBIF/COL XR usage key for {root_name!r}, skipping COL vernacular fetch.")
-        return {}
-
+    children_index = _build_catalog_children_index(catalog)
     result: dict[str, list[str]] = {}
-    offset = 0
-    total = None
-    while total is None or offset < total:
-        payload = _gbif_species_search({
-            "highertaxonKey": highertaxon_key,
-            "datasetKey": COL_XR_CHECKLIST_KEY,
-            "status": "ACCEPTED",
-            "limit": COL_VERNACULAR_PAGE_SIZE,
-            "offset": offset,
-        })
-        total = payload.get("count", 0)
-        for entry in payload.get("results", []):
-            taxon_id = entry.get("taxonID")
-            if not taxon_id:
-                continue
-            names = [
-                v["vernacularName"]
-                for v in (entry.get("vernacularNames") or [])
-                if (v.get("language") or "").strip().lower() in ("en", "eng")
-            ]
-            if names:
-                result[taxon_id] = names
-        offset += COL_VERNACULAR_PAGE_SIZE
-        print(f"  [{min(offset, total):,}/{total:,}] scanned, {len(result):,} taxa with vernacular names...", flush=True)
-        if payload.get("endOfRecords"):
-            break
-        time.sleep(1.0 / COL_API_RATE_LIMIT)
+    _fetch_col_vernacular_subtree(root_name, CONFIG.plantae_key, catalog, children_index, result)
     return result
 
 
@@ -1395,7 +1480,11 @@ def main() -> None:
     inat_map = load_inat_vernacular(dwca_bytes)
     print(f"  iNat: {len(inat_map):,} English names")
     print("\nFetching COL XR vernacular names...")
-    gbif_map = fetch_col_vernacular(catalog)
+    if SKIP_COL_VERNACULAR_FETCH:
+        print("  Skipped (SKIP_COL_VERNACULAR_FETCH set)")
+        gbif_map: dict[str, list[str]] = {}
+    else:
+        gbif_map = fetch_col_vernacular(catalog)
     print(f"  COL XR: {len(gbif_map):,} taxa with English names")
     print(f"  Catalog: {len(catalog):,} taxa")
 

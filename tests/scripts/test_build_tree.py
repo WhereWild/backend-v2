@@ -721,6 +721,40 @@ def test_gbif_species_search_returns_parsed_json():
     assert result == {"count": 1, "results": []}
 
 
+def test_gbif_species_search_retries_transient_network_error():
+    from urllib.error import URLError
+
+    with patch(
+        "scripts.build_tree.urlopen",
+        side_effect=[URLError("SSL: UNEXPECTED_EOF_WHILE_READING"), _json_urlopen({"count": 1, "results": []})],
+    ), patch("scripts.build_tree.time.sleep"):
+        result = build_tree._gbif_species_search({"q": "Opuntia"})
+    assert result == {"count": 1, "results": []}
+
+
+def test_gbif_species_search_gives_up_after_max_retries(monkeypatch):
+    from urllib.error import URLError
+
+    monkeypatch.setattr(build_tree, "COL_API_MAX_RETRIES", 2)
+    with patch(
+        "scripts.build_tree.urlopen",
+        side_effect=[URLError("boom"), URLError("boom again")],
+    ), patch("scripts.build_tree.time.sleep"):
+        with pytest.raises(URLError):
+            build_tree._gbif_species_search({"q": "Opuntia"})
+
+
+def test_gbif_species_search_does_not_retry_http_error():
+    from urllib.error import HTTPError
+
+    http_err = HTTPError("url", 400, "Bad Request", {}, None)
+    with patch("scripts.build_tree.urlopen", side_effect=[http_err, _json_urlopen({"count": 1, "results": []})]), \
+         patch("scripts.build_tree.time.sleep") as mock_sleep:
+        with pytest.raises(HTTPError):
+            build_tree._gbif_species_search({"q": "Opuntia"})
+    mock_sleep.assert_not_called()
+
+
 def test_resolve_col_highertaxon_key_matches_taxon_id():
     payload = {"results": [
         {"taxonID": "OTHER", "key": 111},
@@ -808,6 +842,63 @@ def test_fetch_col_vernacular_paginates_until_end_of_records(monkeypatch):
         catalog = {"7HS": {"scientific_name": "Cactaceae"}}
         result = build_tree.fetch_col_vernacular(catalog)
     assert result == {"A1": ["Name A"], "A2": ["Name B"]}
+
+
+def test_fetch_col_vernacular_splits_oversized_subtree(monkeypatch):
+    # GBIF's /v1/species/search rejects offset > 100,000 — a root whose
+    # accepted-usage count exceeds COL_SAFE_SUBTREE_LIMIT must be split into
+    # its catalog children instead of paginated as one flat scan.
+    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "P")
+    monkeypatch.setattr(
+        build_tree,
+        "_resolve_col_highertaxon_key",
+        lambda name, tid: {"Plantae": 1, "GenusA": 2, "GenusB": 3}[name],
+    )
+    catalog = {
+        "P": {"scientific_name": "Plantae", "path": "Plantae_P"},
+        "A": {"scientific_name": "GenusA", "path": "Plantae_P/GenusA_A"},
+        "B": {"scientific_name": "GenusB", "path": "Plantae_P/GenusB_B"},
+    }
+    root_page = {
+        "count": 200_000,
+        "endOfRecords": True,
+        # Must never be parsed into the result — the root page is discarded
+        # once a split is triggered.
+        "results": [{"taxonID": "SHOULD_NOT_APPEAR", "vernacularNames": [{"vernacularName": "nope", "language": "en"}]}],
+    }
+    child_a_page = {
+        "count": 1,
+        "endOfRecords": True,
+        "results": [{"taxonID": "CA1", "vernacularNames": [{"vernacularName": "Child A Name", "language": "en"}]}],
+    }
+    child_b_page = {
+        "count": 1,
+        "endOfRecords": True,
+        "results": [{"taxonID": "CB1", "vernacularNames": [{"vernacularName": "Child B Name", "language": "en"}]}],
+    }
+    with patch(
+        "scripts.build_tree.urlopen",
+        side_effect=[_json_urlopen(root_page), _json_urlopen(child_a_page), _json_urlopen(child_b_page)],
+    ), patch("scripts.build_tree.time.sleep"):
+        result = build_tree.fetch_col_vernacular(catalog)
+    assert result == {"CA1": ["Child A Name"], "CB1": ["Child B Name"]}
+
+
+def test_fetch_col_vernacular_scans_anyway_when_oversized_with_no_children(monkeypatch):
+    # No catalog children to split by (e.g. a leaf-ish node) — falls back to
+    # scanning the oversized subtree directly rather than silently dropping it.
+    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "P")
+    monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: 1)
+    catalog = {"P": {"scientific_name": "Plantae", "path": "Plantae_P"}}
+    page = {
+        "count": 200_000,
+        "endOfRecords": True,
+        "results": [{"taxonID": "X1", "vernacularNames": [{"vernacularName": "Name X", "language": "en"}]}],
+    }
+    with patch("scripts.build_tree.urlopen", return_value=_json_urlopen(page)), \
+         patch("scripts.build_tree.time.sleep"):
+        result = build_tree.fetch_col_vernacular(catalog)
+    assert result == {"X1": ["Name X"]}
 
 
 # ===========================================================================

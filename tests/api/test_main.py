@@ -530,6 +530,15 @@ def test_layer_tile_not_found():
     assert response.status_code == 404
 
 
+def test_elevation_terrain_tile():
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    with patch.object(tiles, "render_elevation_terrain_rgb_tile_bytes", return_value=png) as mock_render:
+        response = client.get("/api/layers/elevation/terrain-tiles/4/8/5.png")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    mock_render.assert_called_once_with(4, 8, 5, 256)
+
+
 def test_variable_tile_compat():
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
     with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \

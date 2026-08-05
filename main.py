@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+import httpx
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +30,7 @@ from config.config import load_config
 from util import citations, descriptions, download, gis, taxa, tiles, units, upload
 from util.rankings import POSITION_FILE, RANKINGS_FILE
 from util.stats import (
+    CATALOG_NUMBER_INDEX_FILE,
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
     DENSITY_GRID_FILE,
@@ -63,6 +65,7 @@ _LEGEND_DIR = Path("config/gis/legends")
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
 _PHENOLOGY_VALUES: frozenset[str] = frozenset(_CONFIG.phenology_values)
 _LARGE_TAXON_THRESHOLD = 500_000
+_INAT_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
@@ -1463,6 +1466,98 @@ def get_species_environment(
         "categorical_distribution": None,
         "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id),
     }
+
+
+def _occurrence_response(
+    catalog_number: str, taxon: dict, latitude: float | None, longitude: float | None, ingested: bool,
+) -> dict:
+    return {
+        "catalog_number": catalog_number,
+        "taxon_id": taxon["taxon_key"],
+        "scientific_name": (taxon.get("scientific_name") or "").replace("_", " "),
+        "common_name": taxon.get("common_name") or None,
+        "slug": taxon_slug(taxon.get("scientific_name")),
+        "latitude": latitude,
+        "longitude": longitude,
+        "ingested": ingested,
+    }
+
+
+def _lookup_inat_observation(catalog_number: str) -> dict | None:
+    """Resolve an observation directly via iNaturalist's own API.
+
+    Fallback for observations GBIF hasn't (or can't) ingest yet — GBIF's
+    iNaturalist mirror only re-syncs periodically (see the media-join
+    investigation: some research-grade observations never make it into a
+    given export at all). Returns None on any failure (not found, no
+    taxon, network error, or a taxon iNat has that our own catalog doesn't
+    map — see util.taxa.get_taxon_by_inat_id) so the caller can fall back
+    to a plain 404 uniformly.
+    """
+    try:
+        resp = httpx.get(
+            _INAT_OBSERVATIONS_URL, params={"id": catalog_number}, timeout=10.0,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results") or []
+    except Exception:
+        return None
+    if not results:
+        return None
+
+    inat_taxon = results[0].get("taxon") or {}
+    taxon = taxa.get_taxon_by_inat_id(inat_taxon.get("id"))
+    if taxon is None:
+        return None
+
+    coords = (results[0].get("geojson") or {}).get("coordinates")
+    latitude = coords[1] if isinstance(coords, list) and len(coords) == 2 else None
+    longitude = coords[0] if isinstance(coords, list) and len(coords) == 2 else None
+    return {"taxon": taxon, "latitude": latitude, "longitude": longitude}
+
+
+@app.get("/occurrence/{catalog_number}")
+def get_occurrence(catalog_number: str):
+    """Resolve an iNaturalist observation id (catalogNumber) to its taxon + location.
+
+    Powers deep links like /occurrence/{id} on the frontend: given just an
+    inat observation id, find which species page it belongs to and where to
+    place it on that page's map — the same destination as clicking that
+    observation's image in the below-map gallery, just entered by id
+    instead of navigated to. Looks up CATALOG_NUMBER_INDEX_FILE (sorted by
+    catalogNumber) rather than OCCURRENCES_FILE (sorted by taxon_key) so the
+    lookup gets row-group pruning instead of a full scan.
+
+    Falls back to iNaturalist's own API (_lookup_inat_observation) when the
+    observation isn't in our ingested dataset at all — "ingested": false on
+    that path distinguishes a live iNat-only resolution from our own data.
+    """
+    catalog_number = catalog_number.strip()
+    if not catalog_number:
+        raise HTTPException(status_code=404, detail="Observation not found")
+
+    try:
+        rows = _storage.read_table(
+            CATALOG_NUMBER_INDEX_FILE,
+            filters=[("catalogNumber", "=", catalog_number)],
+        ).to_pylist()
+    except Exception:
+        rows = []
+
+    if rows:
+        taxon = taxa.get_taxon_by_id(rows[0].get("taxon_key"))
+        if taxon is None:
+            raise HTTPException(status_code=404, detail="Taxon not found")
+        return _occurrence_response(
+            catalog_number, taxon, rows[0].get("decimalLatitude"), rows[0].get("decimalLongitude"), ingested=True,
+        )
+
+    fallback = _lookup_inat_observation(catalog_number)
+    if fallback is None:
+        raise HTTPException(status_code=404, detail="Observation not found")
+    return _occurrence_response(
+        catalog_number, fallback["taxon"], fallback["latitude"], fallback["longitude"], ingested=False,
+    )
 
 
 @app.get("/species/{taxon_id}/occurrences")

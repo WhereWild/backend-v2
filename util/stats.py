@@ -51,6 +51,7 @@ CONFIG = load_config("global")
 TREE_ROOT = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "tree"
 GLOBAL_STATS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "global"
 OCCURRENCES_FILE = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "occurrences.parquet"
+CATALOG_NUMBER_INDEX_FILE = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "catalog_number_index.parquet"
 NUMERICAL_STATS_FILE = "numerical_stats.parquet"
 NOMINAL_STATS_FILE = "nominal_stats.parquet"
 ORDINAL_STATS_FILE = "ordinal_stats.parquet"

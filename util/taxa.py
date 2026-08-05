@@ -144,6 +144,26 @@ def get_taxon_by_slug(slug: str) -> TaxonRecord | None:
     return get_taxon_by_id(key) if key else None
 
 
+@lru_cache(maxsize=1)
+def _inat_id_index() -> dict[str, str]:
+    """Map iNaturalist taxon id -> our taxon_key (first-seen wins on collision)."""
+    index: dict[str, str] = {}
+    for taxon_key, taxon in load_catalog().items():
+        inat_id = str(taxon.get("inat_id") or "").strip()
+        if inat_id and inat_id not in index:
+            index[inat_id] = taxon_key
+    return index
+
+
+def get_taxon_by_inat_id(inat_id: Any) -> TaxonRecord | None:
+    """Resolve our own taxon from an iNaturalist taxon id (build_tree.py's inat_id field)."""
+    key = str(inat_id).strip() if inat_id is not None else ""
+    if not key:
+        return None
+    mapped = _inat_id_index().get(key)
+    return get_taxon_by_id(mapped) if mapped else None
+
+
 def reload_catalog() -> None:
     """Clear all catalog caches so the next request re-reads from disk."""
     _load_payload.cache_clear()
@@ -152,6 +172,7 @@ def reload_catalog() -> None:
     _slug_index.cache_clear()
     _path_index.cache_clear()
     _children_index.cache_clear()
+    _inat_id_index.cache_clear()
 
 
 def search_taxa_by_name(

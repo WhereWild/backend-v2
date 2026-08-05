@@ -56,6 +56,7 @@ CONFIG = load_config("global")
 OCCURRENCE_PATH = Path("data/occurrences/occurrence.txt")
 MULTIMEDIA_PATH = Path("data/occurrences/multimedia.txt")
 OCCURRENCES_FILE = Path("data/taxonomy/occurrences.parquet")
+CATALOG_NUMBER_INDEX_FILE = Path("data/taxonomy/catalog_number_index.parquet")
 
 # Rows buffered in memory before a streaming flush to the unsorted temp file.
 BATCH_ROWS = 500_000
@@ -215,6 +216,32 @@ def _consolidate(tmp_path: Path) -> None:
     tmp_dest.replace(dest)
 
 
+def _build_catalog_number_index() -> None:
+    """Write catalogNumber -> (taxon_key, lat, lon), sorted by catalogNumber.
+
+    occurrences.parquet itself is sorted by taxon_key for taxon-scoped reads
+    — a catalogNumber lookup (e.g. GET /occurrence/{id}, resolving an
+    inaturalist observation id to its taxon) against that file would need a
+    full scan. This is a narrow, catalogNumber-sorted copy so a point lookup
+    gets row-group pruning instead. lat/lon are carried along so that one
+    lookup is enough to place the highlighted point on the map — no second
+    read against occurrences.parquet needed.
+    """
+    dest = CATALOG_NUMBER_INDEX_FILE
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dest = dest.with_suffix(".parquet.tmp")
+    con = duckdb.connect()
+    con.execute(f"""
+        COPY (
+            SELECT "catalogNumber", taxon_key, "decimalLatitude", "decimalLongitude"
+            FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')
+            ORDER BY "catalogNumber"
+        ) TO '{tmp_dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 50000)
+    """)
+    con.close()
+    tmp_dest.replace(dest)
+
+
 def main() -> None:
     catalog = load_catalog()
     # Keyed by normalize_name'd scientific name (accepted + synonym names,
@@ -316,6 +343,8 @@ def main() -> None:
     if rows_written:
         print("  Consolidating into occurrences.parquet...", flush=True)
         _consolidate(tmp_path)
+        print("  Building catalogNumber index...", flush=True)
+        _build_catalog_number_index()
     tmp_path.unlink(missing_ok=True)
 
     # Only remove the occurrences dir when it's the real pipeline path (not a test tmp dir).

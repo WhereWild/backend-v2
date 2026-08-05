@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 import scripts.populate_tree as pt
@@ -104,12 +105,14 @@ def _make_media_tsv(rows: list[dict]) -> str:
 def _run_main(tsv: str, tmp_path: Path, media_tsv: str | None = None) -> Path:
     """Run pt.main() against a tmp occurrence.txt (+ optional multimedia.txt)."""
     occurrences_file = tmp_path / "taxonomy" / "occurrences.parquet"
+    index_file = tmp_path / "taxonomy" / "catalog_number_index.parquet"
     multimedia_path = tmp_path / "multimedia.txt"
     if media_tsv is not None:
         multimedia_path.write_text(media_tsv)
     with patch.object(pt, "OCCURRENCE_PATH", tmp_path / "occurrence.txt"), \
          patch.object(pt, "MULTIMEDIA_PATH", multimedia_path), \
          patch.object(pt, "OCCURRENCES_FILE", occurrences_file), \
+         patch.object(pt, "CATALOG_NUMBER_INDEX_FILE", index_file), \
          patch.object(pt, "load_catalog", return_value=CATALOG), \
          patch.object(pt, "load_name_index", return_value=NAME_INDEX):
         (tmp_path / "occurrence.txt").write_text(tsv)
@@ -121,6 +124,13 @@ def _read_rows(occurrences_file: Path) -> list[dict]:
     if not occurrences_file.exists():
         return []
     return pq.read_table(occurrences_file).to_pylist()
+
+
+def _index_rows(occurrences_file: Path) -> list[dict]:
+    index_file = occurrences_file.with_name("catalog_number_index.parquet")
+    if not index_file.exists():
+        return []
+    return pq.read_table(index_file).to_pylist()
 
 
 # --- _parse_timestamp ---
@@ -314,6 +324,31 @@ def test_consolidate_dedupes_and_sorts_by_taxon_key(tmp_path):
     assert "_seq" not in table.schema.names
 
 
+# --- _build_catalog_number_index ---
+
+def test_build_catalog_number_index_sorted_with_lookup_fields(tmp_path):
+    occurrences_file = tmp_path / "occurrences.parquet"
+    index_file = tmp_path / "catalog_number_index.parquet"
+    table = pa.table({
+        "catalogNumber": ["b2", "a1"],
+        "decimalLatitude": [41.0, 40.0],
+        "decimalLongitude": [-74.0, -75.0],
+        "taxon_key": ["222", "111"],
+    })
+    pq.write_table(table, occurrences_file)
+
+    with patch.object(pt, "OCCURRENCES_FILE", occurrences_file), \
+         patch.object(pt, "CATALOG_NUMBER_INDEX_FILE", index_file):
+        pt._build_catalog_number_index()
+
+    out = pq.read_table(index_file).to_pylist()
+    assert [r["catalogNumber"] for r in out] == ["a1", "b2"]  # sorted by catalogNumber
+    row = next(r for r in out if r["catalogNumber"] == "a1")
+    assert row["taxon_key"] == "111"
+    assert row["decimalLatitude"] == 40.0
+    assert row["decimalLongitude"] == -75.0
+
+
 # --- main ---
 
 def test_main_writes_consolidated_parquet(tmp_path):
@@ -322,6 +357,21 @@ def test_main_writes_consolidated_parquet(tmp_path):
     assert len(rows) == 1
     assert rows[0]["catalogNumber"] == "obs123"
     assert rows[0]["taxon_key"] == "2923970"
+
+
+def test_main_writes_catalog_number_index(tmp_path):
+    occurrences_file = _run_main(_make_tsv([{}]), tmp_path)
+    index_rows = _index_rows(occurrences_file)
+    assert len(index_rows) == 1
+    assert index_rows[0]["catalogNumber"] == "obs123"
+    assert index_rows[0]["taxon_key"] == "2923970"
+    assert index_rows[0]["decimalLatitude"] == 40.0
+    assert index_rows[0]["decimalLongitude"] == -105.0
+
+
+def test_main_no_rows_written_skips_catalog_number_index(tmp_path):
+    occurrences_file = _run_main(_make_tsv([{"taxonRank": "GENUS"}]), tmp_path)
+    assert _index_rows(occurrences_file) == []
 
 
 def test_main_skips_non_leaf_rank(tmp_path):

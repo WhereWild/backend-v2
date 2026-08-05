@@ -16,7 +16,7 @@ import scripts.build_tree as build_tree
 
 COLUMNS = [
     "taxonRank", "taxonKey", "speciesKey", "acceptedScientificName", "scientificName", "commonName",
-    "kingdom", "kingdomKey", "phylum", "phylumKey", "class", "classKey",
+    "taxonomicStatus", "kingdom", "kingdomKey", "phylum", "phylumKey", "class", "classKey",
     "order", "orderKey", "family", "familyKey", "genus", "genusKey", "species",
 ]
 
@@ -33,6 +33,7 @@ def _make_csv(rows: list[dict], tmp_path: Path) -> Path:
 
 def _base_row(**kwargs) -> dict:
     return {
+        "taxonomicStatus": "ACCEPTED",
         "kingdom": "Plantae", "kingdomKey": "6",
         "phylum": "Tracheophyta", "phylumKey": "7707728",
         "class": "Magnoliopsida", "classKey": "220",
@@ -106,6 +107,7 @@ NO_GENUS_ROW = {
     "scientificName": "Unknown plantae",
     "acceptedScientificName": "Unknown plantae",
     "commonName": "",
+    "taxonomicStatus": "ACCEPTED",
     "kingdom": "Plantae", "kingdomKey": "6",
     "phylum": "Tracheophyta", "phylumKey": "7707728",
     "class": "Magnoliopsida", "classKey": "220",
@@ -123,6 +125,30 @@ SUBSPECIES_NO_SPECIES_ROW = {
         scientificName="Opuntia humifusa var. austrina",
         acceptedScientificName="Opuntia humifusa var. austrina",
         commonName="",
+    ),
+    "species": "",
+}
+
+# Regression fixture for a real COL data gap: a SYNONYM infra row whose
+# accepted target is itself infraspecific (e.g. "Escobaria sneedii var.
+# sneedii" -> "Pelecyphora sneedii subsp. sneedii") can have blank
+# species/speciesKey in COL's GBIF checklist-scoped export, even though the
+# row itself carries real occurrence data. Unlike SUBSPECIES_NO_SPECIES_ROW
+# (an ACCEPTED row, which should still be dropped — there's no parent
+# species to nest it under), this SYNONYM row should be kept and placed
+# directly under its genus, same as any other synonym that can't cleanly
+# nest under an accepted species.
+SYNONYM_VARIETY_NO_SPECIES_ROW = {
+    **_base_row(
+        taxonRank="VARIETY",
+        taxonKey="0000004",
+        speciesKey="",
+        scientificName="Escobaria sneedii var. sneedii",
+        acceptedScientificName="Pelecyphora sneedii subsp. sneedii",
+        commonName="",
+        taxonomicStatus="SYNONYM",
+        genus="Pelecyphora",
+        genusKey="6000000",
     ),
     "species": "",
 }
@@ -233,6 +259,19 @@ def test_build_catalog_skips_subspecies_missing_species(tmp_path):
     csv_path = _make_csv([SUBSPECIES_NO_SPECIES_ROW], tmp_path)
     catalog, _ = build_tree.build_catalog(csv_path)
     assert "0000003" not in catalog
+
+
+def test_build_catalog_keeps_synonym_infra_missing_species(tmp_path):
+    csv_path = _make_csv([SYNONYM_VARIETY_NO_SPECIES_ROW], tmp_path)
+    catalog, _ = build_tree.build_catalog(csv_path)
+    assert "0000004" in catalog
+    entry = catalog["0000004"]
+    assert entry["rank"] == "VARIETY"
+    # Renamed to the accepted genus and placed directly under it (no parent
+    # species node to nest under, since COL's export omits that context).
+    assert entry["scientific_name"] == "Pelecyphora_sneedii_var._sneedii"
+    assert entry["path"].endswith("Pelecyphora_6000000/Pelecyphora_sneedii_var._sneedii_0000004")
+    assert entry["gbif_synonym_names"] == ["Escobaria sneedii var. sneedii"]
 
 
 def test_build_catalog_intermediate_nodes(tmp_path):

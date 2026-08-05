@@ -1023,6 +1023,119 @@ def test_get_species_occurrences_includes_media():
 
 
 # ---------------------------------------------------------------------------
+# /occurrence/{catalog_number}
+# ---------------------------------------------------------------------------
+
+_CATALOG_NUMBER_INDEX_TABLE = pa.table({
+    "catalogNumber": ["143391331"],
+    "taxon_key": ["2923970"],
+    "decimalLatitude": [40.5],
+    "decimalLongitude": [-75.0],
+})
+
+
+_EMPTY_CATALOG_NUMBER_INDEX_TABLE = pa.table({
+    "catalogNumber": pa.array([], type=pa.string()),
+    "taxon_key": pa.array([], type=pa.string()),
+    "decimalLatitude": pa.array([], type=pa.float64()),
+    "decimalLongitude": pa.array([], type=pa.float64()),
+})
+
+
+def test_get_occurrence_found():
+    with patch.object(pq, "read_table", return_value=_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(taxa, "get_taxon_by_id", return_value=TAXON):
+        r = client.get("/occurrence/143391331")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["catalog_number"] == "143391331"
+    assert body["taxon_id"] == "2923970"
+    assert body["scientific_name"] == "Opuntia humifusa"
+    assert body["common_name"] == "devil's tongue"
+    assert body["slug"] == "opuntia-humifusa"
+    assert body["latitude"] == pytest.approx(40.5)
+    assert body["longitude"] == pytest.approx(-75.0)
+    assert body["ingested"] is True
+
+
+def test_get_occurrence_taxon_not_found():
+    # Found in our index, but the taxon it points to doesn't resolve — a
+    # data-integrity gap distinct from "not ingested", so no iNat fallback.
+    with patch.object(pq, "read_table", return_value=_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(taxa, "get_taxon_by_id", return_value=None) as mock_by_id, \
+         patch.object(main_module, "_lookup_inat_observation") as mock_fallback:
+        r = client.get("/occurrence/143391331")
+    assert r.status_code == 404
+    mock_by_id.assert_called_once()
+    mock_fallback.assert_not_called()
+
+
+def _inat_observation_response(taxon_id: int = 48815, lat: float = 41.0, lon: float = -76.0):
+    return {
+        "results": [{
+            "taxon": {"id": taxon_id},
+            "geojson": {"type": "Point", "coordinates": [lon, lat]},
+        }],
+    }
+
+
+def test_get_occurrence_not_in_index_falls_back_to_inat():
+    with patch.object(pq, "read_table", return_value=_EMPTY_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(main_module.httpx, "get") as mock_get, \
+         patch.object(taxa, "get_taxon_by_inat_id", return_value=TAXON):
+        mock_get.return_value = MagicMock(
+            json=lambda: _inat_observation_response(), raise_for_status=lambda: None,
+        )
+        r = client.get("/occurrence/999888777")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["taxon_id"] == "2923970"
+    assert body["ingested"] is False
+    assert body["latitude"] == pytest.approx(41.0)
+    assert body["longitude"] == pytest.approx(-76.0)
+    mock_get.assert_called_once()
+    assert mock_get.call_args.kwargs["params"] == {"id": "999888777"}
+
+
+def test_get_occurrence_index_file_missing_falls_back_to_inat():
+    with patch.object(pq, "read_table", side_effect=FileNotFoundError), \
+         patch.object(main_module.httpx, "get") as mock_get, \
+         patch.object(taxa, "get_taxon_by_inat_id", return_value=TAXON):
+        mock_get.return_value = MagicMock(
+            json=lambda: _inat_observation_response(), raise_for_status=lambda: None,
+        )
+        r = client.get("/occurrence/143391331")
+    assert r.status_code == 200
+    assert r.json()["ingested"] is False
+
+
+def test_get_occurrence_inat_fallback_no_results():
+    with patch.object(pq, "read_table", return_value=_EMPTY_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(main_module.httpx, "get") as mock_get:
+        mock_get.return_value = MagicMock(json=lambda: {"results": []}, raise_for_status=lambda: None)
+        r = client.get("/occurrence/nope")
+    assert r.status_code == 404
+
+
+def test_get_occurrence_inat_fallback_unmapped_taxon():
+    with patch.object(pq, "read_table", return_value=_EMPTY_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(main_module.httpx, "get") as mock_get, \
+         patch.object(taxa, "get_taxon_by_inat_id", return_value=None):
+        mock_get.return_value = MagicMock(
+            json=lambda: _inat_observation_response(), raise_for_status=lambda: None,
+        )
+        r = client.get("/occurrence/999888777")
+    assert r.status_code == 404
+
+
+def test_get_occurrence_inat_fallback_network_error():
+    with patch.object(pq, "read_table", return_value=_EMPTY_CATALOG_NUMBER_INDEX_TABLE), \
+         patch.object(main_module.httpx, "get", side_effect=Exception("boom")):
+        r = client.get("/occurrence/999888777")
+    assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # /species/{id}/locations
 # ---------------------------------------------------------------------------
 

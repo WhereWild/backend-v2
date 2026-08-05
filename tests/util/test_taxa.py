@@ -15,6 +15,7 @@ CATALOG = {
         "scientific_name": "Opuntia_humifusa",
         "common_name": "devil's tongue",
         "rank": "SPECIES",
+        "inat_id": "48815",
     },
     "2923968": {
         "taxon_key": "2923968",
@@ -42,6 +43,7 @@ def clear_lru_caches():
     taxa._slug_index.cache_clear()
     taxa._path_index.cache_clear()
     taxa._children_index.cache_clear()
+    taxa._inat_id_index.cache_clear()
     yield
     taxa._load_payload.cache_clear()
     taxa.load_catalog.cache_clear()
@@ -49,6 +51,7 @@ def clear_lru_caches():
     taxa._slug_index.cache_clear()
     taxa._path_index.cache_clear()
     taxa._children_index.cache_clear()
+    taxa._inat_id_index.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -160,6 +163,30 @@ def test_get_taxon_by_slug_ambiguous():
         taxa.load_catalog.cache_clear()
         taxa._slug_index.cache_clear()
         assert taxa.get_taxon_by_slug("opuntia-humifusa") is None
+
+
+# --- get_taxon_by_inat_id ---
+
+def test_get_taxon_by_inat_id_found():
+    result = taxa.get_taxon_by_inat_id("48815")
+    assert result is not None
+    assert result["taxon_key"] == "2923970"
+
+
+def test_get_taxon_by_inat_id_accepts_int():
+    assert taxa.get_taxon_by_inat_id(48815)["taxon_key"] == "2923970"
+
+
+def test_get_taxon_by_inat_id_not_found():
+    assert taxa.get_taxon_by_inat_id("99999999") is None
+
+
+def test_get_taxon_by_inat_id_empty():
+    assert taxa.get_taxon_by_inat_id("") is None
+
+
+def test_get_taxon_by_inat_id_none():
+    assert taxa.get_taxon_by_inat_id(None) is None
 
 
 # --- search_taxa_by_name ---

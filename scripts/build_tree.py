@@ -168,7 +168,16 @@ def _csv_row_filters(row: dict) -> bool:
         return False
     if not row.get("genus") or not row.get("genusKey"):
         return False
-    if row["taxonRank"] in CONFIG.subspecies_equivalents:
+    if row["taxonRank"] in CONFIG.subspecies_equivalents and row.get("taxonomicStatus") != "SYNONYM":
+        # Only required for ACCEPTED infra rows, which need it to nest under
+        # their parent species. SYNONYM infra rows whose accepted target is
+        # itself infraspecific (e.g. "Escobaria sneedii var. sneedii" ->
+        # "Pelecyphora sneedii subsp. sneedii") can have this blank in COL's
+        # export — build_catalog's across-genus-synonym branch below doesn't
+        # need it, it just places the entry directly under genus, same as
+        # every other synonym that can't cleanly nest under an accepted
+        # species. Dropping these here silently lost real occurrence data
+        # (confirmed: 131 for the sneedii var. sneedii case).
         if not row.get("species") or not row.get("speciesKey"):
             return False
     return True

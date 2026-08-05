@@ -263,13 +263,11 @@ def test_build_catalog_path_structure(tmp_path):
 def test_main_writes_pickle(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "CATALOG_DIR", tmp_path)
     monkeypatch.setattr(build_tree, "CATALOG_PATH", tmp_path / "taxon_catalog.pkl")
-    monkeypatch.setattr(build_tree, "TREE_ROOT", tmp_path / "tree")
     monkeypatch.setattr(build_tree, "fetch_inat_dwca", lambda: b"")
     monkeypatch.setattr(build_tree, "build_mapping", lambda catalog, dwca_bytes: None)
     monkeypatch.setattr(build_tree, "apply_mapping", lambda catalog: 0)
-    monkeypatch.setattr(build_tree, "fetch_backbone_vernacular", lambda: b"")
     monkeypatch.setattr(build_tree, "load_inat_vernacular", lambda b: {})
-    monkeypatch.setattr(build_tree, "load_gbif_vernacular", lambda b: {})
+    monkeypatch.setattr(build_tree, "fetch_col_vernacular", lambda catalog: {})
     monkeypatch.setattr(build_tree, "apply_names", lambda catalog, im, gm: 0)
     monkeypatch.setattr(build_tree, "run_inat_preferred", lambda catalog: (0, 0))
     monkeypatch.setattr(build_tree, "run_gbif_backup", lambda catalog: (0, 0))
@@ -292,13 +290,6 @@ def test_main_missing_csv(tmp_path, monkeypatch):
     monkeypatch.setattr(build_tree, "CATALOG_DIR", tmp_path)
     with pytest.raises(FileNotFoundError, match="sync_gbif"):
         build_tree.main()
-
-
-def test_build_catalog_do_write_dirs(tmp_path, monkeypatch):
-    monkeypatch.setattr(build_tree, "TREE_ROOT", tmp_path / "tree")
-    csv_path = _make_csv([SPECIES_ROW], tmp_path)
-    build_tree.build_catalog(csv_path, write_dirs=True)
-    assert any((tmp_path / "tree").rglob("Plantae_6"))
 
 
 # ===========================================================================
@@ -344,7 +335,7 @@ def _make_dwca_bytes(taxa_rows: list[dict], fieldnames=None) -> bytes:
 
 def _make_occurrence_tsv(rows: list[dict]) -> str:
     fieldnames = [
-        "gbifID", "taxonKey", "speciesKey", "taxonRank",
+        "gbifID", "taxonKey", "speciesKey", "taxonRank", "scientificName",
         "vitality", "reproductiveCondition", "dynamicProperties",
     ]
     buf = io.StringIO()
@@ -676,61 +667,108 @@ def test_apply_mapping_no_inat_taxon_url(tmp_path, monkeypatch):
 
 
 # ===========================================================================
-# fetch_backbone_vernacular
+# _gbif_species_search / _resolve_col_highertaxon_key / fetch_col_vernacular
 # ===========================================================================
 
-def test_fetch_backbone_vernacular_cache_hit(tmp_path, monkeypatch):
-    cache = tmp_path / "gbif_vernacular.tsv"
-    cache.write_bytes(b"cached-tsv")
-    state_path = tmp_path / "sync_state.json"
-    state_path.write_text(json.dumps({"gbif_backbone": {"etag": "etag-xyz"}}))
-    monkeypatch.setattr(build_tree, "BACKBONE_VERNACULAR_CACHE", cache)
-    monkeypatch.setattr(build_tree, "SYNC_STATE_PATH", state_path)
-
-    with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("etag-xyz")):
-        result = build_tree.fetch_backbone_vernacular()
-
-    assert result == b"cached-tsv"
+def _json_urlopen(payload: dict):
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(payload).encode("utf-8")
+    return _make_cm(resp)
 
 
-def _mock_remote_zip(data: bytes):
-    """Context manager mock for RemoteZip that returns data from .read()."""
-    cm = MagicMock()
-    cm.__enter__ = MagicMock(return_value=cm)
-    cm.__exit__ = MagicMock(return_value=False)
-    cm.read.return_value = data
-    return cm
+def test_gbif_species_search_returns_parsed_json():
+    with patch("scripts.build_tree.urlopen", return_value=_json_urlopen({"count": 1, "results": []})):
+        result = build_tree._gbif_species_search({"q": "Opuntia"})
+    assert result == {"count": 1, "results": []}
 
 
-def test_fetch_backbone_vernacular_download(tmp_path, monkeypatch):
-    cache = tmp_path / "gbif_vernacular.tsv"
-    state_path = tmp_path / "sync_state.json"
-    state_path.write_text("{}")
-    monkeypatch.setattr(build_tree, "BACKBONE_VERNACULAR_CACHE", cache)
-    monkeypatch.setattr(build_tree, "SYNC_STATE_PATH", state_path)
-    monkeypatch.setattr(build_tree, "CACHE_DIR", tmp_path)
-
-    with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("etag-new")), \
-         patch("scripts.build_tree.RemoteZip", return_value=_mock_remote_zip(b"tsv-data")):
-        result = build_tree.fetch_backbone_vernacular()
-
-    assert result == b"tsv-data"
-    assert json.loads(state_path.read_text())["gbif_backbone"]["etag"] == "etag-new"
+def test_resolve_col_highertaxon_key_matches_taxon_id():
+    payload = {"results": [
+        {"taxonID": "OTHER", "key": 111},
+        {"taxonID": "7HS", "key": 295935017},
+    ]}
+    with patch("scripts.build_tree.urlopen", return_value=_json_urlopen(payload)):
+        result = build_tree._resolve_col_highertaxon_key("Cactaceae", "7HS")
+    assert result == 295935017
 
 
-def test_fetch_backbone_vernacular_no_etag_saved(tmp_path, monkeypatch):
-    cache = tmp_path / "gbif_vernacular.tsv"
-    state_path = tmp_path / "sync_state.json"
-    state_path.write_text("{}")
-    monkeypatch.setattr(build_tree, "BACKBONE_VERNACULAR_CACHE", cache)
-    monkeypatch.setattr(build_tree, "SYNC_STATE_PATH", state_path)
-    monkeypatch.setattr(build_tree, "CACHE_DIR", tmp_path)
+def test_resolve_col_highertaxon_key_no_match_returns_none():
+    payload = {"results": [{"taxonID": "OTHER", "key": 111}]}
+    with patch("scripts.build_tree.urlopen", return_value=_json_urlopen(payload)):
+        assert build_tree._resolve_col_highertaxon_key("Cactaceae", "7HS") is None
 
-    with patch("scripts.build_tree.urlopen", return_value=_head_urlopen("")), \
-         patch("scripts.build_tree.RemoteZip", return_value=_mock_remote_zip(b"data")):
-        build_tree.fetch_backbone_vernacular()
 
-    assert "gbif_backbone" not in json.loads(state_path.read_text())
+def test_fetch_col_vernacular_missing_root_returns_empty():
+    assert build_tree.fetch_col_vernacular({}) == {}
+
+
+def test_fetch_col_vernacular_unresolvable_root_returns_empty(monkeypatch):
+    monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: None)
+    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "7HS")
+    catalog = {"7HS": {"scientific_name": "Cactaceae"}}
+    assert build_tree.fetch_col_vernacular(catalog) == {}
+
+
+def test_fetch_col_vernacular_single_page(monkeypatch):
+    monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: 295935017)
+    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "7HS")
+    page = {
+        "count": 1,
+        "endOfRecords": True,
+        "results": [
+            {
+                "taxonID": "3BHGW",
+                "vernacularNames": [
+                    {"vernacularName": "Ball Cactus", "language": "eng"},
+                    {"vernacularName": "biznaga", "language": "spa"},
+                ],
+            },
+        ],
+    }
+    with patch("scripts.build_tree.urlopen", return_value=_json_urlopen(page)), \
+         patch("scripts.build_tree.time.sleep"):
+        catalog = {"7HS": {"scientific_name": "Cactaceae"}}
+        result = build_tree.fetch_col_vernacular(catalog)
+    assert result == {"3BHGW": ["Ball Cactus"]}
+
+
+def test_fetch_col_vernacular_skips_taxa_with_no_english_names(monkeypatch):
+    monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: 295935017)
+    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "7HS")
+    page = {
+        "count": 1,
+        "endOfRecords": True,
+        "results": [{"taxonID": "3BHGW", "vernacularNames": [
+            {"vernacularName": "biznaga", "language": "spa"},
+        ]}],
+    }
+    with patch("scripts.build_tree.urlopen", return_value=_json_urlopen(page)), \
+         patch("scripts.build_tree.time.sleep"):
+        catalog = {"7HS": {"scientific_name": "Cactaceae"}}
+        assert build_tree.fetch_col_vernacular(catalog) == {}
+
+
+def test_fetch_col_vernacular_paginates_until_end_of_records(monkeypatch):
+    monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: 295935017)
+    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "7HS")
+    monkeypatch.setattr(build_tree, "COL_VERNACULAR_PAGE_SIZE", 1)
+    page1 = {
+        "count": 2,
+        "endOfRecords": False,
+        "results": [{"taxonID": "A1", "vernacularNames": [{"vernacularName": "Name A", "language": "en"}]}],
+    }
+    page2 = {
+        "count": 2,
+        "endOfRecords": True,
+        "results": [{"taxonID": "A2", "vernacularNames": [{"vernacularName": "Name B", "language": "en"}]}],
+    }
+    with patch(
+        "scripts.build_tree.urlopen",
+        side_effect=[_json_urlopen(page1), _json_urlopen(page2)],
+    ), patch("scripts.build_tree.time.sleep"):
+        catalog = {"7HS": {"scientific_name": "Cactaceae"}}
+        result = build_tree.fetch_col_vernacular(catalog)
+    assert result == {"A1": ["Name A"], "A2": ["Name B"]}
 
 
 # ===========================================================================
@@ -785,55 +823,6 @@ def test_load_inat_vernacular_ignores_non_vernacular_files():
 
 
 # ===========================================================================
-# load_gbif_vernacular
-# ===========================================================================
-
-def _make_gbif_tsv(entries: list[dict]) -> bytes:
-    buf = io.StringIO()
-    fields = ["taxonID", "vernacularName", "language", "isPreferredName"]
-    w = csv.DictWriter(buf, fieldnames=fields, delimiter="\t")
-    w.writeheader()
-    for e in entries:
-        w.writerow({f: e.get(f, "") for f in fields})
-    return buf.getvalue().encode("utf-8")
-
-
-def test_load_gbif_vernacular_basic():
-    tsv = _make_gbif_tsv([{"taxonID": "123", "vernacularName": "Oak", "language": "en"}])
-    result = build_tree.load_gbif_vernacular(tsv)
-    assert "Oak" in result["123"]
-
-
-def test_load_gbif_vernacular_preferred_first():
-    tsv = _make_gbif_tsv([
-        {"taxonID": "123", "vernacularName": "Common Oak", "language": "en", "isPreferredName": "0"},
-        {"taxonID": "123", "vernacularName": "English Oak", "language": "en", "isPreferredName": "1"},
-    ])
-    result = build_tree.load_gbif_vernacular(tsv)
-    assert result["123"][0] == "English Oak"
-
-
-def test_load_gbif_vernacular_url_taxon_id():
-    tsv = _make_gbif_tsv([
-        {"taxonID": "https://www.gbif.org/species/123", "vernacularName": "Oak", "language": "en"},
-    ])
-    assert "123" in build_tree.load_gbif_vernacular(tsv)
-
-
-def test_load_gbif_vernacular_filters_non_english():
-    tsv = _make_gbif_tsv([{"taxonID": "123", "vernacularName": "Eiche", "language": "de"}])
-    assert "123" not in build_tree.load_gbif_vernacular(tsv)
-
-
-def test_load_gbif_vernacular_deduplicates():
-    tsv = _make_gbif_tsv([
-        {"taxonID": "123", "vernacularName": "Oak", "language": "en"},
-        {"taxonID": "123", "vernacularName": "Oak", "language": "en"},
-    ])
-    assert build_tree.load_gbif_vernacular(tsv)["123"].count("Oak") == 1
-
-
-# ===========================================================================
 # apply_names
 # ===========================================================================
 
@@ -865,6 +854,16 @@ def test_apply_names_deduplicates():
     catalog = {"123": {"inat_id": "99", "common_name": ""}}
     build_tree.apply_names(catalog, {"99": ["Oak"]}, {"123": ["Oak"]})
     assert catalog["123"]["vernacular_names"].count("Oak") == 1
+
+
+def test_apply_names_gbif_synonym_key_fallback():
+    # A reclassified species still carries its old COL XR taxon key in
+    # gbif_synonym_keys — vernacular names attached to that old key should
+    # still be found.
+    catalog = {"123": {"common_name": "", "gbif_synonym_keys": ["456"]}}
+    count = build_tree.apply_names(catalog, {}, {"456": ["Old Name"]})
+    assert count == 1
+    assert catalog["123"]["common_name"] == "Old Name"
 
 
 # ===========================================================================
@@ -1172,13 +1171,17 @@ def test_image_quality_rcs_other():
 # _build_gbif_to_taxon / _build_gbif_images / run_gbif_backup
 # ===========================================================================
 
+SPECIES_CATALOG = {"123": {"scientific_name": "Foo_bar"}}
+SUBSPECIES_CATALOG = {"456": {"scientific_name": "Foo_bar_subsp._baz"}}
+
+
 def test_build_gbif_to_taxon_species(tmp_path, monkeypatch):
     occ = tmp_path / "occurrence.txt"
     occ.write_text(_make_occurrence_tsv([
-        {"gbifID": "g1", "taxonKey": "123", "speciesKey": "123", "taxonRank": "SPECIES"},
+        {"gbifID": "g1", "scientificName": "Foo bar", "taxonRank": "SPECIES"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"123": {}})
+    result = build_tree._build_gbif_to_taxon(SPECIES_CATALOG)
     assert "g1" in result
     assert result["g1"][0] == "123"
 
@@ -1186,40 +1189,53 @@ def test_build_gbif_to_taxon_species(tmp_path, monkeypatch):
 def test_build_gbif_to_taxon_subspecies_uses_taxon_key(tmp_path, monkeypatch):
     occ = tmp_path / "occurrence.txt"
     occ.write_text(_make_occurrence_tsv([
-        {"gbifID": "g2", "taxonKey": "456", "speciesKey": "123", "taxonRank": "SUBSPECIES"},
+        {"gbifID": "g2", "scientificName": "Foo bar subsp. baz", "taxonRank": "SUBSPECIES"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"456": {}})
+    result = build_tree._build_gbif_to_taxon(SUBSPECIES_CATALOG)
     assert result["g2"][0] == "456"
 
 
 def test_build_gbif_to_taxon_skips_uncatalogued(tmp_path, monkeypatch):
     occ = tmp_path / "occurrence.txt"
     occ.write_text(_make_occurrence_tsv([
-        {"gbifID": "g3", "taxonKey": "999", "speciesKey": "999", "taxonRank": "SPECIES"},
+        {"gbifID": "g3", "scientificName": "Unmatched species", "taxonRank": "SPECIES"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    assert "g3" not in build_tree._build_gbif_to_taxon({"123": {}})
+    assert "g3" not in build_tree._build_gbif_to_taxon(SPECIES_CATALOG)
 
 
 def test_build_gbif_to_taxon_skips_empty_gbifid(tmp_path, monkeypatch):
     occ = tmp_path / "occurrence.txt"
     occ.write_text(_make_occurrence_tsv([
-        {"gbifID": "", "taxonKey": "123", "speciesKey": "123", "taxonRank": "SPECIES"},
+        {"gbifID": "", "scientificName": "Foo bar", "taxonRank": "SPECIES"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    assert len(build_tree._build_gbif_to_taxon({"123": {}})) == 0
+    assert len(build_tree._build_gbif_to_taxon(SPECIES_CATALOG)) == 0
+
+
+def test_build_gbif_to_taxon_skips_ambiguous_homonym(tmp_path, monkeypatch):
+    occ = tmp_path / "occurrence.txt"
+    occ.write_text(_make_occurrence_tsv([
+        {"gbifID": "g1", "scientificName": "Foo bar", "taxonRank": "SPECIES"},
+    ]))
+    monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
+    ambiguous_catalog = {
+        "123": {"scientific_name": "Foo_bar"},
+        "789": {"scientific_name": "Foo_bar"},
+    }
+    assert "g1" not in build_tree._build_gbif_to_taxon(ambiguous_catalog)
 
 
 def test_build_gbif_to_taxon_parses_dynamic_properties(tmp_path, monkeypatch):
     occ = tmp_path / "occurrence.txt"
     dp = json.dumps({"evidenceOfPresence": "organism"})
     occ.write_text(_make_occurrence_tsv([
-        {"gbifID": "g1", "taxonKey": "123", "speciesKey": "123",
+        {"gbifID": "g1", "scientificName": "Foo bar",
          "taxonRank": "SPECIES", "dynamicProperties": dp},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"123": {}})
+    result = build_tree._build_gbif_to_taxon(SPECIES_CATALOG)
     assert result["g1"][2] == "organism"
 
 
@@ -1227,11 +1243,11 @@ def test_build_gbif_to_taxon_parses_evidence_list(tmp_path, monkeypatch):
     occ = tmp_path / "occurrence.txt"
     dp = json.dumps({"evidenceOfPresence": ["organism", "track"]})
     occ.write_text(_make_occurrence_tsv([
-        {"gbifID": "g1", "taxonKey": "123", "speciesKey": "123",
+        {"gbifID": "g1", "scientificName": "Foo bar",
          "taxonRank": "SPECIES", "dynamicProperties": dp},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"123": {}})
+    result = build_tree._build_gbif_to_taxon(SPECIES_CATALOG)
     assert "organism" in result["g1"][2]
 
 
@@ -1305,7 +1321,7 @@ def test_run_gbif_backup_updates_catalog(tmp_path, monkeypatch):
     occ = tmp_path / "occurrence.txt"
     mm = tmp_path / "multimedia.txt"
     occ.write_text(_make_occurrence_tsv([
-        {"gbifID": "g1", "taxonKey": "123", "speciesKey": "123", "taxonRank": "SPECIES"},
+        {"gbifID": "g1", "scientificName": "Foo bar", "taxonRank": "SPECIES"},
     ]))
     mm.write_text(_make_multimedia_tsv([
         {"gbifID": "g1", "type": "StillImage",
@@ -1313,7 +1329,7 @@ def test_run_gbif_backup_updates_catalog(tmp_path, monkeypatch):
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
     monkeypatch.setattr(build_tree, "MULTIMEDIA_PATH", mm)
-    catalog = {"123": {}}
+    catalog = {"123": {"scientific_name": "Foo_bar"}}
     assert build_tree.run_gbif_backup(catalog) == (1, 0)
     assert "gbif_backup_image" in catalog["123"]
 
@@ -1364,11 +1380,11 @@ def test_update_name_index_skips_empty_normalized_key():
 def test_build_gbif_to_taxon_invalid_dynamic_properties(tmp_path, monkeypatch):
     occ = tmp_path / "occurrence.txt"
     occ.write_text(_make_occurrence_tsv([
-        {"gbifID": "g1", "taxonKey": "123", "speciesKey": "123",
+        {"gbifID": "g1", "scientificName": "Foo bar",
          "taxonRank": "SPECIES", "dynamicProperties": "not-json"},
     ]))
     monkeypatch.setattr(build_tree, "OCCURRENCE_PATH", occ)
-    result = build_tree._build_gbif_to_taxon({"123": {}})
+    result = build_tree._build_gbif_to_taxon(SPECIES_CATALOG)
     assert result["g1"][2] == ""  # evidence remains empty on parse error
 
 

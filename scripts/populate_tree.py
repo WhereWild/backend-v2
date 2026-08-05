@@ -18,6 +18,19 @@ Rows carry only taxon_key, not the taxon's path — the taxonomy tree
 duplicate a taxon's ~100-byte path string onto every one of its occurrence
 rows. Subtree-scoped reads resolve a taxon_key set from the catalog
 (iter_descendants) and join/filter against that instead.
+
+Rows are matched to a catalog entry by scientificName, not by occurrence.txt's
+own taxonKey column. Confirmed against a live GBIF occurrence record
+(api.gbif.org/v1/occurrence/search): even when a download's TAXON_KEY
+predicate is scoped via checklistKey (Catalogue of Life Extended Release, the
+alphanumeric IDs our catalog is keyed by — see config.plantae_key), each
+occurrence's own taxonKey/familyKey/etc. columns still report the legacy
+numeric GBIF Backbone classification. checklistKey only affects how the
+predicate's *filter value* is resolved, not the taxonomy baked into the
+exported rows. So occurrence.txt's taxonKey can never match our catalog's
+COL XR keys directly, hence the name-based lookup via
+util.taxa.load_name_index() (already includes synonym scientific names —
+see scripts.build_tree.update_name_index) instead of a taxonKey dict lookup.
 """
 
 import csv
@@ -32,8 +45,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from config.config import load_config
+from scripts.build_tree import clean_name
 from util.gis import hilbert_index
-from util.taxa import load_catalog
+from util.taxa import load_catalog, load_name_index, normalize_name
 
 csv.field_size_limit(sys.maxsize)
 
@@ -150,11 +164,11 @@ def _consolidate(tmp_path: Path) -> None:
 
 def main() -> None:
     catalog = load_catalog()
-    # Reverse map: across-genus synonym taxon key → accepted catalog entry.
-    synonym_to_taxon: dict[str, dict] = {}
-    for taxon in catalog.values():
-        for syn_key in (taxon.get("gbif_synonym_keys") or []):
-            synonym_to_taxon[str(syn_key)] = taxon
+    # Keyed by normalize_name'd scientific name (accepted + synonym names,
+    # see util.taxa.load_name_index) → taxon_key list. See the module
+    # docstring for why matching goes through names instead of
+    # occurrence.txt's own taxonKey column.
+    name_index = load_name_index()
 
     rows_read = 0
     rows_written = 0
@@ -186,11 +200,18 @@ def main() -> None:
             except ValueError:
                 continue
 
-            taxon_key = (row.get("taxonKey") or "").strip()
-            if not taxon_key:
+            sci_name = (row.get("scientificName") or "").strip()
+            if not sci_name:
                 continue
 
-            taxon = catalog.get(taxon_key) or synonym_to_taxon.get(taxon_key)
+            name_key = normalize_name(clean_name(sci_name, rank))
+            matches = name_index.get(name_key)
+            # Skip unmatched and ambiguous (homonym) names rather than guess —
+            # same conservative behavior as the old "taxon is None" skip.
+            if not matches or len(matches) != 1:
+                continue
+
+            taxon = catalog.get(matches[0])
             if taxon is None:
                 continue
 

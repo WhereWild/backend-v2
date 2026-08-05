@@ -13,12 +13,32 @@ import pyarrow.parquet as pq
 import scripts.populate_tree as pt
 
 CATALOG = {
-    "2923970": {"taxon_key": "2923970", "path": "Plantae_6/Cactaceae/Opuntia_humifusa_2923970", "rank": "SPECIES"},
-    "9999001": {"taxon_key": "9999001", "path": "Plantae_6/Cactaceae/Opuntia_fragilis_2923971/Opuntia_fragilis_subsp_9999001", "rank": "SUBSPECIES"},
+    "2923970": {
+        "taxon_key": "2923970", "path": "Plantae_6/Cactaceae/Opuntia_humifusa_2923970",
+        "rank": "SPECIES", "scientific_name": "Opuntia_humifusa",
+    },
+    "9999001": {
+        "taxon_key": "9999001",
+        "path": "Plantae_6/Cactaceae/Opuntia_fragilis_2923971/Opuntia_fragilis_subsp._novena_9999001",
+        "rank": "SUBSPECIES", "scientific_name": "Opuntia_fragilis_subsp._novena",
+    },
+    "1111001": {
+        "taxon_key": "1111001", "path": "Plantae_6/Homonymia/Homonymia_ambigua_1111001",
+        "rank": "SPECIES", "scientific_name": "Homonymia_ambigua",
+    },
+}
+
+# Matches util.taxa.load_name_index()'s shape: normalize_name(scientific/synonym
+# name) -> [taxon_key, ...]. "homonymia ambigua" intentionally maps to two
+# taxa to exercise the ambiguous-match skip.
+NAME_INDEX = {
+    "opuntia humifusa": ["2923970"],
+    "opuntia fragilis subsp. novena": ["9999001"],
+    "homonymia ambigua": ["1111001", "2923970"],
 }
 
 COLUMNS = [
-    "gbifID", "taxonRank", "taxonKey", "speciesKey",
+    "gbifID", "taxonRank", "scientificName",
     "decimalLatitude", "decimalLongitude", "catalogNumber",
     "coordinateUncertaintyInMeters", "eventDate", "eventTime",
     "informationWithheld", "dynamicProperties", "reproductiveCondition",
@@ -28,8 +48,7 @@ COLUMNS = [
 BASE_ROW = {
     "gbifID": "1",
     "taxonRank": "SPECIES",
-    "taxonKey": "2923970",
-    "speciesKey": "2923970",
+    "scientificName": "Opuntia humifusa (Raf.) Raf.",
     "decimalLatitude": "40.0",
     "decimalLongitude": "-105.0",
     "catalogNumber": "obs123",
@@ -61,7 +80,8 @@ def _run_main(tsv: str, tmp_path: Path) -> Path:
     occurrences_file = tmp_path / "taxonomy" / "occurrences.parquet"
     with patch.object(pt, "OCCURRENCE_PATH", tmp_path / "occurrence.txt"), \
          patch.object(pt, "OCCURRENCES_FILE", occurrences_file), \
-         patch.object(pt, "load_catalog", return_value=CATALOG):
+         patch.object(pt, "load_catalog", return_value=CATALOG), \
+         patch.object(pt, "load_name_index", return_value=NAME_INDEX):
         (tmp_path / "occurrence.txt").write_text(tsv)
         pt.main()
     return occurrences_file
@@ -240,20 +260,27 @@ def test_main_skips_invalid_coords(tmp_path):
 
 
 def test_main_skips_unknown_taxon(tmp_path):
-    occurrences_file = _run_main(_make_tsv([{"taxonKey": "9999999", "speciesKey": "9999999"}]), tmp_path)
+    occurrences_file = _run_main(_make_tsv([{"scientificName": "Nonexistus fakeus"}]), tmp_path)
+    assert _read_rows(occurrences_file) == []
+
+
+def test_main_skips_ambiguous_homonym(tmp_path):
+    # "homonymia ambigua" maps to two taxon_keys in NAME_INDEX — should be
+    # skipped rather than guessing which one is meant.
+    occurrences_file = _run_main(_make_tsv([{"scientificName": "Homonymia ambigua"}]), tmp_path)
     assert _read_rows(occurrences_file) == []
 
 
 def test_main_subspecies_routing(tmp_path):
-    row = {"taxonRank": "SUBSPECIES", "taxonKey": "9999001", "speciesKey": "2923971"}
+    row = {"taxonRank": "SUBSPECIES", "scientificName": "Opuntia fragilis subsp. novena L."}
     occurrences_file = _run_main(_make_tsv([row]), tmp_path)
     rows = _read_rows(occurrences_file)
     assert len(rows) == 1
     assert rows[0]["taxon_key"] == "9999001"
 
 
-def test_main_species_uses_taxon_key(tmp_path):
-    row = {"taxonRank": "SPECIES", "taxonKey": "2923970", "speciesKey": "2923970"}
+def test_main_species_uses_scientific_name(tmp_path):
+    row = {"taxonRank": "SPECIES", "scientificName": "Opuntia humifusa"}
     occurrences_file = _run_main(_make_tsv([row]), tmp_path)
     rows = _read_rows(occurrences_file)
     assert rows[0]["taxon_key"] == "2923970"
@@ -278,7 +305,7 @@ def test_main_uncertainty_invalid_falls_back_to_none(tmp_path):
 
 
 def test_main_skips_empty_lookup_key(tmp_path):
-    occurrences_file = _run_main(_make_tsv([{"taxonKey": "", "speciesKey": ""}]), tmp_path)
+    occurrences_file = _run_main(_make_tsv([{"scientificName": ""}]), tmp_path)
     assert _read_rows(occurrences_file) == []
 
 
@@ -290,10 +317,10 @@ def test_main_no_rows_written_skips_consolidate(tmp_path):
 
 def test_main_dedupes_duplicate_catalog_number_across_taxa(tmp_path):
     rows = [
-        {"catalogNumber": "shared", "taxonKey": "2923970", "speciesKey": "2923970"},
+        {"catalogNumber": "shared", "scientificName": "Opuntia humifusa"},
         {
             "catalogNumber": "shared", "taxonRank": "SUBSPECIES",
-            "taxonKey": "9999001", "speciesKey": "2923971",
+            "scientificName": "Opuntia fragilis subsp. novena",
         },
     ]
     occurrences_file = _run_main(_make_tsv(rows), tmp_path)

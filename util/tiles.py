@@ -1055,6 +1055,7 @@ def _render_derived_soil_texture_tile_bytes(
 
 def _sample_static_cog_to_tile(
     layer: dict, z: int, x: int, y: int, tile_size: int, dst_transform,
+    resampling: Resampling = Resampling.nearest,
 ) -> tuple[np.ndarray, float | None, float | None]:
     """Read+reproject a static COG layer onto a tile grid; return (dest, vmin, vmax).
 
@@ -1062,6 +1063,13 @@ def _sample_static_cog_to_tile(
     when the catalog doesn't provide render_min/render_max — only meaningful
     for the primary rendered layer's colorizing, chain-mask sampling ignores
     them. Shared by _render_static_layer_tile_rgba and _sample_layer_to_tile.
+
+    resampling defaults to nearest so every other caller keeps exact,
+    unblended pixel values (correct for nominal/categorical layers, and the
+    deliberate choice for continuous ones too) — render_elevation_terrain_rgb_tile_bytes
+    is the one caller that opts into bilinear, since a raster-dem mesh reads
+    as smooth slopes only when the heights it interpolates between actually
+    vary continuously instead of being nearest-neighbor stair-stepped.
     """
     path    = LAYERS_DIR / layer["filename"]
     scale   = layer.get("scale_factor") or 1.0
@@ -1069,8 +1077,6 @@ def _sample_static_cog_to_tile(
     nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
     vmin    = layer.get("render_min")
     vmax    = layer.get("render_max")
-
-    resampling = Resampling.nearest
     lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
     dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
 
@@ -1309,5 +1315,7 @@ def render_elevation_terrain_rgb_tile_bytes(z: int, x: int, y: int, tile_size: i
     layer = get_layer("elevation")
     mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
     dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
-    dest, _, _ = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
+    dest, _, _ = _sample_static_cog_to_tile(
+        layer, z, x, y, tile_size, dst_transform, resampling=Resampling.bilinear,
+    )
     return _encode_png(_encode_terrain_rgb(dest))

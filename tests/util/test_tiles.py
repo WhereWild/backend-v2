@@ -529,6 +529,37 @@ def test_render_elevation_terrain_rgb_tile_returns_png():
     assert result[:4] == b"\x89PNG"
 
 
+def test_render_elevation_terrain_rgb_tile_uses_bilinear_resampling():
+    """Unlike every other static layer (nearest, for clean unblended pixel
+    values), the terrain-rgb path opts into bilinear so MapLibre's raster-dem
+    mesh interpolates real varying heights instead of nearest-neighbor
+    stair-stepped plateaus."""
+    from rasterio.enums import Resampling
+
+    raw = np.array([[100.0, 2500.0, -50.0, 8000.0]], dtype=np.float32)
+    mock_ds = _make_mock_ds(raw, nodata=-32768.0, scales=(1.0,), offsets=(0.0,))
+    mock_ds.dtypes = ["float32"]
+    read_spy = MagicMock(return_value=raw)
+    mock_ds.read = read_spy
+    with patch("rasterio.open", return_value=mock_ds):
+        tiles.render_elevation_terrain_rgb_tile_bytes(z=2, x=2, y=1, tile_size=64)
+    assert read_spy.call_args.kwargs["resampling"] == Resampling.bilinear
+
+
+def test_render_tile_still_uses_nearest_resampling():
+    """The normal display path (any other layer) is unaffected by the
+    terrain-rgb bilinear opt-in — still exact, unblended pixel values."""
+    from rasterio.enums import Resampling
+
+    raw = np.full((4, 4), 2731, dtype=np.uint16)
+    mock_ds = _make_mock_ds(raw)
+    read_spy = MagicMock(return_value=raw)
+    mock_ds.read = read_spy
+    with patch("rasterio.open", return_value=mock_ds):
+        tiles.render_layer_tile_bytes("bio1", z=2, x=2, y=1, tile_size=64)
+    assert read_spy.call_args.kwargs["resampling"] == Resampling.nearest
+
+
 def test_render_elevation_terrain_rgb_tile_nodata_encodes_as_zero():
     raw = np.full((4, 4), -32768.0, dtype=np.float32)
     mock_ds = _make_mock_ds(raw, nodata=-32768.0, scales=(1.0,), offsets=(0.0,))

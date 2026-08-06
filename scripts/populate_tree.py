@@ -67,7 +67,7 @@ CATALOG_NUMBER_INDEX_FILE = Path("data/taxonomy/catalog_number_index.parquet")
 # killed). Capping memory_limit well under total RAM and giving it a real
 # temp_directory to spill into turns that into "slower", not "crashes".
 _DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
-_DUCKDB_MEMORY_LIMIT = "40GB"
+_DUCKDB_MEMORY_LIMIT = "28GB"
 
 
 def _duckdb_connect() -> duckdb.DuckDBPyConnection:
@@ -81,6 +81,7 @@ def _duckdb_connect() -> duckdb.DuckDBPyConnection:
     # buffering. See scripts/carry_forward.py's _duckdb_connect for the
     # concrete OOM this was confirmed to cause on the equivalent join+sort.
     con.execute("PRAGMA preserve_insertion_order=false")
+    con.execute("PRAGMA threads=4")
     return con
 
 

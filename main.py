@@ -72,6 +72,16 @@ _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscure
 _PHENOLOGY_VALUES: frozenset[str] = frozenset(_CONFIG.phenology_values)
 _LARGE_TAXON_THRESHOLD = 500_000
 _INAT_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
+# ArcGIS World Imagery satellite basemap — proxied so the API key never
+# reaches the client (see /api/tiles/satellite below). Esri's tile path is
+# z/y/x, not the z/x/y convention used everywhere else in this app.
+_ARCGIS_SATELLITE_TILE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+_ARCGIS_API_KEY = os.environ.get("WW_ARCGIS_API_KEY")
+# Matches the Referrer URL restriction configured on the ArcGIS API key
+# itself — the key is scoped to only work for requests presenting this
+# origin, so this proxy (the only thing that ever sends the real key) sends
+# it explicitly rather than relying on httpx's default of no Referer at all.
+_ARCGIS_REFERER = "https://wherewild.net"
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
@@ -850,6 +860,48 @@ async def elevation_terrain_tile(
     return Response(
         content=payload, media_type="image/png",
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+def _fetch_satellite_tile_bytes(z: int, x: int, y: int) -> bytes:
+    """Fetch one World Imagery tile from Esri using the server-side API key.
+
+    The key (WW_ARCGIS_API_KEY) never reaches the client — only this
+    function ever sees it. Esri's own billing model counts tiles returned
+    per access token, the same whether the caller is a browser or this
+    proxy, so relaying one request per one tile actually shown to a user
+    (no server-side caching/storage of the response) stays within their
+    "no bulk/volume tile exporting" restriction.
+    """
+    if not _ARCGIS_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Satellite basemap is not configured (WW_ARCGIS_API_KEY unset)",
+        )
+    url = _ARCGIS_SATELLITE_TILE_URL.format(z=z, y=y, x=x)
+    try:
+        resp = httpx.get(
+            url,
+            params={"token": _ARCGIS_API_KEY},
+            headers={"Referer": _ARCGIS_REFERER},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Satellite tile fetch failed: {e}") from e
+    return resp.content
+
+
+@app.get("/api/tiles/satellite/{z}/{x}/{y}.jpg")
+async def satellite_tile(z: int, x: int, y: int):
+    """Proxies Esri World Imagery tiles — see _fetch_satellite_tile_bytes for why."""
+    payload = await run_in_threadpool(_fetch_satellite_tile_bytes, z, x, y)
+    # Shorter/mutable TTL than the DEM/derived-layer tiles above: this is
+    # third-party imagery Esri can refresh over time, not our own
+    # deterministically-rendered output, so it isn't safe to mark immutable.
+    return Response(
+        content=payload, media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=604800"},
     )
 
 

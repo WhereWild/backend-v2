@@ -46,6 +46,26 @@ _GBIF_COL = "gbifRegion"
 _GBIF_SCOPE = "gbif_region"
 _LOG_INTERVAL = 100
 
+# _direct_gid_counts scans the full consolidated occurrences file (tens of
+# millions of rows) once per location column. The GROUP BY output itself is
+# small (collapses to unique taxon_key/gid pairs), so this is lower risk than
+# the join+sort patterns that OOM-killed elsewhere in the pipeline, but a
+# bare duckdb.connect() has no temp_directory to spill into if it ever does
+# need more than default memory — cheap insurance to configure it the same
+# way as the rest of the pipeline.
+_DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
+_DUCKDB_MEMORY_LIMIT = "28GB"
+
+
+def _duckdb_connect() -> duckdb.DuckDBPyConnection:
+    _DUCKDB_SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"PRAGMA memory_limit='{_DUCKDB_MEMORY_LIMIT}'")
+    con.execute(f"PRAGMA temp_directory='{_DUCKDB_SPILL_DIR.as_posix()}'")
+    con.execute("PRAGMA preserve_insertion_order=false")
+    con.execute("PRAGMA threads=4")
+    return con
+
 # GADM 4.1 truncates NAME_0/COUNTRY at 32 characters in the GeoPackage.
 # These are the known casualties; keyed by GID_0.
 _NAME_OVERRIDES: dict[str, str] = {
@@ -231,7 +251,7 @@ def _direct_gid_counts() -> dict[tuple[str, str, str], int]:
         (_GBIF_COL, _GBIF_SCOPE)
     ]
     counts: dict[tuple[str, str, str], int] = defaultdict(int)
-    con = duckdb.connect()
+    con = _duckdb_connect()
     try:
         for col, scope in col_defs:
             rows = con.execute(f"""

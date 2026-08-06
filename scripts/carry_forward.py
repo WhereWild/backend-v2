@@ -58,7 +58,7 @@ _BASE_COLS = frozenset([
 # well under total RAM and giving it a real temp_directory to spill into
 # turns that into "slower", not "crashes".
 _DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
-_DUCKDB_MEMORY_LIMIT = "40GB"
+_DUCKDB_MEMORY_LIMIT = "28GB"
 
 
 def _duckdb_connect() -> duckdb.DuckDBPyConnection:
@@ -74,6 +74,7 @@ def _duckdb_connect() -> duckdb.DuckDBPyConnection:
     # "failed to pin block... 37.2 GiB/37.2 GiB used" — DuckDB's own error
     # message names this as the first thing to try).
     con.execute("PRAGMA preserve_insertion_order=false")
+    con.execute("PRAGMA threads=4")
     return con
 
 

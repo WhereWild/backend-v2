@@ -29,6 +29,7 @@ from __future__ import annotations
 import functools
 import gc
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -63,6 +64,26 @@ STAGING_DIR = Path("data/taxonomy/.enrich_staging")
 LAYERS_DIR = Path("data/gis/layers")
 CATALOG_PATH = Path("config/gis/catalog.json")
 ROW_LIMIT = 2_500_000
+
+# _finalize_enrichment's LEFT JOIN + ORDER BY over the full occurrences
+# table (tens of millions of rows) OOM-killed at ~58GB RSS with a bare
+# duckdb.connect() — the same failure mode fixed in scripts/carry_forward.py
+# and scripts/populate_tree.py's _duckdb_connect. memory_limit/temp_directory
+# let it spill instead of crashing; preserve_insertion_order=false drops the
+# default per-thread row-order buffering that isn't needed since the query
+# already has its own explicit ORDER BY.
+_DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
+_DUCKDB_MEMORY_LIMIT = "28GB"
+
+
+def _duckdb_connect() -> duckdb.DuckDBPyConnection:
+    _DUCKDB_SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"PRAGMA memory_limit='{_DUCKDB_MEMORY_LIMIT}'")
+    con.execute(f"PRAGMA temp_directory='{_DUCKDB_SPILL_DIR.as_posix()}'")
+    con.execute("PRAGMA preserve_insertion_order=false")
+    con.execute("PRAGMA threads=4")
+    return con
 
 _LAYER_WORKERS = int(os.environ.get("ENRICH_LAYER_WORKERS", "1"))
 # Rasters whose uncompressed footprint fits under this limit are loaded fully
@@ -563,7 +584,7 @@ def _finalize_enrichment(layer_ids: list[str]) -> None:
     if not staged and not stale:
         return
 
-    con = duckdb.connect()
+    con = _duckdb_connect()
     try:
         base_cols = [
             r[0] for r in con.execute(
@@ -635,7 +656,22 @@ def main() -> None:
         _write_staging_batch(batch_count, staging)
 
     print("[finalize] merging staged updates into occurrences.parquet...")
-    _finalize_enrichment(layer_ids)
+    # Run in a fresh subprocess rather than in-process: the sampling loop
+    # above was confirmed (via rebuild.log + kernel OOM logs) to still be
+    # holding ~35GB RSS by the time it finishes — rasterio/GDAL buffers and
+    # numpy sample arrays that either aren't fully released or, more likely,
+    # freed by Python but not returned to the OS by glibc's allocator. That
+    # baseline stacks on top of whatever _finalize_enrichment's own DuckDB
+    # query needs, so tuning DuckDB's memory_limit down didn't help — the
+    # process was already most of the way to the ceiling before the query
+    # even started. spawn (not fork) gives the child a genuinely fresh
+    # interpreter and heap, independent of whatever the parent accumulated.
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(target=_finalize_enrichment, args=(layer_ids,))
+    proc.start()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"_finalize_enrichment subprocess failed (exit code {proc.exitcode})")
     shutil.rmtree(STAGING_DIR, ignore_errors=True)
     print("Completed GIS enrichment.")
 

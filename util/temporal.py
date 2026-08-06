@@ -2274,6 +2274,66 @@ def _apply_updates_arrow(
     return pa.table(cols, names=names)
 
 
+def _write_one(tpath: str, colmap: dict[str, list[tuple[np.ndarray, np.ndarray]]]) -> None:
+    """Patch colmap's row-indexed updates into parquet_path, streaming by row
+    group instead of loading the whole file into memory.
+
+    row_ids in colmap are global positions into the *whole* file (see
+    build_occ_index), which in the consolidated (single occurrences.parquet)
+    architecture can be tens of millions of rows and 200+ columns —
+    pq.read_table(...).combine_chunks() on the whole table OOM-killed in
+    practice (confirmed: ~60GB RSS on a file that was still only 29GB
+    compressed and growing). Row groups are read/patched/written one at a
+    time, bounding peak memory to one row group's worth of columns
+    regardless of total file size. Each column's update pairs are sorted
+    once up front so slicing the relevant range per row group is a
+    searchsorted instead of an O(rows) mask recomputed per group; stable
+    sort preserves each pair list's original last-write-wins order for any
+    row_id updated more than once, matching the non-streaming behavior this
+    replaces.
+    """
+    parquet_path = Path(tpath)
+    pf = pq.ParquetFile(parquet_path)
+    n_groups = pf.metadata.num_row_groups
+    boundaries = np.concatenate([
+        [0],
+        np.cumsum([pf.metadata.row_group(i).num_rows for i in range(n_groups)]),
+    ]).astype(np.int64)
+
+    sorted_updates: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for col, pairs in colmap.items():
+        if not pairs:
+            sorted_updates[col] = (np.array([], dtype=np.int64), np.array([], dtype=np.float64))
+            continue
+        all_ids = np.concatenate([p[0] for p in pairs])
+        all_vals = np.concatenate([p[1] for p in pairs])
+        order = np.argsort(all_ids, kind="stable")
+        sorted_updates[col] = (all_ids[order], all_vals[order])
+
+    tmp_path = parquet_path.parent / f".{parquet_path.name}.streaming_tmp"
+    writer: pq.ParquetWriter | None = None
+    try:
+        for g in range(n_groups):
+            start, end = int(boundaries[g]), int(boundaries[g + 1])
+            table = pf.read_row_group(g)
+            local_updates = {
+                col: [(ids[lo:hi] - start, vals[lo:hi])]
+                for col, (ids, vals) in sorted_updates.items()
+                for lo, hi in [(
+                    int(np.searchsorted(ids, start, side="left")),
+                    int(np.searchsorted(ids, end, side="left")),
+                )]
+            }
+            table = _apply_updates_arrow(table, local_updates)
+            if writer is None:
+                writer = pq.ParquetWriter(tmp_path, table.schema, compression="zstd")
+            writer.write_table(table, row_group_size=50_000)
+    finally:
+        if writer is not None:
+            writer.close()
+    tmp_path.replace(parquet_path)
+
+
 def write_back(
     updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]],
     max_workers: int = 8,
@@ -2283,12 +2343,6 @@ def write_back(
     Pops entries from updates as they are submitted so colmap memory is freed
     progressively during the flush rather than held until all writes complete.
     """
-    def _write_one(tpath: str, colmap: dict) -> None:
-        parquet_path = Path(tpath)
-        table = pq.read_table(parquet_path).combine_chunks()
-        updated = _apply_updates_arrow(table, colmap)
-        _atomic_write(parquet_path, updated)
-
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         pending: list = []
         while updates:

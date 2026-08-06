@@ -167,6 +167,26 @@ _STATS_FILES = [
 
 _CONSOLIDATION_ROW_GROUP_SIZE = 50_000
 
+# _finalize_stats and the rankings/positions builder below both do an
+# ORDER BY + COPY over a glob of staged chunk files with a bare
+# duckdb.connect() — the same shape that OOM-killed populate_tree's
+# _consolidate, carry_forward's join+sort, and enrich_tree's finalize join
+# (all now fixed the same way). Staged stat/ranking chunks are much smaller
+# than raw occurrences, but applying the same defensive config here is cheap
+# insurance against the same failure mode as this data grows.
+_DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
+_DUCKDB_MEMORY_LIMIT = "28GB"
+
+
+def _duckdb_connect() -> duckdb.DuckDBPyConnection:
+    _DUCKDB_SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"PRAGMA memory_limit='{_DUCKDB_MEMORY_LIMIT}'")
+    con.execute(f"PRAGMA temp_directory='{_DUCKDB_SPILL_DIR.as_posix()}'")
+    con.execute("PRAGMA preserve_insertion_order=false")
+    con.execute("PRAGMA threads=4")
+    return con
+
 
 _STATS_STAGING_DIRNAME = ".stats_staging"
 _RANKINGS_STAGING_DIRNAME = ".rankings_staging"
@@ -205,7 +225,7 @@ def _finalize_rankings(staging_dir: Path) -> None:
         return
 
     glob_pattern = (staging_dir / "*.parquet").as_posix()
-    con = duckdb.connect()
+    con = _duckdb_connect()
     try:
         for filename, order_by in (
             (POSITION_FILE, '"taxon_key", "variable"'),
@@ -237,7 +257,7 @@ def _finalize_stats(staging_dir: Path) -> None:
     GLOBAL_STATS_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
     kinds = [*_STATS_FILES, ("phenology_counts", "phenology_counts.parquet")]
-    con = duckdb.connect()
+    con = _duckdb_connect()
     try:
         for kind, filename in kinds:
             chunk_dir = staging_dir / kind

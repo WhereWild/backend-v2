@@ -539,6 +539,36 @@ def test_elevation_terrain_tile():
     mock_render.assert_called_once_with(4, 8, 5, 256)
 
 
+def test_satellite_tile_proxies_to_esri_with_key_and_referer():
+    jpg = b"\xff\xd8\xff" + b"\x00" * 100
+    mock_response = MagicMock()
+    mock_response.content = jpg
+    mock_response.raise_for_status = MagicMock()
+    with patch.object(main_module, "_ARCGIS_API_KEY", "fake-key"), \
+         patch("httpx.get", return_value=mock_response) as mock_get:
+        response = client.get("/api/tiles/satellite/4/8/5.jpg")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.content == jpg
+    call_args = mock_get.call_args
+    assert call_args.args[0] == "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/4/5/8"
+    assert call_args.kwargs["params"] == {"token": "fake-key"}
+    assert call_args.kwargs["headers"] == {"Referer": "https://wherewild.net"}
+
+
+def test_satellite_tile_without_configured_key_returns_500():
+    with patch.object(main_module, "_ARCGIS_API_KEY", None):
+        response = client.get("/api/tiles/satellite/4/8/5.jpg")
+    assert response.status_code == 500
+
+
+def test_satellite_tile_upstream_error_returns_502():
+    with patch.object(main_module, "_ARCGIS_API_KEY", "fake-key"), \
+         patch("httpx.get", side_effect=main_module.httpx.ConnectError("boom")):
+        response = client.get("/api/tiles/satellite/4/8/5.jpg")
+    assert response.status_code == 502
+
+
 def test_variable_tile_compat():
     png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
     with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \

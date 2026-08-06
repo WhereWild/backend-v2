@@ -48,7 +48,9 @@ from util.stats import (
     ORDINAL_STATS_FILE,
     TREE_ROOT,
     StatsSink,
+    clear_stats_occurrence_cache,
     compute_taxon_stats,
+    preload_stats_occurrence_cache,
 )
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants
 from util.tiles import load_layers
@@ -349,10 +351,24 @@ def run_stats(resume: bool = False) -> None:
     def _task(node: TaxonRecord) -> None:
         compute_taxon_stats(node, layers=layers, layer_meta=layer_meta, sink=sink_holder["sink"])
 
-    _level_pass(
-        by_depth, stats_levels, _task, max_workers=STATS_WORKERS, label="stats", total=total,
-        should_skip_level=_should_skip, on_level_start=_on_start, on_level_end=_on_end,
-    )
+    # Every taxon's stats computation reads its own occurrence rows via a
+    # fresh DuckDB query — at full-tree scale (187k+ taxa) each one's fixed
+    # per-query planning/binding overhead (confirmed via EXPLAIN ANALYZE:
+    # ~0.3-1s per call regardless of how little data it actually reads)
+    # dominates completely, measured at ~0.9 taxa/s versus ~15/s on the old
+    # per-taxon-file architecture. One bulk preload, grouped by taxon_key,
+    # turns that into dict lookups. Falls back to the unchanged per-query
+    # path (returns False) when the file is too large to safely hold in
+    # memory this way — see _STATS_CACHE_MAX_ROWS.
+    cached = preload_stats_occurrence_cache(layer_meta)
+    try:
+        _level_pass(
+            by_depth, stats_levels, _task, max_workers=STATS_WORKERS, label="stats", total=total,
+            should_skip_level=_should_skip, on_level_start=_on_start, on_level_end=_on_end,
+        )
+    finally:
+        if cached:
+            clear_stats_occurrence_cache()
 
     print("[stats] finalizing global stats files...")
     _finalize_stats(staging_dir)

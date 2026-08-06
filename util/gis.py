@@ -25,6 +25,7 @@ from util.tiles import (
     LAYERS_DIR,
     TEMPORAL_RASTERS_DIR,
     _load_temporal_npy,
+    resolve_layer_path,
 )
 
 
@@ -48,7 +49,7 @@ def sample_point(layer: dict, lat: float, lon: float, forecast_suffix: str = "")
 
 
 def _sample_cog_point(layer: dict, lat: float, lon: float) -> float | None:
-    path = LAYERS_DIR / layer["filename"]
+    path = resolve_layer_path(LAYERS_DIR, layer["filename"])
     scale = layer.get("scale_factor") or 1.0
     offset = layer.get("add_offset") or 0.0
     try:
@@ -111,7 +112,7 @@ def _apply_point_elevation_correction(
     Correction = (model_elev - obs_elev) * LAPSE_RATE.
     Returns val unchanged if either elevation is unavailable.
     """
-    elev_layer = LAYERS_DIR / "elevation.tif"
+    elev_layer = resolve_layer_path(LAYERS_DIR, "elevation.tif")
     if not elev_layer.exists():
         return val
 
@@ -207,7 +208,7 @@ def sample_elevation_terrain_batch(
     Returns a dict with keys matching the requested outputs.
     """
     n = len(lats)
-    elev_path = LAYERS_DIR / "elevation.tif"
+    elev_path = resolve_layer_path(LAYERS_DIR, "elevation.tif")
     results: dict[str, list[float | None]] = {}
     if want_elevation:
         results["elevation"] = [None] * n
@@ -464,7 +465,7 @@ def sample_soil_texture_batch(lats: np.ndarray, lons: np.ndarray) -> list[int | 
     out: list[int | None] = [None] * n
     if n == 0:
         return out
-    paths = {k: LAYERS_DIR / v for k, v in _SOIL_TEXTURE_INPUT_FILES.items()}
+    paths = {k: resolve_layer_path(LAYERS_DIR, v) for k, v in _SOIL_TEXTURE_INPUT_FILES.items()}
     if not all(p.exists() for p in paths.values()):
         return out
     coords = list(zip(lons.tolist(), lats.tolist()))

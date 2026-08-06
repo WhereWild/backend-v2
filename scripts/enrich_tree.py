@@ -56,6 +56,7 @@ from util.gis import (
     sample_soil_texture_batch,
 )
 from util.taxa import load_catalog
+from util.tiles import resolve_layer_path
 
 CONFIG = load_config("global")
 
@@ -389,7 +390,7 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> pa.Table | None:
             return layer_id, np.full(len(lats), np.nan)
 
         if layer_id in DERIVED_FROM_ELEVATION:
-            elev_path = LAYERS_DIR / "elevation.tif"
+            elev_path = resolve_layer_path(LAYERS_DIR, "elevation.tif")
             if not elev_path.exists():
                 print(f"[skip] elevation.tif not found; cannot derive {layer_id}")
                 return layer_id, np.full(len(lats), np.nan)
@@ -402,7 +403,7 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> pa.Table | None:
             raw = sample_soil_texture_batch(lats[arr], lons[arr])
             vals = np.array([v if v is not None else np.nan for v in raw], dtype=np.float64)
         else:
-            cog_path = LAYERS_DIR / layer["filename"]
+            cog_path = resolve_layer_path(LAYERS_DIR, layer["filename"])
             if not cog_path.exists():
                 print(f"[warn] {cog_path.name} not found; skipping {layer_id}")
                 return layer_id, np.full(len(lats), np.nan)
@@ -467,7 +468,7 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> pa.Table | None:
         meta = layer_meta.get(lid)
         if not meta or not meta.get("filename"):
             return 0.0
-        p = LAYERS_DIR / meta["filename"]
+        p = resolve_layer_path(LAYERS_DIR, meta["filename"])
         if not p.exists():
             return 0.0
         try:

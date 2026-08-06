@@ -393,6 +393,46 @@ def test_stats_sink_writes_numerical_chunk_with_taxon_key(tmp_path):
     assert "mean" in df.columns
 
 
+def test_stats_sink_circular_mixed_none_mode_does_not_break_schema(tmp_path):
+    # mode is None whenever a variable's KDE couldn't be computed (see
+    # _circ_stats_exact/_circ_stats_streaming). A taxon where every variable
+    # hits that case gives pandas an all-None "mode" column, which
+    # pa.Table.from_pandas infers as Arrow type `null` instead of `double` —
+    # breaking the ParquetWriter's fixed schema against an earlier taxon
+    # that had a real float mode. Confirmed in production: repeated "Table
+    # schema does not match schema used to create file" failures on exactly
+    # this column, deep into a real process_tree run.
+    sink = st.StatsSink(tmp_path, "level_0001")
+    sink.write_circular("111", {"aspect": {
+        "count": 10, "unique_samples": 10, "circular_mean": 90.0,
+        "rbar": 0.5, "circular_var": 0.5, "circular_std": 30.0, "mode": 88.0,
+    }})
+    sink.write_circular("222", {"aspect": {
+        "count": 1, "unique_samples": 1, "circular_mean": 45.0,
+        "rbar": 1.0, "circular_var": 0.0, "circular_std": 0.0, "mode": None,
+    }})
+    sink.close()
+    chunk = tmp_path / "circular_stats" / "level_0001.parquet"
+    df = pq.read_table(chunk).to_pandas()
+    assert set(df["taxon_key"]) == {"111", "222"}
+    assert df.set_index("taxon_key").loc["111", "mode"] == pytest.approx(88.0)
+    assert pd.isna(df.set_index("taxon_key").loc["222", "mode"])
+
+
+def test_stats_sink_numerical_mixed_none_mode_does_not_break_schema(tmp_path):
+    # Same risk as circular's mode, via a different producer:
+    # mode_val = counts.most_common(1)[0][0] if counts else None.
+    sink = st.StatsSink(tmp_path, "level_0001")
+    sink.write_numerical("111", {"kg2": {"mean": 5.0, "mode": 3.0}})
+    sink.write_numerical("222", {"kg2": {"mean": 7.0, "mode": None}})
+    sink.close()
+    chunk = tmp_path / "numerical_stats" / "level_0001.parquet"
+    df = pq.read_table(chunk).to_pandas()
+    assert set(df["taxon_key"]) == {"111", "222"}
+    assert df.set_index("taxon_key").loc["111", "mode"] == pytest.approx(3.0)
+    assert pd.isna(df.set_index("taxon_key").loc["222", "mode"])
+
+
 def test_stats_sink_writes_phenology_alongside_numerical(tmp_path):
     sink = st.StatsSink(tmp_path, "level_0001")
     sink.write_numerical("111", {"bio1": {"mean": 5.0}}, pheno_meta={"phenology_counts": '{"flowers": 3}'})
@@ -433,6 +473,79 @@ def test_stats_sink_multiple_taxa_append_to_same_level_chunk(tmp_path):
     df = pq.read_table(tmp_path / "nominal_stats" / "level_0001.parquet").to_pandas()
     assert len(df) == 5
     assert set(df["taxon_key"]) == {"0", "1", "2", "3", "4"}
+
+
+# ---------------------------------------------------------------------------
+# preload_stats_occurrence_cache — run_stats()'s batch-only per-taxon query
+# elimination (see scripts/process_tree.py::run_stats). Must never affect
+# collect_taxon_df or any other on-demand/live-API caller — those don't
+# preload the cache, so it stays None for them regardless of this being
+# active elsewhere in the same process.
+# ---------------------------------------------------------------------------
+
+def test_preload_stats_occurrence_cache_groups_by_taxon_key(tmp_path, monkeypatch):
+    occurrences_file = tmp_path / "occurrences.parquet"
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
+    _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": [15.0] * 20}, n=20)
+    _write_occ_rows(occurrences_file, FAKE_TAXON, extra_cols={"bio1": [25.0] * 5}, n=5, offset=100)
+    try:
+        assert st.preload_stats_occurrence_cache({"bio1": _CONTINUOUS_LAYER}) is True
+        own = st._read_own_rows(_LEAF_TAXON["taxon_key"], columns=["bio1"])
+        assert own.num_rows == 20
+        other = st._read_own_rows(FAKE_TAXON["taxon_key"], columns=["bio1"])
+        assert other.num_rows == 5
+        missing = st._read_own_rows("no-such-taxon", columns=["bio1"])
+        assert missing.num_rows == 0
+    finally:
+        st.clear_stats_occurrence_cache()
+
+
+def test_preload_stats_occurrence_cache_skips_when_too_large(tmp_path, monkeypatch):
+    occurrences_file = tmp_path / "occurrences.parquet"
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
+    monkeypatch.setattr(st, "_STATS_CACHE_MAX_ROWS", 5)
+    _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": [15.0] * 20}, n=20)
+    assert st.preload_stats_occurrence_cache({"bio1": _CONTINUOUS_LAYER}) is False
+    assert st._stats_occurrence_cache is None
+
+
+def test_clear_stats_occurrence_cache_restores_query_path(tmp_path, monkeypatch):
+    occurrences_file = tmp_path / "occurrences.parquet"
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
+    _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": [15.0] * 20}, n=20)
+    st.preload_stats_occurrence_cache({"bio1": _CONTINUOUS_LAYER})
+    assert st._stats_occurrence_cache is not None
+    st.clear_stats_occurrence_cache()
+    assert st._stats_occurrence_cache is None
+    # Falls back to the real per-query path correctly, not just "doesn't crash".
+    table = st._read_own_rows(_LEAF_TAXON["taxon_key"], columns=["bio1"])
+    assert table.num_rows == 20
+
+
+def test_process_leaf_same_result_with_and_without_cache(tmp_path, monkeypatch):
+    """The whole point of the cache is that it must not change what
+    run_stats() computes — same inputs, same outputs, cache or not."""
+    occurrences_file = tmp_path / "occurrences.parquet"
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
+    bio1_vals = list(np.linspace(10.0, 30.0, 20))
+    _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": bio1_vals})
+
+    uncached_dir = tmp_path / "uncached"
+    st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(uncached_dir), {"bio1": _CONTINUOUS_LAYER})
+    uncached = pd.read_parquet(uncached_dir / st.NUMERICAL_STATS_FILE)
+
+    cached_dir = tmp_path / "cached"
+    assert st.preload_stats_occurrence_cache({"bio1": _CONTINUOUS_LAYER}) is True
+    try:
+        st._process_leaf(_LEAF_TAXON, st._DirStatsTarget(cached_dir), {"bio1": _CONTINUOUS_LAYER})
+    finally:
+        st.clear_stats_occurrence_cache()
+    cached = pd.read_parquet(cached_dir / st.NUMERICAL_STATS_FILE)
+
+    pd.testing.assert_frame_equal(
+        uncached.sort_values("variable").reset_index(drop=True),
+        cached.sort_values("variable").reset_index(drop=True),
+    )
 
 
 # ---------------------------------------------------------------------------

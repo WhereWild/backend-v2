@@ -82,6 +82,13 @@ _ARCGIS_API_KEY = os.environ.get("WW_ARCGIS_API_KEY")
 # origin, so this proxy (the only thing that ever sends the real key) sends
 # it explicitly rather than relying on httpx's default of no Referer at all.
 _ARCGIS_REFERER = "https://wherewild.net"
+# Esri returns a real 200 OK "data not available" placeholder tile (solid
+# gray, near-zero JPEG entropy) instead of a 404 when a zoom level exceeds
+# actual imagery coverage at that location — confirmed by hand: a known-bad
+# tile came back at exactly 2521 bytes, twice, vs. tens of KB for real
+# imagery. A little slack above that exact size covers minor variation
+# across zoom/region without coming anywhere near a real tile's size.
+_ARCGIS_NO_DATA_TILE_MAX_BYTES = 3000
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
@@ -889,6 +896,8 @@ def _fetch_satellite_tile_bytes(z: int, x: int, y: int) -> bytes:
         resp.raise_for_status()
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Satellite tile fetch failed: {e}") from e
+    if len(resp.content) <= _ARCGIS_NO_DATA_TILE_MAX_BYTES:
+        raise HTTPException(status_code=404, detail="No satellite imagery available at this zoom/location")
     return resp.content
 
 

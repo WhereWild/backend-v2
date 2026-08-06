@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import fsspec
 import numpy as np
 import pyarrow as pa
@@ -1053,6 +1054,28 @@ def build_occ_index(
     return total_rows
 
 
+_OCC_INDEX_DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
+_OCC_INDEX_DUCKDB_MEMORY_LIMIT = "28GB"
+_OCC_INDEX_BATCH_ROWS = 500_000
+
+
+def _occ_index_duckdb_connect() -> duckdb.DuckDBPyConnection:
+    """Connection for build_per_layer_occ_indices' scan.
+
+    threads=1 is required for correctness, not just a memory knob: row_idx
+    values are consumed positionally by write_back() later in the same run
+    (see its docstring), so row_number() OVER () here must reproduce the
+    exact physical row order of the source file — only guaranteed under
+    single-threaded execution. Do not "optimize" this to more threads.
+    """
+    _OCC_INDEX_DUCKDB_SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"PRAGMA memory_limit='{_OCC_INDEX_DUCKDB_MEMORY_LIMIT}'")
+    con.execute(f"PRAGMA temp_directory='{_OCC_INDEX_DUCKDB_SPILL_DIR.as_posix()}'")
+    con.execute("PRAGMA threads=1")
+    return con
+
+
 def build_per_layer_occ_indices(
     root_taxon_id: str,
     data_root: str,
@@ -1068,6 +1091,15 @@ def build_per_layer_occ_indices(
     Row positions are global positions in occ_path (see build_occ_index's
     docstring for why that stays valid across a later write_back pass).
     Returns {layer_id: n_obs}.
+
+    Streamed via DuckDB in batches rather than pq.read_table(...).to_pandas()
+    on every skip-check column across every layer — that OOM-killed in
+    practice on the real ~60M-row, ~180-column occurrences.parquet (up to
+    ~77 skip columns loaded fully into memory at once across 11 active
+    layers x 7 windows each). row_number() is computed over the whole
+    unfiltered table before any filtering is applied, so it still reflects
+    true global file positions (matching what a plain sequential read would
+    assign) even though validity/scope filtering happens in the same query.
     """
     if not layers:
         return {}
@@ -1100,61 +1132,79 @@ def build_per_layer_occ_indices(
         }
 
         if occ_path.exists():
-            schema = pq.read_schema(occ_path)
-            schema_names = set(schema.names)
-            read_cols = [_LAT_COL, _LON_COL, _TIME_COL, "taxon_key"]
+            schema_names = set(pq.read_schema(occ_path).names)
             has_elev = "elevation" in schema_names
+            present_skip = [c for c in all_skip_cols if c in schema_names]
+
+            select_cols = [_LAT_COL, _LON_COL, _TIME_COL, "taxon_key"]
             if has_elev:
-                read_cols.append("elevation")
-            df = pq.read_table(occ_path, columns=read_cols).to_pandas()
+                select_cols.append("elevation")
+            select_cols.extend(present_skip)
+            select_sql = ", ".join(f'"{c}"' for c in select_cols)
 
-            scope_keys = _scope_taxon_keys(root)
-            valid = (
-                df[_TIME_COL].notna() & df[_LAT_COL].notna() & df[_LON_COL].notna()
-                & df["taxon_key"].astype(str).isin(scope_keys)
-            )
+            where_parts = [
+                f'"{_TIME_COL}" IS NOT NULL',
+                f'"{_LAT_COL}" IS NOT NULL',
+                f'"{_LON_COL}" IS NOT NULL',
+                '"taxon_key" IN (SELECT taxon_key FROM scope_keys)',
+            ]
             if cutoff is not None:
-                valid &= df[_TIME_COL] >= cutoff
-            valid_np = np.asarray(valid.to_numpy())
-            n_rows = len(df)
+                where_parts.append(f'"{_TIME_COL}" >= {cutoff!r}')
+            where_sql = " AND ".join(where_parts)
 
-            if valid_np.any():
-                # Read all skip columns across all layers in one shot
-                present_skip = {c for c in all_skip_cols if c in schema_names}
-                skip_table = pq.read_table(occ_path, columns=list(present_skip)) if present_skip else None
-
-                for layer in layers:
-                    layer_cols = per_layer_cols[layer.id]
-                    present_g = [c for c in layer_cols if c in present_skip]
-
-                    if len(present_g) == len(layer_cols) and skip_table is not None:
-                        layer_done = np.ones(n_rows, dtype=bool)
-                        for c in present_g:
-                            layer_done &= np.asarray(pc.invert(pc.is_null(skip_table.column(c))))
-                        needs = valid_np & ~layer_done
-                    else:
-                        needs = valid_np  # columns absent → all valid rows need enrichment
-
-                    if not needs.any():
-                        continue
-
-                    row_idx = np.nonzero(needs)[0].astype(np.int64)
-                    times   = df[_TIME_COL].to_numpy(dtype=np.float64)[needs]
-                    lats    = df[_LAT_COL].to_numpy(dtype=np.float64)[needs]
-                    lons    = df[_LON_COL].to_numpy(dtype=np.float64)[needs]
-                    elevs   = (
-                        df["elevation"].to_numpy(dtype=np.float64)[needs]
-                        if has_elev else np.full(len(row_idx), np.nan)
+            con = _occ_index_duckdb_connect()
+            try:
+                con.register("scope_keys", pa.table({
+                    "taxon_key": pa.array(list(_scope_taxon_keys(root)), type=pa.string()),
+                }))
+                reader = con.execute(f"""
+                    SELECT row_idx, {select_sql} FROM (
+                        SELECT row_number() OVER () - 1 AS row_idx, {select_sql}
+                        FROM read_parquet('{occ_path.as_posix()}')
                     )
-                    writers[layer.id].write_table(pa.table({
-                        "taxon_path": pa.array([str(occ_path)] * len(row_idx), type=pa.string()),
-                        "row_idx":    pa.array(row_idx, type=pa.int64()),
-                        "latitude":   pa.array(lats,    type=pa.float64()),
-                        "longitude":  pa.array(lons,    type=pa.float64()),
-                        "timestamp":  pa.array(times,   type=pa.float64()),
-                        "elevation":  pa.array(elevs,   type=pa.float64()),
-                    }))
-                    counts[layer.id] += len(row_idx)
+                    WHERE {where_sql}
+                """).to_arrow_reader(_OCC_INDEX_BATCH_ROWS)
+
+                for record_batch in reader:
+                    batch = pa.Table.from_batches([record_batch])
+                    n_rows = batch.num_rows
+                    if n_rows == 0:
+                        continue
+                    row_idx_arr = batch["row_idx"].to_numpy()
+                    times = batch[_TIME_COL].to_numpy(zero_copy_only=False).astype(np.float64)
+                    lats = batch[_LAT_COL].to_numpy(zero_copy_only=False).astype(np.float64)
+                    lons = batch[_LON_COL].to_numpy(zero_copy_only=False).astype(np.float64)
+                    elevs = (
+                        batch["elevation"].to_numpy(zero_copy_only=False).astype(np.float64)
+                        if has_elev else np.full(n_rows, np.nan)
+                    )
+
+                    for layer in layers:
+                        layer_cols = per_layer_cols[layer.id]
+                        present_g = [c for c in layer_cols if c in present_skip]
+
+                        if layer_cols and len(present_g) == len(layer_cols):
+                            layer_done = np.ones(n_rows, dtype=bool)
+                            for c in present_g:
+                                layer_done &= np.asarray(pc.invert(pc.is_null(batch.column(c))))
+                            needs = ~layer_done
+                        else:
+                            needs = np.ones(n_rows, dtype=bool)  # columns absent → all rows need enrichment
+
+                        if not needs.any():
+                            continue
+
+                        writers[layer.id].write_table(pa.table({
+                            "taxon_path": pa.array([str(occ_path)] * int(needs.sum()), type=pa.string()),
+                            "row_idx":    pa.array(row_idx_arr[needs], type=pa.int64()),
+                            "latitude":   pa.array(lats[needs], type=pa.float64()),
+                            "longitude":  pa.array(lons[needs], type=pa.float64()),
+                            "timestamp":  pa.array(times[needs], type=pa.float64()),
+                            "elevation":  pa.array(elevs[needs], type=pa.float64()),
+                        }))
+                        counts[layer.id] += int(needs.sum())
+            finally:
+                con.close()
 
     elapsed = time.monotonic() - t0
     summary = "  ".join(f"{layer.id}:{counts[layer.id]}" for layer in layers)

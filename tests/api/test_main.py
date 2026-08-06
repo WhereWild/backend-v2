@@ -540,7 +540,8 @@ def test_elevation_terrain_tile():
 
 
 def test_satellite_tile_proxies_to_esri_with_key_and_referer():
-    jpg = b"\xff\xd8\xff" + b"\x00" * 100
+    # Well above _ARCGIS_NO_DATA_TILE_MAX_BYTES, representing a real tile.
+    jpg = b"\xff\xd8\xff" + b"\x00" * 5000
     mock_response = MagicMock()
     mock_response.content = jpg
     mock_response.raise_for_status = MagicMock()
@@ -567,6 +568,40 @@ def test_satellite_tile_upstream_error_returns_502():
          patch("httpx.get", side_effect=main_module.httpx.ConnectError("boom")):
         response = client.get("/api/tiles/satellite/4/8/5.jpg")
     assert response.status_code == 502
+
+
+def test_satellite_tile_no_data_placeholder_returns_404():
+    # Matches the real confirmed no-data placeholder size (2521 bytes).
+    placeholder = b"\xff\xd8\xff" + b"\x00" * 2518
+    mock_response = MagicMock()
+    mock_response.content = placeholder
+    mock_response.raise_for_status = MagicMock()
+    with patch.object(main_module, "_ARCGIS_API_KEY", "fake-key"), \
+         patch("httpx.get", return_value=mock_response):
+        response = client.get("/api/tiles/satellite/20/191949/394497.jpg")
+    assert response.status_code == 404
+
+
+def test_satellite_tile_at_no_data_threshold_boundary_returns_404():
+    exactly_at_max = b"\x00" * main_module._ARCGIS_NO_DATA_TILE_MAX_BYTES
+    mock_response = MagicMock()
+    mock_response.content = exactly_at_max
+    mock_response.raise_for_status = MagicMock()
+    with patch.object(main_module, "_ARCGIS_API_KEY", "fake-key"), \
+         patch("httpx.get", return_value=mock_response):
+        response = client.get("/api/tiles/satellite/4/8/5.jpg")
+    assert response.status_code == 404
+
+
+def test_satellite_tile_just_above_no_data_threshold_returns_200():
+    just_above_max = b"\x00" * (main_module._ARCGIS_NO_DATA_TILE_MAX_BYTES + 1)
+    mock_response = MagicMock()
+    mock_response.content = just_above_max
+    mock_response.raise_for_status = MagicMock()
+    with patch.object(main_module, "_ARCGIS_API_KEY", "fake-key"), \
+         patch("httpx.get", return_value=mock_response):
+        response = client.get("/api/tiles/satellite/4/8/5.jpg")
+    assert response.status_code == 200
 
 
 def test_variable_tile_compat():

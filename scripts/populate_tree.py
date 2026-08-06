@@ -7,10 +7,10 @@ Stream occurrence.txt (DWCA) into one consolidated occurrences.parquet.
 
 Rows are parsed and buffered in memory, periodically flushed as unsorted
 batches to a temp parquet file via ParquetWriter to bound memory use. Once
-the whole input is consumed, a single DuckDB pass dedupes on catalogNumber
-(first-seen wins, tiebroken by insertion order) and sorts by taxon_key so
+the whole input is consumed, a single DuckDB pass sorts by taxon_key so
 single-taxon reads get row-group pruning, then writes the final
-data/taxonomy/occurrences.parquet.
+data/taxonomy/occurrences.parquet. No dedup on catalogNumber: it's the
+iNaturalist observation ID, unique by construction — see _consolidate.
 
 Rows carry only taxon_key, not the taxon's path — the taxonomy tree
 (path, rank, ancestry) already lives in the in-memory catalog
@@ -58,14 +58,37 @@ MULTIMEDIA_PATH = Path("data/occurrences/multimedia.txt")
 OCCURRENCES_FILE = Path("data/taxonomy/occurrences.parquet")
 CATALOG_NUMBER_INDEX_FILE = Path("data/taxonomy/catalog_number_index.parquet")
 
+# _consolidate's dedup+sort over the full occurrences table (tens of
+# millions of rows) has no natural batching point the way the streaming
+# parse above does — it's one DuckDB window function + ORDER BY. A bare
+# duckdb.connect() has no temp_directory, so on an in-memory connection it
+# never spills to disk and just keeps growing until the OS OOM-kills it
+# (confirmed in practice: a 60M-row consolidation hit 61GB RSS and got
+# killed). Capping memory_limit well under total RAM and giving it a real
+# temp_directory to spill into turns that into "slower", not "crashes".
+_DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
+_DUCKDB_MEMORY_LIMIT = "40GB"
+
+
+def _duckdb_connect() -> duckdb.DuckDBPyConnection:
+    _DUCKDB_SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"PRAGMA memory_limit='{_DUCKDB_MEMORY_LIMIT}'")
+    con.execute(f"PRAGMA temp_directory='{_DUCKDB_SPILL_DIR.as_posix()}'")
+    # Both call sites below have their own explicit ORDER BY, which already
+    # overrides whatever row order the scan emits — so there's no reason to
+    # also pay for insertion-order preservation's default-on per-thread
+    # buffering. See scripts/carry_forward.py's _duckdb_connect for the
+    # concrete OOM this was confirmed to cause on the equivalent join+sort.
+    con.execute("PRAGMA preserve_insertion_order=false")
+    return con
+
+
 # Rows buffered in memory before a streaming flush to the unsorted temp file.
 BATCH_ROWS = 500_000
 
 OCCURRENCE_DELIMITER = "|"
 
-# ``_seq`` is a monotonic insertion counter used only to make the final
-# dedup-by-catalogNumber pass deterministic (first-seen wins); it is dropped
-# before the final file is written.
 SCHEMA = pa.schema([
     ("decimalLatitude",               pa.float64()),
     ("decimalLongitude",              pa.float64()),
@@ -85,7 +108,6 @@ SCHEMA = pa.schema([
     ("mediaUrl",                      pa.string()),
     ("mediaAttribution",              pa.string()),
     ("mediaLicense",                  pa.string()),
-    ("_seq",                          pa.int64()),
 ])
 
 
@@ -199,16 +221,23 @@ def _flush(writer_holder: dict, tmp_path: Path, rows: list[dict]) -> None:
 
 
 def _consolidate(tmp_path: Path) -> None:
-    """Dedup on catalogNumber (first-seen wins) and write the final taxon_key-sorted file."""
+    """Sort by taxon_key and write the final occurrences.parquet.
+
+    No dedup on catalogNumber: it's the iNaturalist observation ID, unique
+    by construction, so a first-seen-wins pass over every row would only be
+    paying for a guarantee the data already provides — and the window
+    function driving that pass was the single biggest memory cost of this
+    step (confirmed: it OOM-killed a 60M-row run at 61GB RSS). A stray
+    duplicate would still get caught downstream — carry_forward.py already
+    dedupes its old-tree side defensively regardless of this file.
+    """
     dest = OCCURRENCES_FILE
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_dest = dest.with_suffix(".parquet.tmp")
-    con = duckdb.connect()
+    con = _duckdb_connect()
     con.execute(f"""
         COPY (
-            SELECT * EXCLUDE ("_seq")
-            FROM read_parquet('{tmp_path.as_posix()}')
-            QUALIFY row_number() OVER (PARTITION BY "catalogNumber" ORDER BY "_seq") = 1
+            SELECT * FROM read_parquet('{tmp_path.as_posix()}')
             ORDER BY taxon_key
         ) TO '{tmp_dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 50000)
     """)
@@ -233,7 +262,7 @@ def _build_catalog_number_index() -> None:
     dest = CATALOG_NUMBER_INDEX_FILE
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_dest = dest.with_suffix(".parquet.tmp")
-    con = duckdb.connect()
+    con = _duckdb_connect()
     con.execute(f"""
         COPY (
             SELECT "catalogNumber", taxon_key, "decimalLatitude", "decimalLongitude"
@@ -257,7 +286,6 @@ def main() -> None:
 
     rows_read = 0
     rows_written = 0
-    seq = 0
     buffer: list[dict] = []
     writer_holder: dict = {}
     tmp_path = OCCURRENCES_FILE.parent / ".occurrences_unsorted.tmp.parquet"
@@ -327,9 +355,7 @@ def main() -> None:
                 "mediaUrl":                      media[0] if media else None,
                 "mediaAttribution":              media[1] if media else None,
                 "mediaLicense":                  media[2] if media else None,
-                "_seq":                          seq,
             })
-            seq += 1
             rows_written += 1
 
             if len(buffer) >= BATCH_ROWS:

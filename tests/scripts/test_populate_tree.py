@@ -260,7 +260,6 @@ def _sample_row(**overrides) -> dict:
         "dp": "organism", "vitality": "alive", "rcs": "flowers",
         "taxon_key": "2923970",
         "mediaUrl": None, "mediaAttribution": None, "mediaLicense": None,
-        "_seq": 0,
     }
     row.update(overrides)
     return row
@@ -289,8 +288,8 @@ def test_flush_empty_rows_is_noop(tmp_path):
 def test_flush_multiple_batches_append(tmp_path):
     tmp_file = tmp_path / ".tmp.parquet"
     writer_holder: dict = {}
-    batch1 = [_sample_row(catalogNumber="obs1", _seq=0)]
-    batch2 = [_sample_row(catalogNumber="obs2", _seq=1)]
+    batch1 = [_sample_row(catalogNumber="obs1")]
+    batch2 = [_sample_row(catalogNumber="obs2")]
     pt._flush(writer_holder, tmp_file, batch1)
     pt._flush(writer_holder, tmp_file, batch2)
     writer_holder["writer"].close()
@@ -300,14 +299,18 @@ def test_flush_multiple_batches_append(tmp_path):
 
 # --- _consolidate ---
 
-def test_consolidate_dedupes_and_sorts_by_taxon_key(tmp_path):
+def test_consolidate_sorts_by_taxon_key_no_dedup(tmp_path):
+    # catalogNumber is the iNaturalist observation ID, unique by
+    # construction — _consolidate no longer dedupes on it (see its
+    # docstring), so every row survives; this also covers a catalogNumber
+    # collision across taxa, which used to be silently deduped away.
     tmp_file = tmp_path / ".tmp.parquet"
     dest = tmp_path / "occurrences.parquet"
     writer_holder: dict = {}
     rows = [
-        _sample_row(catalogNumber="dup", taxon_key="333", _seq=0),
-        _sample_row(catalogNumber="dup", taxon_key="111", _seq=1),  # same catalogNumber, later _seq
-        _sample_row(catalogNumber="unique", taxon_key="222", _seq=2),
+        _sample_row(catalogNumber="a", taxon_key="333"),
+        _sample_row(catalogNumber="b", taxon_key="111"),
+        _sample_row(catalogNumber="c", taxon_key="222"),
     ]
     pt._flush(writer_holder, tmp_file, rows)
     writer_holder["writer"].close()
@@ -316,12 +319,9 @@ def test_consolidate_dedupes_and_sorts_by_taxon_key(tmp_path):
         pt._consolidate(tmp_file)
 
     table = pq.read_table(dest)
-    assert table.num_rows == 2  # "dup" deduped down to one row
+    assert table.num_rows == 3
     out = table.to_pylist()
     assert [r["taxon_key"] for r in out] == sorted(r["taxon_key"] for r in out)  # sorted by taxon_key
-    dup_row = next(r for r in out if r["catalogNumber"] == "dup")
-    assert dup_row["taxon_key"] == "333"  # first-seen (_seq=0) wins
-    assert "_seq" not in table.schema.names
 
 
 # --- _build_catalog_number_index ---
@@ -483,7 +483,10 @@ def test_main_no_matching_gbif_id_leaves_media_null(tmp_path):
     assert row["mediaUrl"] is None
 
 
-def test_main_dedupes_duplicate_catalog_number_across_taxa(tmp_path):
+def test_main_does_not_dedupe_duplicate_catalog_number(tmp_path):
+    # catalogNumber (the iNaturalist observation ID) is unique by
+    # construction, so populate_tree no longer dedupes on it — both rows
+    # survive even in this artificial collision case.
     rows = [
         {"catalogNumber": "shared", "scientificName": "Opuntia humifusa"},
         {
@@ -493,5 +496,5 @@ def test_main_dedupes_duplicate_catalog_number_across_taxa(tmp_path):
     ]
     occurrences_file = _run_main(_make_tsv(rows), tmp_path)
     out_rows = _read_rows(occurrences_file)
-    assert len(out_rows) == 1  # cross-taxon catalogNumber collision deduped, first-seen wins
-    assert out_rows[0]["taxon_key"] == "2923970"
+    assert len(out_rows) == 2
+    assert {r["catalogNumber"] for r in out_rows} == {"shared"}

@@ -49,6 +49,33 @@ _BASE_COLS = frozenset([
     "taxon_key", "mediaUrl", "mediaAttribution", "mediaLicense",
 ])
 
+# The LEFT JOIN + ORDER BY below runs over the full new occurrences table
+# (tens of millions of rows) against the old one. A bare duckdb.connect()
+# has no temp_directory, so on an in-memory connection it never spills to
+# disk and just keeps growing until the OS OOM-kills it — the same failure
+# mode confirmed in scripts/populate_tree.py's _consolidate for a plain sort
+# alone; a join on top of a sort is at least as heavy. Capping memory_limit
+# well under total RAM and giving it a real temp_directory to spill into
+# turns that into "slower", not "crashes".
+_DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
+_DUCKDB_MEMORY_LIMIT = "40GB"
+
+
+def _duckdb_connect() -> duckdb.DuckDBPyConnection:
+    _DUCKDB_SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"PRAGMA memory_limit='{_DUCKDB_MEMORY_LIMIT}'")
+    con.execute(f"PRAGMA temp_directory='{_DUCKDB_SPILL_DIR.as_posix()}'")
+    # The LEFT JOIN below is followed by our own explicit ORDER BY, which
+    # already overrides whatever row order the join emits — so there's no
+    # reason to pay for insertion-order preservation too (its default-on
+    # per-thread buffering to reconstruct single-threaded row order was
+    # confirmed in practice to be what pushed this query over memory_limit:
+    # "failed to pin block... 37.2 GiB/37.2 GiB used" — DuckDB's own error
+    # message names this as the first thing to try).
+    con.execute("PRAGMA preserve_insertion_order=false")
+    return con
+
 
 def _load_catalog_ids() -> tuple[frozenset[str], frozenset[str]]:
     """Return (static_layer_ids, temporal_layer_ids) from catalog."""
@@ -81,7 +108,7 @@ def main() -> None:
 
     static_ids, temporal_ids = _load_catalog_ids()
     t0 = time.monotonic()
-    con = duckdb.connect()
+    con = _duckdb_connect()
 
     old_cols = _table_columns(con, OLD_OCCURRENCES_PATH)
     enrich_cols = [c for c in old_cols if c not in _BASE_COLS]
@@ -98,12 +125,13 @@ def main() -> None:
         total_changed = 0
         con.close()
     else:
-        # Old GBIF data is unique on catalogNumber, but dedupe defensively
-        # (first-seen wins, matching the migration/populate dedup policy).
+        # catalogNumber is the iNaturalist observation ID, unique by
+        # construction — no dedup needed here (see populate_tree._consolidate
+        # for the same reasoning). A QUALIFY/row_number() pass over the old
+        # side would just be paying for a guarantee the data already gives.
         con.execute(f"""
-            CREATE OR REPLACE TEMP VIEW old_dedup AS
+            CREATE OR REPLACE TEMP VIEW old_occ AS
             SELECT * FROM read_parquet('{OLD_OCCURRENCES_PATH.as_posix()}')
-            QUALIFY row_number() OVER (PARTITION BY "catalogNumber") = 1
         """)
         con.execute(f"""
             CREATE OR REPLACE TEMP VIEW new_occ AS
@@ -125,7 +153,7 @@ def main() -> None:
                 SUM(CASE WHEN {coords_same} THEN 1 ELSE 0 END) AS n_carried,
                 SUM(CASE WHEN o."catalogNumber" IS NOT NULL AND NOT ({coords_same}) THEN 1 ELSE 0 END) AS n_changed,
                 SUM(CASE WHEN o."catalogNumber" IS NULL THEN 1 ELSE 0 END) AS n_new_obs
-            FROM new_occ n LEFT JOIN old_dedup o ON n."catalogNumber" = o."catalogNumber"
+            FROM new_occ n LEFT JOIN old_occ o ON n."catalogNumber" = o."catalogNumber"
         """).fetchone()
         total_carried, total_changed, total_new_obs = (v or 0 for v in stats_row)
 
@@ -145,7 +173,7 @@ def main() -> None:
             con.execute(f"""
                 COPY (
                     SELECT {select_clause}
-                    FROM new_occ n LEFT JOIN old_dedup o ON n."catalogNumber" = o."catalogNumber"
+                    FROM new_occ n LEFT JOIN old_occ o ON n."catalogNumber" = o."catalogNumber"
                     ORDER BY n."taxon_key"
                 ) TO '{tmp_dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 50000)
             """)

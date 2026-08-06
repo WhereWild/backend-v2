@@ -3,22 +3,25 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
-Rebuild the CANVAS_ROADS and GEONAMES_PLACES datasets embedded in the
-frontend's offline map fallback (used when a species-page map can't reach
-real basemap tiles). These are NOT part of the taxonomy tree pipeline
-(rebuild.py) — this is a standalone, manually-rerun tool for frontend map
-assets, kept here because this is where the GIS stack (geopandas/pyogrio,
-already in pyproject.toml) lives.
+Rebuild the CANVAS_ROADS, CANVAS_RAILROADS, and GEONAMES_PLACES datasets
+embedded in the frontend's offline map fallback (used when a species-page map
+can't reach real basemap tiles). These are NOT part of the taxonomy tree
+pipeline (rebuild.py) — this is a standalone, manually-rerun tool for
+frontend map assets, kept here because this is where the GIS stack
+(geopandas/pyogrio, already in pyproject.toml) lives.
 
 Sources (public domain / CC-BY, matching the attribution already shown in
 the offline fallback UI):
-  - Natural Earth 1:10m Roads — https://naciscdn.org/naturalearth/10m/cultural/ne_10m_roads.zip
-  - GeoNames cities1000       — https://download.geonames.org/export/dump/cities1000.zip
+  - Natural Earth 1:10m Roads     — https://naciscdn.org/naturalearth/10m/cultural/ne_10m_roads.zip
+  - Natural Earth 1:10m Railroads — https://naciscdn.org/naturalearth/10m/cultural/ne_10m_railroads.zip
+  - GeoNames cities1000           — https://download.geonames.org/export/dump/cities1000.zip
 
 Roads are filtered to "significant" types only (see ROAD_KEEP_TYPES) — the
 raw dataset is roughly evenly split between real highways and a huge
 "Unknown"/generic "Road" bucket that's too fine-grained for a world-scale
-fallback basemap.
+fallback basemap. Railroads are filtered to mainlines only (see
+RAIL_MAX_SCALERANK) — most of the raw dataset is branch lines/spurs that add
+visual clutter without much wayfinding value at world scale.
 
 Places are pruned with density-aware logic rather than a flat population
 cutoff: a flat cutoff would silently erase small, isolated towns that are
@@ -60,6 +63,24 @@ from scipy.spatial import cKDTree
 ROAD_KEEP_TYPES = {"Major Highway", "Secondary Highway", "Beltway", "Bypass"}
 # Also keep anything NE flags as an expressway, regardless of its `type` bucket.
 ROAD_KEEP_EXPRESSWAY = True
+# Same Douglas-Peucker simplification as railroads (see RAIL_SIMPLIFY_TOLERANCE_DEG)
+# — roads are already subdivided into short segments so the win is smaller
+# proportionally (~41% of vertices kept vs. rail's ~7%), but CANVAS_ROADS is
+# still the single largest dataset, so it's worth the same treatment.
+ROAD_SIMPLIFY_TOLERANCE_DEG = 0.01
+
+# Natural Earth railroad "scalerank" ceiling to keep (1-10, lower = more
+# significant — mainlines/trunk lines only by default, not every branch/spur).
+# 4 is already the *minimum* (most significant) value present in the raw
+# dataset, so this is already as strict as the source data allows.
+RAIL_MAX_SCALERANK = 4
+# Even at scalerank<=4, long trunk/transcontinental lines carry a huge vertex
+# count relative to their small segment count (unlike roads, which are
+# already subdivided into short segments) — e.g. 2,845 kept segments still
+# added 4.24MB before simplification. Douglas-Peucker simplify tolerance, in
+# degrees (~0.01 deg ~= 1.1km at the equator — plenty fine for a world-scale
+# fallback basemap, cuts vertex count to ~7% with minimal visual difference).
+RAIL_SIMPLIFY_TOLERANCE_DEG = 0.01
 
 # Population floor for a place to be considered at all (cities1000.txt is
 # already pre-filtered to population >= 1000 or admin seats).
@@ -96,10 +117,13 @@ WHEREWILD_ROOT = Path(__file__).resolve().parent.parent
 SOURCES_DIR = WHEREWILD_ROOT / "data" / "tmp" / "offline_fallback_sources"
 ROADS_ZIP = SOURCES_DIR / "ne_10m_roads.zip"
 ROADS_SHP = SOURCES_DIR / "ne_10m_roads" / "ne_10m_roads.shp"
+RAILROADS_ZIP = SOURCES_DIR / "ne_10m_railroads.zip"
+RAILROADS_SHP = SOURCES_DIR / "ne_10m_railroads" / "ne_10m_railroads.shp"
 PLACES_ZIP = SOURCES_DIR / "cities1000.zip"
 PLACES_TXT = SOURCES_DIR / "cities1000.txt"
 
 ROADS_URL = "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_roads.zip"
+RAILROADS_URL = "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_railroads.zip"
 PLACES_URL = "https://download.geonames.org/export/dump/cities1000.zip"
 
 FRONTEND_MAP_DIR = WHEREWILD_ROOT.parent / "frontend" / "components" / "sections" / "speciesOccurrenceMap"
@@ -107,10 +131,10 @@ PARTIALS_DIR = FRONTEND_MAP_DIR / "offlineFallbackPartials"
 
 # Each target file + which const(s) it embeds a copy of.
 TARGET_FILES = {
-    PARTIALS_DIR / "leafletOfflineData.partial.js": ["CANVAS_ROADS", "GEONAMES_PLACES"],
-    PARTIALS_DIR / "globeOfflineDataA.partial.js": ["CANVAS_ROADS"],
+    PARTIALS_DIR / "leafletOfflineData.partial.js": ["CANVAS_ROADS", "CANVAS_RAILROADS", "GEONAMES_PLACES"],
+    PARTIALS_DIR / "globeOfflineDataA.partial.js": ["CANVAS_ROADS", "CANVAS_RAILROADS"],
     PARTIALS_DIR / "globeOfflineDataB.partial.js": ["GEONAMES_PLACES"],
-    FRONTEND_MAP_DIR / "SpeciesOccurrenceMapFallback.html": ["CANVAS_ROADS", "GEONAMES_PLACES"],
+    FRONTEND_MAP_DIR / "SpeciesOccurrenceMapFallback.html": ["CANVAS_ROADS", "CANVAS_RAILROADS", "GEONAMES_PLACES"],
 }
 
 GEONAMES_COLUMNS = [
@@ -144,6 +168,11 @@ def ensure_sources(skip_download: bool) -> None:
             _download(ROADS_URL, ROADS_ZIP)
         with zipfile.ZipFile(ROADS_ZIP) as zf:
             zf.extractall(ROADS_SHP.parent)
+    if not skip_download or not RAILROADS_SHP.exists():
+        if not RAILROADS_ZIP.exists():
+            _download(RAILROADS_URL, RAILROADS_ZIP)
+        with zipfile.ZipFile(RAILROADS_ZIP) as zf:
+            zf.extractall(RAILROADS_SHP.parent)
     if not skip_download or not PLACES_TXT.exists():
         if not PLACES_ZIP.exists():
             _download(PLACES_URL, PLACES_ZIP)
@@ -171,24 +200,20 @@ def _round6(x: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Roads
+# Roads + railroads (same line-geometry -> ring-array encoding for both)
 # ---------------------------------------------------------------------------
 
 
-def build_canvas_roads() -> str:
-    gdf_all = gpd.read_file(ROADS_SHP)
-    keep = gdf_all["type"].isin(ROAD_KEEP_TYPES)
-    if ROAD_KEEP_EXPRESSWAY and "expressway" in gdf_all.columns:
-        keep = keep | (gdf_all["expressway"] == 1)
-    gdf = gdf_all[keep]
-    print(f"Roads: kept {len(gdf)} / {len(gdf_all)} features after significance filter")
-
+def _build_canvas_lines(gdf: gpd.GeoDataFrame, default_z_level: float, z_level_col: str | None) -> list:
     entries = []
     for _, row in gdf.iterrows():
         geom = row.geometry
         if geom is None or geom.is_empty:
             continue
-        z_level = round(float(row["min_zoom"]), 1) if pd.notna(row["min_zoom"]) else 7.0
+        if z_level_col is not None and pd.notna(row[z_level_col]):
+            z_level = round(float(row[z_level_col]), 1)
+        else:
+            z_level = default_z_level
         parts = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
         rings = []
         minx = miny = math.inf
@@ -210,9 +235,34 @@ def build_canvas_roads() -> str:
         if not rings:
             continue
         entries.append([[minx, miny, maxx, maxy], z_level, rings, 0])
+    return entries
 
+
+def build_canvas_roads() -> str:
+    gdf_all = gpd.read_file(ROADS_SHP)
+    keep = gdf_all["type"].isin(ROAD_KEEP_TYPES)
+    if ROAD_KEEP_EXPRESSWAY and "expressway" in gdf_all.columns:
+        keep = keep | (gdf_all["expressway"] == 1)
+    gdf = gdf_all[keep].copy()
+    print(f"Roads: kept {len(gdf)} / {len(gdf_all)} features after significance filter")
+    gdf["geometry"] = gdf.geometry.simplify(ROAD_SIMPLIFY_TOLERANCE_DEG, preserve_topology=False)
+
+    entries = _build_canvas_lines(gdf, default_z_level=7.0, z_level_col="min_zoom")
     print(f"Roads: emitting {len(entries)} entries")
     return "const CANVAS_ROADS = " + json.dumps(entries, separators=(",", ":")) + ";"
+
+
+def build_canvas_railroads() -> str:
+    gdf_all = gpd.read_file(RAILROADS_SHP)
+    gdf = gdf_all[gdf_all["scalerank"] <= RAIL_MAX_SCALERANK].copy()
+    print(f"Railroads: kept {len(gdf)} / {len(gdf_all)} features (scalerank <= {RAIL_MAX_SCALERANK})")
+    gdf["geometry"] = gdf.geometry.simplify(RAIL_SIMPLIFY_TOLERANCE_DEG, preserve_topology=False)
+
+    # Railroads have no per-feature min_zoom like roads; scalerank (1-10,
+    # lower = more significant) doubles as the LOD field directly.
+    entries = _build_canvas_lines(gdf, default_z_level=7.0, z_level_col="scalerank")
+    print(f"Railroads: emitting {len(entries)} entries")
+    return "const CANVAS_RAILROADS = " + json.dumps(entries, separators=(",", ":")) + ";"
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +345,7 @@ def build_geonames_places() -> str:
 
 _CONST_LINE_RE = {
     "CANVAS_ROADS": re.compile(r"^\s*const CANVAS_ROADS = .*;\s*$", re.MULTILINE),
+    "CANVAS_RAILROADS": re.compile(r"^\s*const CANVAS_RAILROADS = .*;\s*$", re.MULTILINE),
     "GEONAMES_PLACES": re.compile(r"^\s*const GEONAMES_PLACES = .*;\s*$", re.MULTILINE),
 }
 
@@ -321,8 +372,13 @@ def main() -> None:
     ensure_sources(args.skip_download)
 
     roads_line = build_canvas_roads()
+    railroads_line = build_canvas_railroads()
     places_line = build_geonames_places()
-    generated = {"CANVAS_ROADS": roads_line, "GEONAMES_PLACES": places_line}
+    generated = {
+        "CANVAS_ROADS": roads_line,
+        "CANVAS_RAILROADS": railroads_line,
+        "GEONAMES_PLACES": places_line,
+    }
 
     for path, const_names in TARGET_FILES.items():
         for const_name in const_names:

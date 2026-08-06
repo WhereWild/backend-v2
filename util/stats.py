@@ -130,12 +130,10 @@ _stats_rg_bounds: list[tuple[str, str]] | None = None  # (min, max) taxon_key pe
 _stats_rg_mins: list[str] | None = None  # same order, just the min values, for bisect
 _stats_rg_columns: list[str] | None = None
 _stats_rg_cache: OrderedDict[int, pd.DataFrame] = OrderedDict()
-# ~200 row groups x ~68MB (169 cols x 50k rows x 8 bytes) ~= 13.6GB worst
-# case — trivial headroom on a 62GB box (measured peak RSS at size=24 was
-# ~3.5GB), and helps species-level lookups (self + scattered child keys)
-# more than the sort-by-taxon_key fix alone does, since those don't benefit
-# from processing order the way pure leaf lookups do.
-_STATS_RG_CACHE_SIZE = 200
+# Measured directly (300-taxon A/B, natural processing order): 24 vs 200
+# made no measurable difference (9.0/s vs 9.1/s) — keeping this small since
+# there's no verified benefit to the larger footprint.
+_STATS_RG_CACHE_SIZE = 24
 
 
 def _occurrences_schema_names() -> set[str]:

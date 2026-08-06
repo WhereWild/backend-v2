@@ -18,6 +18,7 @@ Outputs per taxon directory:
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import os
@@ -25,8 +26,7 @@ import pickle
 import random
 import re
 import threading
-import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from pathlib import Path
 
 import duckdb
@@ -102,8 +102,9 @@ def _get_connection() -> duckdb.DuckDBPyConnection:
 _schema_cache: dict[str, tuple[float, set[str]]] = {}
 
 # Populated only for the run_stats() batch pass (see preload_stats_occurrence_cache
-# in scripts/process_tree.py) — never touched by collect_taxon_df or any other
-# per-request/live-API code path, which must keep querying on demand.
+# below, called from scripts/process_tree.py) — never touched by
+# collect_taxon_df or any other per-request/live-API code path, which must
+# keep querying on demand.
 #
 # Every taxon in the tree walk — leaf, species, and non-leaf alike — was
 # paying a fresh read_parquet(...) DuckDB query (_read_own_rows or
@@ -113,9 +114,28 @@ _schema_cache: dict[str, tuple[float, set[str]]] = {}
 # row-group-pruned scan taking 0.03s out of a 0.35s total. At 187,581 taxa
 # that overhead alone was the entire ~0.9 taxa/s bottleneck (vs ~15/s on
 # the old per-taxon-file architecture, which paid no query-planning cost at
-# all). One bulk read + group-by-taxon_key up front turns ~187,581 queries
-# into 1.
-_stats_occurrence_cache: dict[str, pa.Table] | None = None
+# all).
+#
+# Rather than loading the whole file into memory (rejected: at full scale
+# the relevant column set is ~169 of the file's 179 columns, so this would
+# be nearly the same size as the whole ~35GB file — the same OOM class
+# fixed everywhere else in this pipeline today), this indexes each row
+# group's taxon_key min/max from parquet metadata alone (no data read) and
+# serves lookups from a small LRU cache of decompressed row groups. A
+# taxon's rows normally live in exactly one ~50k-row group; occasionally
+# two, when they straddle a boundary. Memory is bounded by
+# _STATS_RG_CACHE_SIZE regardless of total file size.
+_stats_rg_pf: pq.ParquetFile | None = None
+_stats_rg_bounds: list[tuple[str, str]] | None = None  # (min, max) taxon_key per row group
+_stats_rg_mins: list[str] | None = None  # same order, just the min values, for bisect
+_stats_rg_columns: list[str] | None = None
+_stats_rg_cache: "OrderedDict[int, pd.DataFrame]" = OrderedDict()
+# ~200 row groups x ~68MB (169 cols x 50k rows x 8 bytes) ~= 13.6GB worst
+# case — trivial headroom on a 62GB box (measured peak RSS at size=24 was
+# ~3.5GB), and helps species-level lookups (self + scattered child keys)
+# more than the sort-by-taxon_key fix alone does, since those don't benefit
+# from processing order the way pure leaf lookups do.
+_STATS_RG_CACHE_SIZE = 200
 
 
 def _occurrences_schema_names() -> set[str]:
@@ -174,19 +194,82 @@ def _select_cols(columns: list[str] | None) -> str:
     return ", ".join(f'"{c}"' for c in present)
 
 
+def _row_groups_for_key(key: str) -> list[int]:
+    """Row group indices whose [min, max] taxon_key range could contain key.
+
+    Almost always exactly one; occasionally more, if a taxon's rows
+    straddle a row-group boundary (or, rarely, span several small groups).
+    _stats_rg_mins is sorted (the file is physically ORDER BY taxon_key),
+    so bisect finds A candidate in O(log n) — but bisect_right lands on the
+    *last* group whose min <= key, which is wrong when multiple groups
+    share that same min (e.g. one taxon's rows split across several small
+    groups all with min == max == key): walk backward first to find the
+    true first candidate before scanning forward.
+    """
+    mins = _stats_rg_mins
+    bounds = _stats_rg_bounds
+    assert mins is not None and bounds is not None
+    i = max(0, bisect.bisect_right(mins, key) - 1)
+    while i > 0 and bounds[i - 1][1] >= key:
+        i -= 1
+    result = []
+    n = len(bounds)
+    while i < n:
+        lo, hi = bounds[i]
+        if lo > key:
+            break
+        if hi >= key:
+            result.append(i)
+        i += 1
+    return result
+
+
+def _get_row_group_df(rg_idx: int) -> pd.DataFrame:
+    """Decompressed row group, from the LRU cache when possible."""
+    cached = _stats_rg_cache.get(rg_idx)
+    if cached is not None:
+        _stats_rg_cache.move_to_end(rg_idx)
+        return cached
+    assert _stats_rg_pf is not None
+    table = _stats_rg_pf.read_row_group(rg_idx, columns=_stats_rg_columns)
+    df = table.to_pandas()
+    _stats_rg_cache[rg_idx] = df
+    if len(_stats_rg_cache) > _STATS_RG_CACHE_SIZE:
+        _stats_rg_cache.popitem(last=False)
+    return df
+
+
+def _cached_rows_for_key_set(key_set: set[str]) -> pa.Table | None:
+    """Shared lookup behind _read_own_rows/_read_rows_for_keys. Returns None
+    (caller falls back to the DuckDB path) when the index isn't populated —
+    i.e. everywhere except run_stats()'s own tree walk."""
+    if _stats_rg_bounds is None:
+        return None
+    rg_set: set[int] = set()
+    for key in key_set:
+        rg_set.update(_row_groups_for_key(key))
+    if not rg_set:
+        return pa.table({c: pa.array([], type=pa.string()) for c in (_stats_rg_columns or [])})
+    frames = [_get_row_group_df(i) for i in sorted(rg_set)]
+    df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    match = df[df["taxon_key"].isin(key_set)]
+    return pa.Table.from_pandas(match, preserve_index=False)
+
+
 def _read_own_rows(taxon_key: str, columns: list[str] | None = None) -> pa.Table:
     """Rows for exactly this taxon (no descendants). Local storage only.
 
-    Checks _stats_occurrence_cache first — populated only within
+    Checks the row-group index/LRU cache first — populated only within
     run_stats()'s own process for the duration of its tree walk (see
     preload_stats_occurrence_cache), never touched by the live API's
-    process, so this is a no-op everywhere else. The cache is preloaded
-    with exactly the column set run_stats()'s three tree-walk functions
-    request, so a hit here is only correct for calls using that same
-    columns set — true for all of them (see compute_taxon_stats).
+    process, so this is a no-op everywhere else. The index is built with
+    exactly the column set run_stats()'s three tree-walk functions request,
+    so a hit here is only correct for calls using that same columns set —
+    true for all of them (see compute_taxon_stats).
     """
-    if _stats_occurrence_cache is not None:
-        return _stats_occurrence_cache.get(str(taxon_key), pa.table({}))
+    cached = _cached_rows_for_key_set({str(taxon_key)})
+    if cached is not None:
+        return cached
     if not OCCURRENCES_FILE.exists():
         return pa.table({})
     col_list = _select_cols(columns)
@@ -199,9 +282,9 @@ def _read_own_rows(taxon_key: str, columns: list[str] | None = None) -> pa.Table
 
 def _read_rows_for_keys(keys: list[str], columns: list[str] | None = None) -> pa.Table:
     """See _read_own_rows for the cache-hit contract this also relies on."""
-    if _stats_occurrence_cache is not None:
-        tables = [_stats_occurrence_cache[k] for k in keys if k in _stats_occurrence_cache]
-        return pa.concat_tables(tables) if tables else pa.table({})
+    cached = _cached_rows_for_key_set({str(k) for k in keys})
+    if cached is not None:
+        return cached
     col_list = _select_cols(columns)
     con = _get_connection()
     con.register("scope_keys", pa.table({"taxon_key": pa.array(keys, type=pa.string())}))
@@ -211,66 +294,59 @@ def _read_rows_for_keys(keys: list[str], columns: list[str] | None = None) -> pa
     ).to_arrow_table()
 
 
-# Row count above which preload_stats_occurrence_cache refuses to run —
-# grouping the whole file by taxon_key in memory is safe at dev/experiment
-# scale (e.g. a Cactaceae-only subset) but would risk the same OOM class of
-# failure seen elsewhere in this pipeline at full-Plantae scale (tens of
-# millions of rows x ~150 relevant columns). Falling back to the unchanged
-# per-taxon query path there is slower but always safe.
-_STATS_CACHE_MAX_ROWS = 20_000_000
-
-
 def preload_stats_occurrence_cache(layer_meta: dict[str, dict]) -> bool:
-    """One bulk read of occurrences.parquet, grouped by taxon_key, for
-    run_stats()'s batch tree walk to look up instead of querying per taxon.
+    """Index occurrences.parquet's row groups by taxon_key range (pure
+    parquet metadata — no data read) so run_stats()'s batch tree walk can
+    serve per-taxon lookups from a small LRU cache of decompressed row
+    groups instead of a fresh DuckDB query per taxon.
 
     Column set matches exactly what _process_leaf/_collect_species_df/
     _process_nonleaf each independently compute as `needed` (base cols +
-    every layer id) — plus "taxon_key" itself, needed here for the groupby
-    even though those three don't request it in their own `columns` list
-    (they already know each row's taxon from the taxon record they're
-    processing, not from a per-row column).
+    every layer id) — plus "taxon_key" itself, needed here to filter a
+    fetched row group down to the requested taxon even though those three
+    don't request it in their own `columns` list (they already know each
+    row's taxon from the taxon record they're processing).
 
-    Returns True if the cache was populated (call clear_stats_occurrence_cache
-    when done, typically at the end of run_stats()), False if the file was
-    too large or didn't exist — callers should keep using the existing
-    per-taxon query path in that case, unchanged.
+    Safe at any file size — unlike loading the whole file, memory is
+    bounded by _STATS_RG_CACHE_SIZE regardless of total row count. Returns
+    False only if the file doesn't exist or lacks per-row-group taxon_key
+    statistics (e.g. an unsorted or exotically-written file) — callers
+    should keep using the existing per-taxon query path in that case,
+    unchanged. Call clear_stats_occurrence_cache when done (e.g. at the end
+    of run_stats()).
     """
-    global _stats_occurrence_cache
+    global _stats_rg_pf, _stats_rg_bounds, _stats_rg_mins, _stats_rg_columns
     if not OCCURRENCES_FILE.exists():
         return False
-    con = _get_connection()
-    n_rows = con.execute(
-        f"SELECT COUNT(*) FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')"
-    ).fetchone()[0]
-    if n_rows > _STATS_CACHE_MAX_ROWS:
-        print(
-            f"[stats cache] {n_rows:,} rows exceeds {_STATS_CACHE_MAX_ROWS:,} — "
-            "skipping bulk preload, using per-taxon queries"
-        )
+    pf = pq.ParquetFile(OCCURRENCES_FILE)
+    schema_names = set(pf.schema_arrow.names)
+    if "taxon_key" not in schema_names:
         return False
+    col_idx = pf.schema_arrow.get_field_index("taxon_key")
+    bounds: list[tuple[str, str]] = []
+    for i in range(pf.metadata.num_row_groups):
+        stats = pf.metadata.row_group(i).column(col_idx).statistics
+        if stats is None or stats.min is None:
+            print("[stats cache] row group missing taxon_key statistics — skipping cache, using per-taxon queries")
+            return False
+        bounds.append((stats.min, stats.max))
     columns = list({"taxon_key"} | _OCC_BASE_COLS | layer_meta.keys())
-    col_list = _select_cols(columns)
-    t0 = time.monotonic()
-    table = con.execute(
-        f"SELECT {col_list} FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')"
-    ).to_arrow_table()
-    df = table.to_pandas()
-    cache: dict[str, pa.Table] = {
-        str(key): pa.Table.from_pandas(group, preserve_index=False)
-        for key, group in df.groupby("taxon_key", sort=False)
-    }
-    _stats_occurrence_cache = cache
-    print(
-        f"[stats cache] preloaded {n_rows:,} rows into {len(cache):,} taxa "
-        f"({time.monotonic() - t0:.1f}s)"
-    )
+    _stats_rg_pf = pf
+    _stats_rg_bounds = bounds
+    _stats_rg_mins = [lo for lo, _ in bounds]
+    _stats_rg_columns = [c for c in columns if c in schema_names]
+    _stats_rg_cache.clear()
+    print(f"[stats cache] indexed {len(bounds):,} row groups, {len(_stats_rg_columns)} columns")
     return True
 
 
 def clear_stats_occurrence_cache() -> None:
-    global _stats_occurrence_cache
-    _stats_occurrence_cache = None
+    global _stats_rg_pf, _stats_rg_bounds, _stats_rg_mins, _stats_rg_columns
+    _stats_rg_pf = None
+    _stats_rg_bounds = None
+    _stats_rg_mins = None
+    _stats_rg_columns = None
+    _stats_rg_cache.clear()
 
 
 _children_index_cache: tuple[dict, dict[str, list[str]]] | None = None

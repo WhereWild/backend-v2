@@ -380,6 +380,7 @@ async def reload_data():
     tiles._catalog.cache_clear()
     tiles._load_nominal_colormap.cache_clear()
     build_ternary_classification_overlay.cache_clear()
+    gis.clear_dataset_cache()
     return {"ok": True}
 
 
@@ -513,6 +514,20 @@ def _status_server() -> dict:
     except Exception:
         result["disk_used_gb"] = None
         result["disk_total_gb"] = None
+
+    # Disk 2 (overflow GIS layers dir, e.g. WHEREWILD_EXTRA_LAYERS_DIRS on prod)
+    extra_dirs = tiles._extra_layers_dirs()
+    if extra_dirs:
+        try:
+            st2 = os.statvfs(extra_dirs[0])
+            result["disk2_used_gb"] = (st2.f_blocks - st2.f_bfree) * st2.f_frsize // (1024 ** 3)
+            result["disk2_total_gb"] = st2.f_blocks * st2.f_frsize // (1024 ** 3)
+        except Exception:
+            result["disk2_used_gb"] = None
+            result["disk2_total_gb"] = None
+    else:
+        result["disk2_used_gb"] = None
+        result["disk2_total_gb"] = None
 
     # Uptime
     try:

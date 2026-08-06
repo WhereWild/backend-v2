@@ -500,13 +500,47 @@ def test_preload_stats_occurrence_cache_groups_by_taxon_key(tmp_path, monkeypatc
         st.clear_stats_occurrence_cache()
 
 
-def test_preload_stats_occurrence_cache_skips_when_too_large(tmp_path, monkeypatch):
+def test_preload_stats_occurrence_cache_falls_back_without_row_group_stats(tmp_path, monkeypatch):
+    # write_statistics=False means row groups have no min/max for taxon_key —
+    # the index can't be trusted, so preload must refuse rather than risk
+    # silently missing rows for some taxa.
     occurrences_file = tmp_path / "occurrences.parquet"
     monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
-    monkeypatch.setattr(st, "_STATS_CACHE_MAX_ROWS", 5)
-    _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": [15.0] * 20}, n=20)
+    table = pa.table({
+        "catalogNumber": ["obs0"], "decimalLatitude": [40.0], "decimalLongitude": [-105.0],
+        "hilbertIdx": [0], "obscured": ["No"], "coordinateUncertaintyInMeters": [100.0],
+        "taxon_key": [_LEAF_TAXON["taxon_key"]], "bio1": [15.0],
+    })
+    pq.write_table(table, occurrences_file, write_statistics=False)
     assert st.preload_stats_occurrence_cache({"bio1": _CONTINUOUS_LAYER}) is False
-    assert st._stats_occurrence_cache is None
+    assert st._stats_rg_bounds is None
+
+
+def test_preload_stats_occurrence_cache_spans_multiple_row_groups(tmp_path, monkeypatch):
+    # A taxon whose rows are forced into two small row groups must still be
+    # found in full — exercising the "straddles a boundary" path in
+    # _row_groups_for_key, not just the common single-row-group case.
+    occurrences_file = tmp_path / "occurrences.parquet"
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
+    n = 10
+    data = {
+        "catalogNumber": [f"obs{i}" for i in range(n)],
+        "decimalLatitude": [40.0] * n, "decimalLongitude": [-105.0] * n,
+        "hilbertIdx": list(range(n)), "obscured": ["No"] * n,
+        "coordinateUncertaintyInMeters": [100.0] * n,
+        "taxon_key": [_LEAF_TAXON["taxon_key"]] * n,
+        "bio1": [15.0] * n,
+    }
+    table = pa.table(data)
+    pq.write_table(table, occurrences_file, row_group_size=3)  # forces 4 row groups
+    pf = pq.ParquetFile(occurrences_file)
+    assert pf.metadata.num_row_groups > 1
+    try:
+        assert st.preload_stats_occurrence_cache({"bio1": _CONTINUOUS_LAYER}) is True
+        result = st._read_own_rows(_LEAF_TAXON["taxon_key"], columns=["bio1"])
+        assert result.num_rows == n
+    finally:
+        st.clear_stats_occurrence_cache()
 
 
 def test_clear_stats_occurrence_cache_restores_query_path(tmp_path, monkeypatch):
@@ -514,9 +548,9 @@ def test_clear_stats_occurrence_cache_restores_query_path(tmp_path, monkeypatch)
     monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
     _write_occ_rows(occurrences_file, _LEAF_TAXON, extra_cols={"bio1": [15.0] * 20}, n=20)
     st.preload_stats_occurrence_cache({"bio1": _CONTINUOUS_LAYER})
-    assert st._stats_occurrence_cache is not None
+    assert st._stats_rg_bounds is not None
     st.clear_stats_occurrence_cache()
-    assert st._stats_occurrence_cache is None
+    assert st._stats_rg_bounds is None
     # Falls back to the real per-query path correctly, not just "doesn't crash".
     table = st._read_own_rows(_LEAF_TAXON["taxon_key"], columns=["bio1"])
     assert table.num_rows == 20

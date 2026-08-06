@@ -12,6 +12,16 @@ import util.gis as gis
 from util.gis import _HILBERT_ORDER, hilbert_index
 
 
+@pytest.fixture(autouse=True)
+def _clear_dataset_cache():
+    """Cached dataset handles (util.gis._cached_open) persist across calls
+    within a process, so tests must start each case with an empty cache —
+    otherwise a mock installed in one test could leak into the next."""
+    gis.clear_dataset_cache()
+    yield
+    gis.clear_dataset_cache()
+
+
 def test_hilbert_index_fits_in_int32():
     h = hilbert_index(40.0, -105.0)
     assert 0 <= h < (1 << (2 * _HILBERT_ORDER))
@@ -86,7 +96,7 @@ def test_sample_point_dispatches_to_temporal():
 
 def _make_rasterio_mock(row=50, col=50, height=100, width=100, value=2731.5,
                         dtype=np.float32, nodata=None):
-    """Return a mock rasterio dataset context manager."""
+    """Return a mock rasterio dataset (cached opener uses the handle directly, no context manager)."""
     data = ma.array(np.array([[value]], dtype=dtype), mask=[[False]])
     mock_ds = MagicMock()
     mock_ds.height = height
@@ -94,9 +104,7 @@ def _make_rasterio_mock(row=50, col=50, height=100, width=100, value=2731.5,
     mock_ds.nodata = nodata
     mock_ds.index.return_value = (row, col)
     mock_ds.read.return_value = data
-    mock_open = MagicMock()
-    mock_open.return_value.__enter__.return_value = mock_ds
-    mock_open.return_value.__exit__.return_value = False
+    mock_open = MagicMock(return_value=mock_ds)
     return mock_open, mock_ds
 
 
@@ -122,9 +130,7 @@ def test_cog_point_all_masked_returns_none():
     mock_ds.nodata = None
     mock_ds.index.return_value = (50, 50)
     mock_ds.read.return_value = ma.array(np.array([[0.0]]), mask=[[True]])
-    mock_open = MagicMock()
-    mock_open.return_value.__enter__.return_value = mock_ds
-    mock_open.return_value.__exit__.return_value = False
+    mock_open = MagicMock(return_value=mock_ds)
     with patch("util.gis.rasterio.open", mock_open):
         result = gis._sample_cog_point(_STATIC_LAYER, 40.0, -105.0)
     assert result is None

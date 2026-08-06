@@ -129,7 +129,7 @@ _stats_rg_pf: pq.ParquetFile | None = None
 _stats_rg_bounds: list[tuple[str, str]] | None = None  # (min, max) taxon_key per row group
 _stats_rg_mins: list[str] | None = None  # same order, just the min values, for bisect
 _stats_rg_columns: list[str] | None = None
-_stats_rg_cache: "OrderedDict[int, pd.DataFrame]" = OrderedDict()
+_stats_rg_cache: OrderedDict[int, pd.DataFrame] = OrderedDict()
 # ~200 row groups x ~68MB (169 cols x 50k rows x 8 bytes) ~= 13.6GB worst
 # case — trivial headroom on a 62GB box (measured peak RSS at size=24 was
 # ~3.5GB), and helps species-level lookups (self + scattered child keys)
@@ -208,7 +208,8 @@ def _row_groups_for_key(key: str) -> list[int]:
     """
     mins = _stats_rg_mins
     bounds = _stats_rg_bounds
-    assert mins is not None and bounds is not None
+    assert mins is not None
+    assert bounds is not None
     i = max(0, bisect.bisect_right(mins, key) - 1)
     while i > 0 and bounds[i - 1][1] >= key:
         i -= 1

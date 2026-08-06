@@ -30,7 +30,6 @@ from util.tiles import (
     resolve_layer_path,
 )
 
-
 # ---------------------------------------------------------------------------
 # Cached dataset handles
 #

@@ -161,11 +161,22 @@ def _temporal_layer_ids() -> frozenset[str]:
     )
 
 
-def _existing_columns() -> set[str]:
-    """Column names currently in occurrences.parquet (empty set if it doesn't exist yet)."""
-    if not OCCURRENCES_FILE.exists():
+def _existing_columns(occurrences_file: Path | None = None) -> set[str]:
+    """Column names currently in occurrences.parquet (empty set if it doesn't exist yet).
+
+    occurrences_file defaults to None (resolved to OCCURRENCES_FILE below at
+    call time), not `= OCCURRENCES_FILE` — a literal default is bound once
+    at function-definition time, so it would never see a later
+    patch.object(et, "OCCURRENCES_FILE", ...) override and every caller that
+    calls this bare (e.g. _iter_worklist_batches) would silently read
+    whatever OCCURRENCES_FILE pointed at when this module was first
+    imported instead of the current value.
+    """
+    if occurrences_file is None:
+        occurrences_file = OCCURRENCES_FILE
+    if not occurrences_file.exists():
         return set()
-    return set(pq.read_schema(OCCURRENCES_FILE).names)
+    return set(pq.read_schema(occurrences_file).names)
 
 
 def _stale_gis_columns(layer_ids: list[str], existing: set[str]) -> list[str]:
@@ -570,16 +581,41 @@ def _write_staging_batch(batch_idx: int, table: pa.Table | None) -> None:
     pq.write_table(table, STAGING_DIR / f"batch_{batch_idx:05d}.parquet")
 
 
-def _finalize_enrichment(layer_ids: list[str]) -> None:
+def _finalize_enrichment(
+    layer_ids: list[str],
+    occurrences_file: Path | None = None,
+    staging_dir: Path | None = None,
+) -> None:
     """Join every staged batch's updates into occurrences.parquet in one pass,
     and drop any GIS/temporal columns no longer in the layer catalog.
 
     Replaces what used to be a read-modify-atomic-rewrite of every taxon's
     file, once per worklist batch it appeared in, with a single rewrite of
     the whole consolidated file.
+
+    occurrences_file/staging_dir default to None (resolved to the module
+    globals below, at call time) rather than being bound as literal default
+    values — Python evaluates a `= OCCURRENCES_FILE`-style default exactly
+    once, at function-definition time, so it would freeze whatever the
+    global was at import time and never see a later `patch.object(et,
+    "OCCURRENCES_FILE", ...)` override, breaking every existing caller that
+    relies on patching the module global and calling with just layer_ids.
+
+    Explicit parameters (rather than only reading the globals directly) still
+    matter because main() runs this in a spawned subprocess (see its call
+    site) — spawn re-imports this module fresh in the child, so any runtime
+    override of the OCCURRENCES_FILE/STAGING_DIR globals (tests patch them;
+    a future caller might too) would silently be lost and this would
+    operate on the wrong file. Confirmed by test_main_processes_batch_and_finalizes
+    failing exactly this way before this fix — bio1 never landed because the
+    child fell back to the real default path instead of the patched one.
     """
-    staged = list(STAGING_DIR.glob("*.parquet")) if STAGING_DIR.exists() else []
-    existing = _existing_columns()
+    if occurrences_file is None:
+        occurrences_file = OCCURRENCES_FILE
+    if staging_dir is None:
+        staging_dir = STAGING_DIR
+    staged = list(staging_dir.glob("*.parquet")) if staging_dir.exists() else []
+    existing = _existing_columns(occurrences_file)
     stale = _stale_gis_columns(layer_ids, existing)
     if not staged and not stale:
         return
@@ -588,13 +624,13 @@ def _finalize_enrichment(layer_ids: list[str]) -> None:
     try:
         base_cols = [
             r[0] for r in con.execute(
-                f"DESCRIBE SELECT * FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') LIMIT 0"
+                f"DESCRIBE SELECT * FROM read_parquet('{occurrences_file.as_posix()}') LIMIT 0"
             ).fetchall()
         ]
 
         update_cols: list[str] = []
         if staged:
-            staging_glob = (STAGING_DIR / "*.parquet").as_posix()
+            staging_glob = (staging_dir / "*.parquet").as_posix()
             update_cols = [
                 r[0] for r in con.execute(
                     f"DESCRIBE SELECT * FROM read_parquet('{staging_glob}', union_by_name=True) LIMIT 0"
@@ -622,11 +658,11 @@ def _finalize_enrichment(layer_ids: list[str]) -> None:
             select_parts.append(", ".join(f'u."{c}"' for c in new_cols))
         select_clause = ", ".join(select_parts)
 
-        from_clause = f"read_parquet('{OCCURRENCES_FILE.as_posix()}') o"
+        from_clause = f"read_parquet('{occurrences_file.as_posix()}') o"
         if staged:
             from_clause += ' LEFT JOIN updates u USING ("catalogNumber")'
 
-        tmp_dest = OCCURRENCES_FILE.with_suffix(".parquet.tmp")
+        tmp_dest = occurrences_file.with_suffix(".parquet.tmp")
         con.execute(f"""
             COPY (
                 SELECT {select_clause} FROM {from_clause} ORDER BY taxon_key
@@ -634,7 +670,7 @@ def _finalize_enrichment(layer_ids: list[str]) -> None:
         """)
     finally:
         con.close()
-    tmp_dest.replace(OCCURRENCES_FILE)
+    tmp_dest.replace(occurrences_file)
     if stale:
         print(f"[finalize] dropped stale columns: {stale}")
 
@@ -667,7 +703,14 @@ def main() -> None:
     # even started. spawn (not fork) gives the child a genuinely fresh
     # interpreter and heap, independent of whatever the parent accumulated.
     ctx = multiprocessing.get_context("spawn")
-    proc = ctx.Process(target=_finalize_enrichment, args=(layer_ids,))
+    # Pass the paths explicitly rather than letting the child read its own
+    # freshly-imported module globals — spawn does not carry over any
+    # runtime override of OCCURRENCES_FILE/STAGING_DIR (tests patch them;
+    # see _finalize_enrichment's docstring for the failure this caused).
+    proc = ctx.Process(
+        target=_finalize_enrichment,
+        args=(layer_ids, OCCURRENCES_FILE, STAGING_DIR),
+    )
     proc.start()
     proc.join()
     if proc.exitcode != 0:

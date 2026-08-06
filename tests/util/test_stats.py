@@ -770,7 +770,7 @@ def test_decode_polyline_roundtrip():
 
 
 def test_decode_polyline_truncated_raises():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="truncated polyline"):
         st.decode_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq")
 
 
@@ -807,19 +807,19 @@ def test_parse_polygon_param_unions_multiple_rings():
 
 def test_parse_polygon_param_too_long_raises():
     huge = "a" * (st._MAX_POLYGON_PARAM_LENGTH + 1)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="polygon parameter too long"):
         st.parse_polygon_param(huge)
 
 
 def test_parse_polygon_param_too_many_rings_raises():
     ring = _encode_polyline([(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)])
     param = ";".join([ring] * (st._MAX_POLYGON_RINGS + 1))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="too many polygon rings"):
         st.parse_polygon_param(param)
 
 
 def test_parse_polygon_param_invalid_encoding_raises():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="invalid polygon encoding"):
         st.parse_polygon_param("!!!not-a-valid-polyline")
 
 

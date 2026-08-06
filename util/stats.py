@@ -1631,23 +1631,54 @@ class StatsSink:
     global stats files once the whole stats pass completes.
     """
 
+    # Rows buffered per kind before an actual write_table() call. Every
+    # write_numerical/write_circular/etc. call was writing straight to
+    # ParquetWriter — a fresh row group (often just 1-170 rows, one per
+    # taxon) on every single taxon. py-spy sampling profiling showed
+    # write_table as the single largest identifiable hotspot once the
+    # occurrence-lookup bottleneck was fixed (~7.4% of total time on its
+    # own) — the same "many tiny row groups" cost already fixed on the read
+    # side elsewhere in this pipeline, just on the write side here. Batching
+    # amortizes write_table's fixed per-call overhead (schema/stats
+    # bookkeeping, row group finalization) across many taxa instead of one.
+    _BATCH_ROWS = 20_000
+
     def __init__(self, staging_dir: Path, level_id: str):
         self._staging_dir = staging_dir
         self._level_id = level_id
         self._writers: dict[str, pq.ParquetWriter] = {}
+        self._buffers: dict[str, list[pa.Table]] = {}
+        self._buffer_rows: dict[str, int] = {}
         self._lock = threading.Lock()
 
     def _write(self, kind: str, table: pa.Table) -> None:
         if table.num_rows == 0:
             return
         with self._lock:
-            writer = self._writers.get(kind)
-            if writer is None:
-                out_dir = self._staging_dir / kind
-                out_dir.mkdir(parents=True, exist_ok=True)
-                writer = pq.ParquetWriter(out_dir / f"{self._level_id}.parquet", table.schema)
-                self._writers[kind] = writer
-            writer.write_table(table)
+            self._buffers.setdefault(kind, []).append(table)
+            self._buffer_rows[kind] = self._buffer_rows.get(kind, 0) + table.num_rows
+            if self._buffer_rows[kind] >= self._BATCH_ROWS:
+                self._flush_locked(kind)
+
+    def _flush_locked(self, kind: str) -> None:
+        """Concatenate and write out kind's buffered tables. Caller holds self._lock."""
+        tables = self._buffers.get(kind)
+        if not tables:
+            return
+        # permissive: a backstop against any other column hitting the same
+        # all-None -> null-vs-double dtype mismatch as "mode" (see
+        # write_numerical/write_circular) across different taxa's tables
+        # landing in the same batch, for columns not explicitly audited.
+        batch = pa.concat_tables(tables, promote_options="permissive")
+        writer = self._writers.get(kind)
+        if writer is None:
+            out_dir = self._staging_dir / kind
+            out_dir.mkdir(parents=True, exist_ok=True)
+            writer = pq.ParquetWriter(out_dir / f"{self._level_id}.parquet", batch.schema)
+            self._writers[kind] = writer
+        writer.write_table(batch)
+        self._buffers[kind] = []
+        self._buffer_rows[kind] = 0
 
     def write_numerical(self, taxon_key: str, stats: dict[str, dict], pheno_meta: dict | None = None) -> None:
         if stats:
@@ -1717,9 +1748,13 @@ class StatsSink:
 
     def close(self) -> None:
         with self._lock:
+            for kind in list(self._buffers.keys()):
+                self._flush_locked(kind)
             for w in self._writers.values():
                 w.close()
             self._writers.clear()
+            self._buffers.clear()
+            self._buffer_rows.clear()
 
 
 # ---------------------------------------------------------------------------

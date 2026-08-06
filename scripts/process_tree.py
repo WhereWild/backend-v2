@@ -330,19 +330,6 @@ def run_stats(resume: bool = False) -> None:
     layers, layer_meta, by_depth, stats_levels, _, total = _setup()
     print(f"[process_tree] {total} taxa — stats:{STATS_WORKERS} workers" + (" — RESUME" if resume else ""))
 
-    # Order among same-level siblings doesn't affect the bottom-up merge's
-    # correctness (only "children before parents across levels" does, which
-    # depth ordering already guarantees) — so sorting each level by
-    # taxon_key, matching occurrences.parquet's own physical sort order,
-    # means consecutive per-taxon lookups tend to land in the same or
-    # adjacent row group instead of jumping randomly across the file.
-    # Directly increases the LRU hit rate for preload_stats_occurrence_cache
-    # below; confirmed in practice this was the difference between the
-    # measured ~14/s scattered-access worst case and ~75/s clustered-access
-    # best case for the same lookups.
-    for depth_taxa in by_depth.values():
-        depth_taxa.sort(key=lambda t: t["taxon_key"])
-
     staging_dir = _stats_staging_dir()
     if not resume and staging_dir.exists():
         shutil.rmtree(staging_dir)

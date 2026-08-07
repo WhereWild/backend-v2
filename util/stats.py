@@ -1415,14 +1415,26 @@ def _circ_stats_streaming(
 # ---------------------------------------------------------------------------
 
 def _continuous_stats_exact(
-    values: np.ndarray, unique_samples: int, kde: dict | None, *, discrete: bool = False
+    values: np.ndarray, unique_samples: int, kde: dict | None, *, discrete: bool = False,
+    precomputed: tuple[float, float, float, float, float, float, float] | None = None,
 ) -> dict:
-    """Exact continuous stats via numpy (faster than pd.describe for small arrays)."""
-    q10, q25, q50, q75, q90 = np.percentile(values, [10, 25, 50, 75, 90])
-    mean = float(np.mean(values))
-    std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
-    if not math.isfinite(std):
-        std = 0.0
+    """Exact continuous stats via numpy (faster than pd.describe for small arrays).
+
+    `precomputed`, when given, is (q10, q25, q50, q75, q90, mean, std) already
+    computed elsewhere — see _process_leaf_df, which batches these across all
+    of a taxon's continuous columns in one vectorized numpy call instead of
+    calling percentile/mean/std once per column (169 separate small numpy
+    calls per taxon otherwise, each paying its own fixed overhead). Discrete
+    columns and every other caller keep computing them here as before.
+    """
+    if precomputed is not None:
+        q10, q25, q50, q75, q90, mean, std = precomputed
+    else:
+        q10, q25, q50, q75, q90 = np.percentile(values, [10, 25, 50, 75, 90])
+        mean = float(np.mean(values))
+        std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+        if not math.isfinite(std):
+            std = 0.0
     if discrete:
         counts = Counter(int(v) for v in values)
         total = sum(counts.values())
@@ -1839,6 +1851,101 @@ class StatsSink:
 # Leaf (exact) processing
 # ---------------------------------------------------------------------------
 
+# RATIO/INTERVAL/CIRCULAR columns all go through the same to-numeric-then-
+# isfinite-filter treatment before their per-type stats branch — see
+# _bulk_numeric_block below.
+_NUMERIC_LIKE_TYPES = (ValueType.RATIO, ValueType.INTERVAL, ValueType.CIRCULAR)
+
+
+def _bulk_numeric_block(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
+    """(rows, len(cols)) float64 array for `cols`, built in as few pandas
+    conversions as possible — one frame-level .to_numpy() call instead of
+    one per column. A taxon has up to ~169 GIS columns, and each individual
+    `series.to_numpy(...)` call pays its own fixed pandas/ArrowDtype-boxing
+    overhead (confirmed in cProfile: pandas' ArrowExtensionArray.__getitem__
+    and Series construction were measurable per-column costs); doing the
+    whole block in one call amortizes that across every column at once.
+
+    Fast path: every column already float64 (the normal case for a cleanly
+    enriched GIS layer) — a single DataFrame.to_numpy() call. Falls back to
+    the old per-column pd.to_numeric(errors="coerce") path only for columns
+    that aren't already float64 (defensive: not-yet-cleanly-typed data,
+    e.g. numeric strings), exactly matching what the un-batched code always
+    did for that case.
+    """
+    sub = df[cols]
+    if (sub.dtypes == np.float64).all():
+        return sub.to_numpy(dtype=np.float64, na_value=np.nan)
+    return np.column_stack([
+        (df[c].to_numpy(dtype=np.float64, na_value=np.nan) if df[c].dtype == np.float64
+         else pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=np.float64))
+        for c in cols
+    ])
+
+
+def _batched_continuous_stats(
+    block: np.ndarray, col_block_idx: dict[str, int], cont_cols: list[str]
+) -> dict[str, tuple[float, float, float, float, float, float, float]]:
+    """(q10, q25, q50, q75, q90, mean, std) for every continuous column at
+    once, fed into _continuous_stats_exact's `precomputed` param.
+
+    Matches the per-column `values = col[isfinite(col)]; np.percentile(...)`
+    contract exactly: non-finite entries (NaN or +-inf) are excluded from
+    every column the same way. Columns with fewer than 2 finite values are
+    left out of the result entirely (the per-column path already
+    special-cases those — std=0 for exactly one value, and a wholly-empty
+    column never reaches _continuous_stats_exact at all) — the caller falls
+    back to computing those individually via `precomputed=None`.
+
+    Percentiles are NOT computed via np.nanpercentile(..., axis=0): numpy
+    only vectorizes that across columns when every column has the same
+    number of non-NaN values. Columns here have different occurrence
+    counts of missing GIS data, so with ragged NaN counts nanpercentile
+    silently falls back to calling apply_along_axis once per column
+    internally — confirmed via cProfile: identical per-column call counts
+    to before this function existed, i.e. zero actual vectorization despite
+    the vectorized-looking call. Sorting the whole block once (a single
+    real vectorized op — NaNs sort to the end) and gathering each column's
+    interpolated percentile by its own valid-count via fancy indexing
+    reproduces np.percentile's exact linear-interpolation formula
+    (virtual index h = (n-1)*p, lerp between floor/ceil) without that
+    fallback. nanmean/nanstd, by contrast, are simple reductions (sum/count
+    per column) that numpy already vectorizes for real across ragged
+    columns — those stay as-is.
+    """
+    idx = [col_block_idx[c] for c in cont_cols]
+    sub = block[:, idx]
+    finite = np.isfinite(sub)
+    n_valid = finite.sum(axis=0)
+    keep = n_valid >= 2
+    if not keep.any():
+        return {}
+    masked = np.where(finite, sub, np.nan)[:, keep]
+    n_valid = n_valid[keep]
+    with np.errstate(all="ignore"):
+        means = np.nanmean(masked, axis=0)
+        stds = np.nanstd(masked, axis=0, ddof=1)
+    stds = np.where(np.isfinite(stds), stds, 0.0)
+
+    sorted_block = np.sort(masked, axis=0)  # NaNs sort last; valid values occupy [0, n_valid) per column
+    n_cols = masked.shape[1]
+    col_idx = np.arange(n_cols)
+    q_levels = np.array([10.0, 25.0, 50.0, 75.0, 90.0]) / 100.0
+    h = np.outer(q_levels, (n_valid - 1).astype(np.float64))  # (5, n_cols) virtual index per level/col
+    lo = np.floor(h).astype(np.intp)
+    hi = np.ceil(h).astype(np.intp)
+    frac = h - lo
+    lo_vals = sorted_block[lo, col_idx]
+    hi_vals = sorted_block[hi, col_idx]
+    pcts = lo_vals + frac * (hi_vals - lo_vals)
+    kept_cols = [c for c, k in zip(cont_cols, keep) if k]
+    return {
+        col: (float(pcts[0, j]), float(pcts[1, j]), float(pcts[2, j]),
+              float(pcts[3, j]), float(pcts[4, j]), float(means[j]), float(stds[j]))
+        for j, col in enumerate(kept_cols)
+    }
+
+
 def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[str, dict]) -> None:
     """Compute exact stats from a pre-loaded, pre-filtered DataFrame and write all outputs."""
     gis_cols = [col for col in df.columns if col in layer_meta]
@@ -1851,19 +1958,35 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
     ordinal_entries: list[dict] = []
     density_rows: list[dict] = []
 
+    col_vtype = {col: _layer_value_type(layer_meta[col]) for col in gis_cols}
+    numeric_like_cols = [c for c in gis_cols if col_vtype.get(c) in _NUMERIC_LIKE_TYPES]
+    block = _bulk_numeric_block(df, numeric_like_cols) if numeric_like_cols else None
+    col_block_idx = {c: i for i, c in enumerate(numeric_like_cols)}
+    cont_cols = [
+        c for c in numeric_like_cols
+        if col_vtype[c] in (ValueType.RATIO, ValueType.INTERVAL) and not _is_discrete(layer_meta[c])
+    ]
+    precomputed_by_col = _batched_continuous_stats(block, col_block_idx, cont_cols) if cont_cols else {}
+
     # Cache total unique count — reused across columns with no nulls (the common case).
     _total_unique: int | None = None
 
-    def _col_unique(raw: pd.Series) -> int:
-        """catalogNumber-uniqueness for a column's non-null rows.
+    def _col_unique_mask(nan_mask: np.ndarray) -> int:
+        """Same contract as _col_unique below, but driven off a numpy
+        nan-mask sourced from `block` — used by the RATIO/INTERVAL/CIRCULAR
+        branches below, which no longer fetch their column via df[col] at
+        all (see numeric_like_cols/block above)."""
+        nonlocal _total_unique
+        if not nan_mask.any():
+            if _total_unique is None:
+                _total_unique = int(df["catalogNumber"].nunique())
+            return _total_unique
+        return int(df.loc[~nan_mask, "catalogNumber"].nunique())
 
-        Takes the column's Series (already fetched by the caller via
-        `df[col]`) instead of a column name — every call site here already
-        has it in hand for its own purposes, and a second `df[col]` lookup
-        just to re-derive it is a full column re-fetch on an ArrowDtype-
-        backed column (measurably non-free — see py-spy/cProfile findings
-        on pandas' ArrowExtensionArray.__getitem__).
-        """
+    def _col_unique(raw: pd.Series) -> int:
+        """catalogNumber-uniqueness for a column's non-null rows. Used by
+        NOMINAL/ORDINAL below, which still need the actual Series (for
+        Counter-based counting) so have it in hand already."""
         nonlocal _total_unique
         if not raw.isna().any():
             if _total_unique is None:
@@ -1873,20 +1996,18 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
 
     for col in gis_cols:
         layer = layer_meta[col]
-        vtype = _layer_value_type(layer)
+        vtype = col_vtype[col]
         if vtype is None:
             continue
 
         match vtype:
             case ValueType.RATIO | ValueType.INTERVAL:
-                raw = df[col]
-                values = (raw.to_numpy(dtype=np.float64, na_value=np.nan)
-                          if raw.dtype == np.float64
-                          else pd.to_numeric(raw, errors="coerce").to_numpy(dtype=np.float64))
-                values = values[np.isfinite(values)]
+                col_values = block[:, col_block_idx[col]]
+                nan_mask = np.isnan(col_values)
+                values = col_values[np.isfinite(col_values)]
                 if values.size == 0:
                     continue
-                unique = _col_unique(raw)
+                unique = _col_unique_mask(nan_mask)
                 if _is_discrete(layer):
                     counts_c = Counter(int(v) for v in values)
                     stats = _continuous_stats_exact(values, unique, None, discrete=True)
@@ -1907,7 +2028,7 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
                     })
                 else:
                     kde = build_density_curve(values, vtype)
-                    stats = _continuous_stats_exact(values, unique, kde)
+                    stats = _continuous_stats_exact(values, unique, kde, precomputed=precomputed_by_col.get(col))
                     if kde:
                         density_rows.append({
                             "variable": col,
@@ -1949,14 +2070,12 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
                 ordinal_entries.extend(_ordinal_stat_entries(col, layer, ord_counts, stats))
 
             case ValueType.CIRCULAR:
-                raw = df[col]
-                values = (raw.to_numpy(dtype=np.float64, na_value=np.nan)
-                          if raw.dtype == np.float64
-                          else pd.to_numeric(raw, errors="coerce").to_numpy(dtype=np.float64))
-                values = values[np.isfinite(values)]
+                col_values = block[:, col_block_idx[col]]
+                nan_mask = np.isnan(col_values)
+                values = col_values[np.isfinite(col_values)]
                 if values.size == 0:
                     continue
-                unique = _col_unique(raw)
+                unique = _col_unique_mask(nan_mask)
                 kde = build_density_curve(values, vtype)
                 rad = np.deg2rad(values)
                 cos_s = float(np.sum(np.cos(rad)))

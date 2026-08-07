@@ -129,7 +129,7 @@ _stats_rg_pf: pq.ParquetFile | None = None
 _stats_rg_bounds: list[tuple[str, str]] | None = None  # (min, max) taxon_key per row group
 _stats_rg_mins: list[str] | None = None  # same order, just the min values, for bisect
 _stats_rg_columns: list[str] | None = None
-_stats_rg_cache: OrderedDict[int, pd.DataFrame] = OrderedDict()
+_stats_rg_cache: OrderedDict[int, pa.Table] = OrderedDict()
 # Measured directly (300-taxon A/B, natural processing order): 24 vs 200
 # made no measurable difference (9.0/s vs 9.1/s) — keeping this small since
 # there's no verified benefit to the larger footprint.
@@ -223,19 +223,50 @@ def _row_groups_for_key(key: str) -> list[int]:
     return result
 
 
-def _get_row_group_df(rg_idx: int) -> pd.DataFrame:
-    """Decompressed row group, from the LRU cache when possible."""
+def _get_row_group_table(rg_idx: int) -> pa.Table:
+    """Decompressed row group, from the LRU cache when possible.
+
+    Cached as a pyarrow Table, not a pandas DataFrame: every taxon's rows
+    are only ever a slice of this (see _rows_in_group_for_keys), and Arrow
+    slicing is zero-copy. Converting the *whole* ~50k-row group to pandas
+    up front — as this used to do — meant paying pandas' ArrowDtype boxing
+    overhead (confirmed in profiling: pandas/core/arrays/arrow/array.py
+    __getitem__ was a measurable cost) across every column for every row,
+    just to throw away all but a handful of rows per lookup.
+    """
     cached = _stats_rg_cache.get(rg_idx)
     if cached is not None:
         _stats_rg_cache.move_to_end(rg_idx)
         return cached
     assert _stats_rg_pf is not None
     table = _stats_rg_pf.read_row_group(rg_idx, columns=_stats_rg_columns)
-    df = table.to_pandas()
-    _stats_rg_cache[rg_idx] = df
+    _stats_rg_cache[rg_idx] = table
     if len(_stats_rg_cache) > _STATS_RG_CACHE_SIZE:
         _stats_rg_cache.popitem(last=False)
-    return df
+    return table
+
+
+def _rows_in_group_for_keys(table: pa.Table, key_set: set[str]) -> pa.Table:
+    """Rows in a single cached row-group Table matching key_set.
+
+    Row groups are physically sorted by taxon_key (occurrences.parquet is
+    written ORDER BY taxon_key — see _row_groups_for_key), so every key's
+    rows form one contiguous slice. A pair of searchsorted calls per key
+    against the (cheap, single-column) taxon_key array plus a zero-copy
+    Table.slice() replaces a full-column .isin() boolean scan/materialize
+    across every row and every column in the group — this is the
+    row-group-cache-hit path taken once per taxon for the whole tree walk.
+    """
+    keys_col = table.column("taxon_key").to_numpy(zero_copy_only=False)
+    parts = []
+    for key in sorted(key_set):
+        lo = np.searchsorted(keys_col, key, side="left")
+        hi = np.searchsorted(keys_col, key, side="right")
+        if hi > lo:
+            parts.append(table.slice(int(lo), int(hi - lo)))
+    if not parts:
+        return table.slice(0, 0)
+    return pa.concat_tables(parts) if len(parts) > 1 else parts[0]
 
 
 def _cached_rows_for_key_set(key_set: set[str]) -> pa.Table | None:
@@ -249,10 +280,8 @@ def _cached_rows_for_key_set(key_set: set[str]) -> pa.Table | None:
         rg_set.update(_row_groups_for_key(key))
     if not rg_set:
         return pa.table({c: pa.array([], type=pa.string()) for c in (_stats_rg_columns or [])})
-    frames = [_get_row_group_df(i) for i in sorted(rg_set)]
-    df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
-    match = df[df["taxon_key"].isin(key_set)]
-    return pa.Table.from_pandas(match, preserve_index=False)
+    matches = [_rows_in_group_for_keys(_get_row_group_table(i), key_set) for i in sorted(rg_set)]
+    return pa.concat_tables(matches) if len(matches) > 1 else matches[0]
 
 
 def _read_own_rows(taxon_key: str, columns: list[str] | None = None) -> pa.Table:
@@ -1155,6 +1184,57 @@ def _atomic_write(path: Path, table: pa.Table, custom_metadata: dict[str, str] |
 
 _FFT_GRID = 512  # grid size for FFTKDE — power of 2 for efficiency
 
+# FFTKDE(bw=h).evaluate(int) auto-picks its working domain by calling
+# KDEpy's Kernel.practical_support(h), which — for the Gaussian kernel,
+# which has no closed-form finite support — solves a brentq root-find that
+# itself calls the kernel's python evaluate() function another ~10-13
+# times per solve. h differs per taxon per variable, so this brentq solve
+# ran fresh on every single one of the ~127 KDE curves/taxon this pipeline
+# builds (py-spy/cProfile: practical_support's brentq chain was ~17% of
+# total leaf-stats time). The Gaussian kernel's evaluate(x, bw) has a known
+# closed form — C/bw * exp(-(x/bw)^2/2) for a fixed normalization constant
+# C — so solving evaluate(x, bw) == atol for x has a closed form too:
+# x = bw*sqrt(-2*ln(atol*bw/C)). Passing that domain as an explicit grid
+# array (instead of an int) makes FFTKDE use it directly and skip its own
+# practical_support call entirely. Verified against KDEpy's brentq result
+# across a 200-trial random A/B (varying n, scale, location): max density
+# deviation ~6e-7, i.e. floating-point noise, not a behavior change.
+_KDE_SUPPORT_C = float(FFTKDE().kernel.evaluate(0.0, bw=1.0)[0])
+
+
+def _kde_practical_support(bw: float, atol: float = 10e-5, xtol: float = 1e-3) -> float:
+    """Closed-form replacement for KDEpy's Kernel.practical_support(bw) for
+    the (infinite-support) Gaussian kernel — see _KDE_SUPPORT_C above."""
+    ratio = atol * bw / _KDE_SUPPORT_C
+    if not (0.0 < ratio < 1.0):
+        return bw * 8.0  # matches practical_support's own brentq bracket [0, 8*bw]
+    return bw * math.sqrt(-2.0 * math.log(ratio)) + xtol
+
+
+def _kde_grid(values: np.ndarray, bw: float, num_points: int = _FFT_GRID) -> tuple[np.ndarray, float]:
+    """Same domain KDEpy's autogrid(values, practical_support(bw), num_points)
+    would pick, built without the brentq call — see _kde_practical_support.
+    Also returns the bare practical_support(bw) value itself (no 0.05*range
+    padding), needed to preempt FFTKDE.evaluate's own fallback brentq call
+    below (it calls kernel.practical_support(bw) a second time internally
+    whenever a custom grid array means its usual auto-grid codepath, which
+    caches that value on the instance, never ran)."""
+    lo, hi = float(values.min()), float(values.max())
+    support = _kde_practical_support(bw)
+    outside = max(0.05 * (hi - lo), support)
+    return np.linspace(lo - outside, hi + outside, num_points), support
+
+
+def _kde_evaluate(values: np.ndarray, bw: float) -> tuple[np.ndarray, np.ndarray]:
+    """FFTKDE(bw).fit(values).evaluate(grid) on our own closed-form grid,
+    with _kernel_practical_support pre-set so FFTKDE.evaluate's internal
+    "was a grid auto-picked?" fallback doesn't redo the brentq solve."""
+    grid, support = _kde_grid(values, bw)
+    kde = FFTKDE(bw=bw).fit(values)
+    kde._kernel_practical_support = support
+    density = kde.evaluate(grid)
+    return grid, density
+
 
 def _gaussian_kde_curve(values: np.ndarray, bounded_at_zero: bool = False) -> dict | None:
     if values.size < 2:
@@ -1177,7 +1257,7 @@ def _gaussian_kde_curve(values: np.ndarray, bounded_at_zero: bool = False) -> di
             # Reflection at 0: mirror data into the negative half so the KDE
             # boundary at 0 gets a zero-derivative correction, then fold back.
             work_vals = np.concatenate([-values, values])
-            x_fine, density_fine = FFTKDE(bw=h).fit(work_vals).evaluate(_FFT_GRID)
+            x_fine, density_fine = _kde_evaluate(work_vals, h)
             mask = x_fine >= 0.0
             x_fine, density_fine = x_fine[mask], density_fine[mask] * 2.0
             area = np.trapezoid(density_fine, x_fine)
@@ -1189,7 +1269,7 @@ def _gaussian_kde_curve(values: np.ndarray, bounded_at_zero: bool = False) -> di
             # for species with min > 0 (e.g. desert plants with precip >> 0mm).
             xs = np.linspace(min_val, max_val, _KDE_N_POINTS)
         else:
-            x_fine, density_fine = FFTKDE(bw=h).fit(values).evaluate(_FFT_GRID)
+            x_fine, density_fine = _kde_evaluate(values, h)
             xs = np.linspace(min_val, max_val, _KDE_N_POINTS)
 
         density = np.maximum(np.interp(xs, x_fine, density_fine), 0.0)
@@ -1774,13 +1854,22 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
     # Cache total unique count — reused across columns with no nulls (the common case).
     _total_unique: int | None = None
 
-    def _col_unique(col: str) -> int:
+    def _col_unique(raw: pd.Series) -> int:
+        """catalogNumber-uniqueness for a column's non-null rows.
+
+        Takes the column's Series (already fetched by the caller via
+        `df[col]`) instead of a column name — every call site here already
+        has it in hand for its own purposes, and a second `df[col]` lookup
+        just to re-derive it is a full column re-fetch on an ArrowDtype-
+        backed column (measurably non-free — see py-spy/cProfile findings
+        on pandas' ArrowExtensionArray.__getitem__).
+        """
         nonlocal _total_unique
-        if not df[col].isna().any():
+        if not raw.isna().any():
             if _total_unique is None:
                 _total_unique = int(df["catalogNumber"].nunique())
             return _total_unique
-        return int(df.loc[df[col].notna(), "catalogNumber"].nunique())
+        return int(df.loc[raw.notna(), "catalogNumber"].nunique())
 
     for col in gis_cols:
         layer = layer_meta[col]
@@ -1797,7 +1886,7 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
                 values = values[np.isfinite(values)]
                 if values.size == 0:
                     continue
-                unique = _col_unique(col)
+                unique = _col_unique(raw)
                 if _is_discrete(layer):
                     counts_c = Counter(int(v) for v in values)
                     stats = _continuous_stats_exact(values, unique, None, discrete=True)
@@ -1834,10 +1923,11 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
                 numerical_stats[col] = stats
 
             case ValueType.NOMINAL:
-                raw = df[col].dropna()
+                raw_full = df[col]
+                raw = raw_full.dropna()
                 if raw.empty:
                     continue
-                unique = _col_unique(col)
+                unique = _col_unique(raw_full)
                 raw_counts: Counter = _filter_to_known_classes(Counter(int(float(v)) for v in raw), col)
                 if not raw_counts:
                     continue
@@ -1845,10 +1935,11 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
                 nominal_entries.extend(_nominal_cat_entries(col, layer, raw_counts, summary))
 
             case ValueType.ORDINAL:
-                raw = df[col].dropna()
+                raw_full = df[col]
+                raw = raw_full.dropna()
                 if raw.empty:
                     continue
-                unique = _col_unique(col)
+                unique = _col_unique(raw_full)
                 ord_counts: Counter = _filter_to_known_classes(Counter(int(float(v)) for v in raw), col)
                 if not ord_counts:
                     continue
@@ -1865,7 +1956,7 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
                 values = values[np.isfinite(values)]
                 if values.size == 0:
                     continue
-                unique = _col_unique(col)
+                unique = _col_unique(raw)
                 kde = build_density_curve(values, vtype)
                 rad = np.deg2rad(values)
                 cos_s = float(np.sum(np.cos(rad)))

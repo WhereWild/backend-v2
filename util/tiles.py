@@ -38,6 +38,37 @@ from util.storage import ParquetStorageProxy
 CATALOG_PATH = Path("config/gis/catalog.json")
 LAYERS_DIR   = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "layers"
 
+
+def _extra_layers_dirs() -> list[Path]:
+    """Extra layer directories to search when a file isn't under LAYERS_DIR.
+
+    Set WHEREWILD_EXTRA_LAYERS_DIRS to an os.pathsep-separated list of dirs
+    (e.g. a second disk mounted at /mnt/disk2/layers) for when the full
+    data/gis/layers set — 600+ GB of COGs — doesn't fit on one disk. Layers
+    too big to keep on the primary disk can be moved there; reads fall back
+    to checking each dir in order.
+    """
+    raw = os.environ.get("WHEREWILD_EXTRA_LAYERS_DIRS", "")
+    return [Path(p) for p in raw.split(os.pathsep) if p.strip()]
+
+
+def resolve_layer_path(base_dir: Path, filename: str) -> Path:
+    """Resolve a layer filename to its actual path.
+
+    Checks base_dir first, then each of _extra_layers_dirs() in order.
+    Falls back to base_dir / filename if not found anywhere, so callers see
+    the expected default location in any resulting FileNotFoundError.
+    """
+    primary = base_dir / filename
+    if primary.exists():
+        return primary
+    for extra_dir in _extra_layers_dirs():
+        candidate = extra_dir / filename
+        if candidate.exists():
+            return candidate
+    return primary
+
+
 _storage = ParquetStorageProxy(
     data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
     project_root=Path(__file__).parent.parent,
@@ -440,6 +471,25 @@ def _colorize(
     return rgba
 
 
+def _encode_terrain_rgb(values: np.ndarray) -> np.ndarray:
+    """Encode elevation (meters) as Mapzen Terrarium RGB for MapLibre's
+    raster-dem terrain/hillshade sources: elevation = (R*256 + G + B/256) - 32768.
+
+    Unlike _colorize, this isn't for human viewing — MapLibre decodes these
+    pixels back into elevation on the GPU. Nodata is encoded as 0m rather
+    than left transparent (raster-dem sampling ignores alpha), so missing
+    data reads as sea level instead of punching a hole in the terrain mesh.
+    """
+    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+    safe = np.where(np.isfinite(values), values, 0.0)
+    encoded = np.clip(np.round((safe + 32768.0) * 256.0), 0, 256 ** 3 - 1).astype(np.uint32)
+    rgba[..., 0] = (encoded >> 16) & 0xFF
+    rgba[..., 1] = (encoded >> 8) & 0xFF
+    rgba[..., 2] = encoded & 0xFF
+    rgba[..., 3] = 255
+    return rgba
+
+
 # ---------------------------------------------------------------------------
 # Tile renderer
 # ---------------------------------------------------------------------------
@@ -526,11 +576,14 @@ def get_layer_version(layer: dict, forecast_suffix: str = "") -> int:
             return 0
         return _mtime(Path(fullpath))
     if layer_id in DERIVED_FROM_ELEVATION:
-        return _mtime(LAYERS_DIR / "elevation.tif")
+        return _mtime(resolve_layer_path(LAYERS_DIR, "elevation.tif"))
     if layer_id in DERIVED_FROM_SOIL:
-        return max((_mtime(LAYERS_DIR / fname) for fname in _SOIL_TEXTURE_INPUT_FILES.values()), default=0)
+        return max(
+            (_mtime(resolve_layer_path(LAYERS_DIR, fname)) for fname in _SOIL_TEXTURE_INPUT_FILES.values()),
+            default=0,
+        )
     if layer.get("filename"):
-        return _mtime(LAYERS_DIR / layer["filename"])
+        return _mtime(resolve_layer_path(LAYERS_DIR, layer["filename"]))
     return 0
 
 
@@ -719,7 +772,7 @@ def _nominal_tile_range_classes_soil(z: int, x0: int, y0: int, x1: int, y1: int)
             mx0, my0, mx1, my1 = tile_bounds_mercator(z, tx, ty)
             dst_transform = from_bounds(mx0, my0, mx1, my1, 256, 256)
             bands = {
-                key: _sample_soil_band_to_tile(LAYERS_DIR / filename, lon0, lat0, lon1, lat1, dst_transform, 256)
+                key: _sample_soil_band_to_tile(resolve_layer_path(LAYERS_DIR, filename), lon0, lat0, lon1, lat1, dst_transform, 256)
                 for key, filename in _SOIL_TEXTURE_INPUT_FILES.items()
             }
             dest = derive_soil_texture_array(bands["sand"], bands["silt"], bands["clay"])
@@ -752,7 +805,7 @@ def nominal_tile_range_classes(
     if layer_id in DERIVED_FROM_SOIL:
         return _nominal_tile_range_classes_soil(z, x0, y0, x1, y1)
 
-    path = LAYERS_DIR / layer["filename"]
+    path = resolve_layer_path(LAYERS_DIR, layer["filename"])
     counts: dict[int, int] = {}
 
     with _open_raster(path) as ds:
@@ -814,7 +867,7 @@ def _sample_elevation_derived_to_tile(
     Shared by _render_derived_elevation_tile_bytes (primary layer) and
     _sample_layer_to_tile (chain-mask sampling of slope/aspect as a chained layer).
     """
-    elev_path = LAYERS_DIR / "elevation.tif"
+    elev_path = resolve_layer_path(LAYERS_DIR, "elevation.tif")
     lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
     dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
 
@@ -989,7 +1042,7 @@ def _sample_soil_texture_to_tile(z: int, x: int, y: int, tile_size: int, dst_tra
 
     lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
     bands = {
-        key: _sample_soil_band_to_tile(LAYERS_DIR / filename, lon0, lat0, lon1, lat1, dst_transform, tile_size)
+        key: _sample_soil_band_to_tile(resolve_layer_path(LAYERS_DIR, filename), lon0, lat0, lon1, lat1, dst_transform, tile_size)
         for key, filename in _SOIL_TEXTURE_INPUT_FILES.items()
     }
     return derive_soil_texture_array(bands["sand"], bands["silt"], bands["clay"])
@@ -1036,6 +1089,7 @@ def _render_derived_soil_texture_tile_bytes(
 
 def _sample_static_cog_to_tile(
     layer: dict, z: int, x: int, y: int, tile_size: int, dst_transform,
+    resampling: Resampling = Resampling.nearest,
 ) -> tuple[np.ndarray, float | None, float | None]:
     """Read+reproject a static COG layer onto a tile grid; return (dest, vmin, vmax).
 
@@ -1043,15 +1097,20 @@ def _sample_static_cog_to_tile(
     when the catalog doesn't provide render_min/render_max — only meaningful
     for the primary rendered layer's colorizing, chain-mask sampling ignores
     them. Shared by _render_static_layer_tile_rgba and _sample_layer_to_tile.
+
+    resampling defaults to nearest so every other caller keeps exact,
+    unblended pixel values (correct for nominal/categorical layers, and the
+    deliberate choice for continuous ones too) — render_elevation_terrain_rgb_tile_bytes
+    is the one caller that opts into bilinear, since a raster-dem mesh reads
+    as smooth slopes only when the heights it interpolates between actually
+    vary continuously instead of being nearest-neighbor stair-stepped.
     """
-    path    = LAYERS_DIR / layer["filename"]
+    path    = resolve_layer_path(LAYERS_DIR, layer["filename"])
     scale   = layer.get("scale_factor") or 1.0
     offset  = layer.get("add_offset")   or 0.0
     nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
     vmin    = layer.get("render_min")
     vmax    = layer.get("render_max")
-
-    resampling = Resampling.nearest
     lon0, lat0, lon1, lat1 = tile_bounds_wgs84(z, x, y)
     dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
 
@@ -1277,3 +1336,20 @@ def render_layer_tile_bytes(
         _apply_chain_mask(rgba, chain, z, x, y, tile_size, forecast_suffix)
 
     return _encode_png(rgba)
+
+
+def render_elevation_terrain_rgb_tile_bytes(z: int, x: int, y: int, tile_size: int = 256) -> bytes:
+    """Render the global elevation COG as a Terrarium-encoded raster-dem tile.
+
+    Separate from the "elevation" layer's own /tiles endpoint (which
+    colorizes the same COG with a viridis-style ramp for display) — this
+    encodes raw elevation for MapLibre's setTerrain()/hillshade to decode on
+    the GPU instead.
+    """
+    layer = get_layer("elevation")
+    mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
+    dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
+    dest, _, _ = _sample_static_cog_to_tile(
+        layer, z, x, y, tile_size, dst_transform, resampling=Resampling.bilinear,
+    )
+    return _encode_png(_encode_terrain_rgb(dest))

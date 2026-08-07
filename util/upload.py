@@ -65,7 +65,7 @@ from util.temporal import (
     window_steps,
 )
 from util.ternary import build_ternary_classification_overlay, composition_group_members
-from util.tiles import LAYERS_DIR, load_layers_with_category
+from util.tiles import LAYERS_DIR, load_layers_with_category, resolve_layer_path
 
 _LEGEND_DIR = Path("config/gis/legends")
 _GADM_PATH = Path("data/gis/gadm.gpkg")
@@ -388,7 +388,7 @@ def enrich_with_gis(df: pd.DataFrame) -> pd.DataFrame:
     s_lats = lats[order]
     s_lons = lons[order]
 
-    elev_path = LAYERS_DIR / "elevation.tif"
+    elev_path = resolve_layer_path(LAYERS_DIR, "elevation.tif")
 
     result = df.copy()
     for layer in layers:
@@ -406,7 +406,7 @@ def enrich_with_gis(df: pd.DataFrame) -> pd.DataFrame:
                 sorted_vals = sample_soil_texture_batch(s_lats, s_lons)
                 result[layer_id] = [sorted_vals[i] for i in restore]
             else:
-                cog_path = LAYERS_DIR / layer["filename"]
+                cog_path = resolve_layer_path(LAYERS_DIR, layer["filename"])
                 if not cog_path.exists():
                     continue
                 scale  = layer.get("scale_factor") or 1.0

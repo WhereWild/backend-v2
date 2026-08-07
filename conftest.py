@@ -13,7 +13,8 @@ def pytest_addoption(parser):
         "--live",
         action="store_true",
         default=False,
-        help="Run live S3 tests (test_live.py). Use via: pt --temporal",
+        help="Run tests/temporal/ (skipped by default — fixture-fetching + "
+        "live S3 tests). Use via: pt --temporal",
     )
     parser.addoption(
         "--regenerate-live",

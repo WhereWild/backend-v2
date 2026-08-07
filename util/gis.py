@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import os
+import threading
+from pathlib import Path
 
 import numpy as np
 import rasterio
@@ -25,7 +27,67 @@ from util.tiles import (
     LAYERS_DIR,
     TEMPORAL_RASTERS_DIR,
     _load_temporal_npy,
+    resolve_layer_path,
 )
+
+# ---------------------------------------------------------------------------
+# Cached dataset handles
+#
+# Point-sampling (occurrence enrichment, per-request temporal elevation
+# correction) opens the same COGs over and over — for a well-formed COG this
+# is normally cheap, but for a very large file like elevation.tif (hundreds
+# of GB, millions of tiles) re-parsing the tile-offset tables on every single
+# point is a real, avoidable cost. Cache the open handle instead.
+#
+# rasterio/GDAL datasets aren't safe for concurrent access from multiple
+# threads, so reads against a cached handle are serialized per-file with a
+# lock (FastAPI serves requests from a threadpool). This still beats
+# reopening: the expensive part (parsing the directory) happens once, only
+# the read itself is serialized.
+# ---------------------------------------------------------------------------
+
+_dataset_cache: dict[str, rasterio.io.DatasetReader] = {}
+_dataset_cache_lock = threading.Lock()
+_dataset_read_locks: dict[str, threading.Lock] = {}
+_dataset_read_locks_mx = threading.Lock()
+
+
+def _cached_open(path: Path) -> rasterio.io.DatasetReader:
+    key = str(path)
+    ds = _dataset_cache.get(key)
+    if ds is not None:
+        return ds
+    with _dataset_cache_lock:
+        ds = _dataset_cache.get(key)
+        if ds is None:
+            ds = rasterio.open(path)
+            _dataset_cache[key] = ds
+        return ds
+
+
+def _read_lock(path: Path) -> threading.Lock:
+    key = str(path)
+    lock = _dataset_read_locks.get(key)
+    if lock is not None:
+        return lock
+    with _dataset_read_locks_mx:
+        lock = _dataset_read_locks.setdefault(key, threading.Lock())
+        return lock
+
+
+def clear_dataset_cache() -> None:
+    """Close and drop all cached dataset handles.
+
+    Call after a data rebuild/reload so stale handles from before the swap
+    don't linger (mirrors the other .cache_clear() calls in /internal/reload).
+    """
+    with _dataset_cache_lock:
+        for ds in _dataset_cache.values():
+            try:
+                ds.close()
+            except Exception:
+                pass
+        _dataset_cache.clear()
 
 
 def sample_point(layer: dict, lat: float, lon: float, forecast_suffix: str = "") -> float | None:
@@ -48,25 +110,26 @@ def sample_point(layer: dict, lat: float, lon: float, forecast_suffix: str = "")
 
 
 def _sample_cog_point(layer: dict, lat: float, lon: float) -> float | None:
-    path = LAYERS_DIR / layer["filename"]
+    path = resolve_layer_path(LAYERS_DIR, layer["filename"])
     scale = layer.get("scale_factor") or 1.0
     offset = layer.get("add_offset") or 0.0
     try:
-        with rasterio.open(path) as ds:
+        ds = _cached_open(path)
+        with _read_lock(path):
             row, col = ds.index(lon, lat)
             if not (0 <= row < ds.height and 0 <= col < ds.width):
                 return None
             window = rasterio.windows.Window(col, row, 1, 1)
             data = ds.read(1, window=window, masked=True)
-            if data.mask.all():
+        if data.mask.all():
+            return None
+        raw = float(data.data.flat[0])
+        if np.issubdtype(data.dtype, np.integer) and ds.nodata is not None:
+            dtype_max = np.iinfo(data.dtype).max
+            nd_int = round(ds.nodata)
+            if raw == nd_int or raw >= dtype_max - 3:
                 return None
-            raw = float(data.data.flat[0])
-            if np.issubdtype(data.dtype, np.integer) and ds.nodata is not None:
-                dtype_max = np.iinfo(data.dtype).max
-                nd_int = round(ds.nodata)
-                if raw == nd_int or raw >= dtype_max - 3:
-                    return None
-            return raw * scale + offset
+        return raw * scale + offset
     except Exception:
         return None
 
@@ -111,20 +174,21 @@ def _apply_point_elevation_correction(
     Correction = (model_elev - obs_elev) * LAPSE_RATE.
     Returns val unchanged if either elevation is unavailable.
     """
-    elev_layer = LAYERS_DIR / "elevation.tif"
+    elev_layer = resolve_layer_path(LAYERS_DIR, "elevation.tif")
     if not elev_layer.exists():
         return val
 
     try:
-        with rasterio.open(elev_layer) as ds:
+        ds = _cached_open(elev_layer)
+        with _read_lock(elev_layer):
             r, c = ds.index(lon, lat)
             if not (0 <= r < ds.height and 0 <= c < ds.width):
                 return val
             window = rasterio.windows.Window(c, r, 1, 1)
             data = ds.read(1, window=window, masked=True)
-            if data.mask.all():
-                return val
-            obs_elev = float(data.data.flat[0])
+        if data.mask.all():
+            return val
+        obs_elev = float(data.data.flat[0])
     except Exception:
         return val
 
@@ -207,7 +271,7 @@ def sample_elevation_terrain_batch(
     Returns a dict with keys matching the requested outputs.
     """
     n = len(lats)
-    elev_path = LAYERS_DIR / "elevation.tif"
+    elev_path = resolve_layer_path(LAYERS_DIR, "elevation.tif")
     results: dict[str, list[float | None]] = {}
     if want_elevation:
         results["elevation"] = [None] * n
@@ -464,7 +528,7 @@ def sample_soil_texture_batch(lats: np.ndarray, lons: np.ndarray) -> list[int | 
     out: list[int | None] = [None] * n
     if n == 0:
         return out
-    paths = {k: LAYERS_DIR / v for k, v in _SOIL_TEXTURE_INPUT_FILES.items()}
+    paths = {k: resolve_layer_path(LAYERS_DIR, v) for k, v in _SOIL_TEXTURE_INPUT_FILES.items()}
     if not all(p.exists() for p in paths.values()):
         return out
     coords = list(zip(lons.tolist(), lats.tolist()))

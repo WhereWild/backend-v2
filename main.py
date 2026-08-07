@@ -15,39 +15,48 @@ import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 
+import httpx
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from shapely.geometry.base import BaseGeometry
 from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
 from config.config import load_config
+from scripts.build_tree import _is_usable_license, _normalize_license_url
 from util import citations, descriptions, download, gis, taxa, tiles, units, upload
-from util.rankings import TREE_ROOT as RANKINGS_TREE_ROOT
+from util.rankings import POSITION_FILE, RANKINGS_FILE
 from util.stats import (
+    CATALOG_NUMBER_INDEX_FILE,
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
     DENSITY_GRID_FILE,
     GLOBAL_STATS_DIR,
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
+    OCCURRENCES_FILE,
     ORDINAL_STATS_FILE,
     TREE_ROOT,
     apply_chained_filters,
     apply_phenology_filter,
+    apply_polygon_filter,
     apply_timestamp_filter,
     collect_taxon_df,
     compute_location_filtered_stats,
     compute_phenology_counts,
     numeric_range_mask,
+    parse_polygon_param,
     read_phenology_counts,
 )
 from util.storage import ParquetStorageProxy
 from util.taxa import format_common_name, iter_descendants, normalize_name, reload_catalog, taxon_slug
+from util.temporal import load_temporal_layers
 from util.ternary import build_ternary_classification_overlay, composition_group_members
 
 _CONFIG = load_config("global")
@@ -59,10 +68,27 @@ _storage = ParquetStorageProxy(
     project_root=Path(__file__).parent,
 )
 _LEGEND_DIR = Path("config/gis/legends")
-_OCC_FILE = "occurrence.parquet"
 _OCC_COLUMNS = ["catalogNumber", "decimalLatitude", "decimalLongitude", "obscured", "coordinateUncertaintyInMeters"]
 _PHENOLOGY_VALUES: frozenset[str] = frozenset(_CONFIG.phenology_values)
 _LARGE_TAXON_THRESHOLD = 500_000
+_INAT_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
+# ArcGIS World Imagery satellite basemap — proxied so the API key never
+# reaches the client (see /api/tiles/satellite below). Esri's tile path is
+# z/y/x, not the z/x/y convention used everywhere else in this app.
+_ARCGIS_SATELLITE_TILE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+_ARCGIS_API_KEY = os.environ.get("WW_ARCGIS_API_KEY")
+# Matches the Referrer URL restriction configured on the ArcGIS API key
+# itself — the key is scoped to only work for requests presenting this
+# origin, so this proxy (the only thing that ever sends the real key) sends
+# it explicitly rather than relying on httpx's default of no Referer at all.
+_ARCGIS_REFERER = "https://wherewild.net"
+# Esri returns a real 200 OK "data not available" placeholder tile (solid
+# gray, near-zero JPEG entropy) instead of a 404 when a zoom level exceeds
+# actual imagery coverage at that location — confirmed by hand: a known-bad
+# tile came back at exactly 2521 bytes, twice, vs. tens of KB for real
+# imagery. A little slack above that exact size covers minor variation
+# across zoom/region without coming anywhere near a real tile's size.
+_ARCGIS_NO_DATA_TILE_MAX_BYTES = 3000
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
@@ -128,18 +154,46 @@ def _load_legend_full(layer_id: str) -> dict:
     return json.loads(Path(path).read_text())
 
 
-def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
-    """Read an env value for a known observation directly from occurrence.parquet."""
-    occ_path = TREE_ROOT / taxon["path"] / "occurrence.parquet"
+def _scope_taxon_keys(taxon: dict) -> list[str]:
+    """taxon_keys in scope for occurrence-level queries: species rolls up
+    subspecies/variety/form; a leaf is itself; other ranks read only their
+    descendant leaves (not any stray direct-to-ancestor observations) —
+    mirrors util.stats.collect_taxon_df's own scope dispatch."""
+    rank = taxon["rank"]
+    if rank == _CONFIG.species_rank:
+        return [str(t["taxon_key"]) for t in iter_descendants(taxon, include_self=True)]
+    if rank in _CONFIG.leaf_rank_set:
+        return [str(taxon["taxon_key"])]
+    return [str(t["taxon_key"]) for t in iter_descendants(taxon, include_self=False)]
+
+
+def _read_occurrences_scoped(taxon: dict, columns: list[str] | None = None) -> pd.DataFrame:
+    """Occurrence rows for taxon's scope, read from the consolidated occurrences file."""
     try:
-        import pyarrow.parquet as _pq
-        tbl = _pq.read_table(occ_path, columns=["catalogNumber", variable_id])
-        df = tbl.to_pandas()
-        row = df[df["catalogNumber"] == catalog_number]
-        if row.empty or variable_id not in row.columns:
+        schema_names = set(_storage.read_schema(OCCURRENCES_FILE).names)
+    except Exception:
+        return pd.DataFrame()
+    cols = [c for c in columns if c in schema_names] if columns is not None else None
+    keys = _scope_taxon_keys(taxon)
+    try:
+        table = _storage.read_table(OCCURRENCES_FILE, columns=cols, filters=[("taxon_key", "in", keys)])
+    except Exception:
+        return pd.DataFrame()
+    return table.to_pandas()
+
+
+def _lookup_index_value(taxon: dict, variable_id: str, catalog_number: str) -> float | None:
+    """Read an env value for a known observation directly from the consolidated occurrences file."""
+    try:
+        tbl = _storage.read_table(
+            OCCURRENCES_FILE,
+            columns=["catalogNumber", variable_id],
+            filters=[("taxon_key", "=", str(taxon["taxon_key"])), ("catalogNumber", "=", catalog_number)],
+        )
+        if tbl.num_rows == 0 or variable_id not in tbl.schema.names:
             return None
-        val = row.iloc[0][variable_id]
-        return float(val) if val is not None and pd.notna(val) else None
+        val = tbl.column(variable_id)[0].as_py()
+        return float(val) if val is not None else None
     except Exception:
         return None
 
@@ -326,6 +380,7 @@ async def reload_data():
     tiles._catalog.cache_clear()
     tiles._load_nominal_colormap.cache_clear()
     build_ternary_classification_overlay.cache_clear()
+    gis.clear_dataset_cache()
     return {"ok": True}
 
 
@@ -460,6 +515,20 @@ def _status_server() -> dict:
         result["disk_used_gb"] = None
         result["disk_total_gb"] = None
 
+    # Disk 2 (overflow GIS layers dir, e.g. WHEREWILD_EXTRA_LAYERS_DIRS on prod)
+    extra_dirs = tiles._extra_layers_dirs()
+    if extra_dirs:
+        try:
+            st2 = os.statvfs(extra_dirs[0])
+            result["disk2_used_gb"] = (st2.f_blocks - st2.f_bfree) * st2.f_frsize // (1024 ** 3)
+            result["disk2_total_gb"] = st2.f_blocks * st2.f_frsize // (1024 ** 3)
+        except Exception:
+            result["disk2_used_gb"] = None
+            result["disk2_total_gb"] = None
+    else:
+        result["disk2_used_gb"] = None
+        result["disk2_total_gb"] = None
+
     # Uptime
     try:
         with open("/proc/uptime") as f:
@@ -529,6 +598,56 @@ def list_phenology_values():
     ]
 
 
+def _lookup_temporal_value_at_timestamp(
+    variable: str, lat: float, lon: float, event_ts: int,
+) -> float | None:
+    """Live single-point historical lookup for a temporal variable at a known
+    observation timestamp.
+
+    Reuses the upload flow's per-layer processing (util.upload's
+    _process_one_layer + _df_to_occ_table) with a one-row occ table — same
+    HTTP-range-request path against the ERA5 .om chunks, just for one point
+    instead of a batch. This is what makes "highlight this exact observation"
+    show the value AT THE TIME it was made rather than gis.sample_point's
+    current/live window, which is what a plain map click means.
+
+    Scoped to base window-aggregate layers (derived temporal layers are
+    computed from other already-processed columns, not fetched directly —
+    see load_temporal_layers/TemporalLayer.derived) — returns None for
+    anything else so the caller falls back to gis.sample_point.
+    """
+    try:
+        layers = load_temporal_layers(tiles.CATALOG_PATH)
+    except Exception:
+        return None
+    candidates = [lyr for lyr in layers if not lyr.derived and variable.startswith(f"{lyr.id}_")]
+    if not candidates:
+        return None
+
+    occ_table = upload._df_to_occ_table(pd.DataFrame({
+        "decimalLatitude": [lat],
+        "decimalLongitude": [lon],
+        "eventTimestamp": [float(event_ts)],
+    }))
+
+    for layer in candidates:
+        try:
+            updates = upload._process_one_layer(layer, occ_table)
+        except Exception:
+            continue
+        pairs = updates.get("__upload__", {}).get(variable)
+        if not pairs:
+            continue
+        _, values = pairs[0]
+        if len(values) == 0:
+            continue
+        val = values[0]
+        if val is None or not math.isfinite(float(val)):
+            return None
+        return float(val)
+    return None
+
+
 @app.get("/gis/point")
 async def gis_point_value(
     lat: float = Query(...),
@@ -538,6 +657,7 @@ async def gis_point_value(
     catalog_number: str | None = Query(None),
     unit_system: str | None = Query(None),
     forecast_h: int = Query(0, ge=0),
+    event_ts: int | None = Query(None),
 ):
     """Return the raster value for a variable at a lat/lon coordinate.
 
@@ -546,6 +666,12 @@ async def gis_point_value(
     is identical to what the stats were computed from, and for temporal variables
     returns the historical aggregate at observation time rather than the current
     live window. Falls back to raster sampling when the index row is missing.
+
+    event_ts covers the same "value at observation time, not now" case for a
+    temporal variable when there's no index row to read (e.g. an observation
+    not yet ingested by GBIF — see GET /occurrence/{id}'s "ingested": false):
+    a live single-point historical lookup at that exact timestamp, computed
+    before falling all the way through to the current/live raster.
     """
     if not math.isfinite(lat) or not math.isfinite(lon):
         raise HTTPException(status_code=400, detail="lat and lon must be finite numbers")
@@ -566,6 +692,11 @@ async def gis_point_value(
         taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
         if taxon is not None:
             value = _lookup_index_value(taxon, variable, catalog_number)
+
+    if value is None and event_ts is not None:
+        value = await run_in_threadpool(
+            _lookup_temporal_value_at_timestamp, variable, lat, lon, event_ts,
+        )
 
     if value is None:
         value = await run_in_threadpool(gis.sample_point, layer, lat, lon, forecast_suffix)
@@ -736,6 +867,68 @@ async def layer_tile(
     return Response(content=payload, media_type="image/png", headers=headers)
 
 
+@app.get("/api/layers/elevation/terrain-tiles/{z}/{x}/{y}.png")
+async def elevation_terrain_tile(
+    z: int, x: int, y: int,
+    tile_size: int = Query(256, ge=32, le=1024),
+):
+    """Terrarium-encoded raster-dem tiles for MapLibre's setTerrain()/hillshade —
+    separate from /api/layers/elevation/tiles, which colorizes the same COG
+    for on-map display rather than encoding it for GPU elevation sampling.
+    """
+    payload = await run_in_threadpool(
+        tiles.render_elevation_terrain_rgb_tile_bytes, z, x, y, tile_size,
+    )
+    return Response(
+        content=payload, media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+def _fetch_satellite_tile_bytes(z: int, x: int, y: int) -> bytes:
+    """Fetch one World Imagery tile from Esri using the server-side API key.
+
+    The key (WW_ARCGIS_API_KEY) never reaches the client — only this
+    function ever sees it. Esri's own billing model counts tiles returned
+    per access token, the same whether the caller is a browser or this
+    proxy, so relaying one request per one tile actually shown to a user
+    (no server-side caching/storage of the response) stays within their
+    "no bulk/volume tile exporting" restriction.
+    """
+    if not _ARCGIS_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Satellite basemap is not configured (WW_ARCGIS_API_KEY unset)",
+        )
+    url = _ARCGIS_SATELLITE_TILE_URL.format(z=z, y=y, x=x)
+    try:
+        resp = httpx.get(
+            url,
+            params={"token": _ARCGIS_API_KEY},
+            headers={"Referer": _ARCGIS_REFERER},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Satellite tile fetch failed: {e}") from e
+    if len(resp.content) <= _ARCGIS_NO_DATA_TILE_MAX_BYTES:
+        raise HTTPException(status_code=404, detail="No satellite imagery available at this zoom/location")
+    return resp.content
+
+
+@app.get("/api/tiles/satellite/{z}/{x}/{y}.jpg")
+async def satellite_tile(z: int, x: int, y: int):
+    """Proxies Esri World Imagery tiles — see _fetch_satellite_tile_bytes for why."""
+    payload = await run_in_threadpool(_fetch_satellite_tile_bytes, z, x, y)
+    # Shorter/mutable TTL than the DEM/derived-layer tiles above: this is
+    # third-party imagery Esri can refresh over time, not our own
+    # deterministically-rendered output, so it isn't safe to mark immutable.
+    return Response(
+        content=payload, media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=604800"},
+    )
+
+
 @app.get("/api/layers/{layer_id}/tile-range/classes")
 async def layer_tile_range_classes(
     layer_id: str,
@@ -863,45 +1056,15 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
 def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
     """Return True when every observation in scope has obscured coordinates."""
     filter_col = _location_filter_col(location_gid) if location_gid else None
-    has_any = False
-    has_non_obscured = False
-
-    def _scan(path: Path) -> None:
-        nonlocal has_any, has_non_obscured
-        if has_non_obscured:
-            return
-        try:
-            needed = ["obscured"]
-            if filter_col:
-                needed.append(filter_col)
-            schema_names = set(_storage.read_schema(path).names)
-            cols = [c for c in needed if c in schema_names]
-            if "obscured" not in cols:
-                has_non_obscured = True
-                return
-            tbl = _storage.read_table(path, columns=cols)
-            df = tbl.to_pandas()
-            if filter_col and filter_col in df.columns:
-                df = df[df[filter_col].astype(str) == str(location_gid)]
-            if df.empty:
-                return
-            has_any = True
-            if (df["obscured"] == "No").any():
-                has_non_obscured = True
-        except Exception:
-            return
-
-    is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
-    if taxon["rank"] == _CONFIG.species_rank:
-        for desc in iter_descendants(taxon, include_self=True):
-            _scan(TREE_ROOT / desc["path"] / _OCC_FILE)
-    elif is_leaf:
-        _scan(TREE_ROOT / taxon["path"] / _OCC_FILE)
-    else:
-        for desc in iter_descendants(taxon, include_self=False):
-            _scan(TREE_ROOT / desc["path"] / _OCC_FILE)
-
-    return has_any and not has_non_obscured
+    needed = ["obscured"] + ([filter_col] if filter_col else [])
+    df = _read_occurrences_scoped(taxon, columns=needed)
+    if "obscured" not in df.columns:
+        return False
+    if filter_col and filter_col in df.columns:
+        df = df[df[filter_col].astype(str) == str(location_gid)]
+    if df.empty:
+        return False
+    return not (df["obscured"] == "No").any()
 
 
 @app.get("/api/species/{taxon_id}/obscured")
@@ -1019,90 +1182,42 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
 # ---------------------------------------------------------------------------
 
 def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
-    """Read per-context {rank}_positions.parquet files for one taxon+variable."""
-    taxon = taxa.get_taxon_by_id(taxon_key)
-    if not taxon:
+    """Read this taxon's ranking positions (one row per ancestor context) from
+    the consolidated global positions file."""
+    positions_file = GLOBAL_STATS_DIR / POSITION_FILE
+    if not positions_file.exists():
         return []
-    path = taxon.get("path", "")
-    rank = (taxon.get("rank") or "").upper()
-    if not path or not rank:
+    try:
+        rows = _storage.read_table(
+            positions_file,
+            filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
+        ).to_pylist()
+    except Exception:
         return []
 
-    # Subspecies-equivalent taxa (SUBSPECIES/VARIETY/FORM) appear in two kinds of
-    # positions files, depending on the ancestor level:
-    #   - subspecies_positions.parquet at their parent SPECIES directory
-    #   - species_positions.parquet at GENUS/FAMILY/etc. directories (treated as species)
-    # Regular SPECIES appear only in species_positions.parquet at each ancestor.
-    # Higher taxa appear only in {rank.lower()}_positions.parquet.
-    if rank in _CONFIG.subspecies_equivalents:
-        candidate_files = {"subspecies_positions.parquet", "species_positions.parquet"}
-    else:
-        candidate_files = {f"{rank.lower()}_positions.parquet"}
-
-    parts = path.split("/")
     result = []
-    cumulative = ""
-    for i, part in enumerate(parts[:-1]):
-        cumulative = part if i == 0 else f"{cumulative}/{part}"
-        for filename in candidate_files:
-            positions_file = RANKINGS_TREE_ROOT / cumulative / filename
-            if not positions_file.exists():
-                continue
-            try:
-                rows = _storage.read_table(
-                    positions_file,
-                    filters=[("taxon_key", "=", taxon_key), ("variable", "=", variable_id)],
-                ).to_pylist()
-            except Exception:
-                continue
-            for row in rows:
-                position = row.get("position") or 0
-                count = row.get("count") or 0
-                # (position + 1) / count: rank n/n = 100th percentile
-                percentile = round((position + 1) / count, 3) if count > 0 else 0.0
-                result.append({
-                    "metric": row.get("metric"),
-                    "position": position + 1,
-                    "count": count,
-                    "percentile": percentile,
-                    "sampleCount": row.get("sampleCount"),
-                    "context_label": row.get("contextLabel"),
-                    "label": row.get("contextLabel"),
-                })
+    for row in rows:
+        position = row.get("position") or 0
+        count = row.get("count") or 0
+        # (position + 1) / count: rank n/n = 100th percentile
+        percentile = round((position + 1) / count, 3) if count > 0 else 0.0
+        result.append({
+            "metric": row.get("metric"),
+            "position": position + 1,
+            "count": count,
+            "percentile": percentile,
+            "sampleCount": row.get("sampleCount"),
+            "context_label": row.get("contextLabel"),
+            "label": row.get("contextLabel"),
+        })
     return result
 
 
 _GADM_LEVEL_COLS: dict[int, str] = {0: "level0Gid", 1: "level1Gid", 2: "level2Gid"}
 
 
-def _timestamp_range_from_metadata(path: Path) -> tuple[int, int] | None:
-    """Read min/max eventTimestamp from parquet footer stats — no row scan required."""
-    try:
-        meta = _storage.read_metadata(path)
-        if meta.num_row_groups == 0:
-            return None
-        col_idx = None
-        rg0 = meta.row_group(0)
-        for j in range(rg0.num_columns):
-            if rg0.column(j).path_in_schema == "eventTimestamp":
-                col_idx = j
-                break
-        if col_idx is None:
-            return None
-        ts_min: int | None = None
-        ts_max: int | None = None
-        for i in range(meta.num_row_groups):
-            stats = meta.row_group(i).column(col_idx).statistics
-            if stats and stats.has_statistics and stats.min is not None:
-                ts_min = stats.min if ts_min is None else min(ts_min, stats.min)
-                ts_max = stats.max if ts_max is None else max(ts_max, stats.max)
-        return (int(ts_min), int(ts_max)) if ts_min is not None and ts_max is not None else None
-    except Exception:
-        return None
-
-
 def _location_filter_col(gid: str) -> str | None:
-    """Return the occurrence.parquet column to use when filtering observations to gid."""
+    """Return the occurrences.parquet column to use when filtering observations to gid."""
     rec = _load_hierarchy().get(gid)
     if rec is not None:
         return _GADM_LEVEL_COLS.get(rec["level"])
@@ -1122,6 +1237,7 @@ def _slice_from_raw_occ(
     start_ts: int | None = None,
     end_ts: int | None = None,
     extra_filters: list[dict] | None = None,
+    polygon: BaseGeometry | None = None,
 ) -> list[dict]:
     df = collect_taxon_df(taxon, storage=_storage)
     if df is None or variable_id not in df.columns:
@@ -1134,6 +1250,8 @@ def _slice_from_raw_occ(
         df = apply_phenology_filter(df, phenology)
     if start_ts is not None or end_ts is not None:
         df = apply_timestamp_filter(df, start_ts, end_ts)
+    if polygon is not None:
+        df = apply_polygon_filter(df, polygon)
     if df.empty:
         return []
     col = pd.to_numeric(df[variable_id], errors="coerce")
@@ -1165,6 +1283,7 @@ def _class_samples_from_raw_occ(
     start_ts: int | None = None,
     end_ts: int | None = None,
     extra_filters: list[dict] | None = None,
+    polygon: BaseGeometry | None = None,
 ) -> list[dict]:
     df = collect_taxon_df(taxon, storage=_storage)
     if df is None or variable_id not in df.columns:
@@ -1177,6 +1296,8 @@ def _class_samples_from_raw_occ(
         df = apply_phenology_filter(df, phenology)
     if start_ts is not None or end_ts is not None:
         df = apply_timestamp_filter(df, start_ts, end_ts)
+    if polygon is not None:
+        df = apply_polygon_filter(df, polygon)
     if df.empty:
         return []
     col = pd.to_numeric(df[variable_id], errors="coerce")
@@ -1201,7 +1322,7 @@ def get_species_environment(
     taxon_id: str, variable_id: str, unit_system: str | None = None,
     location: str | None = None, phenology: str | None = None,
     start_ts: int | None = None, end_ts: int | None = None,
-    extra: str | None = None,
+    extra: str | None = None, polygon: str | None = None,
 ):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
@@ -1210,6 +1331,10 @@ def get_species_environment(
     phenology_norm = phenology.strip().lower() if phenology else None
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+    try:
+        polygon_geom = parse_polygon_param(polygon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid polygon: {exc}") from exc
 
     variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
@@ -1224,7 +1349,7 @@ def get_species_environment(
 
     if (
         location is not None or phenology_norm is not None or start_ts is not None
-        or end_ts is not None or extra_filters
+        or end_ts is not None or extra_filters or polygon_geom is not None
     ) and layer is not None:
         _reject_if_large_taxon(taxon)
         filter_col = _location_filter_col(location) if location is not None else None
@@ -1234,7 +1359,7 @@ def get_species_environment(
                 taxon, variable_id, filter_col, location, layer,
                 phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
                 storage=_storage, layer_meta=all_layers_by_id,
-                extra_filters=extra_filters,
+                extra_filters=extra_filters, polygon=polygon_geom,
             )
             if result is not None:
                 if result["type"] == "continuous":
@@ -1515,6 +1640,183 @@ def get_species_environment(
     }
 
 
+def _occurrence_response(
+    catalog_number: str,
+    taxon: dict,
+    latitude: float | None,
+    longitude: float | None,
+    ingested: bool,
+    extra: dict | None = None,
+) -> dict:
+    response = {
+        "catalog_number": catalog_number,
+        "taxon_id": taxon["taxon_key"],
+        "scientific_name": (taxon.get("scientific_name") or "").replace("_", " "),
+        "common_name": taxon.get("common_name") or None,
+        "slug": taxon_slug(taxon.get("scientific_name")),
+        "latitude": latitude,
+        "longitude": longitude,
+        "ingested": ingested,
+    }
+    if extra:
+        response.update(extra)
+    return response
+
+
+def _parse_inat_timestamp(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return int(dt.timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+_INAT_ATTRIBUTION_NAME_RE = re.compile(
+    r"^\(c\)\s*(.+?),\s*(?:some|no) rights reserved", re.IGNORECASE,
+)
+
+
+def _clean_inat_attribution(raw: str) -> str:
+    """Reduce iNat's "(c) Name, some rights reserved (LICENSE)" to just Name.
+
+    The ingested path's mediaAttribution (multimedia.txt's rightsHolder) is
+    already a bare name — iNat's own attribution field bakes the license
+    mention into the string, which would visually duplicate the separately
+    rendered license line (see the map popup / ObservationCard credit row).
+    Falls back to the raw string if it doesn't match this format, rather
+    than dropping it, since iNat's wording isn't 100% guaranteed uniform.
+    """
+    match = _INAT_ATTRIBUTION_NAME_RE.match(raw)
+    return match.group(1).strip() if match else raw
+
+
+def _inat_observation_photo(obs: dict) -> dict:
+    """Extract the first usable-license photo from an iNat observation payload.
+
+    Same permissive-license bar as build_tree.py's GBIF backup images and
+    populate_tree.py's multimedia join (_is_usable_license), so display
+    logic never has to reason about three different license policies.
+    """
+    for photo in obs.get("photos") or []:
+        license_code = photo.get("license_code") or ""
+        if not _is_usable_license(license_code):
+            continue
+        raw_url = photo.get("url") or ""
+        if not raw_url:
+            continue
+        license_url = _normalize_license_url(license_code)
+        raw_attribution = photo.get("attribution") or ""
+        return {
+            "media_url": re.sub(r"/square\.", "/original.", raw_url, count=1),
+            "media_attribution": _clean_inat_attribution(raw_attribution) or None,
+            "media_license_url": license_url or None,
+            "media_license": _license_label(license_url) if license_url else None,
+        }
+    return {"media_url": None, "media_attribution": None, "media_license_url": None, "media_license": None}
+
+
+def _lookup_inat_observation(catalog_number: str) -> dict | None:
+    """Resolve an observation directly via iNaturalist's own API.
+
+    Fallback for observations GBIF hasn't (or can't) ingest yet — GBIF's
+    iNaturalist mirror only re-syncs periodically (see the media-join
+    investigation: some research-grade observations never make it into a
+    given export at all). Returns None on any failure (not found, no
+    taxon, network error, or a taxon iNat has that our own catalog doesn't
+    map — see util.taxa.get_taxon_by_inat_id) so the caller can fall back
+    to a plain 404 uniformly.
+
+    Also returns event_timestamp and media fields — unlike the ingested
+    path, there's no other source for these (the observation isn't part of
+    the taxon's normal /occurrences fetch at all), so this is the only
+    place they're worth carrying.
+    """
+    try:
+        resp = httpx.get(
+            _INAT_OBSERVATIONS_URL, params={"id": catalog_number}, timeout=10.0,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results") or []
+    except Exception:
+        return None
+    if not results:
+        return None
+    obs = results[0]
+
+    inat_taxon = obs.get("taxon") or {}
+    taxon = taxa.get_taxon_by_inat_id(inat_taxon.get("id"))
+    if taxon is None:
+        return None
+
+    coords = (obs.get("geojson") or {}).get("coordinates")
+    latitude = coords[1] if isinstance(coords, list) and len(coords) == 2 else None
+    longitude = coords[0] if isinstance(coords, list) and len(coords) == 2 else None
+    event_timestamp = _parse_inat_timestamp(obs.get("time_observed_at") or obs.get("observed_on"))
+
+    return {
+        "taxon": taxon,
+        "latitude": latitude,
+        "longitude": longitude,
+        "event_timestamp": event_timestamp,
+        **_inat_observation_photo(obs),
+    }
+
+
+@app.get("/occurrence/{catalog_number}")
+def get_occurrence(catalog_number: str):
+    """Resolve an iNaturalist observation id (catalogNumber) to its taxon + location.
+
+    Powers deep links like /occurrence/{id} on the frontend: given just an
+    inat observation id, find which species page it belongs to and where to
+    place it on that page's map — the same destination as clicking that
+    observation's image in the below-map gallery, just entered by id
+    instead of navigated to. Looks up CATALOG_NUMBER_INDEX_FILE (sorted by
+    catalogNumber) rather than OCCURRENCES_FILE (sorted by taxon_key) so the
+    lookup gets row-group pruning instead of a full scan.
+
+    Falls back to iNaturalist's own API (_lookup_inat_observation) when the
+    observation isn't in our ingested dataset at all — "ingested": false on
+    that path distinguishes a live iNat-only resolution from our own data.
+    """
+    catalog_number = catalog_number.strip()
+    if not catalog_number:
+        raise HTTPException(status_code=404, detail="Observation not found")
+
+    try:
+        rows = _storage.read_table(
+            CATALOG_NUMBER_INDEX_FILE,
+            filters=[("catalogNumber", "=", catalog_number)],
+        ).to_pylist()
+    except Exception:
+        rows = []
+
+    if rows:
+        taxon = taxa.get_taxon_by_id(rows[0].get("taxon_key"))
+        if taxon is None:
+            raise HTTPException(status_code=404, detail="Taxon not found")
+        return _occurrence_response(
+            catalog_number, taxon, rows[0].get("decimalLatitude"), rows[0].get("decimalLongitude"), ingested=True,
+        )
+
+    fallback = _lookup_inat_observation(catalog_number)
+    if fallback is None:
+        raise HTTPException(status_code=404, detail="Observation not found")
+    return _occurrence_response(
+        catalog_number, fallback["taxon"], fallback["latitude"], fallback["longitude"], ingested=False,
+        extra={
+            "event_timestamp": fallback["event_timestamp"],
+            "media_url": fallback["media_url"],
+            "media_attribution": fallback["media_attribution"],
+            "media_license": fallback["media_license"],
+            "media_license_url": fallback["media_license_url"],
+        },
+    )
+
+
 @app.get("/species/{taxon_id}/occurrences")
 def get_species_occurrences(
     taxon_id: str,
@@ -1533,7 +1835,6 @@ def get_species_occurrences(
 
     _reject_if_large_taxon(taxon)
 
-    is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
     filter_col = _location_filter_col(location) if location is not None else None
     has_loc_or_pheno = filter_col is not None or phenology_norm is not None
     has_ts = start_ts is not None or end_ts is not None
@@ -1544,67 +1845,53 @@ def get_species_occurrences(
         extra_cols.append(filter_col)
     # Always read rcs so we can fall back to live phenology counts if precomputed is missing
     extra_cols.append("rcs")
-    # Need eventTimestamp in data when filtering by it, or when computing range
-    # from row-filtered data (loc/pheno active).
-    if has_ts or has_loc_or_pheno:
-        extra_cols.append("eventTimestamp")
+    extra_cols.append("eventTimestamp")
+    extra_cols.extend(["mediaUrl", "mediaAttribution", "mediaLicense"])
     occ_columns = list(_OCC_COLUMNS) + extra_cols
 
-    collected: list[dict] = []
-    seen: set[str] = set()
     ts_min: int | None = None
     ts_max: int | None = None
     pheno_acc: Counter = Counter()
 
-    def _read_occ(path: Path) -> None:
-        nonlocal ts_min, ts_max
-        # Fast path: parquet footer stats when no row-level filters change the range
-        if not has_loc_or_pheno:
-            result = _timestamp_range_from_metadata(path)
-            if result:
-                lo, hi = result
-                ts_min = lo if ts_min is None else min(ts_min, lo)
-                ts_max = hi if ts_max is None else max(ts_max, hi)
-        try:
-            schema_names = set(_storage.read_schema(path).names)
-            cols_to_read = [c for c in occ_columns if c in schema_names]
-            table = _storage.read_table(path, columns=cols_to_read)
-        except Exception:
-            return
-        if table.num_rows == 0:
-            return
-        df = _filter_occ_df(table.to_pandas())
-        if filter_col is not None:
+    df = _read_occurrences_scoped(taxon, columns=occ_columns)
+    if df.empty:
+        collected: list[dict] = []
+    else:
+        df = _filter_occ_df(df)
+        if filter_col is not None and filter_col in df.columns:
             df = df[df[filter_col].astype(str) == str(location)]
         if phenology_norm is not None:
             df = apply_phenology_filter(df, phenology_norm)
-        # Range from actual data when loc/pheno filters are active (before ts filter)
-        if has_loc_or_pheno and "eventTimestamp" in df.columns:
+        if "eventTimestamp" in df.columns:
             ts_col = pd.to_numeric(df["eventTimestamp"], errors="coerce").dropna()
             if len(ts_col):
-                lo, hi = int(ts_col.min()), int(ts_col.max())
-                ts_min = lo if ts_min is None else min(ts_min, lo)
-                ts_max = hi if ts_max is None else max(ts_max, hi)
+                ts_min, ts_max = int(ts_col.min()), int(ts_col.max())
         if has_ts:
             df = apply_timestamp_filter(df, start_ts, end_ts)
         if not use_precomputed_pheno and "rcs" in df.columns:
             pheno_acc.update(compute_phenology_counts(df))
-        df = df[["catalogNumber", "decimalLatitude", "decimalLongitude"]].dropna()
+        media_cols = [c for c in ("mediaUrl", "mediaAttribution", "mediaLicense") if c in df.columns]
+        df = df[["catalogNumber", "decimalLatitude", "decimalLongitude", *media_cols]]
+        df = df.dropna(subset=["catalogNumber", "decimalLatitude", "decimalLongitude"])
+        df = df.drop_duplicates(subset="catalogNumber")
+        collected = []
         for r in df.to_dict("records"):
-            cid = str(r["catalogNumber"])
-            if cid in seen:
-                continue
-            seen.add(cid)
-            collected.append({"catalogNumber": cid, "latitude": r["decimalLatitude"], "longitude": r["decimalLongitude"]})
-
-    if taxon["rank"] == _CONFIG.species_rank:
-        for desc in iter_descendants(taxon, include_self=True):
-            _read_occ(TREE_ROOT / desc["path"] / _OCC_FILE)
-    elif is_leaf:
-        _read_occ(TREE_ROOT / taxon["path"] / _OCC_FILE)
-    else:
-        for desc in iter_descendants(taxon, include_self=False):
-            _read_occ(TREE_ROOT / desc["path"] / _OCC_FILE)
+            entry = {
+                "catalogNumber": str(r["catalogNumber"]),
+                "latitude": r["decimalLatitude"],
+                "longitude": r["decimalLongitude"],
+            }
+            media_url = r.get("mediaUrl")
+            if isinstance(media_url, str) and media_url:
+                entry["media_url"] = media_url
+                attribution = r.get("mediaAttribution")
+                if isinstance(attribution, str) and attribution:
+                    entry["media_attribution"] = attribution
+                license_url = r.get("mediaLicense")
+                if isinstance(license_url, str) and license_url:
+                    entry["media_license_url"] = license_url
+                    entry["media_license"] = _license_label(license_url)
+            collected.append(entry)
 
     if use_precomputed_pheno:
         pheno_counts = read_phenology_counts(TREE_ROOT / taxon["path"]) or dict(
@@ -1775,37 +2062,19 @@ def get_observation_variable_values(
         raise HTTPException(status_code=404, detail=f"Variable '{variable_id}' not found")
 
     collected: dict[str, float] = {}
-
-    def _read_occ(path: Path) -> None:
-        if not path.exists():
-            return
-        try:
-            import pyarrow.parquet as _pq
-            schema_names = set(_pq.read_schema(path).names)
-            extra = [c for c in ("obscured", "coordinateUncertaintyInMeters") if c in schema_names]
-            tbl = _pq.read_table(path, columns=["catalogNumber", variable_id] + extra).to_pandas()
-            if "obscured" in tbl.columns:
-                tbl = tbl[tbl["obscured"] == "No"]
-            if "coordinateUncertaintyInMeters" in tbl.columns:
-                col = tbl["coordinateUncertaintyInMeters"]
-                tbl = tbl[col.isna() | (col <= 500)]
-            for cat, val in zip(tbl["catalogNumber"].tolist(), tbl[variable_id].tolist()):
-                if cat not in collected and val is not None and not (isinstance(val, float) and math.isnan(val)):
-                    converted = units.convert_value(float(val), layer, unit_system)
-                    if converted is not None:
-                        collected[cat] = converted
-        except Exception:
-            pass
-
-    is_leaf = taxon["rank"] in _CONFIG.leaf_rank_set
-    if taxon["rank"] == _CONFIG.species_rank:
-        for desc in iter_descendants(taxon, include_self=True):
-            _read_occ(TREE_ROOT / desc["path"] / "occurrence.parquet")
-    elif is_leaf:
-        _read_occ(TREE_ROOT / taxon["path"] / "occurrence.parquet")
-    else:
-        for desc in iter_descendants(taxon, include_self=False):
-            _read_occ(TREE_ROOT / desc["path"] / "occurrence.parquet")
+    df = _read_occurrences_scoped(taxon, columns=["catalogNumber", variable_id, "obscured", "coordinateUncertaintyInMeters"])
+    if variable_id in df.columns:
+        if "obscured" in df.columns:
+            df = df[df["obscured"] == "No"]
+        if "coordinateUncertaintyInMeters" in df.columns:
+            col = df["coordinateUncertaintyInMeters"]
+            df = df[col.isna() | (col <= 500)]
+        for cat, val in zip(df["catalogNumber"].tolist(), df[variable_id].tolist()):
+            cat = str(cat)
+            if cat not in collected and val is not None and not (isinstance(val, float) and math.isnan(val)):
+                converted = units.convert_value(float(val), layer, unit_system)
+                if converted is not None:
+                    collected[cat] = converted
 
     vals = list(collected.values())
     obs_min = min(vals) if vals else None
@@ -1933,6 +2202,7 @@ def get_species_environment_slice(
     end_ts: int | None = None,
     unit_system: str | None = None,
     extra: str | None = None,
+    polygon: str | None = None,
 ):
     if not math.isfinite(min_value) or not math.isfinite(max_value):
         raise HTTPException(status_code=400, detail="min and max must be finite numbers")
@@ -1943,6 +2213,10 @@ def get_species_environment_slice(
     phenology_norm = phenology.strip().lower() if phenology else None
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+    try:
+        polygon_geom = parse_polygon_param(polygon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid polygon: {exc}") from exc
     variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
@@ -1963,7 +2237,7 @@ def get_species_environment_slice(
             taxon, variable_id, filter_col, location,
             raw_min, raw_max, circular_wrap, limit,
             phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
-            extra_filters=extra_filters,
+            extra_filters=extra_filters, polygon=polygon_geom,
         )
         observations = [
             {**obs, "value": units.convert_value(obs["value"], layer, unit_system)}
@@ -1992,6 +2266,7 @@ def get_species_environment_class_samples(
     end_ts: int | None = None,
     unit_system: str | None = None,
     extra: str | None = None,
+    polygon: str | None = None,
 ):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
@@ -2000,6 +2275,10 @@ def get_species_environment_class_samples(
     phenology_norm = phenology.strip().lower() if phenology else None
     if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
         raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+    try:
+        polygon_geom = parse_polygon_param(polygon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid polygon: {exc}") from exc
     variable_id = _resolve_variable_id(variable_id)
     layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
     if layer is None:
@@ -2018,7 +2297,7 @@ def get_species_environment_class_samples(
         observations = _class_samples_from_raw_occ(
             taxon, variable_id, filter_col, location, float(parsed), limit,
             phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
-            extra_filters=extra_filters,
+            extra_filters=extra_filters, polygon=polygon_geom,
         )
     else:
         observations = []
@@ -2057,13 +2336,25 @@ def list_taxa_ranking_options(
         raise HTTPException(status_code=404, detail=f"Taxon not found: {within_taxon}")
 
     norm_rank = descendant_rank.upper()
-    rank_lower = "subspecies" if norm_rank in _CONFIG.subspecies_equivalents else norm_rank.lower()
-    index_path = rankings.TREE_ROOT / resolved["path"] / f"{rank_lower}_index.parquet"
+    rank_key = "SUBSPECIES" if norm_rank in _CONFIG.subspecies_equivalents else norm_rank
 
     try:
-        schema = _storage.read_schema(index_path)
-        raw_lengths = (schema.metadata or {}).get(b"column_lengths")
-        column_lengths = {k: int(v) for k, v in json.loads(raw_lengths).items() if int(v) > 0} if raw_lengths else {}
+        rows = _storage.read_table(
+            GLOBAL_STATS_DIR / RANKINGS_FILE,
+            columns=["variable", "metric", "count"],
+            filters=[
+                ("contextTaxonId", "=", str(resolved["taxon_key"])),
+                ("rank", "=", rank_key),
+            ],
+        ).to_pandas()
+        # `count` is the same for every row in a (variable, metric) group (the
+        # sort's full eligible population, computed once at build time — see
+        # util/rankings.py::_write_rank_positions) — group just to get one
+        # (variable, metric) -> count entry per option.
+        column_counts = {
+            (variable, metric): int(count)
+            for variable, metric, count in rows.groupby(["variable", "metric"], as_index=False)["count"].max().itertuples(index=False)
+        }
     except Exception:
         return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": []}
 
@@ -2087,13 +2378,9 @@ def list_taxa_ranking_options(
         return legend_cache[variable].get(class_id, metric)
 
     options = []
-    for col in schema.names:
-        if "::" not in col:
-            continue
-        count = int(column_lengths.get(col, 0) or 0)
+    for (variable, metric), count in column_counts.items():
         if count <= 0:
             continue
-        variable, metric = col.split("::", 1)
         if metric == "mode" and layer_value_types.get(variable) == "nominal":
             continue
         if metric.startswith("class_"):
@@ -2106,7 +2393,7 @@ def list_taxa_ranking_options(
             "variable": variable,
             "metric": metric,
             "label": label,
-            "column": col,
+            "column": f"{variable}::{metric}",
             "count": count,
         })
 
@@ -2136,6 +2423,7 @@ def query_taxa(
     unit_system: str | None = Query(None),
     sort_reference: float | None = Query(None),
     min_rbar: float | None = Query(None, ge=0.0, le=1.0),
+    filter_params: list[str] = Query([], alias="filter"),
 ):
     normalized_q = normalize_name(q or "") or None
 
@@ -2149,6 +2437,33 @@ def query_taxa(
 
     norm_rank = descendant_rank.upper() if descendant_rank else None
     norm_sort_variable = _resolve_variable_id(sort_variable) if sort_variable else None
+
+    all_layers = tiles.load_layers()
+    layer_by_id = {lyr["id"]: lyr for lyr in all_layers}
+    # Each ?filter=variable:metric:op:value[:count] chains an extra summary-stat
+    # predicate on top of scope/sort/text/location (e.g. "avg temp < 25C AND
+    # at least 10 observations in ecoregion X") — never raw SQL from the
+    # client, just a strict tuple validated against the known layer catalog.
+    parsed_filters: list[rankings.StatFilter] = []
+    for raw in filter_params:
+        try:
+            parsed = rankings.parse_stat_filter(raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        resolved_variable = _resolve_variable_id(parsed.variable)
+        value = parsed.value
+        # class_* filters compare a percentage/count, not a physical unit —
+        # only scalar stat metrics (e.g. bio1 mean) need the same
+        # display-unit-to-raw conversion /slice's min/max range already does.
+        if not parsed.metric.startswith("class_"):
+            layer = layer_by_id.get(resolved_variable)
+            if layer is not None:
+                value = units.convert_value_from_display(
+                    value, layer, unit_system, metric=parsed.metric,
+                )
+        parsed_filters.append(
+            parsed._replace(variable=resolved_variable, value=value)
+        )
 
     result = rankings.query_taxa(
         q=normalized_q,
@@ -2164,9 +2479,11 @@ def query_taxa(
         location_gid=location,
         reference_value=sort_reference,
         min_rbar=min_rbar,
+        stat_filters=parsed_filters or None,
+        layers=all_layers,
     )
 
-    sort_layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == norm_sort_variable), None) if norm_sort_variable else None
+    sort_layer = next((lyr for lyr in all_layers if lyr["id"] == norm_sort_variable), None) if norm_sort_variable else None
     is_class_metric = bool(sort_metric and sort_metric.startswith("class_"))
     serialized: list[dict] = []
     for item in result["results"]:
@@ -2212,6 +2529,7 @@ def query_taxa(
             "location": location,
             "min_samples": min_samples,
             "include_species_like": include_species_like,
+            "filters": filter_params,
         },
         "sort": {
             "variable": sort_variable,

@@ -9,7 +9,6 @@ Runs in three sequential phases after sync_gbif has produced species_list.csv:
 
 Phase 1 — Catalog construction  (formerly build_tree.py)
   - Parse species_list.csv, build catalog + name index, write taxon_catalog.pkl
-  - Create per-taxon directory tree under data/taxonomy/tree/
 
 Phase 2 — ID mapping  (formerly build_id_maps.py)
   - Download iNat DWC-A zip (ETag-cached), extract taxa.csv
@@ -18,11 +17,16 @@ Phase 2 — ID mapping  (formerly build_id_maps.py)
 
 Phase 3 — Name & image enrichment  (formerly polish_tree.py)
   - iNat DWC-A VernacularNames-*.csv  (matched via inat_id, same zip as Phase 2)
-  - GBIF backbone VernacularName.tsv  (matched via GBIF taxon key, range requests)
+  - COL XR vernacular names            (live GBIF species-search, scoped to
+    CONFIG.plantae_key's subtree — see fetch_col_vernacular; each result's
+    taxonID is already this catalog's own COL XR key, so no crosswalk is
+    needed the way GBIF's legacy numeric-keyed Backbone vernacular file
+    would have required)
   - iNat API /v1/taxa                 (preferred_common_name + default_photo)
   - GBIF occurrence DWCA multimedia   (backup images)
 
-File sources are ETag-cached in data/taxonomy/cache/ via data/sync_state.json.
+File sources are ETag-cached in data/taxonomy/cache/ via data/sync_state.json
+(except COL XR vernacular names, fetched live each run — see fetch_col_vernacular).
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import pickle
 import subprocess
 import sys
@@ -37,10 +42,9 @@ import time
 import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
-from remotezip import RemoteZip
 
 from config.config import load_config
 
@@ -49,17 +53,13 @@ CONFIG = load_config("global")
 CATALOG_DIR = Path("data/taxonomy/catalog")
 CATALOG_PATH = CATALOG_DIR / "taxon_catalog.pkl"
 MAPPING_PATH = CATALOG_DIR / "inat_gbif_mapping.csv"
-TREE_ROOT = Path("data/taxonomy/tree")
 CACHE_DIR = Path("data/taxonomy/cache")
 INAT_DWCA_CACHE = CACHE_DIR / "inat_dwca.zip"
-BACKBONE_VERNACULAR_CACHE = CACHE_DIR / "gbif_vernacular.tsv"
 OCCURRENCE_PATH = Path("data/occurrences/occurrence.txt")
 MULTIMEDIA_PATH = Path("data/occurrences/multimedia.txt")
 SYNC_STATE_PATH = Path("data/sync_state.json")
 
 INAT_DWCA_URL = "https://www.inaturalist.org/taxa/inaturalist-taxonomy.dwca.zip"
-BACKBONE_URL = "https://hosted-datasets.gbif.org/datasets/backbone/current/backbone.zip"
-BACKBONE_VERNACULAR_FILENAME = "VernacularName.tsv"
 INAT_TAXA_FILENAME = "taxa.csv"
 
 HYBRID_MARKER = "×"
@@ -170,13 +170,22 @@ def _csv_row_filters(row: dict) -> bool:
         return False
     if not row.get("genus") or not row.get("genusKey"):
         return False
-    if row["taxonRank"] in CONFIG.subspecies_equivalents:
+    if row["taxonRank"] in CONFIG.subspecies_equivalents and row.get("taxonomicStatus") != "SYNONYM":
+        # Only required for ACCEPTED infra rows, which need it to nest under
+        # their parent species. SYNONYM infra rows whose accepted target is
+        # itself infraspecific (e.g. "Escobaria sneedii var. sneedii" ->
+        # "Pelecyphora sneedii subsp. sneedii") can have this blank in COL's
+        # export — build_catalog's across-genus-synonym branch below doesn't
+        # need it, it just places the entry directly under genus, same as
+        # every other synonym that can't cleanly nest under an accepted
+        # species. Dropping these here silently lost real occurrence data
+        # (confirmed: 131 for the sneedii var. sneedii case).
         if not row.get("species") or not row.get("speciesKey"):
             return False
     return True
 
 
-def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]:
+def build_catalog(csv_path: Path) -> tuple[dict, dict]:
     """Parse species list CSV and return (catalog, combined_name_index).
 
     SYNONYM species handling:
@@ -283,9 +292,6 @@ def build_catalog(csv_path: Path, write_dirs: bool = False) -> tuple[dict, dict]
                     cleaned_name = clean_name(row["scientificName"], row["taxonRank"])
                 path_parts.append(f"{cleaned_name}_{taxon_key}")
                 rel_path = "/".join(path_parts)
-
-            if write_dirs:
-                (TREE_ROOT / Path(*path_parts)).mkdir(parents=True, exist_ok=True)
 
             common_name = row.get("commonName", "")
             entry_key = str(taxon_key)
@@ -703,34 +709,184 @@ def _resolve_obs_inat_ids(catalog: dict, obs_by_taxon: dict[str, str]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# GBIF backbone VernacularName.tsv via remote ZIP range requests
+# COL XR vernacular names, fetched live and pre-matched to our own taxon_key
 # ---------------------------------------------------------------------------
 
-def fetch_backbone_vernacular() -> bytes:
-    state = _load_state()
-    cached_etag = state.get("gbif_backbone", {}).get("etag", "")
+# Fetching this live (rather than from a static COL XR dump) is a slow,
+# somewhat-adjacent-to-the-core-pipeline step (~700 requests, ~15 min, plus
+# GBIF's offset cap and transient network drops to work around) — set this
+# to skip it entirely until a COL XR dump keyed to match our current catalog
+# is available to source vernacular names from instead.
+SKIP_COL_VERNACULAR_FETCH = os.environ.get("SKIP_COL_VERNACULAR_FETCH", "").lower() in ("1", "true", "yes")
 
-    print(f"Checking {BACKBONE_URL} ...")
-    req = Request(BACKBONE_URL, method="HEAD", headers={"User-Agent": _UA})
-    with urlopen(req, timeout=30) as r:
-        remote_etag = r.headers.get("ETag", "")
+# Same checklist as scripts/sync_gbif.py's COL_XR_CHECKLIST_KEY — this
+# catalog's taxon_key values are COL XR's own alphanumeric taxonIDs.
+COL_XR_CHECKLIST_KEY = "7ddf754f-d193-4cc9-b351-99906754a03b"
+GBIF_SPECIES_SEARCH_URL = "https://api.gbif.org/v1/species/search"
+COL_VERNACULAR_PAGE_SIZE = 1000
+COL_API_RATE_LIMIT = 1.0  # requests per second
+# GBIF's /v1/species/search hard-rejects offset > 100,000 ("Max offset of
+# 100000 exceeded", HTTP 400) — confirmed directly against the live API.
+# Any highertaxonKey subtree with more accepted usages than this needs to be
+# split into per-child requests (see _fetch_col_vernacular_subtree) instead
+# of paginated as one flat scan.
+COL_SAFE_SUBTREE_LIMIT = 90_000
+# A full-Plantae vernacular fetch is ~700 requests over ~15 min — long enough
+# that a single transient connection drop (seen in practice: SSLEOFError mid-
+# handshake) shouldn't kill the whole run. HTTPError (a real response, e.g.
+# our own 400s) is not retried; only network-level failures are.
+COL_API_MAX_RETRIES = 5
+COL_API_RETRY_BACKOFF_S = 3.0
 
-    if remote_etag and remote_etag == cached_etag and BACKBONE_VERNACULAR_CACHE.exists():
-        print("  GBIF backbone VernacularName.tsv: cache up to date")
-        return BACKBONE_VERNACULAR_CACHE.read_bytes()
 
-    print(f"Fetching {BACKBONE_VERNACULAR_FILENAME} from GBIF backbone...")
-    with RemoteZip(BACKBONE_URL) as rz:
-        data = rz.read(BACKBONE_VERNACULAR_FILENAME)
-    print(f"  {len(data) / 1_048_576:.1f} MB")
+def _gbif_species_search(params: dict) -> dict:
+    url = f"{GBIF_SPECIES_SEARCH_URL}?{urlencode(params)}"
+    req = Request(url, headers={"User-Agent": _UA})
+    for attempt in range(COL_API_MAX_RETRIES):
+        try:
+            with urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except HTTPError:
+            # A real response (e.g. our own 400 from exceeding the offset
+            # cap) — not transient, retrying won't help.
+            raise
+        except URLError:
+            if attempt == COL_API_MAX_RETRIES - 1:
+                raise
+            wait = COL_API_RETRY_BACKOFF_S * (2 ** attempt)
+            print(f"  GBIF request failed (attempt {attempt + 1}/{COL_API_MAX_RETRIES}), retrying in {wait:.0f}s...", flush=True)
+            time.sleep(wait)
+    raise AssertionError("unreachable")  # loop always returns or raises
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    BACKBONE_VERNACULAR_CACHE.write_bytes(data)
-    if remote_etag:
-        state.setdefault("gbif_backbone", {})["etag"] = remote_etag
-        _save_state(state)
 
-    return data
+def _resolve_col_highertaxon_key(name: str, taxon_id: str) -> int | None:
+    """Resolve a COL XR taxonID (our own taxon_key format, e.g. "P") to
+    GBIF's internal numeric usage key for that same record in the COL XR
+    checklist — needed as highertaxonKey below, since GBIF's species-search
+    API scopes subtrees by its own internal key, not the source checklist's
+    taxonID.
+    """
+    payload = _gbif_species_search({
+        "q": name,
+        "datasetKey": COL_XR_CHECKLIST_KEY,
+        "limit": 50,
+    })
+    for result in payload.get("results", []):
+        if result.get("taxonID") == taxon_id:
+            return result.get("key")
+    return None
+
+
+def _build_catalog_children_index(catalog: dict) -> dict[str, list[str]]:
+    """taxon_key -> direct child taxon_keys, derived from each entry's
+    "path" (an ancestor chain of Name_Key segments set by build_catalog)
+    since catalog entries don't carry an explicit parent pointer."""
+    children: dict[str, list[str]] = defaultdict(list)
+    for key, entry in catalog.items():
+        segments = entry.get("path", "").split("/")
+        if len(segments) < 2:
+            continue
+        parent_key = segments[-2].rsplit("_", 1)[-1]
+        children[parent_key].append(key)
+    return children
+
+
+def _fetch_col_vernacular_subtree(
+    name: str,
+    taxon_id: str,
+    catalog: dict,
+    children_index: dict[str, list[str]],
+    result: dict[str, list[str]],
+) -> None:
+    """Page through one highertaxonKey subtree into result, splitting into
+    per-child subtrees (via our own catalog tree) whenever a subtree's
+    accepted-usage count exceeds COL_SAFE_SUBTREE_LIMIT — GBIF's
+    /v1/species/search rejects offset > 100,000 outright, so a single flat
+    scan only works up to that ceiling. Most subtrees never come close and
+    resolve in one pass; only oversized branches (e.g. Tracheophyta) recurse.
+    """
+    highertaxon_key = _resolve_col_highertaxon_key(name, taxon_id)
+    if highertaxon_key is None:
+        print(f"  Could not resolve a GBIF/COL XR usage key for {name!r}, skipping.")
+        return
+
+    offset = 0
+    total = None
+    while total is None or offset < total:
+        payload = _gbif_species_search({
+            "highertaxonKey": highertaxon_key,
+            "datasetKey": COL_XR_CHECKLIST_KEY,
+            "status": "ACCEPTED",
+            "limit": COL_VERNACULAR_PAGE_SIZE,
+            "offset": offset,
+        })
+        total = payload.get("count", 0)
+
+        if offset == 0 and total > COL_SAFE_SUBTREE_LIMIT:
+            children = children_index.get(taxon_id, [])
+            if not children:
+                print(
+                    f"  {name!r} has {total:,} accepted usages and no catalog "
+                    "children to split by — scanning anyway, may hit GBIF's offset cap."
+                )
+            else:
+                print(f"  {name!r} has {total:,} accepted usages — splitting into {len(children):,} children")
+                for child_key in children:
+                    child = catalog[child_key]
+                    child_name = str(child.get("scientific_name") or "").replace("_", " ")
+                    time.sleep(1.0 / COL_API_RATE_LIMIT)
+                    _fetch_col_vernacular_subtree(child_name, child_key, catalog, children_index, result)
+                return
+
+        for entry in payload.get("results", []):
+            taxon_id_result = entry.get("taxonID")
+            if not taxon_id_result:
+                continue
+            names = [
+                v["vernacularName"]
+                for v in (entry.get("vernacularNames") or [])
+                if (v.get("language") or "").strip().lower() in ("en", "eng")
+            ]
+            if names:
+                result[taxon_id_result] = names
+        offset += COL_VERNACULAR_PAGE_SIZE
+        print(f"  [{name}] [{min(offset, total):,}/{total:,}] scanned, {len(result):,} taxa with vernacular names total...", flush=True)
+        if payload.get("endOfRecords"):
+            break
+        time.sleep(1.0 / COL_API_RATE_LIMIT)
+
+
+def fetch_col_vernacular(catalog: dict) -> dict[str, list[str]]:
+    """Return taxon_key -> all English vernacular names, fetched live from
+    GBIF's COL XR-backed species search, scoped to CONFIG.plantae_key's
+    subtree, accepted usages only.
+
+    Not GBIF's legacy Backbone VernacularName.tsv (the old approach): its own
+    taxonID is a legacy numeric GBIF Backbone key, not one of this catalog's
+    COL XR keys, so it can never join directly — and bridging the two via a
+    numeric-ID-to-name crosswalk (from the backbone's ~2.3GB Taxon.tsv) isn't
+    guaranteed to be a clean 1:1 mapping either. Querying COL XR directly by
+    our own root's subtree returns each result's taxonID pre-matched to our
+    catalog's own key format, with vernacularNames already inline — no
+    crosswalk needed.
+
+    Scoped + paginated (not per-taxon): a single highertaxonKey covers the
+    whole configured subtree, ~5 requests for the current Cactaceae-only
+    catalog, ~660 requests (~11 min at COL_API_RATE_LIMIT) for a full-Plantae
+    catalog — vs. one request per taxon (thousands) or per genus (hundreds).
+    Subtrees over GBIF's 100,000-offset cap are split further; see
+    _fetch_col_vernacular_subtree.
+    """
+    root = catalog.get(CONFIG.plantae_key)
+    if root is None:
+        print(f"  plantae_key {CONFIG.plantae_key!r} not found in catalog, skipping COL vernacular fetch.")
+        return {}
+
+    root_name = str(root.get("scientific_name") or "").replace("_", " ")
+    children_index = _build_catalog_children_index(catalog)
+    result: dict[str, list[str]] = {}
+    _fetch_col_vernacular_subtree(root_name, CONFIG.plantae_key, catalog, children_index, result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -758,34 +914,6 @@ def load_inat_vernacular(dwca_bytes: bytes) -> dict[str, list[str]]:
     return result
 
 
-def load_gbif_vernacular(tsv_bytes: bytes) -> dict[str, list[str]]:
-    """Return gbif_taxon_key -> all English vernacular names (preferred names first)."""
-    preferred: dict[str, list[str]] = {}
-    others: dict[str, list[str]] = {}
-    seen: dict[str, set[str]] = {}
-    reader = csv.DictReader(io.StringIO(tsv_bytes.decode("utf-8")), delimiter="\t")
-    for row in reader:
-        taxon_id = (row.get("taxonID") or "").strip()
-        name = (row.get("vernacularName") or "").strip()
-        lang = (row.get("language") or "").strip().lower()
-        is_preferred = (row.get("isPreferredName") or "").strip() in ("1", "true")
-        if not taxon_id or not name or lang not in ("en", "eng"):
-            continue
-        if "/" in taxon_id:
-            taxon_id = taxon_id.rsplit("/", 1)[-1]
-        if name in seen.setdefault(taxon_id, set()):
-            continue
-        seen[taxon_id].add(name)
-        if is_preferred:
-            preferred.setdefault(taxon_id, []).append(name)
-        else:
-            others.setdefault(taxon_id, []).append(name)
-    result = {**others}
-    for tid, names in preferred.items():
-        result[tid] = names + result.get(tid, [])
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Catalog update
 # ---------------------------------------------------------------------------
@@ -805,9 +933,12 @@ def apply_names(
             for name in (inat_map.get(syn_inat_id) or []):
                 if name not in inat_names:
                     inat_names = list(inat_names) + [name]
-        # Look up GBIF vernacular under the primary key AND any synonym keys (e.g. a
-        # reclassified species still has its old taxon key in the backbone TSV).
-        gbif_keys = [taxon_key]
+        # Look up COL XR vernacular under the primary key AND any synonym
+        # keys (e.g. a reclassified species still carries its old COL XR
+        # taxon key in gbif_synonym_keys) — gbif_map is keyed by taxon_key
+        # directly (see fetch_col_vernacular), since each result's taxonID
+        # already matches this catalog's own key format.
+        gbif_keys = [taxon_key, *(taxon.get("gbif_synonym_keys") or [])]
         seen_gbif: set[str] = set()
         gbif_names: list[str] = []
         for gk in gbif_keys:
@@ -1092,6 +1223,26 @@ def _image_quality(license_str: str, vitality: str, evidence: str, rcs: str) -> 
     return (v, e, r, _license_score(license_str))
 
 
+def _build_scientific_name_index(catalog: dict) -> dict[str, list[str]]:
+    """normalize_name(scientific/synonym name) -> [taxon_key, ...].
+
+    Self-contained rather than reusing payload["combined_name_index"]: this
+    runs (via run_gbif_backup, in Phase 3 of main()) before update_name_index
+    has folded gbif_synonym_names into that index, so at this point in the
+    pipeline it wouldn't yet cover synonyms.
+    """
+    index: dict[str, list[str]] = defaultdict(list)
+    for taxon_key, taxon in catalog.items():
+        name_key = normalize_name(str(taxon.get("scientific_name") or ""))
+        if name_key:
+            index[name_key].append(taxon_key)
+        for old_name in taxon.get("gbif_synonym_names") or []:
+            key = normalize_name(str(old_name))
+            if key:
+                index[key].append(taxon_key)
+    return dict(index)
+
+
 def _build_gbif_to_taxon(
     catalog: dict,
     unmatched_inat_keys: set[str] | None = None,
@@ -1099,17 +1250,20 @@ def _build_gbif_to_taxon(
 ) -> dict[str, tuple]:
     """Stream occurrence.txt → gbifID: (taxon_key, vitality, evidence, rcs).
 
-    Direct taxonKey lookup against catalog, with synonym key fallback for
-    across-genus synonyms stored in gbif_synonym_keys.
+    Matched by scientificName (+ taxonRank), not occurrence.txt's own taxonKey
+    column: even when a download's TAXON_KEY predicate is scoped via
+    checklistKey (Catalogue of Life Extended Release, the alphanumeric IDs
+    this catalog is keyed by), each occurrence row's own
+    taxonKey/familyKey/etc. columns still report the legacy numeric GBIF
+    Backbone classification — checklistKey only affects how the predicate's
+    filter value is resolved, not the taxonomy baked into exported rows.
+    Confirmed against a live GBIF occurrence record. See also
+    populate_tree.py's module docstring, which hit the same issue.
 
     If unmatched_inat_keys and obs_id_out are provided, also collects the first
     iNat catalogNumber per unmatched taxon in the same pass.
     """
-    catalog_keys = set(catalog.keys())
-    synonym_to_key: dict[str, str] = {}
-    for taxon_key, taxon in catalog.items():
-        for syn_key in (taxon.get("gbif_synonym_keys") or []):
-            synonym_to_key[str(syn_key)] = taxon_key
+    name_index = _build_scientific_name_index(catalog)
 
     mapping: dict[str, tuple] = {}
     rows = 0
@@ -1121,12 +1275,16 @@ def _build_gbif_to_taxon(
             gbif_id = (row.get("gbifID") or "").strip()
             if not gbif_id:
                 continue
-            raw_key = (row.get("taxonKey") or "").strip()
-            if not raw_key:
+            sci_name = (row.get("scientificName") or "").strip()
+            if not sci_name:
                 continue
-            key = raw_key if raw_key in catalog_keys else synonym_to_key.get(raw_key, "")
-            if not key:
+            rank = (row.get("taxonRank") or "").strip()
+            name_key = normalize_name(clean_name(sci_name, rank))
+            matches = name_index.get(name_key)
+            # Skip unmatched and ambiguous (homonym) names rather than guess.
+            if not matches or len(matches) != 1:
                 continue
+            key = matches[0]
             # Opportunistically collect an obs ID for iNat ID resolution.
             if unmatched_inat_keys and obs_id_out is not None and key in unmatched_inat_keys and key not in obs_id_out:
                 catalog_num = (row.get("catalogNumber") or "").strip()
@@ -1293,7 +1451,7 @@ def main() -> None:
     if not csv_path.exists():
         raise FileNotFoundError(f"Species list not found: {csv_path} — run sync_gbif first")
     print(f"Building catalog from {csv_path}...")
-    catalog, combined_index = build_catalog(csv_path, write_dirs=True)
+    catalog, combined_index = build_catalog(csv_path)
     payload: dict = {"catalog": catalog, "combined_name_index": combined_index}
     with open(CATALOG_PATH, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1318,13 +1476,16 @@ def main() -> None:
     # Load vernacular name maps now (no inat_id dependency), but defer apply_names
     # until after run_gbif_backup so that obs-based inat_id resolutions also get
     # their iNat vernacular names applied.
-    print("\nFetching GBIF backbone vernacular names...")
-    vernacular_bytes = fetch_backbone_vernacular()
-    print("Loading vernacular names...")
+    print("Loading iNat vernacular names...")
     inat_map = load_inat_vernacular(dwca_bytes)
     print(f"  iNat: {len(inat_map):,} English names")
-    gbif_map = load_gbif_vernacular(vernacular_bytes)
-    print(f"  GBIF: {len(gbif_map):,} English names")
+    print("\nFetching COL XR vernacular names...")
+    if SKIP_COL_VERNACULAR_FETCH:
+        print("  Skipped (SKIP_COL_VERNACULAR_FETCH set)")
+        gbif_map: dict[str, list[str]] = {}
+    else:
+        gbif_map = fetch_col_vernacular(catalog)
+    print(f"  COL XR: {len(gbif_map):,} taxa with English names")
     print(f"  Catalog: {len(catalog):,} taxa")
 
     print("\nFetching GBIF backup images from occurrence data...")

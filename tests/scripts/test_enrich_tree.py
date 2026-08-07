@@ -75,26 +75,18 @@ FAKE_CATALOG = {
 }
 
 
-def _make_occurrence_parquet(path: Path, extra_cols: dict | None = None) -> None:
+def _make_occurrences_parquet(path: Path, rows: dict | None = None) -> None:
+    """Write a minimal consolidated occurrences.parquet for worklist tests."""
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
-        "decimalLatitude": [40.0, 41.0],
+        "decimalLatitude":  [40.0, 41.0],
         "decimalLongitude": [-105.0, -106.0],
-        "catalogNumber": ["obs1", "obs2"],
-        "hilbertIdx": [1000, 1001],
-        "eventTimestamp": [None, None],
-        "coordinateUncertaintyInMeters": [10.0, 20.0],
-        "obscured": ["No", "No"],
-        "gbifRegion": ["NORTH_AMERICA", "NORTH_AMERICA"],
-        "level0Gid": ["USA", "USA"],
-        "level1Gid": ["USA.5", "USA.5"],
-        "level2Gid": ["USA.5.1", "USA.5.2"],
-        "dp": ["", ""],
-        "vitality": ["", ""],
-        "rcs": ["flowers", ""],
+        "catalogNumber":    ["obs1", "obs2"],
+        "hilbertIdx":       pa.array([1000, 1001], type=pa.int32()),
+        "taxon_key":        ["2923970", "2923970"],
     }
-    if extra_cols:
-        data.update(extra_cols)
+    if rows:
+        data.update(rows)
     pq.write_table(pa.table(data), path)
 
 
@@ -112,6 +104,19 @@ def _mock_rasterio_open(values: list[float], nodata: float | None = None):
     return ds
 
 
+def _make_worklist(missing_layers: list[str], hilbert_vals: list[int] | None = None) -> pa.Table:
+    n = 2
+    if hilbert_vals is None:
+        hilbert_vals = [1000, 1001]
+    return pa.table({
+        "catalogNumber":    pa.array(["obs1", "obs2"], type=pa.string()),
+        "hilbertIdx":       pa.array(hilbert_vals,     type=pa.int32()),
+        "decimalLatitude":  pa.array([40.0, 41.0],     type=pa.float64()),
+        "decimalLongitude": pa.array([-105.0, -106.0], type=pa.float64()),
+        "missingLayers":    pa.array([missing_layers] * n, type=pa.list_(pa.string())),
+    })
+
+
 # ---------------------------------------------------------------------------
 # _load_layers
 # ---------------------------------------------------------------------------
@@ -127,204 +132,114 @@ def test_load_layers_returns_all(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _atomic_write
+# _stale_gis_columns
 # ---------------------------------------------------------------------------
 
-def test_atomic_write_creates_file(tmp_path):
-    dest = tmp_path / "out.parquet"
-    table = pa.table({"x": [1, 2, 3]})
-    et._atomic_write(dest, table)
-    assert dest.exists()
-    assert pq.read_table(dest).num_rows == 3
+def test_stale_gis_columns_noop():
+    existing = {"decimalLatitude", "catalogNumber", "taxon_key", "bio1"}
+    assert et._stale_gis_columns(["bio1"], existing) == []
 
 
-def test_atomic_write_replaces_existing(tmp_path):
-    dest = tmp_path / "out.parquet"
-    pq.write_table(pa.table({"x": [9]}), dest)
-    et._atomic_write(dest, pa.table({"x": [1, 2]}))
-    assert pq.read_table(dest).num_rows == 2
+def test_stale_gis_columns_removes_unknown():
+    existing = {"decimalLatitude", "catalogNumber", "taxon_key", "bio1", "old_layer"}
+    assert et._stale_gis_columns(["bio1"], existing) == ["old_layer"]
 
 
-# ---------------------------------------------------------------------------
-# _drop_stale_gis_columns
-# ---------------------------------------------------------------------------
-
-def test_drop_stale_noop(tmp_path):
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    table = pq.read_table(path)
-    df = table.to_pandas()
-    original_cols = list(df.columns)
-    et._drop_stale_gis_columns(df, ["bio1"], path)
-    assert list(df.columns) == original_cols
-
-
-def test_drop_stale_removes_unknown(tmp_path):
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path, extra_cols={"old_layer": [1.0, 2.0]})
-    table = pq.read_table(path)
-    df = table.to_pandas()
-    assert "old_layer" in df.columns
-    et._drop_stale_gis_columns(df, ["bio1"], path)
-    assert "old_layer" not in df.columns
-    # file should have been rewritten without the stale column
-    reloaded = pq.read_table(path).to_pandas()
-    assert "old_layer" not in reloaded.columns
-
-
-def test_drop_stale_keeps_current_gis_columns(tmp_path):
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path, extra_cols={"bio1": [1.0, 2.0], "stale": [3.0, 4.0]})
-    df = pq.read_table(path).to_pandas()
-    et._drop_stale_gis_columns(df, ["bio1"], path)
-    assert "bio1" in df.columns
-    assert "stale" not in df.columns
+def test_stale_gis_columns_keeps_temporal_prefixed():
+    existing = {"decimalLatitude", "catalogNumber", "taxon_key", "temperature_2m_avg_24h"}
+    with patch.object(et, "_temporal_layer_ids", return_value=frozenset({"temperature_2m"})):
+        assert et._stale_gis_columns([], existing) == []
 
 
 # ---------------------------------------------------------------------------
-# _missing_rows_for_taxon
+# _iter_worklist_batches / _build_worklist_chunk
 # ---------------------------------------------------------------------------
 
-def test_missing_rows_no_parquet(tmp_path):
-    taxon = {**FAKE_TAXON, "path": "Plantae_6/Ghost_0"}
-    with patch.object(et, "TREE_ROOT", tmp_path):
-        result = et._missing_rows_for_taxon(taxon, ["bio1"])
-    assert result is None
-
-
-def test_missing_rows_empty_parquet(tmp_path):
-    path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
-    path.parent.mkdir(parents=True)
-    pq.write_table(pa.table({"decimalLatitude": pa.array([], type=pa.float64())}), path)
-    with patch.object(et, "TREE_ROOT", tmp_path):
-        result = et._missing_rows_for_taxon(FAKE_TAXON, ["bio1"])
-    assert result is None
-
-
-def test_missing_rows_missing_required_col(tmp_path):
-    path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
-    path.parent.mkdir(parents=True)
-    pq.write_table(pa.table({"decimalLatitude": [1.0]}), path)
-    with patch.object(et, "TREE_ROOT", tmp_path):
-        result = et._missing_rows_for_taxon(FAKE_TAXON, ["bio1"])
-    assert result is None
-
-
-def test_missing_rows_returns_none_when_fully_enriched(tmp_path):
-    # All requested layers are already non-null → no work to do → None
-    path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
-    _make_occurrence_parquet(path, extra_cols={"bio1": [1.0, 2.0]})
-    with patch.object(et, "TREE_ROOT", tmp_path):
-        result = et._missing_rows_for_taxon(FAKE_TAXON, ["bio1"])
-    assert result is None
-
-
-def test_missing_rows_returns_chunk(tmp_path):
-    path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
-    _make_occurrence_parquet(path)
-    with patch.object(et, "TREE_ROOT", tmp_path):
-        result = et._missing_rows_for_taxon(FAKE_TAXON, ["bio1", "bio2"])
-    assert result is not None
-    assert result.num_rows == 2
-    assert result.schema.field("hilbertIdx").type == pa.int32()
-    missing = result.column("missingLayers").to_pylist()
-    assert missing[0] == ["bio1", "bio2"]
-    assert result.column("taxonKey").to_pylist()[0] == "2923970"
-
-
-def test_missing_rows_excludes_present_layers(tmp_path):
-    # bio1 already non-null → only bio2 appears in missingLayers
-    path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
-    _make_occurrence_parquet(path, extra_cols={"bio1": [1.0, 2.0]})
-    with patch.object(et, "TREE_ROOT", tmp_path):
-        result = et._missing_rows_for_taxon(FAKE_TAXON, ["bio1", "bio2"])
-    assert result is not None
-    assert result.column("missingLayers").to_pylist()[0] == ["bio2"]
-
-
-# ---------------------------------------------------------------------------
-# _iter_leaf_taxa
-# ---------------------------------------------------------------------------
-
-def test_iter_leaf_taxa_unknown_root():
-    with patch.object(et, "load_catalog", return_value={}):
-        results = list(et._iter_leaf_taxa("999"))
-    assert results == []
-
-
-def test_iter_leaf_taxa_yields_leaf_ranks():
-    with patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
-        results = list(et._iter_leaf_taxa("6"))
-    taxon_keys = {t["taxon_key"] for t in results}
-    assert "2923970" in taxon_keys   # SPECIES under Plantae_6
-    assert "9999" not in taxon_keys  # under Fungi, not Plantae
-    assert "6" not in taxon_keys     # KINGDOM rank
-
-
-def test_iter_leaf_taxa_ignores_non_descendants():
-    with patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
-        results = list(et._iter_leaf_taxa("9999"))
-    # Fungi_9999 is the root; 9999 is SPECIES so it matches its own prefix
-    taxon_keys = {t["taxon_key"] for t in results}
-    assert "9999" in taxon_keys
-    assert "2923970" not in taxon_keys
-
-
-# ---------------------------------------------------------------------------
-# _iter_worklist_batches
-# ---------------------------------------------------------------------------
-
-def test_worklist_batches_empty_tree(tmp_path):
-    with patch.object(et, "TREE_ROOT", tmp_path), \
-         patch.object(et, "load_catalog", return_value={}):
+def test_worklist_batches_no_occurrences_file(tmp_path):
+    with patch.object(et, "OCCURRENCES_FILE", tmp_path / "occurrences.parquet"), \
+         patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
         batches = list(et._iter_worklist_batches(["bio1"], "6", row_limit=100))
     assert batches == []
 
 
+def test_worklist_batches_unknown_root(tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path)
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "load_catalog", return_value={}):
+        batches = list(et._iter_worklist_batches(["bio1"], "999", row_limit=100))
+    assert batches == []
+
+
 def test_worklist_batches_yields_sorted_batch(tmp_path):
-    path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
+    occ_path = tmp_path / "occurrences.parquet"
     # hilbertIdx intentionally out of order
-    path.parent.mkdir(parents=True)
-    pq.write_table(pa.table({
-        "decimalLatitude": [40.0, 41.0],
-        "decimalLongitude": [-105.0, -106.0],
-        "catalogNumber": ["obs1", "obs2"],
-        "hilbertIdx": [2000, 1000],
-        "eventTimestamp": pa.array([None, None], type=pa.int64()),
-        "coordinateUncertaintyInMeters": [10.0, 20.0],
-        "obscured": ["No", "No"],
-        "gbifRegion": ["NORTH_AMERICA", "NORTH_AMERICA"],
-        "level0Gid": ["USA", "USA"],
-        "level1Gid": ["USA.5", "USA.5"],
-        "level2Gid": ["USA.5.1", "USA.5.2"],
-        "dp": ["", ""],
-        "vitality": ["", ""],
-        "rcs": ["", ""],
-    }), path)
-    with patch.object(et, "TREE_ROOT", tmp_path), \
+    _make_occurrences_parquet(occ_path, rows={"hilbertIdx": pa.array([2000, 1000], type=pa.int32())})
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
          patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
         batches = list(et._iter_worklist_batches(["bio1"], "6", row_limit=1000))
     assert len(batches) == 1
     hilbert_vals = batches[0].column("hilbertIdx").to_pylist()
     assert hilbert_vals == sorted(hilbert_vals)
+    assert batches[0].column("missingLayers").to_pylist()[0] == ["bio1"]  # bio1 absent → all missing
 
 
 def test_worklist_batches_splits_on_row_limit(tmp_path):
-    # Two taxa each with 2 rows; limit=2 → should yield 2 batches
-    for suffix in ["A_1", "B_2"]:
-        path = tmp_path / f"Plantae_6/{suffix}" / et.OCCURRENCE_FILE
-        _make_occurrence_parquet(path)
-    taxa = {
-        "6": FAKE_CATALOG["6"],
-        "1": {"taxon_key": "1", "path": "Plantae_6/A_1", "rank": "SPECIES",
-              "scientific_name": "A", "common_name": "a"},
-        "2": {"taxon_key": "2", "path": "Plantae_6/B_2", "rank": "SPECIES",
-              "scientific_name": "B", "common_name": "b"},
-    }
-    with patch.object(et, "TREE_ROOT", tmp_path), \
-         patch.object(et, "load_catalog", return_value=taxa):
-        batches = list(et._iter_worklist_batches(["bio1"], "6", row_limit=2))
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path)  # 2 rows
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
+        batches = list(et._iter_worklist_batches(["bio1"], "6", row_limit=1))
     assert len(batches) == 2
+    assert all(b.num_rows == 1 for b in batches)
+
+
+def test_worklist_batches_excludes_present_nonnull_layer(tmp_path):
+    # bio1 present and non-null for both rows → no rows missing it
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path, rows={"bio1": [1.0, 2.0]})
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
+        batches = list(et._iter_worklist_batches(["bio1"], "6", row_limit=1000))
+    assert batches == []
+
+
+def test_worklist_batches_partial_nulls(tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path, rows={"bio1": [1.0, None]})
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
+        batches = list(et._iter_worklist_batches(["bio1"], "6", row_limit=1000))
+    assert len(batches) == 1
+    assert batches[0].num_rows == 1
+    assert batches[0].column("catalogNumber").to_pylist() == ["obs2"]
+
+
+def test_worklist_batches_scopes_by_taxon_key_subtree(tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    pq.write_table(pa.table({
+        "decimalLatitude":  [40.0, 50.0],
+        "decimalLongitude": [-105.0, -110.0],
+        "catalogNumber":    ["obs1", "obs2"],
+        "hilbertIdx":       pa.array([1000, 2000], type=pa.int32()),
+        "taxon_key":        ["2923970", "9999"],  # 2923970 under Plantae_6, 9999 under Fungi_9999
+    }), occ_path)
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
+        batches = list(et._iter_worklist_batches(["bio1"], "6", row_limit=1000))
+    assert len(batches) == 1
+    assert batches[0].column("catalogNumber").to_pylist() == ["obs1"]  # Fungi row excluded
+
+
+def test_scope_taxon_keys_unknown_root(tmp_path):
+    with patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
+        assert et._scope_taxon_keys("999") is None
+
+
+def test_scope_taxon_keys_includes_self_and_descendants(tmp_path):
+    with patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
+        keys = set(et._scope_taxon_keys("6"))
+    assert keys == {"6", "2923970"}  # Plantae_6 itself + its descendant, not Fungi_9999
 
 
 # ---------------------------------------------------------------------------
@@ -383,75 +298,8 @@ def test_sample_cog_nominal_no_transform():
 
 
 # ---------------------------------------------------------------------------
-# _flush_taxon_updates
+# _process_batch (now returns a staging table instead of writing files)
 # ---------------------------------------------------------------------------
-
-def test_flush_missing_key():
-    pending = {}
-    et._flush_taxon_updates("nope", "/dev/null", pending)
-    assert pending == {}
-
-
-def test_flush_file_not_exists(tmp_path):
-    pending = {"tk1": {"bio1": [("obs1", 5.0)]}}
-    et._flush_taxon_updates("tk1", str(tmp_path / "missing.parquet"), pending)
-    assert "tk1" not in pending
-
-
-def test_flush_empty_dataframe(tmp_path):
-    path = tmp_path / "occ.parquet"
-    pq.write_table(pa.table({"catalogNumber": pa.array([], type=pa.string())}), path)
-    pending = {"tk1": {"bio1": [("obs1", 5.0)]}}
-    et._flush_taxon_updates("tk1", str(path), pending)
-    assert "tk1" not in pending
-
-
-def test_flush_writes_values(tmp_path):
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    pending = {"tk1": {"bio1": [("obs1", 12.3), ("obs2", 7.8)]}}
-    et._flush_taxon_updates("tk1", str(path), pending)
-    df = pq.read_table(path).to_pandas()
-    assert "bio1" in df.columns
-    assert pytest.approx(df.loc[df["catalogNumber"] == "obs1", "bio1"].iloc[0]) == 12.3
-    assert pytest.approx(df.loc[df["catalogNumber"] == "obs2", "bio1"].iloc[0]) == 7.8
-    assert "tk1" not in pending
-
-
-def test_flush_skips_unknown_catalog(tmp_path):
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    pending = {"tk1": {"bio1": [("ghost", 99.9)]}}
-    et._flush_taxon_updates("tk1", str(path), pending)
-    df = pq.read_table(path).to_pandas()
-    # bio1 column created but only for known catalog numbers; ghost skipped
-    assert "bio1" in df.columns
-    assert df["bio1"].isna().all()
-
-
-# ---------------------------------------------------------------------------
-# _process_batch
-# ---------------------------------------------------------------------------
-
-def _make_worklist(
-    taxon_key: str,
-    data_path: str,
-    missing_layers: list[str],
-    hilbert_vals: list[int] | None = None,
-) -> pa.Table:
-    n = 2
-    if hilbert_vals is None:
-        hilbert_vals = [1000, 1001]
-    return pa.table({
-        "catalogNumber":    pa.array(["obs1", "obs2"],              type=pa.string()),
-        "hilbertIdx":       pa.array(hilbert_vals,                  type=pa.int32()),
-        "decimalLatitude":  pa.array([40.0, 41.0],                  type=pa.float64()),
-        "decimalLongitude": pa.array([-105.0, -106.0],              type=pa.float64()),
-        "missingLayers":    pa.array([missing_layers] * n,          type=pa.list_(pa.string())),
-        "taxonKey":         pa.array([taxon_key] * n,               type=pa.string()),
-        "dataPath":         pa.array([data_path] * n,               type=pa.string()),
-    })
-
 
 def test_process_batch_empty():
     worklist = pa.table({
@@ -460,16 +308,12 @@ def test_process_batch_empty():
         "decimalLatitude": pa.array([], type=pa.float64()),
         "decimalLongitude": pa.array([], type=pa.float64()),
         "missingLayers": pa.array([], type=pa.list_(pa.string())),
-        "taxonKey": pa.array([], type=pa.string()),
-        "dataPath": pa.array([], type=pa.string()),
     })
-    et._process_batch(worklist, [])  # should not raise
+    assert et._process_batch(worklist, []) is None
 
 
-def test_process_batch_unknown_layer(tmp_path, capsys):
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    worklist = _make_worklist("tk1", str(path), ["ghost_layer"])
+def test_process_batch_unknown_layer(capsys):
+    worklist = _make_worklist(["ghost_layer"])
     layers = [{"id": "bio1", "filename": "bio1.tif", "scale_factor": 0.1, "add_offset": 0.0}]
     et._process_batch(worklist, layers)
     out = capsys.readouterr().out
@@ -477,9 +321,7 @@ def test_process_batch_unknown_layer(tmp_path, capsys):
 
 
 def test_process_batch_missing_file(tmp_path, capsys):
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    worklist = _make_worklist("tk1", str(path), ["bio1"])
+    worklist = _make_worklist(["bio1"])
     layers = [{"id": "bio1", "filename": "bio1.tif", "scale_factor": 0.1, "add_offset": 0.0}]
     with patch.object(et, "LAYERS_DIR", tmp_path / "nonexistent"):
         et._process_batch(worklist, layers)
@@ -488,28 +330,23 @@ def test_process_batch_missing_file(tmp_path, capsys):
 
 
 def test_process_batch_full_flow(tmp_path):
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    worklist = _make_worklist("tk1", str(path), ["bio1"])
+    worklist = _make_worklist(["bio1"])
     layers = [{"id": "bio1", "filename": "bio1.tif", "scale_factor": 0.1, "add_offset": -273.15}]
     layers_dir = tmp_path / "layers"
     layers_dir.mkdir()
     mock_ds = _mock_rasterio_open([2731.0, 2830.0], nodata=65535.0)
     with patch.object(et, "LAYERS_DIR", layers_dir), \
          patch("rasterio.open", return_value=mock_ds):
-        # Make the file "exist" by creating it
         (layers_dir / "bio1.tif").touch()
-        et._process_batch(worklist, layers)
-    df = pq.read_table(path).to_pandas()
-    assert "bio1" in df.columns
-    assert pytest.approx(df.loc[df["catalogNumber"] == "obs1", "bio1"].iloc[0], abs=0.01) == 2731.0 * 0.1 - 273.15
+        staging = et._process_batch(worklist, layers)
+    assert staging is not None
+    assert staging.num_rows == 2
+    vals = dict(zip(staging.column("catalogNumber").to_pylist(), staging.column("bio1").to_pylist()))
+    assert pytest.approx(vals["obs1"], abs=0.01) == 2731.0 * 0.1 - 273.15
 
 
 def test_process_batch_none_scale_offset(tmp_path):
-    # nominal layer: scale_factor=None, add_offset=None → defaults to 1.0, 0.0
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    worklist = _make_worklist("tk1", str(path), ["kg2"])
+    worklist = _make_worklist(["kg2"])
     layers = [{"id": "kg2", "filename": "kg2.tif", "scale_factor": None, "add_offset": None}]
     layers_dir = tmp_path / "layers"
     layers_dir.mkdir()
@@ -517,49 +354,28 @@ def test_process_batch_none_scale_offset(tmp_path):
     mock_ds = _mock_rasterio_open([15.0, 3.0], nodata=65535.0)
     with patch.object(et, "LAYERS_DIR", layers_dir), \
          patch("rasterio.open", return_value=mock_ds):
-        et._process_batch(worklist, layers)
-    df = pq.read_table(path).to_pandas()
-    assert pytest.approx(df.loc[df["catalogNumber"] == "obs1", "kg2"].iloc[0]) == 15.0
-def test_main_nothing_to_do(tmp_path, capsys):
-    cat_path = tmp_path / "catalog.json"
-    cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
-    # Empty tree → no worklist batches
-    with patch.object(et, "CATALOG_PATH", cat_path), \
-         patch.object(et, "TREE_ROOT", tmp_path / "tree"), \
-         patch.object(et, "load_catalog", return_value={}):
-        et.main()
-    out = capsys.readouterr().out
-    assert "Completed" in out
+        staging = et._process_batch(worklist, layers)
+    vals = dict(zip(staging.column("catalogNumber").to_pylist(), staging.column("kg2").to_pylist()))
+    assert pytest.approx(vals["obs1"]) == 15.0
+
+
+def test_process_batch_empty_missing_layers(tmp_path):
+    worklist = pa.table({
+        "catalogNumber":    pa.array(["obs1", "obs2"], type=pa.string()),
+        "hilbertIdx":       pa.array([1000, 1001],     type=pa.int32()),
+        "decimalLatitude":  pa.array([40.0, 41.0],     type=pa.float64()),
+        "decimalLongitude": pa.array([-105.0, -106.0], type=pa.float64()),
+        "missingLayers":    pa.array([[], []],         type=pa.list_(pa.string())),
+    })
+    assert et._process_batch(worklist, []) is None
 
 
 # ---------------------------------------------------------------------------
 # _process_batch — derived elevation (slope) paths
 # ---------------------------------------------------------------------------
 
-FAKE_CATALOG_JSON_WITH_SLOPE = {
-    "categories": [
-        {
-            "id": "terrain",
-            "layers": [
-                {
-                    "id": "slope",
-                    "filename": None,
-                    "derived": True,
-                    "value_type": "ratio",
-                    "scale_factor": None,
-                    "add_offset": None,
-                },
-            ],
-        }
-    ]
-}
-
-
 def test_process_batch_derived_elevation_not_found(tmp_path, capsys):
-    # slope layer present but elevation.tif missing → skip with message
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    worklist = _make_worklist("tk1", str(path), ["slope"])
+    worklist = _make_worklist(["slope"])
     layers = [{"id": "slope", "filename": None, "scale_factor": None, "add_offset": None}]
     layers_dir = tmp_path / "layers"
     layers_dir.mkdir()
@@ -571,9 +387,7 @@ def test_process_batch_derived_elevation_not_found(tmp_path, capsys):
 
 
 def test_process_batch_derived_slope_success(tmp_path):
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    worklist = _make_worklist("tk1", str(path), ["slope"])
+    worklist = _make_worklist(["slope"])
     layers = [{"id": "slope", "filename": None, "scale_factor": None, "add_offset": None}]
     layers_dir = tmp_path / "layers"
     layers_dir.mkdir()
@@ -582,28 +396,119 @@ def test_process_batch_derived_slope_success(tmp_path):
     with patch.object(et, "LAYERS_DIR", layers_dir), \
          patch.object(et, "DERIVED_FROM_ELEVATION", frozenset({"slope"})), \
          patch.object(et, "sample_slope_batch", return_value=[5.5, 12.0]):
-        et._process_batch(worklist, layers)
-    df = pq.read_table(path).to_pandas()
-    assert "slope" in df.columns
-    assert pytest.approx(df.loc[df["catalogNumber"] == "obs1", "slope"].iloc[0]) == 5.5
-    assert pytest.approx(df.loc[df["catalogNumber"] == "obs2", "slope"].iloc[0]) == 12.0
+        staging = et._process_batch(worklist, layers)
+    vals = dict(zip(staging.column("catalogNumber").to_pylist(), staging.column("slope").to_pylist()))
+    assert pytest.approx(vals["obs1"]) == 5.5
+    assert pytest.approx(vals["obs2"]) == 12.0
 
 
-def test_main_processes_batch(tmp_path, capsys):
+# ---------------------------------------------------------------------------
+# _write_staging_batch / _finalize_enrichment
+# ---------------------------------------------------------------------------
+
+def test_write_staging_batch_noop_on_empty(tmp_path):
+    staging_dir = tmp_path / "staging"
+    with patch.object(et, "STAGING_DIR", staging_dir):
+        et._write_staging_batch(1, None)
+        et._write_staging_batch(2, pa.table({"catalogNumber": pa.array([], type=pa.string())}))
+    assert not staging_dir.exists() or not list(staging_dir.glob("*.parquet"))
+
+
+def test_write_staging_batch_writes_file(tmp_path):
+    staging_dir = tmp_path / "staging"
+    table = pa.table({"catalogNumber": ["obs1"], "bio1": [1.0]})
+    with patch.object(et, "STAGING_DIR", staging_dir):
+        et._write_staging_batch(1, table)
+    files = list(staging_dir.glob("*.parquet"))
+    assert len(files) == 1
+    assert pq.read_table(files[0]).num_rows == 1
+
+
+def test_finalize_enrichment_noop_when_nothing_to_do(tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path, rows={"bio1": [1.0, 2.0]})
+    before = occ_path.stat().st_mtime_ns
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "STAGING_DIR", tmp_path / "staging"):
+        et._finalize_enrichment(["bio1"])
+    assert occ_path.stat().st_mtime_ns == before  # untouched, nothing staged or stale
+
+
+def test_finalize_enrichment_coalesces_updates_without_clobbering(tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path, rows={"bio1": [None, 5.0]})  # obs1 missing, obs2 already has a value
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    pq.write_table(
+        pa.table({"catalogNumber": ["obs1"], "bio1": [9.9]}),
+        staging_dir / "batch_00001.parquet",
+    )
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "STAGING_DIR", staging_dir):
+        et._finalize_enrichment(["bio1"])
+    out = pq.read_table(occ_path).to_pandas().set_index("catalogNumber")
+    assert pytest.approx(out.loc["obs1", "bio1"]) == 9.9      # filled from update
+    assert pytest.approx(out.loc["obs2", "bio1"]) == 5.0      # untouched, preserved
+
+
+def test_finalize_enrichment_adds_new_column(tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path)  # no bio1 column yet
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    pq.write_table(
+        pa.table({"catalogNumber": ["obs1", "obs2"], "bio1": [1.1, 2.2]}),
+        staging_dir / "batch_00001.parquet",
+    )
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "STAGING_DIR", staging_dir):
+        et._finalize_enrichment(["bio1"])
+    out = pq.read_table(occ_path).to_pandas().set_index("catalogNumber")
+    assert pytest.approx(out.loc["obs1", "bio1"]) == 1.1
+    assert pytest.approx(out.loc["obs2", "bio1"]) == 2.2
+
+
+def test_finalize_enrichment_drops_stale_columns(tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path, rows={"old_layer": [1.0, 2.0]})
+    with patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "STAGING_DIR", tmp_path / "staging"):
+        et._finalize_enrichment(["bio1"])  # old_layer no longer in catalog
+    out = pq.read_table(occ_path)
+    assert "old_layer" not in out.schema.names
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def test_main_nothing_to_do(tmp_path, capsys):
+    cat_path = tmp_path / "catalog.json"
+    cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
+    with patch.object(et, "CATALOG_PATH", cat_path), \
+         patch.object(et, "OCCURRENCES_FILE", tmp_path / "occurrences.parquet"), \
+         patch.object(et, "STAGING_DIR", tmp_path / "staging"), \
+         patch.object(et, "load_catalog", return_value={}):
+        et.main()
+    out = capsys.readouterr().out
+    assert "Completed" in out
+
+
+def test_main_processes_batch_and_finalizes(tmp_path, capsys):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
     layers_dir = tmp_path / "layers"
     layers_dir.mkdir()
     (layers_dir / "bio1.tif").touch()
 
-    occ_path = tmp_path / FAKE_TAXON["path"] / et.OCCURRENCE_FILE
-    _make_occurrence_parquet(occ_path)
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path)
 
-    # Patch _iter_worklist_batches directly so CONFIG.plantae_key (which varies
-    # by environment via PLANTAE_KEY env var) doesn't affect the test.
-    worklist = _make_worklist("2923970", str(occ_path), ["bio1"])
+    worklist = _make_worklist(["bio1"])
     mock_ds = _mock_rasterio_open([2731.0, 2830.0], nodata=65535.0)
     with patch.object(et, "CATALOG_PATH", cat_path), \
+         patch.object(et, "OCCURRENCES_FILE", occ_path), \
+         patch.object(et, "STAGING_DIR", tmp_path / "staging"), \
          patch.object(et, "LAYERS_DIR", layers_dir), \
          patch.object(et, "_iter_worklist_batches", return_value=iter([worklist])), \
          patch("rasterio.open", return_value=mock_ds):
@@ -611,78 +516,30 @@ def test_main_processes_batch(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "processing batch" in out
     assert "Completed" in out
-
-
-def test_worklist_batches_skips_none_chunks(tmp_path):
-    # Taxon with no parquet → _missing_rows_for_taxon returns None → line 120 continue
-    taxa = {
-        "6": FAKE_CATALOG["6"],
-        "1": {"taxon_key": "1", "path": "Plantae_6/Ghost_1", "rank": "SPECIES",
-              "scientific_name": "Ghost", "common_name": "ghost"},
-    }
-    with patch.object(et, "TREE_ROOT", tmp_path), \
-         patch.object(et, "load_catalog", return_value=taxa):
-        batches = list(et._iter_worklist_batches(["bio1"], "6", row_limit=100))
-    assert batches == []
-
-
-def test_worklist_batches_progress_print(tmp_path, capsys):
-    # Build 1001 taxa to trigger the idx % 1000 == 0 progress print (line 125)
-    taxa = {"6": FAKE_CATALOG["6"]}
-    for i in range(1001):
-        key = str(1000 + i)
-        path = f"Plantae_6/Species_{key}"
-        taxa[key] = {"taxon_key": key, "path": path, "rank": "SPECIES",
-                     "scientific_name": f"Species_{key}", "common_name": ""}
-        occ = tmp_path / path / et.OCCURRENCE_FILE
-        _make_occurrence_parquet(occ)
-    with patch.object(et, "TREE_ROOT", tmp_path), \
-         patch.object(et, "load_catalog", return_value=taxa):
-        list(et._iter_worklist_batches(["bio1"], "6", row_limit=10_000_000))
-    out = capsys.readouterr().out
-    assert "scanned 1000 taxa" in out
-
-
-def test_process_batch_empty_missing_layers(tmp_path):
-    # Row with missingLayers=[] → line 215 continue, nothing written
-    path = tmp_path / "occ.parquet"
-    _make_occurrence_parquet(path)
-    worklist = pa.table({
-        "catalogNumber":    pa.array(["obs1", "obs2"],      type=pa.string()),
-        "hilbertIdx":       pa.array([1000, 1001],          type=pa.int32()),
-        "decimalLatitude":  pa.array([40.0, 41.0],          type=pa.float64()),
-        "decimalLongitude": pa.array([-105.0, -106.0],      type=pa.float64()),
-        "missingLayers":    pa.array([[], []],              type=pa.list_(pa.string())),
-        "taxonKey":         pa.array(["tk1", "tk1"],        type=pa.string()),
-        "dataPath":         pa.array([str(path)] * 2,       type=pa.string()),
-    })
-    et._process_batch(worklist, [])
-    # parquet unchanged (no layers sampled)
-    reloaded = pq.read_table(path)
-    assert reloaded.num_rows == 2
+    result = pq.read_table(occ_path).to_pandas().set_index("catalogNumber")
+    assert pytest.approx(result.loc["obs1", "bio1"], abs=0.01) == 2731.0 * 0.1 - 273.15
 
 
 def test_main_skips_empty_batch(tmp_path, capsys):
-    # Inject an empty batch to cover line 254 continue
     empty_batch = pa.table({
         "catalogNumber":    pa.array([], type=pa.string()),
         "hilbertIdx":       pa.array([], type=pa.int32()),
         "decimalLatitude":  pa.array([], type=pa.float64()),
         "decimalLongitude": pa.array([], type=pa.float64()),
         "missingLayers":    pa.array([], type=pa.list_(pa.string())),
-        "taxonKey":         pa.array([], type=pa.string()),
-        "dataPath":         pa.array([], type=pa.string()),
     })
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
     with patch.object(et, "CATALOG_PATH", cat_path), \
+         patch.object(et, "OCCURRENCES_FILE", tmp_path / "occurrences.parquet"), \
+         patch.object(et, "STAGING_DIR", tmp_path / "staging"), \
          patch.object(et, "_iter_worklist_batches", return_value=iter([empty_batch])):
         et.main()
     out = capsys.readouterr().out
     assert "Completed" in out
 
 
-def test_main_vars_to_enrich_filters_layers(tmp_path, capsys):
+def test_main_vars_to_enrich_filters_layers(tmp_path):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
     captured_layer_ids = []
@@ -692,6 +549,8 @@ def test_main_vars_to_enrich_filters_layers(tmp_path, capsys):
         return iter([])
 
     with patch.object(et, "CATALOG_PATH", cat_path), \
+         patch.object(et, "OCCURRENCES_FILE", tmp_path / "occurrences.parquet"), \
+         patch.object(et, "STAGING_DIR", tmp_path / "staging"), \
          patch.object(et, "VARS_TO_ENRICH", ["bio1"]), \
          patch.object(et, "_iter_worklist_batches", side_effect=fake_iter_batches):
         et.main()
@@ -699,7 +558,7 @@ def test_main_vars_to_enrich_filters_layers(tmp_path, capsys):
     assert captured_layer_ids == ["bio1"]
 
 
-def test_main_vars_to_enrich_none_uses_all_layers(tmp_path, capsys):
+def test_main_vars_to_enrich_none_uses_all_layers(tmp_path):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
     captured_layer_ids = []
@@ -709,6 +568,8 @@ def test_main_vars_to_enrich_none_uses_all_layers(tmp_path, capsys):
         return iter([])
 
     with patch.object(et, "CATALOG_PATH", cat_path), \
+         patch.object(et, "OCCURRENCES_FILE", tmp_path / "occurrences.parquet"), \
+         patch.object(et, "STAGING_DIR", tmp_path / "staging"), \
          patch.object(et, "VARS_TO_ENRICH", None), \
          patch.object(et, "_iter_worklist_batches", side_effect=fake_iter_batches):
         et.main()

@@ -81,7 +81,7 @@ def clear_config_cache() -> None:
 @dataclass
 @register_config("global")
 class GlobalConfig:
-    plantae_key: int = 6
+    plantae_key: str = "P"
     leaf_ranks: tuple[str, ...] = ("SPECIES", "SUBSPECIES", "VARIETY", "FORM")
     subspecies_equivalents: tuple[str, ...] = ("SUBSPECIES", "VARIETY", "FORM")
     species_rank: str = "SPECIES"
@@ -105,7 +105,7 @@ class GlobalConfig:
     )
 
     # Taxonomy / occurrence
-    occurrence_parquet_filename: str = "occurrence.parquet"
+    occurrence_parquet_filename: str = "occurrences.parquet"
     data_root: str = "data"
 
     # Temporal enrichment

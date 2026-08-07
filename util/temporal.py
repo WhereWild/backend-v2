@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import fsspec
 import numpy as np
 import pyarrow as pa
@@ -46,7 +47,7 @@ from rasterio.warp import Resampling as _Resampling
 from rasterio.warp import reproject as _reproject
 
 from config.config import load_config
-from util.taxa import get_taxon_by_id, iter_descendants
+from util.taxa import TaxonRecord, get_taxon_by_id, load_catalog
 
 CONFIG = load_config("global")
 
@@ -911,6 +912,69 @@ def iter_occ_index_batches(index_path: Path, batch_rows: int) -> Iterable[pa.Tab
         yield pa.Table.from_batches([batch]).combine_chunks()
 
 
+def _scope_taxon_keys(root: TaxonRecord) -> frozenset[str]:
+    """taxon_keys of root and every descendant, resolved from the in-memory catalog.
+
+    Occurrence rows carry only taxon_key, not a path — a taxon's ancestry
+    already lives once in the catalog, so subtree scoping is a membership
+    check against this key set rather than a stored-path prefix match.
+    """
+    prefix = root["path"]
+    return frozenset(
+        str(t["taxon_key"]) for t in load_catalog().values()
+        if t["path"] == prefix or t["path"].startswith(prefix + "/")
+    )
+
+
+def _occ_valid_mask(
+    df: Any,
+    schema_names: set[str],
+    cutoff: float | None,
+    scope_keys: frozenset[str],
+    skip_if_cols: list[list[str]] | None,
+    occ_path: Path,
+) -> tuple[np.ndarray, int]:
+    """Boolean mask over the whole occurrences table: in-scope, valid, not-already-done.
+
+    Row positions in the returned mask are global positions in occ_path — the
+    caller must read the WHOLE file (no row-level filter pushed into the read)
+    for those positions to remain valid for a later write-back pass.
+    """
+    valid = (
+        df[_TIME_COL].notna() & df[_LAT_COL].notna() & df[_LON_COL].notna()
+        & df["taxon_key"].astype(str).isin(scope_keys)
+    )
+    if cutoff is not None:
+        valid &= df[_TIME_COL] >= cutoff
+
+    total_skipped = 0
+    if skip_if_cols:
+        all_skip_cols = list({c for group in skip_if_cols for c in group})
+        present_set = {c for c in all_skip_cols if c in schema_names}
+        if present_set:
+            skip_table = pq.read_table(occ_path, columns=list(present_set))
+            # A row is skippable only when ALL layer groups are complete.
+            # Within each group: done = all columns non-null (AND).
+            # Across groups: skippable = all groups done (AND).
+            # NaN is a real float value in Arrow so is_null returns False —
+            # NaN sentinels ("tried, no coverage") correctly count as done.
+            already_done = np.ones(len(df), dtype=bool)
+            for group in skip_if_cols:
+                present_g = [c for c in group if c in present_set]
+                if len(present_g) < len(group):
+                    # Layer columns absent — not yet enriched, include all rows
+                    already_done[:] = False
+                    break
+                layer_done = np.ones(len(df), dtype=bool)
+                for c in present_g:
+                    layer_done &= np.asarray(pc.invert(pc.is_null(skip_table.column(c))))
+                already_done &= layer_done
+            total_skipped = int((already_done & valid).sum())
+            valid &= ~already_done
+
+    return np.asarray(valid.to_numpy()), total_skipped
+
+
 def build_occ_index(
     root_taxon_id: str,
     data_root: str,
@@ -919,10 +983,14 @@ def build_occ_index(
     min_date: str | None = None,
     skip_if_cols: list[list[str]] | None = None,
 ) -> int:
-    """Scan all descendant occurrence parquets and write a flat index to disk.
+    """Scan the consolidated occurrences file and write a flat index to disk.
 
-    Streams one taxon at a time so memory usage is bounded regardless of total
-    observation count. Returns the total number of rows written.
+    Reads occurrences.parquet once in full (column-projected), masks down to
+    the requested taxon subtree + validity + not-already-done, and writes the
+    result as a single-file index — every row's ``row_idx`` is its position in
+    the *whole* occurrences file, which stays valid for write_back() later in
+    the same run since nothing reorders or resizes that file in between; only
+    column values get patched in place.
 
     skip_if_cols: list of per-layer column groups. A row is excluded only when
     every group is fully non-null (i.e. every active layer is already enriched
@@ -938,95 +1006,74 @@ def build_occ_index(
         else None
     )
 
-    tree_root = Path(data_root) / "taxonomy" / "tree"
-    total_rows = 0
-    total_skipped = 0
-    n_files = 0
+    occ_path = Path(data_root) / "taxonomy" / occ_filename
     t0 = time.monotonic()
-    last_report = t0
+    total_rows = 0
 
     with pq.ParquetWriter(index_path, _OCC_INDEX_SCHEMA) as writer:
-        for node in iter_descendants(root, include_self=True):
-            occ_path = tree_root / node["path"] / occ_filename
-            if not occ_path.exists():
-                continue
-            n_files += 1
+        if occ_path.exists():
             schema = pq.read_schema(occ_path)
-            read_cols = [_LAT_COL, _LON_COL, _TIME_COL]
-            has_elev = "elevation" in schema.names
+            schema_names = set(schema.names)
+            read_cols = [_LAT_COL, _LON_COL, _TIME_COL, "taxon_key"]
+            has_elev = "elevation" in schema_names
             if has_elev:
                 read_cols.append("elevation")
-            table = pq.read_table(occ_path, columns=read_cols)
-            df = table.to_pandas()
+            df = pq.read_table(occ_path, columns=read_cols).to_pandas()
 
-            valid = df[_TIME_COL].notna() & df[_LAT_COL].notna() & df[_LON_COL].notna()
-            if cutoff is not None:
-                valid &= df[_TIME_COL] >= cutoff
-
-            if skip_if_cols:
-                all_skip_cols = list({c for group in skip_if_cols for c in group})
-                present_set = {c for c in all_skip_cols if c in schema.names}
-                if present_set:
-                    skip_table = pq.read_table(occ_path, columns=list(present_set))
-                    # A row is skippable only when ALL layer groups are complete.
-                    # Within each group: done = all columns non-null (AND).
-                    # Across groups: skippable = all groups done (AND).
-                    # NaN is a real float value in Arrow so is_null returns False —
-                    # NaN sentinels ("tried, no coverage") correctly count as done.
-                    already_done = np.ones(skip_table.num_rows, dtype=bool)
-                    for group in skip_if_cols:
-                        present_g = [c for c in group if c in present_set]
-                        if len(present_g) < len(group):
-                            # Layer columns absent — not yet enriched, include all rows
-                            already_done[:] = False
-                            break
-                        layer_done = np.ones(skip_table.num_rows, dtype=bool)
-                        for c in present_g:
-                            layer_done &= np.asarray(pc.invert(pc.is_null(skip_table.column(c))))
-                        already_done &= layer_done
-                    total_skipped += int(already_done.sum())
-                    valid &= ~already_done
-
-            if not valid.any():
-                continue
-
-            row_idx = df.index[valid].to_numpy(dtype=np.int64)
-            times = df.loc[valid, _TIME_COL].to_numpy(dtype=np.float64)
-            lats = df.loc[valid, _LAT_COL].to_numpy(dtype=np.float64)
-            lons = df.loc[valid, _LON_COL].to_numpy(dtype=np.float64)
-            elevs = (
-                df.loc[valid, "elevation"].to_numpy(dtype=np.float64)
-                if has_elev
-                else np.full(len(row_idx), np.nan)
+            valid, total_skipped = _occ_valid_mask(
+                df, schema_names, cutoff, _scope_taxon_keys(root), skip_if_cols, occ_path
             )
-            path_str = str(occ_path)
 
-            chunk_table = pa.table({
-                "taxon_path": pa.array([path_str] * len(row_idx), type=pa.string()),
-                "row_idx":    pa.array(row_idx,  type=pa.int64()),
-                "latitude":   pa.array(lats,     type=pa.float64()),
-                "longitude":  pa.array(lons,     type=pa.float64()),
-                "timestamp":  pa.array(times,    type=pa.float64()),
-                "elevation":  pa.array(elevs,    type=pa.float64()),
-            })
-            writer.write_table(chunk_table)
-            total_rows += len(row_idx)
-
-            now = time.monotonic()
-            if now - last_report >= 30:
-                print(
-                    f"[occ_index] {n_files} files scanned  "
-                    f"found={total_rows}  skipped={total_skipped}  "
-                    f"elapsed={now - t0:.0f}s"
+            row_idx = np.nonzero(valid)[0].astype(np.int64)
+            if row_idx.size:
+                times = df.loc[valid, _TIME_COL].to_numpy(dtype=np.float64)
+                lats = df.loc[valid, _LAT_COL].to_numpy(dtype=np.float64)
+                lons = df.loc[valid, _LON_COL].to_numpy(dtype=np.float64)
+                elevs = (
+                    df.loc[valid, "elevation"].to_numpy(dtype=np.float64)
+                    if has_elev
+                    else np.full(len(row_idx), np.nan)
                 )
-                last_report = now
+                writer.write_table(pa.table({
+                    "taxon_path": pa.array([str(occ_path)] * len(row_idx), type=pa.string()),
+                    "row_idx":    pa.array(row_idx,  type=pa.int64()),
+                    "latitude":   pa.array(lats,     type=pa.float64()),
+                    "longitude":  pa.array(lons,     type=pa.float64()),
+                    "timestamp":  pa.array(times,    type=pa.float64()),
+                    "elevation":  pa.array(elevs,    type=pa.float64()),
+                }))
+            total_rows = int(row_idx.size)
+        else:
+            total_skipped = 0
 
     elapsed = time.monotonic() - t0
     print(
-        f"[occ_index] done: {n_files} files  found={total_rows}  "
+        f"[occ_index] done: found={total_rows}  "
         f"skipped={total_skipped}  elapsed={elapsed:.1f}s"
     )
     return total_rows
+
+
+_OCC_INDEX_DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
+_OCC_INDEX_DUCKDB_MEMORY_LIMIT = "28GB"
+_OCC_INDEX_BATCH_ROWS = 500_000
+
+
+def _occ_index_duckdb_connect() -> duckdb.DuckDBPyConnection:
+    """Connection for build_per_layer_occ_indices' scan.
+
+    threads=1 is required for correctness, not just a memory knob: row_idx
+    values are consumed positionally by write_back() later in the same run
+    (see its docstring), so row_number() OVER () here must reproduce the
+    exact physical row order of the source file — only guaranteed under
+    single-threaded execution. Do not "optimize" this to more threads.
+    """
+    _OCC_INDEX_DUCKDB_SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"PRAGMA memory_limit='{_OCC_INDEX_DUCKDB_MEMORY_LIMIT}'")
+    con.execute(f"PRAGMA temp_directory='{_OCC_INDEX_DUCKDB_SPILL_DIR.as_posix()}'")
+    con.execute("PRAGMA threads=1")
+    return con
 
 
 def build_per_layer_occ_indices(
@@ -1037,11 +1084,22 @@ def build_per_layer_occ_indices(
     index_paths: dict[str, Path],
     min_date: str | None = None,
 ) -> dict[str, int]:
-    """Single tree scan; writes one occ_index file per layer in index_paths.
+    """Single occurrences-file scan; writes one occ_index file per layer in index_paths.
 
     A row is written to a layer's index only when that layer still has null
     columns for that row — already-enriched rows are never re-processed.
+    Row positions are global positions in occ_path (see build_occ_index's
+    docstring for why that stays valid across a later write_back pass).
     Returns {layer_id: n_obs}.
+
+    Streamed via DuckDB in batches rather than pq.read_table(...).to_pandas()
+    on every skip-check column across every layer — that OOM-killed in
+    practice on the real ~60M-row, ~180-column occurrences.parquet (up to
+    ~77 skip columns loaded fully into memory at once across 11 active
+    layers x 7 windows each). row_number() is computed over the whole
+    unfiltered table before any filtering is applied, so it still reflects
+    true global file positions (matching what a plain sequential read would
+    assign) even though validity/scope filtering happens in the same query.
     """
     if not layers:
         return {}
@@ -1056,7 +1114,7 @@ def build_per_layer_occ_indices(
         else None
     )
 
-    tree_root = Path(data_root) / "taxonomy" / "tree"
+    occ_path = Path(data_root) / "taxonomy" / occ_filename
     counts: dict[str, int] = {layer.id: 0 for layer in layers}
 
     per_layer_cols: dict[str, list[str]] = {
@@ -1065,9 +1123,7 @@ def build_per_layer_occ_indices(
     }
     all_skip_cols = list({c for cols in per_layer_cols.values() for c in cols})
 
-    n_files = 0
     t0 = time.monotonic()
-    last_report = t0
 
     with ExitStack() as stack:
         writers: dict[str, pq.ParquetWriter] = {
@@ -1075,72 +1131,84 @@ def build_per_layer_occ_indices(
             for layer in layers
         }
 
-        for node in iter_descendants(root, include_self=True):
-            occ_path = tree_root / node["path"] / occ_filename
-            if not occ_path.exists():
-                continue
-            n_files += 1
-            schema = pq.read_schema(occ_path)
+        if occ_path.exists():
+            schema_names = set(pq.read_schema(occ_path).names)
+            has_elev = "elevation" in schema_names
+            present_skip = [c for c in all_skip_cols if c in schema_names]
 
-            read_cols = [_LAT_COL, _LON_COL, _TIME_COL]
-            has_elev = "elevation" in schema.names
+            select_cols = [_LAT_COL, _LON_COL, _TIME_COL, "taxon_key"]
             if has_elev:
-                read_cols.append("elevation")
-            df = pq.read_table(occ_path, columns=read_cols).to_pandas()
+                select_cols.append("elevation")
+            select_cols.extend(present_skip)
+            select_sql = ", ".join(f'"{c}"' for c in select_cols)
 
-            valid = df[_TIME_COL].notna() & df[_LAT_COL].notna() & df[_LON_COL].notna()
+            where_parts = [
+                f'"{_TIME_COL}" IS NOT NULL',
+                f'"{_LAT_COL}" IS NOT NULL',
+                f'"{_LON_COL}" IS NOT NULL',
+                '"taxon_key" IN (SELECT taxon_key FROM scope_keys)',
+            ]
             if cutoff is not None:
-                valid &= df[_TIME_COL] >= cutoff
-            if not valid.any():
-                continue
+                where_parts.append(f'"{_TIME_COL}" >= {cutoff!r}')
+            where_sql = " AND ".join(where_parts)
 
-            # Read all skip columns across all layers in one shot
-            present_skip = {c for c in all_skip_cols if c in schema.names}
-            skip_table = pq.read_table(occ_path, columns=list(present_skip)) if present_skip else None
-            n_rows = len(df)
-
-            for layer in layers:
-                layer_cols = per_layer_cols[layer.id]
-                present_g = [c for c in layer_cols if c in present_skip]
-
-                if len(present_g) == len(layer_cols) and skip_table is not None:
-                    layer_done = np.ones(n_rows, dtype=bool)
-                    for c in present_g:
-                        layer_done &= np.asarray(pc.invert(pc.is_null(skip_table.column(c))))
-                    needs = valid & ~layer_done
-                else:
-                    needs = valid  # columns absent → all valid rows need enrichment
-
-                if not needs.any():
-                    continue
-
-                row_idx = df.index[needs].to_numpy(dtype=np.int64)
-                times   = df.loc[needs, _TIME_COL].to_numpy(dtype=np.float64)
-                lats    = df.loc[needs, _LAT_COL].to_numpy(dtype=np.float64)
-                lons    = df.loc[needs, _LON_COL].to_numpy(dtype=np.float64)
-                elevs   = (
-                    df.loc[needs, "elevation"].to_numpy(dtype=np.float64)
-                    if has_elev else np.full(len(row_idx), np.nan)
-                )
-                writers[layer.id].write_table(pa.table({
-                    "taxon_path": pa.array([str(occ_path)] * len(row_idx), type=pa.string()),
-                    "row_idx":    pa.array(row_idx, type=pa.int64()),
-                    "latitude":   pa.array(lats,    type=pa.float64()),
-                    "longitude":  pa.array(lons,    type=pa.float64()),
-                    "timestamp":  pa.array(times,   type=pa.float64()),
-                    "elevation":  pa.array(elevs,   type=pa.float64()),
+            con = _occ_index_duckdb_connect()
+            try:
+                con.register("scope_keys", pa.table({
+                    "taxon_key": pa.array(list(_scope_taxon_keys(root)), type=pa.string()),
                 }))
-                counts[layer.id] += len(row_idx)
+                reader = con.execute(f"""
+                    SELECT row_idx, {select_sql} FROM (
+                        SELECT row_number() OVER () - 1 AS row_idx, {select_sql}
+                        FROM read_parquet('{occ_path.as_posix()}')
+                    )
+                    WHERE {where_sql}
+                """).to_arrow_reader(_OCC_INDEX_BATCH_ROWS)
 
-            now = time.monotonic()
-            if now - last_report >= 30:
-                summary = "  ".join(f"{layer.id}={counts[layer.id]}" for layer in layers)
-                print(f"[occ_index] {n_files} files  {summary}  elapsed={now - t0:.0f}s")
-                last_report = now
+                for record_batch in reader:
+                    batch = pa.Table.from_batches([record_batch])
+                    n_rows = batch.num_rows
+                    if n_rows == 0:
+                        continue
+                    row_idx_arr = batch["row_idx"].to_numpy()
+                    times = batch[_TIME_COL].to_numpy(zero_copy_only=False).astype(np.float64)
+                    lats = batch[_LAT_COL].to_numpy(zero_copy_only=False).astype(np.float64)
+                    lons = batch[_LON_COL].to_numpy(zero_copy_only=False).astype(np.float64)
+                    elevs = (
+                        batch["elevation"].to_numpy(zero_copy_only=False).astype(np.float64)
+                        if has_elev else np.full(n_rows, np.nan)
+                    )
+
+                    for layer in layers:
+                        layer_cols = per_layer_cols[layer.id]
+                        present_g = [c for c in layer_cols if c in present_skip]
+
+                        if layer_cols and len(present_g) == len(layer_cols):
+                            layer_done = np.ones(n_rows, dtype=bool)
+                            for c in present_g:
+                                layer_done &= np.asarray(pc.invert(pc.is_null(batch.column(c))))
+                            needs = ~layer_done
+                        else:
+                            needs = np.ones(n_rows, dtype=bool)  # columns absent → all rows need enrichment
+
+                        if not needs.any():
+                            continue
+
+                        writers[layer.id].write_table(pa.table({
+                            "taxon_path": pa.array([str(occ_path)] * int(needs.sum()), type=pa.string()),
+                            "row_idx":    pa.array(row_idx_arr[needs], type=pa.int64()),
+                            "latitude":   pa.array(lats[needs], type=pa.float64()),
+                            "longitude":  pa.array(lons[needs], type=pa.float64()),
+                            "timestamp":  pa.array(times[needs], type=pa.float64()),
+                            "elevation":  pa.array(elevs[needs], type=pa.float64()),
+                        }))
+                        counts[layer.id] += int(needs.sum())
+            finally:
+                con.close()
 
     elapsed = time.monotonic() - t0
     summary = "  ".join(f"{layer.id}:{counts[layer.id]}" for layer in layers)
-    print(f"[occ_index] done: {n_files} files  elapsed={elapsed:.1f}s  {summary}")
+    print(f"[occ_index] done: elapsed={elapsed:.1f}s  {summary}")
     return counts
 
 
@@ -2256,6 +2324,66 @@ def _apply_updates_arrow(
     return pa.table(cols, names=names)
 
 
+def _write_one(tpath: str, colmap: dict[str, list[tuple[np.ndarray, np.ndarray]]]) -> None:
+    """Patch colmap's row-indexed updates into parquet_path, streaming by row
+    group instead of loading the whole file into memory.
+
+    row_ids in colmap are global positions into the *whole* file (see
+    build_occ_index), which in the consolidated (single occurrences.parquet)
+    architecture can be tens of millions of rows and 200+ columns —
+    pq.read_table(...).combine_chunks() on the whole table OOM-killed in
+    practice (confirmed: ~60GB RSS on a file that was still only 29GB
+    compressed and growing). Row groups are read/patched/written one at a
+    time, bounding peak memory to one row group's worth of columns
+    regardless of total file size. Each column's update pairs are sorted
+    once up front so slicing the relevant range per row group is a
+    searchsorted instead of an O(rows) mask recomputed per group; stable
+    sort preserves each pair list's original last-write-wins order for any
+    row_id updated more than once, matching the non-streaming behavior this
+    replaces.
+    """
+    parquet_path = Path(tpath)
+    pf = pq.ParquetFile(parquet_path)
+    n_groups = pf.metadata.num_row_groups
+    boundaries = np.concatenate([
+        [0],
+        np.cumsum([pf.metadata.row_group(i).num_rows for i in range(n_groups)]),
+    ]).astype(np.int64)
+
+    sorted_updates: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for col, pairs in colmap.items():
+        if not pairs:
+            sorted_updates[col] = (np.array([], dtype=np.int64), np.array([], dtype=np.float64))
+            continue
+        all_ids = np.concatenate([p[0] for p in pairs])
+        all_vals = np.concatenate([p[1] for p in pairs])
+        order = np.argsort(all_ids, kind="stable")
+        sorted_updates[col] = (all_ids[order], all_vals[order])
+
+    tmp_path = parquet_path.parent / f".{parquet_path.name}.streaming_tmp"
+    writer: pq.ParquetWriter | None = None
+    try:
+        for g in range(n_groups):
+            start, end = int(boundaries[g]), int(boundaries[g + 1])
+            table = pf.read_row_group(g)
+            local_updates = {
+                col: [(ids[lo:hi] - start, vals[lo:hi])]
+                for col, (ids, vals) in sorted_updates.items()
+                for lo, hi in [(
+                    int(np.searchsorted(ids, start, side="left")),
+                    int(np.searchsorted(ids, end, side="left")),
+                )]
+            }
+            table = _apply_updates_arrow(table, local_updates)
+            if writer is None:
+                writer = pq.ParquetWriter(tmp_path, table.schema, compression="zstd")
+            writer.write_table(table, row_group_size=50_000)
+    finally:
+        if writer is not None:
+            writer.close()
+    tmp_path.replace(parquet_path)
+
+
 def write_back(
     updates: dict[str, dict[str, list[tuple[np.ndarray, np.ndarray]]]],
     max_workers: int = 8,
@@ -2265,12 +2393,6 @@ def write_back(
     Pops entries from updates as they are submitted so colmap memory is freed
     progressively during the flush rather than held until all writes complete.
     """
-    def _write_one(tpath: str, colmap: dict) -> None:
-        parquet_path = Path(tpath)
-        table = pq.read_table(parquet_path).combine_chunks()
-        updated = _apply_updates_arrow(table, colmap)
-        _atomic_write(parquet_path, updated)
-
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         pending: list = []
         while updates:
@@ -2294,37 +2416,42 @@ def derive_vpd(
     occ_filename: str,
     window_hours: list[int],
 ) -> None:
-    """Compute vapor_pressure_deficit_avg_{h}h from temperature_2m and dew_point_2m averages."""
+    """Compute vapor_pressure_deficit_avg_{h}h from temperature_2m and dew_point_2m averages.
+
+    A pure per-row column derivation (no cross-row state), so the whole
+    consolidated occurrences file is processed in one vectorized pass instead
+    of a per-taxon loop — root_taxon_id is accepted for interface parity with
+    the other temporal builders but every row in the file already belongs to
+    the same rebuild scope, so no path-prefix filtering is needed here.
+    """
     root = get_taxon_by_id(root_taxon_id)
     if root is None:
         raise RuntimeError(f"Unknown root taxon {root_taxon_id}")
 
-    tree_root = Path(data_root) / "taxonomy" / "tree"
-    for node in iter_descendants(root, include_self=True):
-        path = tree_root / node["path"] / occ_filename
-        if not path.exists():
-            continue
-        table = pq.read_table(path).combine_chunks()
-        df = table.to_pandas()
-        if df.empty:
-            continue
+    path = Path(data_root) / "taxonomy" / occ_filename
+    if not path.exists():
+        return
+    table = pq.read_table(path).combine_chunks()
+    df = table.to_pandas()
+    if df.empty:
+        return
 
-        updated_any = False
-        for hours in window_hours:
-            t_col = f"temperature_2m_avg_{hours}h"
-            td_col = f"dew_point_2m_avg_{hours}h"
-            vpd_col = f"vapor_pressure_deficit_avg_{hours}h"
-            if t_col not in df.columns or td_col not in df.columns:
-                continue
-            t = df[t_col].to_numpy(dtype=float)
-            td = df[td_col].to_numpy(dtype=float)
-            vpd = vpd_kpa(t, td)
-            vpd[~np.isfinite(vpd)] = np.nan
-            df[vpd_col] = vpd
-            updated_any = True
+    updated_any = False
+    for hours in window_hours:
+        t_col = f"temperature_2m_avg_{hours}h"
+        td_col = f"dew_point_2m_avg_{hours}h"
+        vpd_col = f"vapor_pressure_deficit_avg_{hours}h"
+        if t_col not in df.columns or td_col not in df.columns:
+            continue
+        t = df[t_col].to_numpy(dtype=float)
+        td = df[td_col].to_numpy(dtype=float)
+        vpd = vpd_kpa(t, td)
+        vpd[~np.isfinite(vpd)] = np.nan
+        df[vpd_col] = vpd
+        updated_any = True
 
-        if updated_any:
-            _atomic_write(path, pa.Table.from_pandas(df, preserve_index=False))
+    if updated_any:
+        _atomic_write(path, pa.Table.from_pandas(df, preserve_index=False))
 
 
 # ---------------------------------------------------------------------------

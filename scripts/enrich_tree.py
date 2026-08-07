@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
-Enrich per-taxon occurrence parquets with GIS layer values.
+Enrich the consolidated occurrences.parquet with GIS layer values.
 
 Two sampling paths based on raster size:
 - Small rasters (≤ MEMORY_MB_THRESHOLD): loaded fully into RAM on first use,
@@ -13,6 +13,15 @@ Two sampling paths based on raster size:
   effective. GDAL_CACHEMAX is set to 4 GB at startup.
 
 Layers are processed in parallel threads.
+
+Rows needing enrichment are streamed directly out of occurrences.parquet via
+one DuckDB query (rather than opened file-by-file per taxon), in row_limit-
+sized batches ordered by hilbertIdx. Each batch's sampled values are staged
+to a small parquet file instead of being written back immediately; once all
+batches are processed, one DuckDB pass joins every staged update into
+occurrences.parquet and rewrites it — replacing what used to be a
+read-modify-atomic-rewrite of every taxon's file, once per batch it
+appeared in.
 """
 
 from __future__ import annotations
@@ -20,13 +29,16 @@ from __future__ import annotations
 import functools
 import gc
 import json
+import multiprocessing
 import os
 import re
+import shutil
 from collections import defaultdict
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -43,15 +55,36 @@ from util.gis import (
     sample_slope_batch,
     sample_soil_texture_batch,
 )
-from util.taxa import TaxonRecord, load_catalog
+from util.taxa import load_catalog
+from util.tiles import resolve_layer_path
 
 CONFIG = load_config("global")
 
-TREE_ROOT = Path("data/taxonomy/tree")
+OCCURRENCES_FILE = Path("data/taxonomy/occurrences.parquet")
+STAGING_DIR = Path("data/taxonomy/.enrich_staging")
 LAYERS_DIR = Path("data/gis/layers")
 CATALOG_PATH = Path("config/gis/catalog.json")
-OCCURRENCE_FILE = "occurrence.parquet"
 ROW_LIMIT = 2_500_000
+
+# _finalize_enrichment's LEFT JOIN + ORDER BY over the full occurrences
+# table (tens of millions of rows) OOM-killed at ~58GB RSS with a bare
+# duckdb.connect() — the same failure mode fixed in scripts/carry_forward.py
+# and scripts/populate_tree.py's _duckdb_connect. memory_limit/temp_directory
+# let it spill instead of crashing; preserve_insertion_order=false drops the
+# default per-thread row-order buffering that isn't needed since the query
+# already has its own explicit ORDER BY.
+_DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
+_DUCKDB_MEMORY_LIMIT = "28GB"
+
+
+def _duckdb_connect() -> duckdb.DuckDBPyConnection:
+    _DUCKDB_SPILL_DIR.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect()
+    con.execute(f"PRAGMA memory_limit='{_DUCKDB_MEMORY_LIMIT}'")
+    con.execute(f"PRAGMA temp_directory='{_DUCKDB_SPILL_DIR.as_posix()}'")
+    con.execute("PRAGMA preserve_insertion_order=false")
+    con.execute("PRAGMA threads=4")
+    return con
 
 _LAYER_WORKERS = int(os.environ.get("ENRICH_LAYER_WORKERS", "1"))
 # Rasters whose uncompressed footprint fits under this limit are loaded fully
@@ -83,6 +116,7 @@ _BASE_COLS = frozenset([
     "decimalLatitude", "decimalLongitude", "catalogNumber", "hilbertIdx",
     "eventTimestamp", "coordinateUncertaintyInMeters", "obscured",
     "gbifRegion", "level0Gid", "level1Gid", "level2Gid", "dp", "vitality", "rcs",
+    "mediaUrl", "mediaAttribution", "mediaLicense",
 ])
 _REQUIRED_COLS = ("decimalLatitude", "decimalLongitude", "catalogNumber", "hilbertIdx")
 
@@ -116,11 +150,6 @@ def _load_layers() -> list[dict]:
     ]
 
 
-def _atomic_write(path: Path, table: pa.Table) -> None:
-    from util.storage import atomic_write_parquet
-    atomic_write_parquet(path, table, row_group_size=50_000)
-
-
 @functools.lru_cache(maxsize=1)
 def _temporal_layer_ids() -> frozenset[str]:
     with open(CATALOG_PATH) as f:
@@ -133,120 +162,55 @@ def _temporal_layer_ids() -> frozenset[str]:
     )
 
 
-def _drop_stale_gis_columns(df, layer_ids: list[str], data_path: Path) -> None:
-    """Remove GIS columns that are no longer in the layer catalog."""
-    allowed = _BASE_COLS | set(layer_ids)
-    temporal_ids = _temporal_layer_ids()
-    stale = [
-        col for col in df.columns
-        if col not in allowed
-        and not any(col.startswith(tid + "_") for tid in temporal_ids)
-    ]
-    if not stale:
-        return
-    df.drop(columns=stale, inplace=True)
-    arrow_table = pa.Table.from_pandas(df, preserve_index=False)
-    # pa.Table.from_pandas converts float NaN → Arrow null; restore NaN sentinels
-    # so nodata rows aren't re-queued as needing enrichment on the next scan.
-    new_columns = {}
-    for name in arrow_table.schema.names:
-        col = arrow_table.column(name)
-        if pa.types.is_floating(col.type) and pc.any(pc.is_null(col)).as_py():
-            new_columns[name] = pc.if_else(pc.is_null(col), float("nan"), col)
-    for col_name, new_col in new_columns.items():
-        idx = arrow_table.schema.get_field_index(col_name)
-        arrow_table = arrow_table.set_column(idx, col_name, new_col)
-    _atomic_write(data_path, arrow_table)
+def _existing_columns(occurrences_file: Path | None = None) -> set[str]:
+    """Column names currently in occurrences.parquet (empty set if it doesn't exist yet).
 
-
-def _missing_rows_for_taxon(taxon: TaxonRecord, layer_ids: list[str]) -> pa.Table | None:
-    """Return a worklist chunk for rows missing GIS values, or None if nothing to do.
-
-    Only rows with at least one null layer value are included; per-row
-    missingLayers lists only the layers that are actually null for that row.
-    Rows already fully enriched (carry_forward or a prior run) are skipped.
+    occurrences_file defaults to None (resolved to OCCURRENCES_FILE below at
+    call time), not `= OCCURRENCES_FILE` — a literal default is bound once
+    at function-definition time, so it would never see a later
+    patch.object(et, "OCCURRENCES_FILE", ...) override and every caller that
+    calls this bare (e.g. _iter_worklist_batches) would silently read
+    whatever OCCURRENCES_FILE pointed at when this module was first
+    imported instead of the current value.
     """
-    data_path = TREE_ROOT / taxon["path"] / OCCURRENCE_FILE
-    if not data_path.exists():
-        return None
+    if occurrences_file is None:
+        occurrences_file = OCCURRENCES_FILE
+    if not occurrences_file.exists():
+        return set()
+    return set(pq.read_schema(occurrences_file).names)
 
-    # Read schema only (no data) to decide which columns are needed and whether
-    # stale GIS columns exist. Avoids loading temporal columns (~200+) into RAM
-    # on every taxon scan when only GIS columns + coordinates are needed here.
-    try:
-        schema = pq.read_schema(data_path)
-    except Exception:
-        return None
-    schema_names = set(schema.names)
-    if any(col not in schema_names for col in _REQUIRED_COLS):
-        return None
 
-    allowed = _BASE_COLS | set(layer_ids)
+def _stale_gis_columns(layer_ids: list[str], existing: set[str]) -> list[str]:
+    """GIS/temporal columns present in the file that are no longer in the layer catalog."""
+    allowed = _BASE_COLS | {"taxon_key"} | set(layer_ids)
     temporal_ids = _temporal_layer_ids()
-    stale = [
-        col for col in schema_names
+    return [
+        col for col in existing
         if col not in allowed
         and not any(col.startswith(tid + "_") for tid in temporal_ids)
     ]
 
-    if stale:
-        # Rare: need full read to detect and rewrite without stale columns.
-        table = pq.read_table(data_path)
-        df = table.to_pandas()
-        _drop_stale_gis_columns(df, layer_ids, data_path)
-        table = pa.Table.from_pandas(df, preserve_index=False)
-    else:
-        # Common path: read only the GIS layer columns + coordinates we actually need.
-        needed = list((set(_REQUIRED_COLS) | set(layer_ids)) & schema_names)
-        table = pq.read_table(data_path, columns=needed)
 
-    if table.num_rows == 0:
-        return None
+def _scope_taxon_keys(root_key: str | int) -> list[str] | None:
+    """taxon_keys of root_key and every descendant, resolved from the in-memory catalog.
 
-    # Use pc.is_null on the Arrow table (not pandas isna) so that no-coverage
-    # sentinels (NaN for continuous, -1 for nominal) are not re-queued.
-    # pc.is_null returns False for both NaN and -1 since they are real values,
-    # so a single check handles all cases.
-    null_cols = [
-        np.asarray(pc.is_null(table.column(lid))) if lid in table.schema.names
-        else np.ones(table.num_rows, dtype=bool)
-        for lid in layer_ids
-    ]
-    if not null_cols:
-        return None
-    null_matrix = np.column_stack(null_cols)  # shape: (n_rows, n_layers)
-    has_missing = null_matrix.any(axis=1)
-    if not has_missing.any():
-        return None  # all rows already fully enriched
-
-    df_f = table.to_pandas() if not stale else df
-    df_f = df_f[has_missing].reset_index(drop=True)
-    null_f = null_matrix[has_missing]
-    layer_arr = np.array(layer_ids)
-    missing_layers = [layer_arr[row].tolist() for row in null_f]
-
-    return pa.table({
-        "catalogNumber":    pa.array(df_f["catalogNumber"].astype(str).tolist(), type=pa.string()),
-        "hilbertIdx":       pa.array(df_f["hilbertIdx"].to_numpy(),               type=pa.int32()),
-        "decimalLatitude":  pa.array(df_f["decimalLatitude"].to_numpy(),          type=pa.float64()),
-        "decimalLongitude": pa.array(df_f["decimalLongitude"].to_numpy(),         type=pa.float64()),
-        "missingLayers":    pa.array(missing_layers,                              type=pa.list_(pa.large_string())),
-        "taxonKey":         pa.array([taxon["taxon_key"]] * len(df_f),            type=pa.string()),
-        "dataPath":         pa.array([str(data_path)] * len(df_f),                type=pa.string()),
-    })
-
-
-def _iter_leaf_taxa(root_key: str | int) -> Iterable[TaxonRecord]:
-    """Yield all leaf-rank taxa that are descendants of root_key (inclusive)."""
-    root = load_catalog().get(str(root_key))
+    Occurrence rows carry only taxon_key (not a path — a taxon's ancestry
+    already lives once in the catalog, no reason to duplicate it onto every
+    one of its rows), so subtree scoping is a join against this key set
+    rather than a stored-path LIKE predicate. Walks the catalog's own path
+    field directly (catalog metadata, not per-row data) rather than going
+    through util.taxa.iter_descendants, since that helper reads its own
+    module-level cached catalog rather than this module's load_catalog.
+    """
+    catalog = load_catalog()
+    root = catalog.get(str(root_key))
     if root is None:
-        return
+        return None
     prefix = root["path"]
-    for taxon in load_catalog().values():
-        if taxon["rank"] not in CONFIG.leaf_rank_set:
-            continue
-        if taxon["path"].startswith(prefix):
-            yield taxon
+    return [
+        str(t["taxon_key"]) for t in catalog.values()
+        if t["path"] == prefix or t["path"].startswith(prefix + "/")
+    ]
 
 
 def _iter_worklist_batches(
@@ -255,34 +219,76 @@ def _iter_worklist_batches(
     *,
     row_limit: int,
 ) -> Iterable[pa.Table]:
-    """Yield worklist batches sorted by hilbertIdx, capped at row_limit rows."""
-    chunks: list[pa.Table] = []
-    total_rows = 0
-    batch_rows = 0
-    for idx, taxon in enumerate(_iter_leaf_taxa(root_key), 1):
-        chunk = _missing_rows_for_taxon(taxon, layer_ids)
-        if chunk is None or chunk.num_rows == 0:
-            continue
-        chunks.append(chunk)
-        total_rows += chunk.num_rows
-        batch_rows += chunk.num_rows
-        if idx % 1000 == 0:
-            print(f"[worklist] scanned {idx} taxa, captured {total_rows} rows")
-            gc.collect()
-            pa.default_memory_pool().release_unused()
-        if batch_rows >= row_limit:
-            print(f"[worklist] concatenating {len(chunks)} chunks ({batch_rows} rows)")
-            worklist = pa.concat_tables(chunks).combine_chunks().sort_by([("hilbertIdx", "ascending")])
-            print(f"[worklist] batch rows pending GIS lookup: {worklist.num_rows}")
-            yield worklist
-            chunks = []
-            batch_rows = 0
-    if not chunks:
+    """Stream worklist batches (rows missing >=1 target layer), row_limit rows at a time.
+
+    Runs a single DuckDB scan over occurrences.parquet instead of opening one
+    file per leaf taxon. Layers with no column yet in the file are treated as
+    entirely missing (every in-scope row needs them) — same semantics as the
+    old per-taxon "column absent" case, just evaluated once globally instead
+    of file-by-file, since the schema is now shared by every row.
+    """
+    if not layer_ids or not OCCURRENCES_FILE.exists():
         return
-    print(f"[worklist] concatenating {len(chunks)} chunks ({batch_rows} rows)")
-    worklist = pa.concat_tables(chunks).combine_chunks().sort_by([("hilbertIdx", "ascending")])
-    print(f"[worklist] batch rows pending GIS lookup: {worklist.num_rows}")
-    yield worklist
+    scope_keys = _scope_taxon_keys(root_key)
+    if scope_keys is None:
+        return
+
+    existing = _existing_columns()
+    present_layer_ids = [lid for lid in layer_ids if lid in existing]
+    absent_layer_ids = [lid for lid in layer_ids if lid not in existing]
+
+    select_cols = ["catalogNumber", "hilbertIdx", "decimalLatitude", "decimalLongitude", *present_layer_ids]
+    col_list = ", ".join(f'"{c}"' for c in select_cols)
+
+    where = '"taxon_key" IN (SELECT "taxon_key" FROM scope_keys)'
+    if present_layer_ids and not absent_layer_ids:
+        null_check = " OR ".join(f'"{lid}" IS NULL' for lid in present_layer_ids)
+        where += f" AND ({null_check})"
+    # If any layer is entirely absent, every in-scope row is missing it —
+    # no null-check predicate needed, the scope filter alone selects everything.
+
+    sql = (
+        f"SELECT {col_list} FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') "
+        f"WHERE {where} ORDER BY hilbertIdx"
+    )
+    con = duckdb.connect()
+    try:
+        con.register("scope_keys", pa.table({"taxon_key": pa.array(scope_keys, type=pa.string())}))
+        reader = con.execute(sql).to_arrow_reader(row_limit)
+        batch_count = 0
+        for record_batch in reader:
+            table = pa.Table.from_batches([record_batch])
+            if table.num_rows == 0:
+                continue
+            batch_count += 1
+            print(f"[worklist] batch {batch_count}: {table.num_rows} rows pending GIS lookup")
+            yield _build_worklist_chunk(table, present_layer_ids, absent_layer_ids)
+    finally:
+        con.close()
+
+
+def _build_worklist_chunk(
+    table: pa.Table, present_layer_ids: list[str], absent_layer_ids: list[str]
+) -> pa.Table:
+    """Attach a per-row missingLayers list, derived from null present-layer values
+    plus every absent layer (which is missing for every row by definition)."""
+    n = table.num_rows
+    all_ids = present_layer_ids + absent_layer_ids
+    null_cols = [np.asarray(pc.is_null(table.column(lid))) for lid in present_layer_ids]
+    null_cols += [np.ones(n, dtype=bool) for _ in absent_layer_ids]
+    layer_arr = np.array(all_ids)
+    if null_cols:
+        null_matrix = np.column_stack(null_cols)
+        missing_layers = [layer_arr[row].tolist() for row in null_matrix]
+    else:
+        missing_layers = [[] for _ in range(n)]
+    return pa.table({
+        "catalogNumber":    table.column("catalogNumber"),
+        "hilbertIdx":       table.column("hilbertIdx"),
+        "decimalLatitude":  table.column("decimalLatitude"),
+        "decimalLongitude": table.column("decimalLongitude"),
+        "missingLayers":    pa.array(missing_layers, type=pa.list_(pa.large_string())),
+    })
 
 
 def _sample_cog_batch(
@@ -340,30 +346,25 @@ def _sample_cog_batch(
     return out
 
 
-def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
-    """Sample all layers for every row in the worklist and flush results."""
+def _process_batch(worklist: pa.Table, layers: list[dict]) -> pa.Table | None:
+    """Sample all layers for every row in the worklist.
+
+    Returns a staging table of (catalogNumber, <sampled layer columns...>) for
+    rows that received at least one value, or None if nothing was sampled.
+    Columns are null for any row/layer combination this batch didn't touch,
+    so a later ``COALESCE(update, existing)`` join leaves untouched values
+    alone instead of clobbering them.
+    """
     print(f"[process] batch start  rss={_rss_mb():.0f}MB  rows={worklist.num_rows}")
     df = worklist.to_pandas()
     if df.empty:
-        return
+        return None
     df.sort_values("hilbertIdx", inplace=True)
     df.reset_index(drop=True, inplace=True)
 
     lats = df["decimalLatitude"].to_numpy(dtype=float)
     lons = df["decimalLongitude"].to_numpy(dtype=float)
     catalogs = df["catalogNumber"].astype(str).to_numpy()
-    taxon_keys = df["taxonKey"].to_numpy()
-    data_paths_arr = df["dataPath"].to_numpy()
-
-    taxon_paths: dict[str, str] = {}
-    for tk, dp in zip(taxon_keys, data_paths_arr):
-        taxon_paths.setdefault(tk, dp)
-
-    # Map taxon_key → worklist row indices
-    unique_taxa, inverse = np.unique(taxon_keys, return_inverse=True)
-    taxon_to_rows: dict[str, np.ndarray] = {
-        tk: np.where(inverse == i)[0] for i, tk in enumerate(unique_taxa)
-    }
 
     # Determine which rows need each layer
     layer_row_lists: dict[str, list[int]] = defaultdict(list)
@@ -389,7 +390,7 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
             return layer_id, np.full(len(lats), np.nan)
 
         if layer_id in DERIVED_FROM_ELEVATION:
-            elev_path = LAYERS_DIR / "elevation.tif"
+            elev_path = resolve_layer_path(LAYERS_DIR, "elevation.tif")
             if not elev_path.exists():
                 print(f"[skip] elevation.tif not found; cannot derive {layer_id}")
                 return layer_id, np.full(len(lats), np.nan)
@@ -402,7 +403,7 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
             raw = sample_soil_texture_batch(lats[arr], lons[arr])
             vals = np.array([v if v is not None else np.nan for v in raw], dtype=np.float64)
         else:
-            cog_path = LAYERS_DIR / layer["filename"]
+            cog_path = resolve_layer_path(LAYERS_DIR, layer["filename"])
             if not cog_path.exists():
                 print(f"[warn] {cog_path.name} not found; skipping {layer_id}")
                 return layer_id, np.full(len(lats), np.nan)
@@ -467,7 +468,7 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
         meta = layer_meta.get(lid)
         if not meta or not meta.get("filename"):
             return 0.0
-        p = LAYERS_DIR / meta["filename"]
+        p = resolve_layer_path(LAYERS_DIR, meta["filename"])
         if not p.exists():
             return 0.0
         try:
@@ -520,11 +521,10 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
                 print(f"[process] layer {completed}/{total}: {layer_id}  rss={_rss_mb():.0f}MB")
 
     rss_after_sample = _rss_mb()
-    print(f"[process] sampling done — rss={rss_after_sample:.0f}MB  taxa={len(taxon_to_rows)}")
+    print(f"[process] sampling done — rss={rss_after_sample:.0f}MB")
 
-    # Precompute a boolean mask per layer (size = worklist rows) so the flush
-    # loop can filter relevant rows with a cheap mask[row_indices] slice instead
-    # of np.intersect1d (which is O(n+m) and called taxa×layers times).
+    # Precompute a boolean mask per layer (size = worklist rows) marking which
+    # rows this batch actually sampled that layer for.
     n_worklist = len(lats)
     layer_mask: dict[str, np.ndarray] = {}
     for lid, arr in layer_rows.items():
@@ -532,79 +532,34 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> None:
         m[arr] = True
         layer_mask[lid] = m
 
-    # Flush per taxon — read parquet once, assign all layers at once
-    flush_n = 0
-    for taxon_key, row_indices in taxon_to_rows.items():
-        data_path = taxon_paths.get(taxon_key)
-        if not data_path:
+    # Build one staging column per sampled layer, null everywhere this batch
+    # didn't sample that row (so the later COALESCE join leaves those alone —
+    # NaN is a real "sampled, no coverage" value and must stay distinguishable
+    # from "not touched this batch").
+    row_has_update = np.zeros(n_worklist, dtype=bool)
+    update_arrays: dict[str, pa.Array] = {}
+    for layer_id, full_values in layer_results.items():
+        mask = layer_mask.get(layer_id)
+        if mask is None or not mask.any():
             continue
-        data_file = Path(data_path)
-        if not data_file.exists():
-            continue
+        row_has_update |= mask
+        update_arrays[layer_id] = pa.array(full_values, type=pa.float64(), mask=~mask)
 
-        # Only write values for rows that were actually missing each layer.
-        # full_values arrays default to NaN outside layer_rows[layer_id], so using
-        # the full row_indices would overwrite existing valid values with NaN for any
-        # taxon rows that already had that layer enriched (carry-forward case).
-        taxon_updates: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for layer_id, full_values in layer_results.items():
-            mask = layer_mask.get(layer_id)
-            if mask is None:
-                continue
-            relevant = row_indices[mask[row_indices]]
-            if relevant.size == 0:
-                continue
-            taxon_updates[layer_id] = (relevant, full_values[relevant])
+    if not row_has_update.any() or not update_arrays:
+        gc.collect()
+        pa.default_memory_pool().release_unused()
+        return None
 
-        if not taxon_updates:
-            continue
+    idx = pa.array(np.where(row_has_update)[0])
+    staging = pa.table({
+        "catalogNumber": pa.array(catalogs, type=pa.string()).take(idx),
+        **{lid: arr.take(idx) for lid, arr in update_arrays.items()},
+    })
 
-        table = pq.read_table(data_file)
-        df_taxon = table.to_pandas()
-        if df_taxon.empty or "catalogNumber" not in df_taxon.columns:
-            continue
-
-        catalog_arr = df_taxon["catalogNumber"].astype(str).to_numpy()
-        catalog_index = {v: i for i, v in enumerate(catalog_arr)}
-
-        for layer_id, (relevant, t_vals) in taxon_updates.items():
-            if layer_id not in df_taxon.columns:
-                df_taxon[layer_id] = np.nan
-            col = df_taxon[layer_id].to_numpy(dtype=np.float64, copy=True)
-            df_indices = np.array([catalog_index.get(c, -1) for c in catalogs[relevant]])
-            valid = df_indices >= 0
-            col[df_indices[valid]] = t_vals[valid]
-            df_taxon[layer_id] = col
-
-        # Stamp NaN (not null) for no-coverage rows so they aren't re-queued on
-        # future rebuilds. pa.Table.from_pandas converts NaN→null for float cols,
-        # so we restore NaN in Arrow after the conversion.
-        # NaN is ignored by all stats computation (same as for continuous layers).
-        arrow_table = pa.Table.from_pandas(df_taxon, preserve_index=False)
-        # pa.Table.from_pandas converts ALL float NaN → Arrow null, including
-        # NaN sentinels in columns we didn't touch this pass. Stamp NaN back
-        # across every floating column, not just the ones in taxon_updates.
-        new_columns = {}
-        for layer_id in arrow_table.schema.names:
-            col = arrow_table.column(layer_id)
-            if pa.types.is_floating(col.type) and pc.any(pc.is_null(col)).as_py():
-                new_columns[layer_id] = pc.if_else(pc.is_null(col), float("nan"), col)
-        if new_columns:
-            for col_name, new_col in new_columns.items():
-                idx = arrow_table.schema.get_field_index(col_name)
-                arrow_table = arrow_table.set_column(idx, col_name, new_col)
-
-        _atomic_write(data_file, arrow_table)
-        flush_n += 1
-        if flush_n % 500 == 0:
-            gc.collect()
-            pa.default_memory_pool().release_unused()
-            print(f"[flush] {flush_n}/{len(taxon_to_rows)}  rss={_rss_mb():.0f}MB")
-
-    # Return Arrow allocator memory to the OS so it doesn't accumulate across batches.
     gc.collect()
     pa.default_memory_pool().release_unused()
-    print(f"[flush] done  rss={_rss_mb():.0f}MB")
+    print(f"[process] batch done  rows_updated={staging.num_rows}  rss={_rss_mb():.0f}MB")
+    return staging
 
 
 def _sample_cog(
@@ -620,35 +575,105 @@ def _sample_cog(
     return [None if np.isnan(v) else float(v) for v in arr]
 
 
-def _flush_taxon_updates(
-    taxon_key: str,
-    data_path: str,
-    pending: dict,
+def _write_staging_batch(batch_idx: int, table: pa.Table | None) -> None:
+    if table is None or table.num_rows == 0:
+        return
+    STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, STAGING_DIR / f"batch_{batch_idx:05d}.parquet")
+
+
+def _finalize_enrichment(
+    layer_ids: list[str],
+    occurrences_file: Path | None = None,
+    staging_dir: Path | None = None,
 ) -> None:
-    """Write pending (catalogNumber, value) pairs for taxon_key to its parquet file."""
-    if taxon_key not in pending:
+    """Join every staged batch's updates into occurrences.parquet in one pass,
+    and drop any GIS/temporal columns no longer in the layer catalog.
+
+    Replaces what used to be a read-modify-atomic-rewrite of every taxon's
+    file, once per worklist batch it appeared in, with a single rewrite of
+    the whole consolidated file.
+
+    occurrences_file/staging_dir default to None (resolved to the module
+    globals below, at call time) rather than being bound as literal default
+    values — Python evaluates a `= OCCURRENCES_FILE`-style default exactly
+    once, at function-definition time, so it would freeze whatever the
+    global was at import time and never see a later `patch.object(et,
+    "OCCURRENCES_FILE", ...)` override, breaking every existing caller that
+    relies on patching the module global and calling with just layer_ids.
+
+    Explicit parameters (rather than only reading the globals directly) still
+    matter because main() runs this in a spawned subprocess (see its call
+    site) — spawn re-imports this module fresh in the child, so any runtime
+    override of the OCCURRENCES_FILE/STAGING_DIR globals (tests patch them;
+    a future caller might too) would silently be lost and this would
+    operate on the wrong file. Confirmed by test_main_processes_batch_and_finalizes
+    failing exactly this way before this fix — bio1 never landed because the
+    child fell back to the real default path instead of the patched one.
+    """
+    if occurrences_file is None:
+        occurrences_file = OCCURRENCES_FILE
+    if staging_dir is None:
+        staging_dir = STAGING_DIR
+    staged = list(staging_dir.glob("*.parquet")) if staging_dir.exists() else []
+    existing = _existing_columns(occurrences_file)
+    stale = _stale_gis_columns(layer_ids, existing)
+    if not staged and not stale:
         return
-    colmap = pending.pop(taxon_key)
-    parquet_path = Path(data_path)
-    if not parquet_path.exists():
-        return
-    table = pq.read_table(parquet_path)
-    if table.num_rows == 0:
-        return
-    df = table.to_pandas()
-    if "catalogNumber" not in df.columns:
-        return
-    catalog_index = {v: i for i, v in enumerate(df["catalogNumber"].astype(str))}
-    for col, pairs in colmap.items():
-        if col not in df.columns:
-            df[col] = np.nan
-        col_arr = df[col].to_numpy(dtype=np.float64, copy=True)
-        for cat_num, value in pairs:
-            idx = catalog_index.get(str(cat_num))
-            if idx is not None:
-                col_arr[idx] = float(value)
-        df[col] = col_arr
-    _atomic_write(parquet_path, pa.Table.from_pandas(df, preserve_index=False))
+
+    con = _duckdb_connect()
+    try:
+        base_cols = [
+            r[0] for r in con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{occurrences_file.as_posix()}') LIMIT 0"
+            ).fetchall()
+        ]
+
+        update_cols: list[str] = []
+        if staged:
+            staging_glob = (staging_dir / "*.parquet").as_posix()
+            update_cols = [
+                r[0] for r in con.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{staging_glob}', union_by_name=True) LIMIT 0"
+                ).fetchall()
+                if r[0] != "catalogNumber"
+            ]
+            # A catalogNumber should only appear in one batch's staging output
+            # (each worklist row is scanned once per run), but dedupe defensively.
+            con.execute(f"""
+                CREATE OR REPLACE TEMP VIEW updates AS
+                SELECT * FROM read_parquet('{staging_glob}', union_by_name=True)
+                QUALIFY row_number() OVER (PARTITION BY "catalogNumber") = 1
+            """)
+
+        overlapping = [c for c in update_cols if c in base_cols]
+        new_cols = [c for c in update_cols if c not in base_cols]
+        exclude_cols = sorted(set(overlapping) | set(stale))
+
+        select_parts = ["o.*"]
+        if exclude_cols:
+            select_parts[0] += " EXCLUDE (" + ", ".join(f'"{c}"' for c in exclude_cols) + ")"
+        if overlapping:
+            select_parts.append(", ".join(f'COALESCE(u."{c}", o."{c}") AS "{c}"' for c in overlapping))
+        if new_cols:
+            select_parts.append(", ".join(f'u."{c}"' for c in new_cols))
+        select_clause = ", ".join(select_parts)
+
+        from_clause = f"read_parquet('{occurrences_file.as_posix()}') o"
+        if staged:
+            from_clause += ' LEFT JOIN updates u USING ("catalogNumber")'
+
+        tmp_dest = occurrences_file.with_suffix(".parquet.tmp")
+        con.execute(f"""
+            COPY (
+                SELECT {select_clause} FROM {from_clause} ORDER BY taxon_key
+            ) TO '{tmp_dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 50000)
+        """)
+    finally:
+        con.close()
+    tmp_dest.replace(occurrences_file)
+    if stale:
+        print(f"[finalize] dropped stale columns: {stale}")
 
 
 def main() -> None:
@@ -656,13 +681,42 @@ def main() -> None:
     if VARS_TO_ENRICH is not None:
         layers = [layer for layer in layers if layer["id"] in VARS_TO_ENRICH]
     layer_ids = [layer["id"] for layer in layers]
+
+    shutil.rmtree(STAGING_DIR, ignore_errors=True)
     batch_count = 0
     for batch in _iter_worklist_batches(layer_ids, CONFIG.plantae_key, row_limit=ROW_LIMIT):
         if batch.num_rows == 0:
             continue
         batch_count += 1
         print(f"[worklist] processing batch {batch_count}")
-        _process_batch(batch, layers)
+        staging = _process_batch(batch, layers)
+        _write_staging_batch(batch_count, staging)
+
+    print("[finalize] merging staged updates into occurrences.parquet...")
+    # Run in a fresh subprocess rather than in-process: the sampling loop
+    # above was confirmed (via rebuild.log + kernel OOM logs) to still be
+    # holding ~35GB RSS by the time it finishes — rasterio/GDAL buffers and
+    # numpy sample arrays that either aren't fully released or, more likely,
+    # freed by Python but not returned to the OS by glibc's allocator. That
+    # baseline stacks on top of whatever _finalize_enrichment's own DuckDB
+    # query needs, so tuning DuckDB's memory_limit down didn't help — the
+    # process was already most of the way to the ceiling before the query
+    # even started. spawn (not fork) gives the child a genuinely fresh
+    # interpreter and heap, independent of whatever the parent accumulated.
+    ctx = multiprocessing.get_context("spawn")
+    # Pass the paths explicitly rather than letting the child read its own
+    # freshly-imported module globals — spawn does not carry over any
+    # runtime override of OCCURRENCES_FILE/STAGING_DIR (tests patch them;
+    # see _finalize_enrichment's docstring for the failure this caused).
+    proc = ctx.Process(
+        target=_finalize_enrichment,
+        args=(layer_ids, OCCURRENCES_FILE, STAGING_DIR),
+    )
+    proc.start()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"_finalize_enrichment subprocess failed (exit code {proc.exitcode})")
+    shutil.rmtree(STAGING_DIR, ignore_errors=True)
     print("Completed GIS enrichment.")
 
 

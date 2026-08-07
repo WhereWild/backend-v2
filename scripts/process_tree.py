@@ -21,6 +21,22 @@ Pass 2 — Rankings (top-down, shallowest first):
 
 from __future__ import annotations
 
+import os
+
+# OpenBLAS/OpenMP/MKL default to sizing their internal thread pool to the
+# core count and spinning it up per call — fine for a few large calls, pure
+# thread-spawn/teardown overhead for the many tiny per-taxon KDE/matrix ops
+# this pipeline does. STATS_WORKERS=1 makes this process deliberately
+# single-process, so there's no real parallelism to gain here, only
+# contention. Must be set before numpy/scipy get imported anywhere in the
+# process (BLAS reads these once at load time) — confirmed via a real
+# 1411-taxon subtree benchmark: 5m00s -> 2m40s wall time (27m42s -> 2m36s
+# CPU time) with these pinned to 1.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import argparse
 import shutil
 import time

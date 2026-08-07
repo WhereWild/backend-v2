@@ -2,9 +2,14 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-FROM ghcr.io/osgeo/gdal:ubuntu-full-latest
+# Pinned by digest (not :latest) so local/CI builds don't get cache-blasted
+# and reproducibility doesn't silently drift whenever upstream repushes their
+# floating tag. Bump deliberately: `docker buildx imagetools inspect
+# ghcr.io/osgeo/gdal:ubuntu-full-latest` / `...astral-sh/uv:latest` for the
+# current digest.
+FROM ghcr.io/osgeo/gdal:ubuntu-full-latest@sha256:323828a57fd01e2f0a96ece1b2caf6b4ad41e2e47458386836697418fd67665c
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:latest@sha256:2d890623d310b57771ce840f0da5eed5fc6d657da05ffaa45d82797b53fa3abc /uv /usr/local/bin/uv
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \

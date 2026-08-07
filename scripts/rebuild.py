@@ -182,11 +182,17 @@ def _push_stage() -> None:
             )
         print(f"  Destination free space: {free_gb:.1f} GB")
 
+    tmp_dir = DATA_DIR / "tmp"
+    if tmp_dir.exists():
+        print(f"  Removing local {tmp_dir} (scratch/spill space — never meant to be pushed)")
+        shutil.rmtree(tmp_dir)
+
     transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
     flags = [
         "--exclude", "taxonomy/cache/**",
         "--exclude", "gis/temporal/rasters/**",
         "--exclude", "gis/layers/elevation.tif",
+        "--exclude", "tmp/**",
         "--delete-excluded",
         "--transfers", transfers,
         "--stats-one-line", "--stats", "1m",

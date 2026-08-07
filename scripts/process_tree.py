@@ -298,33 +298,29 @@ def _finalize_stats(staging_dir: Path) -> None:
 
 
 def run_consolidation() -> None:
-    """Merge per-node ranking positions into a global file, and clean up
-    now-unneeded per-node intermediate state (.acc accumulators, rank
-    catalogs). Summary stats no longer need consolidating here —
-    run_stats() already streams them straight into their final global
-    files (see _finalize_stats)."""
+    """Clean up now-unneeded per-node intermediate state (.acc accumulators,
+    rank catalogs, and everything else under TREE_ROOT). Summary stats and
+    rankings no longer need consolidating here — run_stats()/run_rankings()
+    already stream them straight into their final global files (see
+    _finalize_stats/_finalize_rankings).
+
+    TREE_ROOT itself is wholly disposable at this point: every taxon's
+    accumulator has already been merged upward and consumed by its parent,
+    and everything the live API reads (main.py, read_phenology_counts, ...)
+    comes from GLOBAL_STATS_DIR, with any TREE_ROOT-based path only a
+    legacy/defensive fallback that's never actually hit once the global
+    files exist. Deleting files by pattern (the old approach) left behind
+    an empty directory for every one of the ~187k taxa in the tree — pure
+    dead weight that still had to be rclone-synced to production on every
+    push for zero benefit. Removing the whole directory avoids that; the
+    next stats run recreates only the directories it actually needs.
+    """
     GLOBAL_STATS_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.monotonic()
 
-    # Remove accumulator state and rank catalogs — no longer needed once
-    # rankings have been computed from them.
-    removed = 0
-    patterns = [
-        "species.parquet", "subspecies.parquet", "genus.parquet",
-        "family.parquet", "order.parquet", "variety.parquet", "form.parquet",
-        ".acc",
-        POSITION_FILE,  # old per-taxon positions files (new approach never creates them)
-        "*_index.parquet",  # old per-ancestor wide struct-array rank indexes (superseded by RANKINGS_FILE)
-        "*_positions.parquet",  # old per-ancestor position ctx files (superseded by RankingsSink staging)
-    ]
-    for filename in patterns:
-        for path in TREE_ROOT.rglob(filename):
-            path.unlink()
-            removed += 1
-    for path in TREE_ROOT.rglob("tmp*.parquet"):
-        path.unlink()
-        removed += 1
-    print(f"[consolidate] removed {removed} per-node files")
+    if TREE_ROOT.exists():
+        shutil.rmtree(TREE_ROOT)
+        print("[consolidate] removed TREE_ROOT (all per-node intermediate state)")
 
     cache_file = GLOBAL_STATS_DIR.parent / "stats_cache.pkl.gz"
     if cache_file.exists():

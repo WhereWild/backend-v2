@@ -88,7 +88,71 @@ def _taxon_key_predicate() -> dict:
     }
 
 
+def _predicate_matches(request: dict, fmt: str, has_coordinate: bool) -> bool:
+    """True if a GBIF download's own recorded request matches what we'd
+    submit right now for the given format — same dataset, same taxon roots
+    (order-independent), same checklist, same HAS_COORDINATE presence.
+    Ignores fields GBIF injects that we never set (e.g. matchCase)."""
+    if request.get("format") != fmt:
+        return False
+    predicates = request.get("predicate", {}).get("predicates", [])
+    taxon_pred = next((p for p in predicates if p.get("key") == "TAXON_KEY"), None)
+    if taxon_pred is None:
+        return False
+    if taxon_pred.get("checklistKey") != COL_XR_CHECKLIST_KEY:
+        return False
+    values = taxon_pred.get("values")
+    if values is None and "value" in taxon_pred:
+        values = [taxon_pred["value"]]
+    expected = sorted(str(r) for r in CONFIG.taxonomy_roots)
+    if sorted(str(v) for v in (values or [])) != expected:
+        return False
+    has_hc = any(p.get("key") == "HAS_COORDINATE" for p in predicates)
+    return has_hc == has_coordinate
+
+
+def _find_existing_download(fmt: str, has_coordinate: bool) -> str | None:
+    """Return the key of an existing GBIF download (not FAILED/KILLED/
+    CANCELLED) whose predicate matches what we'd request right now, or None.
+    A SUCCEEDED match is always preferred over a still-preparing one (usable
+    immediately, no wait) — results come back newest-first, and the newest
+    matching job is often still PREPARING while an older identical one has
+    already finished, so a naive first-match scan would pick the slower one.
+
+    GBIF does not deduplicate download requests on its own — submitting the
+    same predicate twice just creates two separate ~1hr jobs (confirmed live:
+    identical predicates minutes apart got distinct keys and both ran their
+    full prep time independently). Without this check, any crash/retry
+    before local state is persisted burns a fresh ~1hr download every time,
+    and can exhaust GBIF's small per-account concurrent-download quota.
+    """
+    resp = httpx.get(
+        f"{BASE_URL}/occurrence/download/user/{GBIF_USER}",
+        auth=(GBIF_USER, GBIF_PASSWORD),
+        params={"limit": 50},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    fallback: str | None = None
+    for entry in resp.json().get("results", []):
+        status = entry.get("status")
+        if status in ("FAILED", "KILLED", "CANCELLED"):
+            continue
+        if not _predicate_matches(entry.get("request", {}), fmt, has_coordinate):
+            continue
+        if status == "SUCCEEDED":
+            return entry["key"]
+        if fallback is None:
+            fallback = entry["key"]
+    return fallback
+
+
 def request_download() -> str:
+    existing = _find_existing_download("SPECIES_LIST", has_coordinate=False)
+    if existing:
+        print(f"Reusing existing download: {existing}")
+        return existing
+
     payload = {
         "creator": GBIF_USER,
         "notificationAddresses": [GBIF_EMAIL],
@@ -214,6 +278,11 @@ def _cleanup_occurrences_dir() -> None:
 
 
 def request_occurrence_download() -> str:
+    existing = _find_existing_download("DWCA", has_coordinate=True)
+    if existing:
+        print(f"Reusing existing occurrence download: {existing}")
+        return existing
+
     payload = {
         "creator": GBIF_USER,
         "notificationAddresses": [GBIF_EMAIL],

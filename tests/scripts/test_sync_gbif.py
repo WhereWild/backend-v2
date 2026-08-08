@@ -104,11 +104,124 @@ def test_save_sync_state():
     assert saved["gbif_taxonomy"]["download_key"] == DOWNLOAD_KEY
 
 
+# --- _predicate_matches / _find_existing_download ---
+
+def _species_list_request(values=("7HS", "CXQ")):
+    return {
+        "format": "SPECIES_LIST",
+        "predicate": {
+            "type": "and",
+            "predicates": [
+                {"type": "equals", "key": "DATASET_KEY", "value": sync_gbif.INAT_DATASET_KEY},
+                {
+                    "type": "in", "key": "TAXON_KEY", "values": list(values),
+                    "checklistKey": sync_gbif.COL_XR_CHECKLIST_KEY,
+                },
+                {"type": "equals", "key": "OCCURRENCE_STATUS", "value": "PRESENT"},
+            ],
+        },
+    }
+
+
+def _dwca_request(values=("7HS", "CXQ")):
+    req = _species_list_request(values)
+    req["format"] = "DWCA"
+    req["predicate"]["predicates"].append(
+        {"type": "equals", "key": "HAS_COORDINATE", "value": "true"}
+    )
+    return req
+
+
+def test_predicate_matches_species_list(monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    assert sync_gbif._predicate_matches(_species_list_request(), "SPECIES_LIST", has_coordinate=False)
+
+
+def test_predicate_matches_order_independent(monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    assert sync_gbif._predicate_matches(
+        _species_list_request(values=("CXQ", "7HS")), "SPECIES_LIST", has_coordinate=False
+    )
+
+
+def test_predicate_matches_false_wrong_format(monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    assert not sync_gbif._predicate_matches(_species_list_request(), "DWCA", has_coordinate=False)
+
+
+def test_predicate_matches_false_different_roots(monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    assert not sync_gbif._predicate_matches(
+        _species_list_request(values=("7HS",)), "SPECIES_LIST", has_coordinate=False
+    )
+
+
+def test_predicate_matches_false_wrong_checklist(monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    req = _species_list_request()
+    req["predicate"]["predicates"][1]["checklistKey"] = "some-other-checklist"
+    assert not sync_gbif._predicate_matches(req, "SPECIES_LIST", has_coordinate=False)
+
+
+def test_predicate_matches_dwca_requires_has_coordinate(monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    assert sync_gbif._predicate_matches(_dwca_request(), "DWCA", has_coordinate=True)
+    assert not sync_gbif._predicate_matches(_dwca_request(), "DWCA", has_coordinate=False)
+    assert not sync_gbif._predicate_matches(_species_list_request(), "SPECIES_LIST", has_coordinate=True)
+
+
+def test_find_existing_download_prefers_succeeded_over_newer_preparing(httpx_mock: HTTPXMock, monkeypatch):
+    # Results come back newest-first; the newest match is still PREPARING
+    # while an older identical one already SUCCEEDED — must pick the
+    # succeeded one, not just the first match in list order.
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    httpx_mock.add_response(json={"results": [
+        {"key": "new-preparing", "status": "PREPARING", "request": _species_list_request()},
+        {"key": "old-succeeded", "status": "SUCCEEDED", "request": _species_list_request()},
+    ]})
+    assert sync_gbif._find_existing_download("SPECIES_LIST", has_coordinate=False) == "old-succeeded"
+
+
+def test_find_existing_download_falls_back_to_preparing_if_none_succeeded(httpx_mock: HTTPXMock, monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    httpx_mock.add_response(json={"results": [
+        {"key": "preparing-1", "status": "PREPARING", "request": _species_list_request()},
+        {"key": "preparing-2", "status": "RUNNING", "request": _species_list_request()},
+    ]})
+    assert sync_gbif._find_existing_download("SPECIES_LIST", has_coordinate=False) == "preparing-1"
+
+
+def test_find_existing_download_skips_terminal_failures(httpx_mock: HTTPXMock, monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    httpx_mock.add_response(json={"results": [
+        {"key": "cancelled", "status": "CANCELLED", "request": _species_list_request()},
+        {"key": "failed", "status": "FAILED", "request": _species_list_request()},
+        {"key": "killed", "status": "KILLED", "request": _species_list_request()},
+    ]})
+    assert sync_gbif._find_existing_download("SPECIES_LIST", has_coordinate=False) is None
+
+
+def test_find_existing_download_no_match_returns_none(httpx_mock: HTTPXMock, monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    httpx_mock.add_response(json={"results": [
+        {"key": "wrong-format", "status": "SUCCEEDED", "request": _dwca_request()},
+    ]})
+    assert sync_gbif._find_existing_download("SPECIES_LIST", has_coordinate=False) is None
+
+
 # --- request_download ---
+
+def test_request_download_reuses_existing(httpx_mock: HTTPXMock, capsys):
+    with patch("scripts.sync_gbif._find_existing_download", return_value="old-succeeded"):
+        assert sync_gbif.request_download() == "old-succeeded"
+    assert "Reusing existing download" in capsys.readouterr().out
+    assert len(httpx_mock.get_requests()) == 0  # no POST made
+
 
 def test_request_download(httpx_mock: HTTPXMock):
     httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
-    assert sync_gbif.request_download() == DOWNLOAD_KEY
+    with patch("scripts.sync_gbif._find_existing_download", return_value=None):
+        assert sync_gbif.request_download() == DOWNLOAD_KEY
     request = httpx_mock.get_requests()[0]
     body = json.loads(request.content)
     predicates = body["predicate"]["predicates"]
@@ -121,7 +234,8 @@ def test_request_download(httpx_mock: HTTPXMock):
 def test_request_download_multiple_roots(httpx_mock: HTTPXMock, monkeypatch):
     monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
     httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
-    assert sync_gbif.request_download() == DOWNLOAD_KEY
+    with patch("scripts.sync_gbif._find_existing_download", return_value=None):
+        assert sync_gbif.request_download() == DOWNLOAD_KEY
     request = httpx_mock.get_requests()[0]
     body = json.loads(request.content)
     predicates = body["predicate"]["predicates"]
@@ -223,9 +337,17 @@ def test_extract_dwca(tmp_path):
 
 # --- request_occurrence_download ---
 
+def test_request_occurrence_download_reuses_existing(httpx_mock: HTTPXMock, capsys):
+    with patch("scripts.sync_gbif._find_existing_download", return_value="old-succeeded"):
+        assert sync_gbif.request_occurrence_download() == "old-succeeded"
+    assert "Reusing existing occurrence download" in capsys.readouterr().out
+    assert len(httpx_mock.get_requests()) == 0
+
+
 def test_request_occurrence_download(httpx_mock: HTTPXMock):
     httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
-    key = sync_gbif.request_occurrence_download()
+    with patch("scripts.sync_gbif._find_existing_download", return_value=None):
+        key = sync_gbif.request_occurrence_download()
     assert key == DOWNLOAD_KEY
     request = httpx_mock.get_requests()[0]
     body = json.loads(request.content)
@@ -261,7 +383,8 @@ def test_sync_occurrences_new_crawl(httpx_mock: HTTPXMock):
     httpx_mock.add_response(json=_crawl_response())
     httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
 
-    with patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
+    with patch("scripts.sync_gbif._find_existing_download", return_value=None), \
+         patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
          patch("scripts.sync_gbif.download_zip"), \
          patch("scripts.sync_gbif.extract"):
         result = sync_gbif.sync_occurrences()
@@ -297,7 +420,8 @@ def test_main_new_crawl(httpx_mock: HTTPXMock):
     httpx_mock.add_response(json=_crawl_response())
     httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
 
-    with patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
+    with patch("scripts.sync_gbif._find_existing_download", return_value=None), \
+         patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
          patch("scripts.sync_gbif.download_zip"), \
          patch("scripts.sync_gbif.extract"):
         result = sync_gbif.main()
@@ -360,7 +484,8 @@ def test_sync_all_requests_both_before_polling_either(httpx_mock: HTTPXMock):
         call_order.append(f"poll:{key}")
         return GBIF_META
 
-    with patch("scripts.sync_gbif.request_download", side_effect=tracked_request_download), \
+    with patch("scripts.sync_gbif._find_existing_download", return_value=None), \
+         patch("scripts.sync_gbif.request_download", side_effect=tracked_request_download), \
          patch("scripts.sync_gbif.request_occurrence_download", side_effect=tracked_request_occurrence_download), \
          patch("scripts.sync_gbif.poll_until_ready", side_effect=tracked_poll), \
          patch("scripts.sync_gbif.download_zip"), \
@@ -382,7 +507,8 @@ def test_sync_all_new_crawl_both(httpx_mock: HTTPXMock):
     httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
     httpx_mock.add_response(text=f'"{OCCURRENCE_DOWNLOAD_KEY}"')
 
-    with patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
+    with patch("scripts.sync_gbif._find_existing_download", return_value=None), \
+         patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
          patch("scripts.sync_gbif.download_zip"), \
          patch("scripts.sync_gbif.extract"), \
          patch("scripts.sync_gbif._cleanup_occurrences_dir"):
@@ -401,7 +527,8 @@ def test_sync_all_only_occurrences_stale(httpx_mock: HTTPXMock):
     httpx_mock.add_response(text=f'"{OCCURRENCE_DOWNLOAD_KEY}"')
     sync_gbif.save_sync_state({"gbif_taxonomy": {"crawl_finished": CRAWL_TS}})
 
-    with patch("scripts.sync_gbif.request_download") as mock_request_download, \
+    with patch("scripts.sync_gbif._find_existing_download", return_value=None), \
+         patch("scripts.sync_gbif.request_download") as mock_request_download, \
          patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
          patch("scripts.sync_gbif.download_zip"), \
          patch("scripts.sync_gbif.extract"), \

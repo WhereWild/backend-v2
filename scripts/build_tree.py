@@ -18,10 +18,10 @@ Phase 2 — ID mapping  (formerly build_id_maps.py)
 Phase 3 — Name & image enrichment  (formerly polish_tree.py)
   - iNat DWC-A VernacularNames-*.csv  (matched via inat_id, same zip as Phase 2)
   - COL XR vernacular names            (live GBIF species-search, scoped to
-    CONFIG.plantae_key's subtree — see fetch_col_vernacular; each result's
-    taxonID is already this catalog's own COL XR key, so no crosswalk is
-    needed the way GBIF's legacy numeric-keyed Backbone vernacular file
-    would have required)
+    each of CONFIG.taxonomy_roots' subtrees — see fetch_col_vernacular; each
+    result's taxonID is already this catalog's own COL XR key, so no
+    crosswalk is needed the way GBIF's legacy numeric-keyed Backbone
+    vernacular file would have required)
   - iNat API /v1/taxa                 (preferred_common_name + default_photo)
   - GBIF occurrence DWCA multimedia   (backup images)
 
@@ -858,8 +858,10 @@ def _fetch_col_vernacular_subtree(
 
 def fetch_col_vernacular(catalog: dict) -> dict[str, list[str]]:
     """Return taxon_key -> all English vernacular names, fetched live from
-    GBIF's COL XR-backed species search, scoped to CONFIG.plantae_key's
-    subtree, accepted usages only.
+    GBIF's COL XR-backed species search, scoped to each of
+    CONFIG.taxonomy_roots' subtrees (merged — roots are disjoint kingdom
+    trees by construction, so there's no collision risk), accepted usages
+    only.
 
     Not GBIF's legacy Backbone VernacularName.tsv (the old approach): its own
     taxonID is a legacy numeric GBIF Backbone key, not one of this catalog's
@@ -870,22 +872,22 @@ def fetch_col_vernacular(catalog: dict) -> dict[str, list[str]]:
     catalog's own key format, with vernacularNames already inline — no
     crosswalk needed.
 
-    Scoped + paginated (not per-taxon): a single highertaxonKey covers the
-    whole configured subtree, ~5 requests for the current Cactaceae-only
-    catalog, ~660 requests (~11 min at COL_API_RATE_LIMIT) for a full-Plantae
-    catalog — vs. one request per taxon (thousands) or per genus (hundreds).
-    Subtrees over GBIF's 100,000-offset cap are split further; see
+    Scoped + paginated (not per-taxon): a single highertaxonKey covers each
+    configured subtree, ~5 requests for the current Cactaceae-only catalog,
+    ~660 requests (~11 min at COL_API_RATE_LIMIT) for a full-Plantae catalog
+    — vs. one request per taxon (thousands) or per genus (hundreds). Subtrees
+    over GBIF's 100,000-offset cap are split further; see
     _fetch_col_vernacular_subtree.
     """
-    root = catalog.get(CONFIG.plantae_key)
-    if root is None:
-        print(f"  plantae_key {CONFIG.plantae_key!r} not found in catalog, skipping COL vernacular fetch.")
-        return {}
-
-    root_name = str(root.get("scientific_name") or "").replace("_", " ")
     children_index = _build_catalog_children_index(catalog)
     result: dict[str, list[str]] = {}
-    _fetch_col_vernacular_subtree(root_name, CONFIG.plantae_key, catalog, children_index, result)
+    for root_key in CONFIG.taxonomy_roots:
+        root = catalog.get(root_key)
+        if root is None:
+            print(f"  taxonomy root {root_key!r} not found in catalog, skipping COL vernacular fetch.")
+            continue
+        root_name = str(root.get("scientific_name") or "").replace("_", " ")
+        _fetch_col_vernacular_subtree(root_name, root_key, catalog, children_index, result)
     return result
 
 

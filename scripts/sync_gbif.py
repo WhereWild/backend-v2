@@ -3,11 +3,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
-Sync GBIF species list for Plantae (full taxonomy, all ranks).
+Sync GBIF species list for CONFIG.taxonomy_roots (full taxonomy, all ranks).
 
 Checks the iNaturalist crawl history on GBIF to detect new ingestions.
 Only re-downloads if GBIF has processed new data since our last download.
 Credentials are read from environment variables loaded from .env
+
+Multiple configured roots (e.g. Plantae + Fungi) are pulled in a single
+download via an "in" TAXON_KEY predicate rather than one download per root —
+GBIF's TAXON_KEY predicate already matches a taxon and all its descendants,
+and "in" unions that match across every listed value (confirmed live: a
+combined query's occurrence count exactly equals the sum of each root's own
+count, no overlap). This keeps the rest of the pipeline (one species_list.csv,
+one occurrence.txt/multimedia.txt) unchanged regardless of how many roots are
+configured.
 """
 
 import json
@@ -30,8 +39,8 @@ GBIF_EMAIL = os.environ.get("GBIF_EMAIL", "")
 BASE_URL = "https://api.gbif.org/v1"
 INAT_DATASET_KEY = "50c9509d-22c7-4a22-a47d-8c48425ef4a7"
 # Catalogue of Life Extended Release — required on TAXON_KEY predicates since
-# plantae_key is now a COL XR id (e.g. "7HS"), not a legacy numeric GBIF
-# Backbone key. Without this, GBIF resolves TAXON_KEY against the obsolete
+# taxonomy_roots entries are COL XR ids (e.g. "7HS"), not legacy numeric GBIF
+# Backbone keys. Without this, GBIF resolves TAXON_KEY against the obsolete
 # Backbone by default, where the value doesn't exist.
 COL_XR_CHECKLIST_KEY = "7ddf754f-d193-4cc9-b351-99906754a03b"
 
@@ -68,6 +77,17 @@ def save_sync_state(state: dict) -> None:
     SYNC_STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
+def _taxon_key_predicate() -> dict:
+    """TAXON_KEY predicate matching every configured root (and each root's
+    descendants — GBIF's TAXON_KEY predicate already includes descendants,
+    "in" unions that across every listed root, confirmed live via matching
+    occurrence counts). Works identically for a single configured root."""
+    return {
+        "type": "in", "key": "TAXON_KEY", "values": [str(r) for r in CONFIG.taxonomy_roots],
+        "checklistKey": COL_XR_CHECKLIST_KEY,
+    }
+
+
 def request_download() -> str:
     payload = {
         "creator": GBIF_USER,
@@ -78,10 +98,7 @@ def request_download() -> str:
             "type": "and",
             "predicates": [
                 {"type": "equals", "key": "DATASET_KEY", "value": INAT_DATASET_KEY},
-                {
-                    "type": "equals", "key": "TAXON_KEY", "value": str(CONFIG.plantae_key),
-                    "checklistKey": COL_XR_CHECKLIST_KEY,
-                },
+                _taxon_key_predicate(),
                 {"type": "equals", "key": "OCCURRENCE_STATUS", "value": "PRESENT"},
             ],
         },
@@ -96,6 +113,21 @@ def request_download() -> str:
     key = resp.text.strip().strip('"')
     print(f"Download requested: {key}")
     return key
+
+
+def _download_state_entry(crawl_finished: str, download_key: str, gbif_meta: dict) -> dict:
+    return {
+        "crawl_finished": crawl_finished,
+        "download_key": download_key,
+        "download_link": gbif_meta.get("downloadLink"),
+        "doi": gbif_meta.get("doi"),
+        "citation": _build_citation(gbif_meta),
+        "created": gbif_meta.get("created"),
+        "erase_after": gbif_meta.get("eraseAfter"),
+        "total_records": gbif_meta.get("totalRecords"),
+        "number_datasets": gbif_meta.get("numberDatasets"),
+        "size_bytes": gbif_meta.get("size"),
+    }
 
 
 def _build_citation(gbif_meta: dict) -> str:
@@ -191,10 +223,7 @@ def request_occurrence_download() -> str:
             "type": "and",
             "predicates": [
                 {"type": "equals", "key": "DATASET_KEY", "value": INAT_DATASET_KEY},
-                {
-                    "type": "equals", "key": "TAXON_KEY", "value": str(CONFIG.plantae_key),
-                    "checklistKey": COL_XR_CHECKLIST_KEY,
-                },
+                _taxon_key_predicate(),
                 {"type": "equals", "key": "OCCURRENCE_STATUS", "value": "PRESENT"},
                 {"type": "equals", "key": "HAS_COORDINATE", "value": "true"},
             ],
@@ -233,18 +262,7 @@ def sync_occurrences() -> bool:
     extract(OCCURRENCES_DIR)
     _cleanup_occurrences_dir()
 
-    state["gbif_occurrences"] = {
-        "crawl_finished": crawl_finished,
-        "download_key": download_key,
-        "download_link": gbif_meta.get("downloadLink"),
-        "doi": gbif_meta.get("doi"),
-        "citation": _build_citation(gbif_meta),
-        "created": gbif_meta.get("created"),
-        "erase_after": gbif_meta.get("eraseAfter"),
-        "total_records": gbif_meta.get("totalRecords"),
-        "number_datasets": gbif_meta.get("numberDatasets"),
-        "size_bytes": gbif_meta.get("size"),
-    }
+    state["gbif_occurrences"] = _download_state_entry(crawl_finished, download_key, gbif_meta)
     save_sync_state(state)
     print("Done.")
     return True
@@ -270,23 +288,65 @@ def main() -> bool:
     download_zip(gbif_meta["downloadLink"])
     extract()
 
-    state["gbif_taxonomy"] = {
-        "crawl_finished": crawl_finished,
-        "download_key": download_key,
-        "download_link": gbif_meta.get("downloadLink"),
-        "doi": gbif_meta.get("doi"),
-        "citation": _build_citation(gbif_meta),
-        "created": gbif_meta.get("created"),
-        "erase_after": gbif_meta.get("eraseAfter"),
-        "total_records": gbif_meta.get("totalRecords"),
-        "number_datasets": gbif_meta.get("numberDatasets"),
-        "size_bytes": gbif_meta.get("size"),
-    }
+    state["gbif_taxonomy"] = _download_state_entry(crawl_finished, download_key, gbif_meta)
     save_sync_state(state)
     print("Done.")
     return True
 
 
+def sync_all() -> bool:
+    """Sync both the taxonomy species list and occurrence records, requesting
+    both GBIF downloads up front before waiting on either.
+
+    GBIF downloads routinely take on the order of an hour to prepare, and
+    that preparation happens entirely on GBIF's side once requested — polling
+    doesn't influence it. main() then sync_occurrences() run sequentially
+    would request the occurrence download only after the species-list one
+    has fully finished preparing, doubling the wall-clock wait for no reason.
+    Requesting both immediately lets them prepare concurrently: by the time
+    the first poll loop finishes, the second download is often already done
+    or close to it.
+
+    Returns True if anything was downloaded.
+    """
+    if not all([GBIF_USER, GBIF_PASSWORD, GBIF_EMAIL]):
+        raise OSError("GBIF_USER, GBIF_PASSWORD, and GBIF_EMAIL must be set")
+
+    print("Checking GBIF iNat crawl history...")
+    crawl_finished = latest_crawl_finished()
+    state = load_sync_state()
+
+    need_taxonomy = state.get("gbif_taxonomy", {}).get("crawl_finished") != crawl_finished
+    need_occurrences = state.get("gbif_occurrences", {}).get("crawl_finished") != crawl_finished
+
+    if not need_taxonomy and not need_occurrences:
+        print(f"Already up to date (last crawl: {crawl_finished})")
+        return False
+
+    print(f"New crawl detected: {crawl_finished}")
+
+    taxonomy_key = request_download() if need_taxonomy else None
+    occurrences_key = request_occurrence_download() if need_occurrences else None
+
+    if taxonomy_key:
+        gbif_meta = poll_until_ready(taxonomy_key)
+        download_zip(gbif_meta["downloadLink"])
+        extract()
+        state["gbif_taxonomy"] = _download_state_entry(crawl_finished, taxonomy_key, gbif_meta)
+        save_sync_state(state)
+        print("Taxonomy sync done.")
+
+    if occurrences_key:
+        gbif_meta = poll_until_ready(occurrences_key)
+        download_zip(gbif_meta["downloadLink"], OCCURRENCES_DIR)
+        extract(OCCURRENCES_DIR)
+        _cleanup_occurrences_dir()
+        state["gbif_occurrences"] = _download_state_entry(crawl_finished, occurrences_key, gbif_meta)
+        save_sync_state(state)
+        print("Occurrences sync done.")
+
+    return True
+
+
 if __name__ == "__main__":  # pragma: no cover
-    main()
-    sync_occurrences()
+    sync_all()

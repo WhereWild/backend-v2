@@ -912,18 +912,27 @@ def iter_occ_index_batches(index_path: Path, batch_rows: int) -> Iterable[pa.Tab
         yield pa.Table.from_batches([batch]).combine_chunks()
 
 
-def _scope_taxon_keys(root: TaxonRecord) -> frozenset[str]:
-    """taxon_keys of root and every descendant, resolved from the in-memory catalog.
+def _scope_taxon_keys(roots: TaxonRecord | Iterable[TaxonRecord]) -> frozenset[str]:
+    """taxon_keys of the given root(s) and every descendant, resolved from
+    the in-memory catalog and unioned across roots (independent taxonomy
+    roots are disjoint subtrees by construction, so no cross-root dedup
+    concerns).
 
     Occurrence rows carry only taxon_key, not a path — a taxon's ancestry
     already lives once in the catalog, so subtree scoping is a membership
     check against this key set rather than a stored-path prefix match.
     """
-    prefix = root["path"]
-    return frozenset(
-        str(t["taxon_key"]) for t in load_catalog().values()
-        if t["path"] == prefix or t["path"].startswith(prefix + "/")
-    )
+    if isinstance(roots, dict):
+        roots = (roots,)
+    catalog = load_catalog()
+    keys: set[str] = set()
+    for root in roots:
+        prefix = root["path"]
+        keys.update(
+            str(t["taxon_key"]) for t in catalog.values()
+            if t["path"] == prefix or t["path"].startswith(prefix + "/")
+        )
+    return frozenset(keys)
 
 
 def _occ_valid_mask(
@@ -995,6 +1004,10 @@ def build_occ_index(
     skip_if_cols: list of per-layer column groups. A row is excluded only when
     every group is fully non-null (i.e. every active layer is already enriched
     for that row). Rows needing enrichment for any one layer are included.
+
+    Single-root only (unlike build_per_layer_occ_indices below) — no
+    production call site needs multiple roots here today; generalize if one
+    shows up.
     """
     root = get_taxon_by_id(root_taxon_id)
     if root is None:
@@ -1077,7 +1090,7 @@ def _occ_index_duckdb_connect() -> duckdb.DuckDBPyConnection:
 
 
 def build_per_layer_occ_indices(
-    root_taxon_id: str,
+    root_taxon_ids: str | Iterable[str],
     data_root: str,
     occ_filename: str,
     layers: list[TemporalLayer],
@@ -1092,6 +1105,12 @@ def build_per_layer_occ_indices(
     docstring for why that stays valid across a later write_back pass).
     Returns {layer_id: n_obs}.
 
+    Accepts one or more root taxon ids — independent taxonomy roots (e.g.
+    Plantae + Fungi) are scanned together in this one pass, with descendant
+    scoping unioned across all of them (see _scope_taxon_keys). Raises if
+    ANY given root id is unknown, matching this function's existing
+    single-root strictness.
+
     Streamed via DuckDB in batches rather than pq.read_table(...).to_pandas()
     on every skip-check column across every layer — that OOM-killed in
     practice on the real ~60M-row, ~180-column occurrences.parquet (up to
@@ -1104,9 +1123,14 @@ def build_per_layer_occ_indices(
     if not layers:
         return {}
 
-    root = get_taxon_by_id(root_taxon_id)
-    if root is None:
-        raise RuntimeError(f"Unknown root taxon {root_taxon_id}")
+    if isinstance(root_taxon_ids, str):
+        root_taxon_ids = (root_taxon_ids,)
+    roots = []
+    for root_taxon_id in root_taxon_ids:
+        root = get_taxon_by_id(root_taxon_id)
+        if root is None:
+            raise RuntimeError(f"Unknown root taxon {root_taxon_id}")
+        roots.append(root)
 
     cutoff = (
         datetime.fromisoformat(min_date).replace(tzinfo=UTC).timestamp()
@@ -1155,7 +1179,7 @@ def build_per_layer_occ_indices(
             con = _occ_index_duckdb_connect()
             try:
                 con.register("scope_keys", pa.table({
-                    "taxon_key": pa.array(list(_scope_taxon_keys(root)), type=pa.string()),
+                    "taxon_key": pa.array(list(_scope_taxon_keys(roots)), type=pa.string()),
                 }))
                 reader = con.execute(f"""
                     SELECT row_idx, {select_sql} FROM (

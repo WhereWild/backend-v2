@@ -191,8 +191,12 @@ def _stale_gis_columns(layer_ids: list[str], existing: set[str]) -> list[str]:
     ]
 
 
-def _scope_taxon_keys(root_key: str | int) -> list[str] | None:
-    """taxon_keys of root_key and every descendant, resolved from the in-memory catalog.
+def _scope_taxon_keys(root_keys: str | int | Iterable[str | int]) -> list[str] | None:
+    """taxon_keys of the given root(s) and every descendant, resolved from
+    the in-memory catalog and unioned across roots (independent taxonomy
+    roots are disjoint subtrees by construction, so this is a plain union
+    with no cross-root dedup concerns). Returns None only if none of the
+    given roots resolve in the catalog.
 
     Occurrence rows carry only taxon_key (not a path — a taxon's ancestry
     already lives once in the catalog, no reason to duplicate it onto every
@@ -202,20 +206,27 @@ def _scope_taxon_keys(root_key: str | int) -> list[str] | None:
     through util.taxa.iter_descendants, since that helper reads its own
     module-level cached catalog rather than this module's load_catalog.
     """
+    if isinstance(root_keys, (str, int)):
+        root_keys = (root_keys,)
     catalog = load_catalog()
-    root = catalog.get(str(root_key))
-    if root is None:
-        return None
-    prefix = root["path"]
-    return [
-        str(t["taxon_key"]) for t in catalog.values()
-        if t["path"] == prefix or t["path"].startswith(prefix + "/")
-    ]
+    keys: set[str] = set()
+    found_any = False
+    for root_key in root_keys:
+        root = catalog.get(str(root_key))
+        if root is None:
+            continue
+        found_any = True
+        prefix = root["path"]
+        keys.update(
+            str(t["taxon_key"]) for t in catalog.values()
+            if t["path"] == prefix or t["path"].startswith(prefix + "/")
+        )
+    return list(keys) if found_any else None
 
 
 def _iter_worklist_batches(
     layer_ids: list[str],
-    root_key: str | int,
+    root_keys: str | int | Iterable[str | int],
     *,
     row_limit: int,
 ) -> Iterable[pa.Table]:
@@ -229,7 +240,7 @@ def _iter_worklist_batches(
     """
     if not layer_ids or not OCCURRENCES_FILE.exists():
         return
-    scope_keys = _scope_taxon_keys(root_key)
+    scope_keys = _scope_taxon_keys(root_keys)
     if scope_keys is None:
         return
 
@@ -684,7 +695,7 @@ def main() -> None:
 
     shutil.rmtree(STAGING_DIR, ignore_errors=True)
     batch_count = 0
-    for batch in _iter_worklist_batches(layer_ids, CONFIG.plantae_key, row_limit=ROW_LIMIT):
+    for batch in _iter_worklist_batches(layer_ids, CONFIG.taxonomy_roots, row_limit=ROW_LIMIT):
         if batch.num_rows == 0:
             continue
         batch_count += 1

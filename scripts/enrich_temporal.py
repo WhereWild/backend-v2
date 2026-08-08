@@ -339,9 +339,9 @@ def main() -> None:
 
     completed = False
     try:
-        print(f"[occ_index] scanning root={str(cfg.plantae_key)}")
+        print(f"[occ_index] scanning roots={list(cfg.taxonomy_roots)}")
         counts = build_per_layer_occ_indices(
-            str(cfg.plantae_key),
+            list(cfg.taxonomy_roots),
             cfg.data_root,
             cfg.occurrence_parquet_filename,
             layers=non_derived,

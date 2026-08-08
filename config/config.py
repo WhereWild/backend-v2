@@ -81,7 +81,15 @@ def clear_config_cache() -> None:
 @dataclass
 @register_config("global")
 class GlobalConfig:
-    plantae_key: str = "P"
+    # Root taxa the pipeline treats as independent trees — no combining "Life"
+    # node exists in the catalog above these, so each root's stats/rankings
+    # (see scripts/process_tree.py) stop at its own node and never aggregate
+    # into any other root's. Override via TAXONOMY_ROOTS (comma-separated
+    # COL XR ids, e.g. "7HS,CXQ" for a small dev subset) — see __post_init__,
+    # this can't go through the generic scalar-field env loader below since
+    # it's a tuple. Adding a new root (e.g. Animalia) is purely a config/env
+    # change; every call site iterates this instead of naming a kingdom.
+    taxonomy_roots: tuple[str, ...] = ("P",)
     leaf_ranks: tuple[str, ...] = ("SPECIES", "SUBSPECIES", "VARIETY", "FORM")
     subspecies_equivalents: tuple[str, ...] = ("SUBSPECIES", "VARIETY", "FORM")
     species_rank: str = "SPECIES"
@@ -130,6 +138,12 @@ class GlobalConfig:
         return Path(self.data_root) / "gis"
 
     def __post_init__(self):
+        raw_roots = os.environ.get("TAXONOMY_ROOTS")
+        if raw_roots is not None:
+            self.taxonomy_roots = tuple(
+                part.strip() for part in raw_roots.split(",") if part.strip()
+            )
+
         hints = get_type_hints(self.__class__)
         for f in fields(self):
             if hints.get(f.name) not in _SCALAR_TYPES:

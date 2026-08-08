@@ -496,6 +496,37 @@ class TestBuildPerLayerOccIndices:
                 [self._layer("temperature_2m")], {"temperature_2m": tmp_path / "idx.parquet"},
             )
 
+    def test_raises_if_any_of_two_roots_unknown(self, tmp_path, monkeypatch):
+        catalog = self._catalog()
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda tid: catalog.get(tid))
+        monkeypatch.setattr("util.temporal.load_catalog", lambda: catalog)
+        with pytest.raises(RuntimeError, match="Unknown root taxon bad"):
+            util.temporal.build_per_layer_occ_indices(
+                ["1", "bad"], str(tmp_path), "occurrences.parquet",
+                [self._layer("temperature_2m")], {"temperature_2m": tmp_path / "idx.parquet"},
+            )
+
+    def test_two_roots_no_cross_contamination(self, tmp_path, monkeypatch):
+        # "1" (Root_1) and "9" (Other_9) are independent, disjoint roots —
+        # union their scopes but exclude a third taxon outside both.
+        catalog = self._catalog()
+        monkeypatch.setattr("util.temporal.get_taxon_by_id", lambda tid: catalog.get(tid))
+        monkeypatch.setattr("util.temporal.load_catalog", lambda: catalog)
+        self._write_occ(tmp_path, {
+            "decimalLatitude":  pa.array([52.52, 10.0, 20.0], type=pa.float64()),
+            "decimalLongitude": pa.array([13.40, 11.0, 21.0], type=pa.float64()),
+            "eventTimestamp":   pa.array([1_000_000.0, 1_000_001.0, 1_000_002.0], type=pa.float64()),
+            "taxon_key":        pa.array(["1", "9", "999"], type=pa.string()),
+        })
+        layer = self._layer("temperature_2m")
+        index_paths = {layer.id: tmp_path / f"idx_{layer.id}.parquet"}
+        counts = util.temporal.build_per_layer_occ_indices(
+            ["1", "9"], str(tmp_path), "occurrences.parquet", [layer], index_paths,
+        )
+        assert counts == {"temperature_2m": 2}
+        table = pq.read_table(index_paths["temperature_2m"])
+        assert sorted(table["row_idx"].to_pylist()) == [0, 1]
+
     def test_no_occ_file_returns_zero_counts_and_empty_indices(self, tmp_path, monkeypatch):
         self._patch_catalog(monkeypatch)
         layer = self._layer("temperature_2m")

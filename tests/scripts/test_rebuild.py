@@ -220,8 +220,7 @@ def test_main_full_pipeline_completes(tmp_path):
     call_order = []
     check1, check2 = _patch_sync_check()
     with check1, check2, \
-         patch("scripts.sync_gbif.main"), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.sync_gbif.sync_all"), \
          patch.object(rebuild, "SKIPPABLE_REBUILD_STAGES", frozenset()), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("tree")), \
@@ -265,12 +264,11 @@ def test_main_full_pipeline_completes(tmp_path):
 
 
 def test_main_wipe_happens_before_sync_download(tmp_path):
-    """Wipe must precede sync_gbif.main() so the download lands in a clean dir."""
+    """Wipe must precede sync_gbif.sync_all() so the download lands in a clean dir."""
     call_order = []
     check1, check2 = _patch_sync_check()
     with check1, check2, \
-         patch("scripts.sync_gbif.main", side_effect=lambda: call_order.append("sync")), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.sync_gbif.sync_all", side_effect=lambda: call_order.append("sync")), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main"), \
          patch("scripts.populate_tree.main"), \
@@ -298,8 +296,7 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
 
     check1, check2 = _patch_sync_check()
     with check1, check2, \
-         patch("scripts.sync_gbif.main"), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.sync_gbif.sync_all"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main", side_effect=capture), \
          patch("scripts.populate_tree.main"), \
@@ -321,8 +318,7 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
 def test_main_errored_on_exception(tmp_path):
     check1, check2 = _patch_sync_check()
     with check1, check2, \
-         patch("scripts.sync_gbif.main"), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.sync_gbif.sync_all"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main", side_effect=RuntimeError("boom in build_tree")), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
@@ -347,8 +343,7 @@ def test_main_crash_detected_on_next_run(tmp_path, capsys):
         "pipeline": {"status": "in_progress", "stage": "build_tree", "stages": {}}
     }))
 
-    with patch("scripts.sync_gbif.main"), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+    with patch("scripts.sync_gbif.sync_all"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main"), \
          patch("scripts.populate_tree.main"), \
@@ -381,8 +376,7 @@ def test_main_crash_overwrites_pipeline_state(tmp_path):
         "pipeline": {"status": "in_progress", "stage": "build_tree", "stages": {}}
     }))
 
-    with patch("scripts.sync_gbif.main", side_effect=RuntimeError("sync fail")), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+    with patch("scripts.sync_gbif.sync_all", side_effect=RuntimeError("sync fail")), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=None), \
          patch("scripts.rebuild._release_inhibitor"), \
@@ -398,8 +392,7 @@ def test_main_inhibitor_released_on_error():
     mock_proc = MagicMock()
     check1, check2 = _patch_sync_check()
     with check1, check2, \
-         patch("scripts.sync_gbif.main"), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.sync_gbif.sync_all"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main", side_effect=RuntimeError("fail")), \
          patch("scripts.rebuild._acquire_shutdown_inhibitor", return_value=mock_proc), \
@@ -414,8 +407,7 @@ def test_main_inhibitor_released_on_success():
     mock_proc = MagicMock()
     check1, check2 = _patch_sync_check()
     with check1, check2, \
-         patch("scripts.sync_gbif.main"), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.sync_gbif.sync_all"), \
          patch("scripts.rebuild.wipe_data_dir"), \
          patch("scripts.build_tree.main"), \
          patch("scripts.populate_tree.main"), \
@@ -463,8 +455,7 @@ def test_main_force_clears_gbif_crawl_timestamps(tmp_path, monkeypatch):
     }))
 
     with patch("scripts.rebuild.wipe_data_dir"), \
-         patch("scripts.sync_gbif.main"), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.sync_gbif.sync_all"), \
          patch("scripts.build_tree.main"), \
          patch("scripts.populate_tree.main"), \
          patch("scripts.gis.process_gadm.main"), \
@@ -489,8 +480,7 @@ def test_main_stage_flag_skips_prior_stages(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["rebuild", "--stage", "enrich_tree"])
     call_order = []
 
-    with patch("scripts.sync_gbif.main", side_effect=lambda: call_order.append("sync_gbif")), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+    with patch("scripts.sync_gbif.sync_all", side_effect=lambda: call_order.append("sync_gbif")), \
          patch.object(rebuild, "SKIPPABLE_REBUILD_STAGES", frozenset()), \
          patch("scripts.rebuild.wipe_data_dir", side_effect=lambda: call_order.append("wipe")), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("build_tree")), \
@@ -536,8 +526,7 @@ def test_main_resume_skips_completed_stages(tmp_path, monkeypatch):
 
     call_order = []
     with patch("scripts.rebuild.wipe_data_dir"), \
-         patch("scripts.sync_gbif.main", side_effect=lambda: call_order.append("sync_gbif")), \
-         patch("scripts.sync_gbif.sync_occurrences"), \
+         patch("scripts.sync_gbif.sync_all", side_effect=lambda: call_order.append("sync_gbif")), \
          patch("scripts.build_tree.main", side_effect=lambda: call_order.append("build_tree")), \
          patch("scripts.populate_tree.main", side_effect=lambda: call_order.append("populate_tree")), \
          patch("scripts.gis.process_gadm.main"), \

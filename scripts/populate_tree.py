@@ -23,7 +23,7 @@ Rows are matched to a catalog entry by scientificName, not by occurrence.txt's
 own taxonKey column. Confirmed against a live GBIF occurrence record
 (api.gbif.org/v1/occurrence/search): even when a download's TAXON_KEY
 predicate is scoped via checklistKey (Catalogue of Life Extended Release, the
-alphanumeric IDs our catalog is keyed by — see config.plantae_key), each
+alphanumeric IDs our catalog is keyed by — see config.taxonomy_roots), each
 occurrence's own taxonKey/familyKey/etc. columns still report the legacy
 numeric GBIF Backbone classification. checklistKey only affects how the
 predicate's *filter value* is resolved, not the taxonomy baked into the

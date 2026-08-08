@@ -109,6 +109,24 @@ def test_save_sync_state():
 def test_request_download(httpx_mock: HTTPXMock):
     httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
     assert sync_gbif.request_download() == DOWNLOAD_KEY
+    request = httpx_mock.get_requests()[0]
+    body = json.loads(request.content)
+    predicates = body["predicate"]["predicates"]
+    taxon_key_pred = next(p for p in predicates if p["key"] == "TAXON_KEY")
+    assert taxon_key_pred["type"] == "in"
+    assert taxon_key_pred["values"] == list(sync_gbif.CONFIG.taxonomy_roots)
+    assert taxon_key_pred["checklistKey"] == sync_gbif.COL_XR_CHECKLIST_KEY
+
+
+def test_request_download_multiple_roots(httpx_mock: HTTPXMock, monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
+    assert sync_gbif.request_download() == DOWNLOAD_KEY
+    request = httpx_mock.get_requests()[0]
+    body = json.loads(request.content)
+    predicates = body["predicate"]["predicates"]
+    taxon_key_pred = next(p for p in predicates if p["key"] == "TAXON_KEY")
+    assert taxon_key_pred["values"] == ["7HS", "CXQ"]
 
 
 # --- poll_until_ready ---
@@ -213,10 +231,14 @@ def test_request_occurrence_download(httpx_mock: HTTPXMock):
     body = json.loads(request.content)
     assert body["format"] == "DWCA"
     predicates = body["predicate"]["predicates"]
-    keys = {p["key"]: p["value"] for p in predicates}
+    keys = {p["key"]: p["value"] for p in predicates if p["key"] != "TAXON_KEY"}
     assert keys["DATASET_KEY"] == sync_gbif.INAT_DATASET_KEY
     assert keys["HAS_COORDINATE"] == "true"
     assert keys["OCCURRENCE_STATUS"] == "PRESENT"
+    taxon_key_pred = next(p for p in predicates if p["key"] == "TAXON_KEY")
+    assert taxon_key_pred["type"] == "in"
+    assert taxon_key_pred["values"] == list(sync_gbif.CONFIG.taxonomy_roots)
+    assert taxon_key_pred["checklistKey"] == sync_gbif.COL_XR_CHECKLIST_KEY
 
 
 # --- sync_occurrences ---
@@ -289,3 +311,106 @@ def test_main_new_crawl(httpx_mock: HTTPXMock):
     assert state["gbif_taxonomy"]["download_link"] == DOWNLOAD_LINK
     assert state["gbif_taxonomy"]["total_records"] == 1122173
     assert state["gbif_taxonomy"]["citation"].startswith("GBIF.org")
+
+
+# --- sync_all ---
+
+OCCURRENCE_DOWNLOAD_KEY = "0020580-260507073636909"
+
+
+def test_sync_all_missing_creds(monkeypatch):
+    monkeypatch.setattr(sync_gbif, "GBIF_USER", "")
+    with pytest.raises(OSError, match="GBIF_USER"):
+        sync_gbif.sync_all()
+
+
+def test_sync_all_already_up_to_date(httpx_mock: HTTPXMock, capsys):
+    httpx_mock.add_response(json=_crawl_response())
+    sync_gbif.save_sync_state({
+        "gbif_taxonomy": {"crawl_finished": CRAWL_TS},
+        "gbif_occurrences": {"crawl_finished": CRAWL_TS},
+    })
+    result = sync_gbif.sync_all()
+    assert result is False
+    assert "Already up to date" in capsys.readouterr().out
+
+
+def test_sync_all_requests_both_before_polling_either(httpx_mock: HTTPXMock):
+    # The whole point of sync_all over main()+sync_occurrences() run
+    # sequentially: both GBIF downloads must be *requested* before either is
+    # polled, so they prepare concurrently on GBIF's side instead of one
+    # only starting after the other has fully finished (~1hr each).
+    httpx_mock.add_response(json=_crawl_response())
+    httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
+    httpx_mock.add_response(text=f'"{OCCURRENCE_DOWNLOAD_KEY}"')
+    call_order = []
+
+    real_request_download = sync_gbif.request_download
+    real_request_occurrence_download = sync_gbif.request_occurrence_download
+
+    def tracked_request_download():
+        call_order.append("request_taxonomy")
+        return real_request_download()
+
+    def tracked_request_occurrence_download():
+        call_order.append("request_occurrences")
+        return real_request_occurrence_download()
+
+    def tracked_poll(key, *a, **kw):
+        call_order.append(f"poll:{key}")
+        return GBIF_META
+
+    with patch("scripts.sync_gbif.request_download", side_effect=tracked_request_download), \
+         patch("scripts.sync_gbif.request_occurrence_download", side_effect=tracked_request_occurrence_download), \
+         patch("scripts.sync_gbif.poll_until_ready", side_effect=tracked_poll), \
+         patch("scripts.sync_gbif.download_zip"), \
+         patch("scripts.sync_gbif.extract"), \
+         patch("scripts.sync_gbif._cleanup_occurrences_dir"):
+        result = sync_gbif.sync_all()
+
+    assert result is True
+    assert call_order == [
+        "request_taxonomy",
+        "request_occurrences",
+        f"poll:{DOWNLOAD_KEY}",
+        f"poll:{OCCURRENCE_DOWNLOAD_KEY}",
+    ]
+
+
+def test_sync_all_new_crawl_both(httpx_mock: HTTPXMock):
+    httpx_mock.add_response(json=_crawl_response())
+    httpx_mock.add_response(text=f'"{DOWNLOAD_KEY}"')
+    httpx_mock.add_response(text=f'"{OCCURRENCE_DOWNLOAD_KEY}"')
+
+    with patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
+         patch("scripts.sync_gbif.download_zip"), \
+         patch("scripts.sync_gbif.extract"), \
+         patch("scripts.sync_gbif._cleanup_occurrences_dir"):
+        result = sync_gbif.sync_all()
+
+    assert result is True
+    state = json.loads(sync_gbif.SYNC_STATE_PATH.read_text())
+    assert state["gbif_taxonomy"]["crawl_finished"] == CRAWL_TS
+    assert state["gbif_taxonomy"]["download_key"] == DOWNLOAD_KEY
+    assert state["gbif_occurrences"]["crawl_finished"] == CRAWL_TS
+    assert state["gbif_occurrences"]["download_key"] == OCCURRENCE_DOWNLOAD_KEY
+
+
+def test_sync_all_only_occurrences_stale(httpx_mock: HTTPXMock):
+    httpx_mock.add_response(json=_crawl_response())
+    httpx_mock.add_response(text=f'"{OCCURRENCE_DOWNLOAD_KEY}"')
+    sync_gbif.save_sync_state({"gbif_taxonomy": {"crawl_finished": CRAWL_TS}})
+
+    with patch("scripts.sync_gbif.request_download") as mock_request_download, \
+         patch("scripts.sync_gbif.poll_until_ready", return_value=GBIF_META), \
+         patch("scripts.sync_gbif.download_zip"), \
+         patch("scripts.sync_gbif.extract"), \
+         patch("scripts.sync_gbif._cleanup_occurrences_dir"):
+        result = sync_gbif.sync_all()
+
+    assert result is True
+    mock_request_download.assert_not_called()
+    state = json.loads(sync_gbif.SYNC_STATE_PATH.read_text())
+    assert state["gbif_taxonomy"]["crawl_finished"] == CRAWL_TS
+    assert state["gbif_occurrences"]["crawl_finished"] == CRAWL_TS
+    assert state["gbif_occurrences"]["download_key"] == OCCURRENCE_DOWNLOAD_KEY

@@ -168,7 +168,7 @@ def _occ_table_with_chunk() -> pa.Table:
 
 
 class _MockCfg:
-    plantae_key = 1
+    taxonomy_roots = (1,)
     data_root = "/data"
     occurrence_parquet_filename = "occurrence.parquet"
     temporal_min_date = "2000-01-01"
@@ -307,7 +307,7 @@ def _all_layers() -> list[TemporalLayer]:
 class TestMain:
     def _patch_base(self, monkeypatch, tmp_path: Path, occ_table: pa.Table) -> None:
         class _Cfg:
-            plantae_key = 1
+            taxonomy_roots = (1,)
             data_root = str(tmp_path)
             occurrence_parquet_filename = "occurrence.parquet"
             temporal_min_date = "2000-01-01"

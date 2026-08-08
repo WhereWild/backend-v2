@@ -242,6 +242,23 @@ def test_scope_taxon_keys_includes_self_and_descendants(tmp_path):
     assert keys == {"6", "2923970"}  # Plantae_6 itself + its descendant, not Fungi_9999
 
 
+def test_scope_taxon_keys_unions_two_roots(tmp_path):
+    with patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
+        keys = set(et._scope_taxon_keys(("6", "9999")))
+    assert keys == {"6", "2923970", "9999"}
+
+
+def test_scope_taxon_keys_all_roots_unknown_returns_none(tmp_path):
+    with patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
+        assert et._scope_taxon_keys(("111", "222")) is None
+
+
+def test_scope_taxon_keys_partial_unknown_root_returns_found_subset(tmp_path):
+    with patch.object(et, "load_catalog", return_value=FAKE_CATALOG):
+        keys = set(et._scope_taxon_keys(("6", "999")))
+    assert keys == {"6", "2923970"}
+
+
 # ---------------------------------------------------------------------------
 # _sample_cog
 # ---------------------------------------------------------------------------

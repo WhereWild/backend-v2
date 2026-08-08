@@ -190,7 +190,7 @@ def _push_stage() -> None:
     transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
     flags = [
         "--exclude", "taxonomy/cache/**",
-        "--exclude", "gis/temporal/rasters/**",
+        "--exclude", "gis/temporal/**",
         "--exclude", "gis/layers/elevation.tif",
         "--exclude", "tmp/**",
         "--delete-excluded",
@@ -279,8 +279,7 @@ def wipe_data_dir() -> None:
 
 
 def _sync_gbif_stage() -> None:
-    sync_gbif.main()
-    sync_gbif.sync_occurrences()
+    sync_gbif.sync_all()
 
 
 STAGES: list[tuple[str, str, object]] = [

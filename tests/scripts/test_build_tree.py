@@ -777,14 +777,14 @@ def test_fetch_col_vernacular_missing_root_returns_empty():
 
 def test_fetch_col_vernacular_unresolvable_root_returns_empty(monkeypatch):
     monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: None)
-    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "7HS")
+    monkeypatch.setattr(build_tree.CONFIG, "taxonomy_roots", ("7HS",))
     catalog = {"7HS": {"scientific_name": "Cactaceae"}}
     assert build_tree.fetch_col_vernacular(catalog) == {}
 
 
 def test_fetch_col_vernacular_single_page(monkeypatch):
     monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: 295935017)
-    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "7HS")
+    monkeypatch.setattr(build_tree.CONFIG, "taxonomy_roots", ("7HS",))
     page = {
         "count": 1,
         "endOfRecords": True,
@@ -807,7 +807,7 @@ def test_fetch_col_vernacular_single_page(monkeypatch):
 
 def test_fetch_col_vernacular_skips_taxa_with_no_english_names(monkeypatch):
     monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: 295935017)
-    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "7HS")
+    monkeypatch.setattr(build_tree.CONFIG, "taxonomy_roots", ("7HS",))
     page = {
         "count": 1,
         "endOfRecords": True,
@@ -823,7 +823,7 @@ def test_fetch_col_vernacular_skips_taxa_with_no_english_names(monkeypatch):
 
 def test_fetch_col_vernacular_paginates_until_end_of_records(monkeypatch):
     monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: 295935017)
-    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "7HS")
+    monkeypatch.setattr(build_tree.CONFIG, "taxonomy_roots", ("7HS",))
     monkeypatch.setattr(build_tree, "COL_VERNACULAR_PAGE_SIZE", 1)
     page1 = {
         "count": 2,
@@ -848,7 +848,7 @@ def test_fetch_col_vernacular_splits_oversized_subtree(monkeypatch):
     # GBIF's /v1/species/search rejects offset > 100,000 — a root whose
     # accepted-usage count exceeds COL_SAFE_SUBTREE_LIMIT must be split into
     # its catalog children instead of paginated as one flat scan.
-    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "P")
+    monkeypatch.setattr(build_tree.CONFIG, "taxonomy_roots", ("P",))
     monkeypatch.setattr(
         build_tree,
         "_resolve_col_highertaxon_key",
@@ -884,10 +884,55 @@ def test_fetch_col_vernacular_splits_oversized_subtree(monkeypatch):
     assert result == {"CA1": ["Child A Name"], "CB1": ["Child B Name"]}
 
 
+def test_fetch_col_vernacular_merges_two_independent_roots(monkeypatch):
+    monkeypatch.setattr(build_tree.CONFIG, "taxonomy_roots", ("P", "F"))
+    monkeypatch.setattr(
+        build_tree,
+        "_resolve_col_highertaxon_key",
+        lambda name, tid: {"Plantae": 1, "Fungi": 2}[name],
+    )
+    catalog = {
+        "P": {"scientific_name": "Plantae", "path": "Plantae_P"},
+        "F": {"scientific_name": "Fungi", "path": "Fungi_F"},
+    }
+    plantae_page = {
+        "count": 1,
+        "endOfRecords": True,
+        "results": [{"taxonID": "PL1", "vernacularNames": [{"vernacularName": "A Plant", "language": "en"}]}],
+    }
+    fungi_page = {
+        "count": 1,
+        "endOfRecords": True,
+        "results": [{"taxonID": "FU1", "vernacularNames": [{"vernacularName": "A Fungus", "language": "en"}]}],
+    }
+    with patch(
+        "scripts.build_tree.urlopen",
+        side_effect=[_json_urlopen(plantae_page), _json_urlopen(fungi_page)],
+    ), patch("scripts.build_tree.time.sleep"):
+        result = build_tree.fetch_col_vernacular(catalog)
+    assert result == {"PL1": ["A Plant"], "FU1": ["A Fungus"]}
+
+
+def test_fetch_col_vernacular_one_root_missing_still_returns_other(monkeypatch, capsys):
+    monkeypatch.setattr(build_tree.CONFIG, "taxonomy_roots", ("P", "MISSING"))
+    monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: 1)
+    catalog = {"P": {"scientific_name": "Plantae", "path": "Plantae_P"}}
+    page = {
+        "count": 1,
+        "endOfRecords": True,
+        "results": [{"taxonID": "PL1", "vernacularNames": [{"vernacularName": "A Plant", "language": "en"}]}],
+    }
+    with patch("scripts.build_tree.urlopen", return_value=_json_urlopen(page)), \
+         patch("scripts.build_tree.time.sleep"):
+        result = build_tree.fetch_col_vernacular(catalog)
+    assert result == {"PL1": ["A Plant"]}
+    assert "MISSING" in capsys.readouterr().out
+
+
 def test_fetch_col_vernacular_scans_anyway_when_oversized_with_no_children(monkeypatch):
     # No catalog children to split by (e.g. a leaf-ish node) — falls back to
     # scanning the oversized subtree directly rather than silently dropping it.
-    monkeypatch.setattr(build_tree.CONFIG, "plantae_key", "P")
+    monkeypatch.setattr(build_tree.CONFIG, "taxonomy_roots", ("P",))
     monkeypatch.setattr(build_tree, "_resolve_col_highertaxon_key", lambda name, tid: 1)
     catalog = {"P": {"scientific_name": "Plantae", "path": "Plantae_P"}}
     page = {

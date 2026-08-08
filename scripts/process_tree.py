@@ -160,10 +160,19 @@ def _level_pass(
 def _setup() -> tuple[list[dict], dict[str, dict], dict[int, list[TaxonRecord]], list[int], list[int], int]:
     layers = _load_layers()
     layer_meta = {layer["id"]: layer for layer in layers}
-    root = get_taxon_by_id(CONFIG.plantae_key)
-    if root is None:
-        raise RuntimeError(f"[process_tree] root taxon {CONFIG.plantae_key} not found")
-    all_taxa = list(iter_descendants(root, include_self=True))
+    # Each configured root (e.g. Plantae, Fungi) is an independent tree — no
+    # combining "Life" node exists above kingdom in the catalog, so this is a
+    # plain union of each root's own subtree. Every downstream stats/rankings
+    # step already merges purely via a taxon's own children/descendants (see
+    # util/taxa.py's catalog-based parent/child index), so mixing multiple
+    # roots' taxa into one all_taxa/by_depth just works — no root ever
+    # aggregates into another root's context.
+    all_taxa: list[TaxonRecord] = []
+    for root_key in CONFIG.taxonomy_roots:
+        root = get_taxon_by_id(root_key)
+        if root is None:
+            raise RuntimeError(f"[process_tree] root taxon {root_key} not found")
+        all_taxa.extend(iter_descendants(root, include_self=True))
     total = len(all_taxa)
     by_depth: dict[int, list[TaxonRecord]] = defaultdict(list)
     for t in all_taxa:

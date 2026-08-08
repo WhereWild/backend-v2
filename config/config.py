@@ -89,7 +89,7 @@ class GlobalConfig:
     # this can't go through the generic scalar-field env loader below since
     # it's a tuple. Adding a new root (e.g. Animalia) is purely a config/env
     # change; every call site iterates this instead of naming a kingdom.
-    taxonomy_roots: tuple[str, ...] = ("P",)
+    taxonomy_roots: tuple[str, ...] = ("P","F")
     leaf_ranks: tuple[str, ...] = ("SPECIES", "SUBSPECIES", "VARIETY", "FORM")
     subspecies_equivalents: tuple[str, ...] = ("SUBSPECIES", "VARIETY", "FORM")
     species_rank: str = "SPECIES"

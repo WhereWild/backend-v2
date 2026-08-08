@@ -14,7 +14,7 @@ def test_load_config_global(monkeypatch):
     clear_config_cache()
     cfg = load_config("global")
     assert isinstance(cfg, GlobalConfig)
-    assert cfg.taxonomy_roots == ("P",)
+    assert cfg.taxonomy_roots == ("P","F")
     assert cfg.species_rank == "SPECIES"
     assert "SUBSPECIES" in cfg.leaf_rank_set
     assert "SPECIES" in cfg.leaf_ranks

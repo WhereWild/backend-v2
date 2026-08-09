@@ -53,8 +53,14 @@ RAW_DIR     = Path("data/gis/ecoregions_raw")
 LAYERS_DIR  = Path("data/gis/layers")
 LEGENDS_DIR = Path("config/gis/legends")
 
-# 30 arcsec, matching CHELSA/kg2's global grid.
-RESOLUTION_DEG = 1.0 / 120.0
+# 1 arcsec (~30m at the equator, in line with how other "30m" products like
+# SRTM/NASADEM label themselves — real width shrinks with cos(latitude) away
+# from the equator). Up from 30 arcsec (~927m); no longer matches CHELSA/kg2's
+# coarser grid, but nothing depends on ecoregions/biome sharing that grid —
+# every layer gets independently warped to the requested tile at serve time.
+# ~840B pixels globally (vs. ~933M before) — expect a much longer rasterize
+# and a much larger (if still well-compressed) output file.
+RESOLUTION_DEG = 1.0 / 3600.0
 ROCK_AND_ICE_ECO_ID  = 0
 ROCK_AND_ICE_BIOME_ID = 15
 
@@ -146,6 +152,15 @@ def _rasterize(
             "-ot", dtype,
             "-a_nodata", nodata,
             "-init", nodata,
+            # Without this, gdal_rasterize only burns a pixel whose *center*
+            # falls inside a polygon. Cells are fixed-size in degrees, so
+            # their real-world width shrinks by cos(latitude) while height
+            # stays constant — near the poles each cell is a tall, narrow
+            # sliver, and center-only testing misses much more of what's
+            # actually under it than it would near the equator. That's what
+            # was producing gappy, offset-looking boundaries at high
+            # latitude. -at burns every pixel the polygon touches at all.
+            "-at",
             "-te", "-180", "-90", "180", "90",
             "-tr", str(RESOLUTION_DEG), str(RESOLUTION_DEG),
             "-a_srs", "EPSG:4326",
@@ -153,7 +168,7 @@ def _rasterize(
             "-co", "TILED=YES",
             "-co", "BLOCKXSIZE=256",
             "-co", "BLOCKYSIZE=256",
-            "-co", "BIGTIFF=IF_SAFER",
+            "-co", "BIGTIFF=YES",
             str(shp_path), str(scratch),
         ]
         _run(cmd)

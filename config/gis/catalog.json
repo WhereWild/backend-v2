@@ -1171,20 +1171,6 @@
       "description": "Soil properties (SoilGrids 2.0), soil salinity (ISRIC), and lithology (Hengl 2018).",
       "layers": [
         {
-          "id": "lithology",
-          "source": "hengl_landform_2018",
-          "display_name": "Lithology Class",
-          "units": "",
-          "value_type": "nominal",
-          "zenodo_record_id": "1464846",
-          "download_url": null,
-          "filename": "lithology.tif",
-          "scale_factor": null,
-          "add_offset": null,
-          "render_min": 1.0,
-          "render_max": 15.0
-        },
-        {
           "id": "clay",
           "source": "soilgrids_2_0",
           "display_name": "Clay Content (0–5cm)",
@@ -1368,6 +1354,20 @@
           "resampling": "near",
           "render_min": 0.0,
           "render_max": 29.0
+        },
+        {
+          "id": "lithology",
+          "source": "hengl_landform_2018",
+          "display_name": "Lithology Class",
+          "units": "",
+          "value_type": "nominal",
+          "zenodo_record_id": "1464846",
+          "download_url": null,
+          "filename": "lithology.tif",
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 1.0,
+          "render_max": 15.0
         }
       ]
     },

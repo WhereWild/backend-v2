@@ -1300,6 +1300,33 @@
           "render_max": 220.0
         },
         {
+          "id": "glwd",
+          "source": "glwd_v2",
+          "display_name": "Wetland Type",
+          "units": "",
+          "value_type": "nominal",
+          "download_url": "https://ndownloader.figshare.com/files/54001814",
+          "filename": "glwd.tif",
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 0.0,
+          "render_max": 33.0
+        },
+        {
+          "id": "glwd_pct",
+          "source": "glwd_v2",
+          "display_name": "Wetland Cover",
+          "units": "%",
+          "value_type": "ratio",
+          "domain": "continuous",
+          "download_url": "https://ndownloader.figshare.com/files/54001814",
+          "filename": "glwd_pct.tif",
+          "scale_factor": null,
+          "add_offset": null,
+          "render_min": 0.0,
+          "render_max": 100.0
+        },
+        {
           "id": "elevation",
           "source": "fabdem",
           "display_name": "Elevation",

@@ -1,0 +1,458 @@
+{
+  "layer_id": "glwd",
+  "source": "Lehner et al. (2025) / GLWD v2 (https://doi.org/10.5194/essd-17-2277-2025)",
+  "classes": [
+    {
+      "id": 0,
+      "name": "Dryland (non-wetland)",
+      "group": "dryland",
+      "group_label": "Dryland",
+      "traits": {
+        "color": "#F3F3F3"
+      }
+    },
+    {
+      "id": 1,
+      "name": "Freshwater lake",
+      "group": "open_water",
+      "group_label": "Open Water",
+      "traits": {
+        "color": "#13235A"
+      }
+    },
+    {
+      "id": 2,
+      "name": "Saline lake",
+      "group": "saline",
+      "group_label": "Saline",
+      "traits": {
+        "color": "#DB76B0"
+      }
+    },
+    {
+      "id": 3,
+      "name": "Reservoir",
+      "group": "open_water",
+      "group_label": "Open Water",
+      "traits": {
+        "color": "#E81D24"
+      }
+    },
+    {
+      "id": 4,
+      "name": "Large river",
+      "group": "river",
+      "group_label": "River",
+      "traits": {
+        "color": "#2D5EAB"
+      }
+    },
+    {
+      "id": 5,
+      "name": "Large estuarine river",
+      "group": "river",
+      "group_label": "River",
+      "traits": {
+        "color": "#09B290"
+      }
+    },
+    {
+      "id": 6,
+      "name": "Other permanent waterbody",
+      "group": "open_water",
+      "group_label": "Open Water",
+      "traits": {
+        "color": "#4B6CB4"
+      }
+    },
+    {
+      "id": 7,
+      "name": "Small streams",
+      "group": "river",
+      "group_label": "River",
+      "traits": {
+        "color": "#94AFDB"
+      }
+    },
+    {
+      "id": 8,
+      "name": "Lacustrine, forested",
+      "group": "lacustrine_wetland",
+      "group_label": "Lacustrine Wetlands",
+      "attributes": [
+        "forested"
+      ],
+      "traits": {
+        "color": "#045A30"
+      }
+    },
+    {
+      "id": 9,
+      "name": "Lacustrine, non-forested",
+      "group": "lacustrine_wetland",
+      "group_label": "Lacustrine Wetlands",
+      "attributes": [
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#04436B"
+      }
+    },
+    {
+      "id": 10,
+      "name": "Riverine, regularly flooded, forested",
+      "group": "riverine_wetland",
+      "group_label": "Riverine Wetlands",
+      "attributes": [
+        "regularly flooded",
+        "forested"
+      ],
+      "traits": {
+        "color": "#21A94A"
+      }
+    },
+    {
+      "id": 11,
+      "name": "Riverine, regularly flooded, non-forested",
+      "group": "riverine_wetland",
+      "group_label": "Riverine Wetlands",
+      "attributes": [
+        "regularly flooded",
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#0081A8"
+      }
+    },
+    {
+      "id": 12,
+      "name": "Riverine, seasonally flooded, forested",
+      "group": "riverine_wetland",
+      "group_label": "Riverine Wetlands",
+      "attributes": [
+        "seasonally flooded",
+        "forested"
+      ],
+      "traits": {
+        "color": "#55BA52"
+      }
+    },
+    {
+      "id": 13,
+      "name": "Riverine, seasonally flooded, non-forested",
+      "group": "riverine_wetland",
+      "group_label": "Riverine Wetlands",
+      "attributes": [
+        "seasonally flooded",
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#08A3DE"
+      }
+    },
+    {
+      "id": 14,
+      "name": "Riverine, seasonally saturated, forested",
+      "group": "riverine_wetland",
+      "group_label": "Riverine Wetlands",
+      "attributes": [
+        "seasonally saturated",
+        "forested"
+      ],
+      "traits": {
+        "color": "#96CC67"
+      }
+    },
+    {
+      "id": 15,
+      "name": "Riverine, seasonally saturated, non-forested",
+      "group": "riverine_wetland",
+      "group_label": "Riverine Wetlands",
+      "attributes": [
+        "seasonally saturated",
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#7AD2F3"
+      }
+    },
+    {
+      "id": 16,
+      "name": "Palustrine, regularly flooded, forested",
+      "group": "palustrine_wetland",
+      "group_label": "Palustrine Wetlands",
+      "attributes": [
+        "regularly flooded",
+        "forested"
+      ],
+      "traits": {
+        "color": "#F7A075"
+      }
+    },
+    {
+      "id": 17,
+      "name": "Palustrine, regularly flooded, non-forested",
+      "group": "palustrine_wetland",
+      "group_label": "Palustrine Wetlands",
+      "attributes": [
+        "regularly flooded",
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#FFD378"
+      }
+    },
+    {
+      "id": 18,
+      "name": "Palustrine, seasonally saturated, forested",
+      "group": "palustrine_wetland",
+      "group_label": "Palustrine Wetlands",
+      "attributes": [
+        "seasonally saturated",
+        "forested"
+      ],
+      "traits": {
+        "color": "#CC5E97"
+      }
+    },
+    {
+      "id": 19,
+      "name": "Palustrine, seasonally saturated, non-forested",
+      "group": "palustrine_wetland",
+      "group_label": "Palustrine Wetlands",
+      "attributes": [
+        "seasonally saturated",
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#F4BFD8"
+      }
+    },
+    {
+      "id": 20,
+      "name": "Ephemeral, forested",
+      "group": "ephemeral_wetland",
+      "group_label": "Ephemeral Wetlands",
+      "attributes": [
+        "forested"
+      ],
+      "traits": {
+        "color": "#765DA8"
+      }
+    },
+    {
+      "id": 21,
+      "name": "Ephemeral, non-forested",
+      "group": "ephemeral_wetland",
+      "group_label": "Ephemeral Wetlands",
+      "attributes": [
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#BE9CC9"
+      }
+    },
+    {
+      "id": 22,
+      "name": "Arctic/boreal peatland, forested",
+      "group": "peatland",
+      "group_label": "Peatlands",
+      "attributes": [
+        "arctic/boreal",
+        "forested"
+      ],
+      "traits": {
+        "color": "#5B0D0B"
+      }
+    },
+    {
+      "id": 23,
+      "name": "Arctic/boreal peatland, non-forested",
+      "group": "peatland",
+      "group_label": "Peatlands",
+      "attributes": [
+        "arctic/boreal",
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#290F11"
+      }
+    },
+    {
+      "id": 24,
+      "name": "Temperate peatland, forested",
+      "group": "peatland",
+      "group_label": "Peatlands",
+      "attributes": [
+        "temperate",
+        "forested"
+      ],
+      "traits": {
+        "color": "#986766"
+      }
+    },
+    {
+      "id": 25,
+      "name": "Temperate peatland, non-forested",
+      "group": "peatland",
+      "group_label": "Peatlands",
+      "attributes": [
+        "temperate",
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#692323"
+      }
+    },
+    {
+      "id": 26,
+      "name": "Tropical/subtropical peatland, forested",
+      "group": "peatland",
+      "group_label": "Peatlands",
+      "attributes": [
+        "tropical/subtropical",
+        "forested"
+      ],
+      "traits": {
+        "color": "#CB7B7A"
+      }
+    },
+    {
+      "id": 27,
+      "name": "Tropical/subtropical peatland, non-forested",
+      "group": "peatland",
+      "group_label": "Peatlands",
+      "attributes": [
+        "tropical/subtropical",
+        "non-forested"
+      ],
+      "traits": {
+        "color": "#D4453F"
+      }
+    },
+    {
+      "id": 28,
+      "name": "Mangrove",
+      "group": "coastal_wetland",
+      "group_label": "Coastal Wetlands",
+      "traits": {
+        "color": "#D63A96"
+      }
+    },
+    {
+      "id": 29,
+      "name": "Saltmarsh",
+      "group": "coastal_wetland",
+      "group_label": "Coastal Wetlands",
+      "traits": {
+        "color": "#F2EA0B"
+      }
+    },
+    {
+      "id": 30,
+      "name": "Large river delta",
+      "group": "coastal_wetland",
+      "group_label": "Coastal Wetlands",
+      "traits": {
+        "color": "#57BF98"
+      }
+    },
+    {
+      "id": 31,
+      "name": "Other coastal wetland",
+      "group": "coastal_wetland",
+      "group_label": "Coastal Wetlands",
+      "traits": {
+        "color": "#8DD2C8"
+      }
+    },
+    {
+      "id": 32,
+      "name": "Salt pan, saline/brackish wetland",
+      "group": "saline",
+      "group_label": "Saline",
+      "traits": {
+        "color": "#F9A71A"
+      }
+    },
+    {
+      "id": 33,
+      "name": "Rice paddies",
+      "group": "rice_paddies",
+      "group_label": "Rice Paddies",
+      "traits": {
+        "color": "#A02380"
+      }
+    }
+  ],
+  "attribute_axes": {
+    "lacustrine_wetland": [
+      {
+        "name": "vegetation",
+        "values": [
+          "forested",
+          "non-forested"
+        ]
+      }
+    ],
+    "riverine_wetland": [
+      {
+        "name": "hydrology",
+        "values": [
+          "regularly flooded",
+          "seasonally flooded",
+          "seasonally saturated"
+        ]
+      },
+      {
+        "name": "vegetation",
+        "values": [
+          "forested",
+          "non-forested"
+        ]
+      }
+    ],
+    "palustrine_wetland": [
+      {
+        "name": "hydrology",
+        "values": [
+          "regularly flooded",
+          "seasonally saturated"
+        ]
+      },
+      {
+        "name": "vegetation",
+        "values": [
+          "forested",
+          "non-forested"
+        ]
+      }
+    ],
+    "ephemeral_wetland": [
+      {
+        "name": "vegetation",
+        "values": [
+          "forested",
+          "non-forested"
+        ]
+      }
+    ],
+    "peatland": [
+      {
+        "name": "climate_zone",
+        "values": [
+          "arctic/boreal",
+          "temperate",
+          "tropical/subtropical"
+        ]
+      },
+      {
+        "name": "vegetation",
+        "values": [
+          "forested",
+          "non-forested"
+        ]
+      }
+    ]
+  }
+}

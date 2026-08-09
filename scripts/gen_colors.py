@@ -338,17 +338,35 @@ def _ach_l_values(all_count: int, group_rank: int, group_size: int) -> list[floa
 # Main generation
 # ---------------------------------------------------------------------------
 
+def _class_group(cls: dict) -> str:
+    """Return the group a class's single rendered color is assigned to.
+
+    Most classes carry a plain top-level 'group'. Compound classes instead
+    carry 'memberships' (see biome_legend.json) to fan their fraction out to
+    several groups for *description* purposes (util/descriptions.py) — but a
+    raster pixel only has one traits.color, so for color-generation purposes
+    a fanned-out class is anchored to its first membership's group.
+    """
+    group = cls.get('group')
+    if group:
+        return group
+    memberships = cls.get('memberships') or []
+    if memberships:
+        return memberships[0]['group']
+    raise KeyError(f"class {cls.get('id')!r} has neither 'group' nor 'memberships'")
+
 def generate_variable(classes: list[dict]) -> dict[str, dict]:
     """Return {'cb', 'ach', 'shapes'} → {class_id → value} dicts."""
     groups: dict[str, list[dict]] = defaultdict(list)
     for cls in classes:
-        groups[cls['group']].append(cls)
+        groups[_class_group(cls)].append(cls)
 
     # Track first-appearance order for stable shape assignment
     seen_groups: list[str] = []
     for cls in classes:
-        if cls['group'] not in seen_groups:
-            seen_groups.append(cls['group'])
+        g = _class_group(cls)
+        if g not in seen_groups:
+            seen_groups.append(g)
 
     # Sort members within each group by source L (darkest first)
     for members in groups.values():
@@ -466,7 +484,7 @@ def main() -> None:
             data = json.load(f)
         layer_id = data['layer_id']
         classes = data['classes']
-        all_groups = sorted(set(c['group'] for c in classes))
+        all_groups = sorted(set(_class_group(c) for c in classes))
         real_group_count = sum(1 for g in all_groups if g not in _NEUTRAL_GROUPS)
         palette_name = (
             'Okabe-Ito' if real_group_count <= 7

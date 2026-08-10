@@ -45,12 +45,22 @@ METRICS_BY_TYPE: dict[ValueType, tuple[str, ...]] = {
 
 # GIS layers where the raster nodata value means the property is absent (= 0),
 # not that the data is missing. E.g. scd=nodata at the equator → 0 snow cover days.
+#
+# The single source of truth for which layers get this treatment — the
+# actual fill (burn 0 into nodata pixels, clear the nodata flag) happens
+# once, in scripts/gis/build_overviews.py, before overviews are built from
+# the corrected data. That covers every consumer (map tiles, the /gis/point
+# background-point endpoint, and enrich_tree.py's per-observation sampling)
+# from one place, rather than each caller needing its own nodata-aware
+# special-casing (enrich_tree.py's is a harmless no-op once a layer's
+# nodata has actually been cleared, since ds.nodata reads back as None).
 ZERO_NODATA_LAYERS: frozenset[str] = frozenset({
     "swe", "scd", "fcf",
     "gdd0", "gdd5", "gdd10",
     "gddlgd0", "gddlgd5", "gddlgd10",
     "ngd0", "ngd5", "ngd10",
     "gsl",
+    "scdur", "scsl", "sfsl", "sper", "ssper", "sreg",
 })
 
 _REGISTRY: dict[str, type] = {}

@@ -9,6 +9,15 @@ each to a Cloud Optimized GeoTIFF (COG) with appropriate overview levels.
 Overview resampling is chosen by value_type:
   interval / ratio → average
   nominal          → nearest  (preserves discrete class values)
+
+Also the one place config.ZERO_NODATA_LAYERS actually gets acted on: for
+those layers, nodata pixels are burned in as a real 0 (and the nodata flag
+cleared) before overviews are built from the corrected data. Doing it here
+rather than in each download script means every consumer benefits from one
+fix — map tiles render a real "no snow"-equivalent color with no
+transparent gaps, the /gis/point background-point endpoint returns 0
+instead of "No data", and enrich_tree.py's own nodata check becomes a
+harmless no-op for these layers (ds.nodata reads back as None).
 """
 
 from __future__ import annotations
@@ -19,7 +28,10 @@ import os
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import rasterio
+
+from config.config import ZERO_NODATA_LAYERS
 
 CATALOG_PATH        = Path("config/gis/catalog.json")
 LAYERS_DIR          = Path("data/gis/layers")
@@ -97,6 +109,37 @@ def _has_required_overviews(existing: list[int], desired: list[int]) -> bool:
     )
 
 
+def _fill_nodata_with_zero(path: Path) -> bool:
+    """Burn nodata pixels in as a real 0 and clear the nodata marker.
+
+    Mutates path in place (r+) — cheap read/modify/write, not a full COG
+    rebuild; _build_cog rebuilds the actual COG (with fresh overviews) from
+    this corrected file right after, so this doesn't itself need to produce
+    a valid COG. Returns True if anything changed, so the caller can force
+    an overview rebuild even when existing overviews would otherwise look
+    sufficient (old overviews built from the un-filled data could have
+    transparent-gap artifacts baked into their downsampled pixels).
+    """
+    # IGNORE_COG_LAYOUT_BREAK: a file already processed by a previous
+    # build_overviews run is a strict-layout COG, and GDAL's COG driver
+    # refuses in-place r+ writes against that layout by default. Harmless
+    # here — _build_cog rebuilds a fresh, correctly-laid-out COG from this
+    # file immediately after, so whatever layout optimization this write
+    # "breaks" is being discarded anyway.
+    with rasterio.open(path, "r+", IGNORE_COG_LAYOUT_BREAK="YES") as ds:
+        nodata = ds.nodata
+        if nodata is None:
+            return False
+        data = ds.read(1)
+        mask = np.isnan(data) if np.isnan(nodata) else (data == nodata)
+        changed = bool(np.any(mask))
+        if changed:
+            data[mask] = 0
+            ds.write(data, 1)
+        ds.nodata = None
+        return changed
+
+
 def _build_cog(src_path: Path, dst_path: Path, *, nominal: bool, overview_factors: list[int]) -> None:
     resampling = "mode" if nominal else "average"
     base_tif = dst_path.with_suffix(".base.tif")
@@ -144,13 +187,19 @@ def main() -> None:
         total += 1
         layer = layer_meta.get(path.name)
         nominal = _is_class_based(layer)
+        layer_id = layer.get("id") if layer else None
 
         try:
+            force_rebuild = False
+            if layer_id in ZERO_NODATA_LAYERS and _fill_nodata_with_zero(path):
+                print(f"[overview] zero-filled nodata -> {path.name}")
+                force_rebuild = True
+
             with rasterio.open(path) as ds:
                 existing = ds.overviews(1) or []
                 desired = _overview_factors_for_dataset(ds)
 
-            if existing and _has_required_overviews(existing, desired):
+            if not force_rebuild and existing and _has_required_overviews(existing, desired):
                 skipped += 1
                 continue
 

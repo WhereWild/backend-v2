@@ -658,6 +658,7 @@ async def gis_point_value(
     unit_system: str | None = Query(None),
     forecast_h: int = Query(0, ge=0),
     event_ts: int | None = Query(None),
+    colormap: str = Query("viridis"),
 ):
     """Return the raster value for a variable at a lat/lon coordinate.
 
@@ -703,13 +704,28 @@ async def gis_point_value(
 
     class_name: str | None = None
     class_color: str | None = None
-    if value is not None and layer.get("value_type") in ("nominal", "ordinal"):
+    value_type = layer.get("value_type")
+    if value is not None and value_type in ("nominal", "ordinal"):
         legend = _load_legend(variable)
-        int_val = int(value) if value == int(value) else None
+        # round(), not exact equality — a sampled/reprojected raster value
+        # isn't guaranteed to land on a mathematically exact integer (e.g.
+        # nearest-neighbor resampling, or float32 round-trip), so an exact
+        # `value == int(value)` check can silently fail to match any class,
+        # leaving class_name null and the UI falling back to showing the
+        # raw numeric value instead of a class name.
+        int_val = round(value)
         for entry in legend:
             if entry.get("id") == int_val:
                 class_name = entry.get("name")
-                class_color = (entry.get("traits") or {}).get("color") or None
+                if value_type == "ordinal":
+                    # Ordinal has no per-class traits.color — its color is
+                    # the same live-colormap-stepped lookup the tile
+                    # renderer uses (see util/tiles.py's matching branch),
+                    # not a hand-picked legend value.
+                    rgb = tiles._cb_colormap_for_layer(variable, colormap).get(int_val)
+                    class_color = f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}" if rgb else None
+                else:
+                    class_color = (entry.get("traits") or {}).get("color") or None
                 break
 
     converted_value = units.convert_value(value, layer, unit_system)

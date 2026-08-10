@@ -1,0 +1,11 @@
+{
+  "layer_id": "sreg",
+  "source": "Johnston, J.M., Jacobs, J.M., and Cho, E. (2024). NSIDC-0791 SSC (snow cover seasonality classification), water year 2023.",
+  "classes": [
+    { "id": 0, "name": "No Snow",         "group": "none",        "group_label": "No Snow" },
+    { "id": 1, "name": "Ephemeral Snow",  "group": "intermittent", "group_label": "Intermittent" },
+    { "id": 2, "name": "Transitional Snow", "group": "intermittent", "group_label": "Intermittent" },
+    { "id": 3, "name": "Seasonal Snow",   "group": "seasonal",    "group_label": "Seasonal" },
+    { "id": 4, "name": "Perennial Snow",  "group": "perennial",   "group_label": "Perennial" }
+  ]
+}

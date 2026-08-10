@@ -10,14 +10,23 @@ Overview resampling is chosen by value_type:
   interval / ratio → average
   nominal          → nearest  (preserves discrete class values)
 
-Also the one place config.ZERO_NODATA_LAYERS actually gets acted on: for
-those layers, nodata pixels are burned in as a real 0 (and the nodata flag
-cleared) before overviews are built from the corrected data. Doing it here
-rather than in each download script means every consumer benefits from one
-fix — map tiles render a real "no snow"-equivalent color with no
-transparent gaps, the /gis/point background-point endpoint returns 0
-instead of "No data", and enrich_tree.py's own nodata check becomes a
-harmless no-op for these layers (ds.nodata reads back as None).
+Also the one place two config.py-driven corrections actually get applied,
+for the same reason in both cases: acting on every layer in data/gis/layers/
+from one place means every consumer benefits, instead of each download
+script needing its own special-casing.
+
+  - ZERO_NODATA_LAYERS: nodata pixels are burned in as a real 0 (and the
+    nodata flag cleared) before overviews are built from the corrected
+    data — map tiles render a real "absent"-equivalent color with no
+    transparent gaps, /gis/point returns 0 instead of "No data", and
+    enrich_tree.py's own nodata check becomes a harmless no-op.
+
+  - Every continuous (interval/ratio) layer's render_min/render_max is
+    recomputed as the 1st/99th percentile of valid pixel values
+    (PERCENTILE_RENDER_BOUNDS) instead of true min/max — avoids a long tail
+    (e.g. precipitation) compressing the bulk of "normal" values into a
+    narrow slice of the color range under a linear scale. Never applied to
+    nominal/ordinal layers.
 """
 
 from __future__ import annotations
@@ -31,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 
-from config.config import ZERO_NODATA_LAYERS
+from config.config import PERCENTILE_RENDER_BOUNDS, ZERO_NODATA_LAYERS
 
 CATALOG_PATH        = Path("config/gis/catalog.json")
 LAYERS_DIR          = Path("data/gis/layers")
@@ -140,6 +149,40 @@ def _fill_nodata_with_zero(path: Path) -> bool:
         return changed
 
 
+def _compute_percentile_bounds(path: Path, layer: dict) -> tuple[float, float]:
+    """Return (render_min, render_max) as the PERCENTILE_RENDER_BOUNDS
+    percentiles of valid pixel values, in display units (scale_factor/
+    add_offset applied) — same nodata-masking logic as download_chelsa.py's
+    _compute_stats, just np.percentile instead of nanmin/nanmax.
+    """
+    scale = layer.get("scale_factor") or 1.0
+    offset = layer.get("add_offset") or 0.0
+    with rasterio.open(path) as ds:
+        dtype_str = ds.dtypes[0]
+        nodata = ds.nodata
+        raw_native = ds.read(1)
+    if np.issubdtype(np.dtype(dtype_str), np.integer):
+        iinfo = np.iinfo(dtype_str)
+        dtype_max = iinfo.max
+        nd_int = round(nodata) if nodata is not None else dtype_max
+        if nd_int == dtype_max:
+            nodata_mask = raw_native >= dtype_max - 3
+        else:
+            nodata_mask = (raw_native == nd_int) | (raw_native >= dtype_max - 3)
+        raw = raw_native.astype(np.float32)
+        raw[nodata_mask] = np.nan
+    else:
+        raw = raw_native.astype(np.float32)
+        if nodata is not None:
+            raw[raw == nodata] = np.nan
+    raw = raw * scale + offset
+    valid = raw[np.isfinite(raw)]
+    if valid.size == 0:
+        return 0.0, 1.0
+    lo, hi = np.percentile(valid, list(PERCENTILE_RENDER_BOUNDS))
+    return round(float(lo), 6), round(float(hi), 6)
+
+
 def _build_cog(src_path: Path, dst_path: Path, *, nominal: bool, overview_factors: list[int]) -> None:
     resampling = "mode" if nominal else "average"
     base_tif = dst_path.with_suffix(".base.tif")
@@ -182,18 +225,29 @@ def main() -> None:
 
     layer_meta = _load_layer_meta()
     total = updated = skipped = 0
+    catalog_updates: dict[str, tuple[float, float]] = {}
 
     for path in sorted(LAYERS_DIR.glob("*.tif")):
         total += 1
         layer = layer_meta.get(path.name)
         nominal = _is_class_based(layer)
         layer_id = layer.get("id") if layer else None
+        value_type = str(layer.get("value_type") or "").lower() if layer else ""
 
         try:
             force_rebuild = False
             if layer_id in ZERO_NODATA_LAYERS and _fill_nodata_with_zero(path):
                 print(f"[overview] zero-filled nodata -> {path.name}")
                 force_rebuild = True
+
+            if layer_id and value_type not in ("nominal", "ordinal"):
+                new_min, new_max = _compute_percentile_bounds(path, layer)
+                if (layer.get("render_min"), layer.get("render_max")) != (new_min, new_max):
+                    print(
+                        f"[overview] percentile render bounds -> {path.name}: "
+                        f"{layer.get('render_min')}/{layer.get('render_max')} -> {new_min}/{new_max}"
+                    )
+                    catalog_updates[layer_id] = (new_min, new_max)
 
             with rasterio.open(path) as ds:
                 existing = ds.overviews(1) or []
@@ -217,6 +271,22 @@ def main() -> None:
             print(f"[overview] failed {path.name}: {exc}")
             path.with_suffix(".tif.tmp").unlink(missing_ok=True)
             path.with_suffix(".base.tif").unlink(missing_ok=True)
+
+    if catalog_updates:
+        # Re-read from disk before writing so external edits made while this
+        # ran aren't clobbered — same pattern as download_chelsa.py.
+        with open(CATALOG_PATH) as f:
+            on_disk = json.load(f)
+        for cat in on_disk["categories"]:
+            for layer in cat["layers"]:
+                if layer["id"] in catalog_updates:
+                    render_min, render_max = catalog_updates[layer["id"]]
+                    layer["render_min"] = render_min
+                    layer["render_max"] = render_max
+        with open(CATALOG_PATH, "w") as f:
+            json.dump(on_disk, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        print(f"[overview] catalog updated: {len(catalog_updates)} layer(s) -> {CATALOG_PATH}")
 
     print(f"[overview] done  total={total}  updated={updated}  skipped={skipped}")
 

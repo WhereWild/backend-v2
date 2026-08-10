@@ -63,6 +63,20 @@ ZERO_NODATA_LAYERS: frozenset[str] = frozenset({
     "scdur", "scsl", "sfsl", "sper", "ssper", "sreg",
 })
 
+# A linear color scale over a layer's TRUE global min/max compresses the
+# bulk of "normal" values into a narrow slice of the color range whenever
+# there's a long tail (e.g. precipitation — a handful of rainforest pixels
+# stretch the top of the scale far past where almost all the data actually
+# sits). Render bounds are instead the 1st/99th percentile of valid pixel
+# values for every continuous (interval/ratio) layer, computed once in
+# scripts/gis/build_overviews.py (same single-source-of-truth reasoning as
+# ZERO_NODATA_LAYERS above) — deliberately OVERWRITES whatever render_min/
+# render_max a layer's download script already set, rather than filling
+# only when null, since replacing the true-extremes convention is the whole
+# point. Never applied to nominal/ordinal layers — percentile bounds are
+# meaningless for discrete classes.
+PERCENTILE_RENDER_BOUNDS: tuple[float, float] = (1.0, 99.0)
+
 _REGISTRY: dict[str, type] = {}
 _CACHE: dict[str, Any] = {}
 

@@ -641,7 +641,8 @@ def _render_temporal_tile_rgba(
     var_id = layer["var_id"]
     window_label = layer["window_label"]
     model = layer.get("model", "copernicus_era5")
-    nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
+    value_type = str(layer.get("value_type") or "").lower()
+    nominal = value_type in ("nominal", "ordinal")
 
     npy_path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{forecast_suffix}.npy"
     arr = _load_temporal_npy(npy_path)
@@ -673,7 +674,18 @@ def _render_temporal_tile_rgba(
         vmin = vmin if vmin is not None else 0.0
         vmax = vmax if vmax is not None else 1.0
 
-    if nominal:
+    if value_type == "ordinal":
+        # Ordinal classes have no separate accessibility variant — the
+        # selected continuous colormap doubles as a cb_colors.json "mode"
+        # key (see gen_colors.py's generate_ordinal_variable), stepped into
+        # one swatch per class instead of smoothly interpolated.
+        ordinal_cmap = _cb_colormap_for_layer(layer_id, colormap)
+        rgba = (
+            _colorize_nominal(dest, ordinal_cmap, class_filter)
+            if ordinal_cmap
+            else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap, value_ranges)
+        )
+    elif value_type == "nominal":
         if cb_mode in SUPPORTED_CB_MODES:
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
@@ -683,7 +695,7 @@ def _render_temporal_tile_rgba(
             if nominal_cmap
             else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap, value_ranges)
         )
-    elif str(layer.get("value_type") or "").lower() == "circular":
+    elif value_type == "circular":
         circular_colormap = (
             colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP
         )
@@ -1208,20 +1220,25 @@ def _render_static_layer_tile_rgba(
     value_ranges: list[tuple[float | None, float | None]] | None = None,
 ) -> np.ndarray:
     layer_id = layer["id"]
-    nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
+    value_type = str(layer.get("value_type") or "").lower()
     mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
     dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
     dest, vmin, vmax = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
     vmin = vmin if vmin is not None else 0.0
     vmax = vmax if vmax is not None else 1.0
 
-    if nominal:
+    if value_type == "ordinal":
+        # See _render_temporal_tile_rgba for why ordinal reuses the
+        # colormap-name-as-cb-mode lookup instead of legend-file colors.
+        ordinal_cmap = _cb_colormap_for_layer(layer_id, colormap)
+        return _colorize_nominal(dest, ordinal_cmap, class_filter) if ordinal_cmap else _colorize(dest, vmin, vmax, colormap, value_ranges)
+    if value_type == "nominal":
         if cb_mode in SUPPORTED_CB_MODES:
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
         return _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap, value_ranges)
-    if str(layer.get("value_type") or "").lower() == "circular":
+    if value_type == "circular":
         return _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_ranges)
     return _colorize(dest, vmin, vmax, colormap, value_ranges)
 

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -159,84 +160,182 @@ def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
             return ()
 
 
-def _accumulate_numerical_or_circular(
-    raw: dict[str, dict], path: Path, kind: str, ids: set[str], metrics_by_var: dict[str, tuple[str, ...]] | None,
+def _wide_seen_and_counts(
+    path: Path, kind: str, ids: set[str],
+) -> tuple[set[str], pd.Series | None]:
+    """Cheap structural pass over a wide-format stats file (numerical or
+    circular): which taxa have >=1 row for a variable in `ids`, and —
+    numerical only — each taxon's sample count from the `count` column.
+
+    Reads only taxon_key/variable/(count) via Arrow column selection, never
+    the metric-value columns — those are the bulk of numerical_stats.parquet
+    (~1.8GB on disk for the real catalog) and aren't needed for this pass.
+    """
+    if not path.exists():
+        return set(), None
+    tbl = pq.read_table(path)
+    col_names = set(tbl.schema.names)
+    if "taxon_key" not in col_names or "variable" not in col_names:
+        return set(), None
+    select_cols = ["taxon_key", "variable"]
+    has_count = kind == "numerical" and "count" in col_names
+    if has_count:
+        select_cols.append("count")
+    df = tbl.select(select_cols).to_pandas()
+    df = df[df["variable"].isin(ids)]
+    if df.empty:
+        return set(), None
+    seen = set(df["taxon_key"].unique())
+    sample_counts = None
+    if has_count:
+        cnt = df.loc[df["count"].fillna(0) > 0, ["taxon_key", "count"]]
+        if not cnt.empty:
+            sample_counts = cnt.groupby("taxon_key")["count"].first().astype("int64")
+    return seen, sample_counts
+
+
+def _wide_fill(
+    values: np.ndarray, taxon_pos: pd.Series, metric_pos: pd.Series,
+    path: Path, kind: str, ids: set[str], metrics_by_var: dict[str, tuple[str, ...]] | None,
     circ_metrics: tuple[str, ...] = (),
 ) -> None:
-    """Wide-format stats (one row per taxon_key+variable, metric columns) —
-    shared by numerical and circular stats, which have the same shape."""
+    """Fill `values` (shape n_taxa x n_metrics) from a wide-format stats
+    file, one metric COLUMN at a time via vectorized numpy/pandas ops.
+
+    Deliberately does *not* reshape the file into a taxon*metric "long"
+    table (melt): that reshape multiplies row count by metric count, and on
+    the real numerical_stats.parquet (~1.8GB, many metric columns) that
+    intermediate ended up *larger* than the old per-row Python-dict
+    accumulation it was meant to replace — confirmed by an actual rebuild
+    OOMing faster than before. Filling column-by-column keeps every
+    intermediate proportional to the file's own row count, never multiplied
+    by metric count, and only pulls in the metric columns this call needs
+    (via Arrow column selection) rather than the whole table.
+    """
     if not path.exists():
         return
-    try:
-        tbl = pq.read_table(path)
-        col_names = set(tbl.schema.names)
-        if "taxon_key" not in col_names:
-            return
-        taxon_keys = tbl.column("taxon_key").to_pylist()
-        variables = tbl.column("variable").to_pylist()
+    tbl = pq.read_table(path)
+    col_names = set(tbl.schema.names)
+    if "taxon_key" not in col_names:
+        return
+
+    if kind == "numerical":
+        needed_metrics: set[str] = set()
+        for var, metrics in (metrics_by_var or {}).items():
+            if var in ids:
+                needed_metrics.update(metrics)
+        metric_cols = [m for m in needed_metrics if m in col_names]
+    else:
+        metric_cols = [m for m in circ_metrics if m in col_names]
+    if not metric_cols:
+        return
+
+    df = tbl.select(["taxon_key", "variable", *metric_cols]).to_pandas()
+    df = df[df["variable"].isin(ids)]
+    if df.empty:
+        return
+    variable = df["variable"].astype(str).to_numpy()
+    row_pos_all = taxon_pos.reindex(df["taxon_key"]).to_numpy()
+
+    for m in metric_cols:
+        col_vals = pd.to_numeric(df[m], errors="coerce").to_numpy()
+        finite = np.isfinite(col_vals)
+        if not finite.any():
+            continue
         if kind == "numerical":
-            counts = tbl.column("count").to_pylist() if "count" in col_names else [None] * len(variables)
-            needed_metrics: set[str] = set()
-            for var in set(variables):
-                if var in ids:
-                    needed_metrics.update((metrics_by_var or {}).get(var, ()))
-            metric_cols = {m: tbl.column(m).to_pylist() for m in needed_metrics if m in col_names}
+            # Metrics can in principle differ by variable (e.g. RATIO vs
+            # INTERVAL) — only assign where this metric actually applies to
+            # that row's variable.
+            vars_using_m = np.array(sorted(
+                v for v, metrics in (metrics_by_var or {}).items() if m in metrics
+            ))
+            applies = np.isin(variable[finite], vars_using_m)
+            sel = np.where(finite)[0][applies]
         else:
-            counts = None
-            metric_cols = {m: tbl.column(m).to_pylist() for m in circ_metrics if m in col_names}
-        for i, (taxon_key, variable) in enumerate(zip(taxon_keys, variables)):
-            if not variable or variable not in ids:
-                continue
-            entry = raw.setdefault(taxon_key, {"__sample_count__": 0})
-            if counts is not None:
-                cnt = counts[i]
-                if cnt and entry["__sample_count__"] == 0:
-                    try:
-                        entry["__sample_count__"] = int(cnt)
-                    except (TypeError, ValueError):
-                        pass
-            row_metrics = (metrics_by_var or {}).get(variable, ()) if kind == "numerical" else circ_metrics
-            for metric in row_metrics:
-                col = metric_cols.get(metric)
-                if col is None:
-                    continue
-                val = col[i]
-                if val is not None and _safe_finite(val):
-                    entry[f"{variable}::{metric}"] = float(val)
-    except Exception:
-        pass
+            sel = np.where(finite)[0]
+        if sel.size == 0:
+            continue
+        metric_keys = np.char.add(np.char.add(variable[sel].astype(str), "::"), m)
+        c = metric_pos.reindex(metric_keys).to_numpy()
+        valid = ~np.isnan(c)
+        if not valid.any():
+            continue
+        r = row_pos_all[sel][valid]
+        cc = c[valid].astype(np.int64)
+        values[r, cc] = col_vals[sel][valid]
 
 
-def _accumulate_tall(raw: dict[str, dict], path: Path, ids: set[str], metrics: set[str]) -> None:
-    """Tall-format stats (taxon_key, variable, metric, value rows) — shared
-    by nominal and ordinal stats, which have the same shape."""
+def _tall_seen_counts_and_vocab(
+    path: Path, ids: set[str], metrics: set[str],
+) -> tuple[set[str], pd.Series | None, set[str]]:
+    """Structural + sample-count pass over a tall-format stats file
+    (nominal/ordinal). Unlike the wide-format files, these are already
+    one-value-per-row and much smaller in practice (tens of MB vs
+    numerical's ~1.8GB), so reading variable+metric+value together here is
+    fine — no separate cheap/heavy split needed, and no melt is involved
+    since the file is already in long form."""
+    if not path.exists():
+        return set(), None, set()
+    tbl = pq.read_table(path)
+    if "taxon_key" not in tbl.schema.names:
+        return set(), None, set()
+    df = tbl.to_pandas()
+    variable = df["variable"].astype(str)
+    metric = df["metric"].astype(str)
+    mask = variable.isin(ids) & (metric.isin(metrics) | metric.str.startswith("class_"))
+    df = df.loc[mask]
+    if df.empty:
+        return set(), None, set()
+    variable = variable.loc[mask]
+    metric = metric.loc[mask]
+    seen = set(df["taxon_key"].unique())
+    vocab = set((variable + "::" + metric).unique())
+
+    # First non-zero total_samples row per taxon, in file row order — same
+    # "only set once" semantics as the old entry["__sample_count__"] == 0 guard.
+    sample_counts = None
+    ts_mask = (metric == "total_samples").to_numpy()
+    if ts_mask.any():
+        ts_val = pd.to_numeric(df.loc[ts_mask, "value"], errors="coerce").fillna(0)
+        nonzero = ts_val > 0
+        if nonzero.any():
+            sample_counts = (
+                pd.Series(ts_val[nonzero].to_numpy(), index=df.loc[ts_mask, "taxon_key"].to_numpy()[nonzero.to_numpy()])
+                .groupby(level=0).first().astype("int64")
+            )
+    return seen, sample_counts, vocab
+
+
+def _tall_fill(values: np.ndarray, taxon_pos: pd.Series, metric_pos: pd.Series,
+               path: Path, ids: set[str], metrics: set[str]) -> None:
+    """Fill `values` from a tall-format stats file. No melt needed (already
+    long-form); see _tall_seen_counts_and_vocab for why a single full read
+    is fine for these smaller files."""
     if not path.exists():
         return
-    try:
-        tbl = pq.read_table(path)
-        if "taxon_key" not in tbl.schema.names:
-            return
-        taxon_keys = tbl.column("taxon_key").to_pylist()
-        tall_variables = tbl.column("variable").to_pylist()
-        tall_metrics = tbl.column("metric").to_pylist()
-        tall_values = tbl.column("value").to_pylist()
-        for taxon_key, variable, metric, val in zip(taxon_keys, tall_variables, tall_metrics, tall_values):
-            variable = str(variable or "")
-            metric = str(metric or "")
-            if variable not in ids:
-                continue
-            if metric not in metrics and not metric.startswith("class_"):
-                continue
-            entry = raw.setdefault(taxon_key, {"__sample_count__": 0})
-            if entry["__sample_count__"] == 0 and metric == "total_samples":
-                try:
-                    entry["__sample_count__"] = int(float(val or 0))
-                except (TypeError, ValueError):
-                    pass
-            if _safe_finite(val):
-                entry[f"{variable}::{metric}"] = float(val)
-    except Exception:
-        pass
+    tbl = pq.read_table(path)
+    if "taxon_key" not in tbl.schema.names:
+        return
+    df = tbl.to_pandas()
+    variable = df["variable"].astype(str)
+    metric = df["metric"].astype(str)
+    mask = variable.isin(ids) & (metric.isin(metrics) | metric.str.startswith("class_"))
+    df = df.loc[mask]
+    if df.empty:
+        return
+    variable = variable.loc[mask]
+    metric = metric.loc[mask]
+    value = pd.to_numeric(df["value"], errors="coerce")
+    finite = np.isfinite(value)
+    if not finite.any():
+        return
+    metric_key = (variable[finite] + "::" + metric[finite]).to_numpy()
+    r = taxon_pos.reindex(df.loc[finite, "taxon_key"]).to_numpy()
+    c = metric_pos.reindex(metric_key).to_numpy()
+    valid = ~np.isnan(c)
+    if not valid.any():
+        return
+    values[r[valid], c[valid].astype(np.int64)] = value[finite].to_numpy(dtype=np.float32)[valid]
 
 
 def preload_stats_cache(layers: list[dict]) -> None:
@@ -297,37 +396,64 @@ def preload_stats_cache(layers: list[dict]) -> None:
             _metric_to_idx.clear()
 
     t0 = _time.monotonic()
-    # Phase 1: read the four global stats files, collect raw per-taxon dicts
-    raw: dict[str, dict] = {}
     print("[rankings] preloading stats cache from global stats files...")
-    _accumulate_numerical_or_circular(
-        raw, GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE, "numerical", ratio_interval_ids, layer_metrics,
-    )
-    _accumulate_tall(raw, GLOBAL_STATS_DIR / NOMINAL_STATS_FILE, nominal_ids, nominal_metrics)
-    _accumulate_tall(raw, GLOBAL_STATS_DIR / ORDINAL_STATS_FILE, ordinal_ids, ordinal_metrics)
-    _accumulate_numerical_or_circular(
-        raw, GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE, "circular", circular_ids, None, circ_metrics=circ_metrics,
-    )
+    numerical_path = GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE
+    nominal_path = GLOBAL_STATS_DIR / NOMINAL_STATS_FILE
+    ordinal_path = GLOBAL_STATS_DIR / ORDINAL_STATS_FILE
+    circular_path = GLOBAL_STATS_DIR / CIRCULAR_STATS_FILE
 
-    # Phase 2: build global metric vocab and convert to numpy float32 arrays (~6x RAM reduction)
-    all_keys: set[str] = set()
-    for entry in raw.values():
-        all_keys.update(k for k in entry if k != "__sample_count__")
-    _metric_vocab[:] = sorted(all_keys)
+    # Pass 1 (cheap): seen-taxa + sample counts via lightweight column
+    # selections — never touches the wide files' metric-value columns, the
+    # bulk of their size. Numerical/circular vocab is config-driven (every
+    # variable::metric the layer catalog says is possible for that value
+    # type), not data-driven, so it costs nothing to compute; nominal/
+    # ordinal vocab still needs the (cheap, small-file) "class_N" scan since
+    # those labels are data-dependent.
+    seen_num, sc_num = _wide_seen_and_counts(numerical_path, "numerical", ratio_interval_ids)
+    seen_circ, _ = _wide_seen_and_counts(circular_path, "circular", circular_ids)
+    seen_nom, sc_nom, vocab_nom = _tall_seen_counts_and_vocab(nominal_path, nominal_ids, nominal_metrics)
+    seen_ord, sc_ord, vocab_ord = _tall_seen_counts_and_vocab(ordinal_path, ordinal_ids, ordinal_metrics)
+
+    vocab_num = {f"{v}::{m}" for v, metrics in layer_metrics.items() for m in metrics}
+    vocab_circ = {f"{v}::{m}" for v in circular_ids for m in circ_metrics}
+    _metric_vocab[:] = sorted(vocab_num | vocab_circ | vocab_nom | vocab_ord)
     _metric_to_idx.update({k: i for i, k in enumerate(_metric_vocab)})
     _build_rankings_mask()
     n_metrics = len(_metric_vocab)
 
-    for taxon_key, entry in raw.items():
-        sc = int(entry.get("__sample_count__", 0))
-        arr = np.full(n_metrics, np.nan, dtype=np.float32)
-        for k, v in entry.items():
-            if k != "__sample_count__":
-                idx = _metric_to_idx.get(k)
-                if idx is not None:
-                    arr[idx] = np.float32(v)
-        _stats_cache[taxon_key] = (sc, arr)
-    del raw
+    sample_counts: pd.Series | None = None
+    for sc in (sc_num, sc_nom, sc_ord):  # priority order: numerical, nominal, ordinal
+        if sc is not None:
+            sample_counts = sc if sample_counts is None else sample_counts.combine_first(sc)
+
+    taxon_union = seen_num | seen_circ | seen_nom | seen_ord
+    if sample_counts is not None:
+        taxon_union |= set(sample_counts.index)
+    row_idx = pd.Index(sorted(taxon_union))
+
+    values = np.full((len(row_idx), n_metrics), np.nan, dtype=np.float32)
+    if n_metrics and len(row_idx):
+        taxon_pos = pd.Series(np.arange(len(row_idx)), index=row_idx)
+        metric_pos = pd.Series(np.arange(n_metrics), index=_metric_vocab)
+        # Pass 2: fill the matrix directly, one metric column at a time —
+        # see _wide_fill's docstring for why this replaced an earlier
+        # melt-based version that made memory use worse, not better.
+        _wide_fill(values, taxon_pos, metric_pos, numerical_path, "numerical", ratio_interval_ids, layer_metrics)
+        _tall_fill(values, taxon_pos, metric_pos, nominal_path, nominal_ids, nominal_metrics)
+        _tall_fill(values, taxon_pos, metric_pos, ordinal_path, ordinal_ids, ordinal_metrics)
+        _wide_fill(values, taxon_pos, metric_pos, circular_path, "circular", circular_ids, None,
+                   circ_metrics=circ_metrics)
+
+    sc_full = (
+        sample_counts.reindex(row_idx).fillna(0).astype("int64")
+        if sample_counts is not None else pd.Series(0, index=row_idx, dtype="int64")
+    )
+    sc_values = sc_full.to_numpy()
+    # values[i] is a view into the shared `values` matrix, not a per-taxon
+    # copy — one contiguous allocation for all taxa instead of ~213k small
+    # numpy allocations, and no further mutation happens after this point.
+    for i, taxon_key in enumerate(row_idx):
+        _stats_cache[taxon_key] = (int(sc_values[i]), values[i])
 
     elapsed = _time.monotonic() - t0
     print(f"[rankings] stats cache ready: {len(_stats_cache):,} taxa  {n_metrics:,} metrics  [{elapsed:.1f}s]")

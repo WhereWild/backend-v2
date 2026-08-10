@@ -59,31 +59,6 @@ def _download(url: str, dest: Path) -> None:
     )
 
 
-def _compute_stats(path: Path, nodata: float | None, scale: float, offset: float) -> tuple[float, float]:
-    """Read the full raster and return (real_min, real_max) in display units."""
-    print("  Computing statistics (full raster read)...", flush=True)
-    with rasterio.open(path) as ds:
-        dtype_str = ds.dtypes[0]
-        raw_native = ds.read(1)
-    if np.issubdtype(np.dtype(dtype_str), np.integer):
-        iinfo = np.iinfo(dtype_str)
-        dtype_max = iinfo.max
-        # Compare in native dtype to avoid float32 precision loss on uint32.
-        nd_int = round(nodata) if nodata is not None else dtype_max
-        if nd_int == dtype_max:
-            nodata_mask = raw_native >= dtype_max - 3
-        else:
-            nodata_mask = (raw_native == nd_int) | (raw_native >= dtype_max - 3)
-        raw = raw_native.astype(np.float32)
-        raw[nodata_mask] = np.nan
-    else:
-        raw = raw_native.astype(np.float32)
-        if nodata is not None:
-            raw[raw == nodata] = np.nan
-    raw = raw * scale + offset
-    return float(np.nanmin(raw)), float(np.nanmax(raw))
-
-
 def _read_file_metadata(path: Path) -> dict:
     """Read scale, offset, and statistics from the file. Returns only values that are meaningfully present."""
     with rasterio.open(path) as ds:
@@ -130,8 +105,16 @@ def _inspect(path: Path, meta: dict) -> None:
     print(f"  Stat max   : {meta['stat_max']}")
 
 
-def _sync_catalog(layer: dict, meta: dict, path: Path) -> bool:
-    """Patch null catalog fields from file metadata. Returns True if anything changed."""
+def _sync_catalog(layer: dict, meta: dict) -> bool:
+    """Patch null catalog fields from file metadata. Returns True if anything changed.
+
+    render_min/render_max are deliberately NOT synced here — scripts/gis/
+    build_overviews.py now computes those for every continuous layer as a
+    percentile of valid pixel values (see PERCENTILE_RENDER_BOUNDS), and
+    runs unconditionally as the next rebuild stage after this one, so
+    anything set here would just be immediately overwritten. Leaving it out
+    avoids a second full-raster read for the exact same fields.
+    """
     changed = False
 
     # scale_factor / add_offset — file is informational, catalog is authoritative
@@ -144,25 +127,6 @@ def _sync_catalog(layer: dict, meta: dict, path: Path) -> bool:
             changed = True
         elif catalog_val is not None and file_val is not None and catalog_val != file_val:
             print(f"  WARNING: catalog {key}={catalog_val} differs from file {file_val} — keeping catalog value")
-
-    # render_min / render_max — try embedded stats first, fall back to full read
-    scale  = layer.get("scale_factor") or 1.0
-    offset = layer.get("add_offset")   or 0.0
-    if layer.get("render_min") is None or layer.get("render_max") is None:
-        stat_min, stat_max = meta["stat_min"], meta["stat_max"]
-        if stat_min is not None and stat_max is not None:
-            computed_min = round(stat_min * scale + offset, 6)
-            computed_max = round(stat_max * scale + offset, 6)
-        else:
-            computed_min, computed_max = _compute_stats(path, meta["nodata"], scale, offset)
-            computed_min = round(computed_min, 6)
-            computed_max = round(computed_max, 6)
-
-        for key, val in [("render_min", computed_min), ("render_max", computed_max)]:
-            if layer.get(key) is None:
-                print(f"  {key}: null → {val}")
-                layer[key] = val
-                changed = True
 
     return changed
 
@@ -188,14 +152,14 @@ def main() -> None:
         print(f"[inspect] {layer['id']}")
         _inspect(dest, meta)
 
-        if _sync_catalog(layer, meta, dest):
+        if _sync_catalog(layer, meta):
             catalog_dirty = True
         print()
 
     if catalog_dirty:
         # Re-read from disk before writing so external edits (e.g. value_type) aren't clobbered.
         updates = {
-            layer["id"]: {k: layer[k] for k in ("scale_factor", "add_offset", "render_min", "render_max")}
+            layer["id"]: {k: layer[k] for k in ("scale_factor", "add_offset")}
             for cat in catalog["categories"]
             for layer in cat["layers"]
         }

@@ -13,9 +13,12 @@ Supports two sources:
 
   isric_salinity_2016 — Global Soil Salinity Map (Ivushkin et al. 2019) at
     files.isric.org. Already in EPSG:4326, so no reprojection is needed —
-    translated directly to a COG via gdal_translate. render_min/render_max are
-    computed from approximate pixel statistics and patched into catalog.json if
-    they are currently null.
+    translated directly to a COG via gdal_translate.
+
+render_min/render_max are NOT computed here — scripts/gis/build_overviews.py
+computes those for every continuous layer as a percentile of valid pixel
+values (config.PERCENTILE_RENDER_BOUNDS) and runs right after this stage in
+the rebuild pipeline, so anything set here would be immediately overwritten.
 
 Re-running skips files that already exist (use --force to rebuild).
 
@@ -30,8 +33,6 @@ import json
 import os
 import subprocess
 from pathlib import Path
-
-import rasterio
 
 CATALOG_PATH     = Path("config/gis/catalog.json")
 LAYERS_DIR       = Path("data/gis/layers")
@@ -123,14 +124,6 @@ def _gdal_translate(vrt_url: str, dest: Path) -> None:
     tmp.replace(dest)
 
 
-def _compute_render_range(path: Path, scale: float, offset: float) -> tuple[float, float]:
-    """Return (min, max) in display units (scale+offset applied) from approx statistics."""
-    print("  Computing render range (approx stats)...", flush=True)
-    with rasterio.open(path) as ds:
-        stats = ds.statistics(bidx=1, approx=True)
-    return float(stats.min) * scale + offset, float(stats.max) * scale + offset
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main(force: bool = False) -> None:
@@ -140,7 +133,6 @@ def main(force: bool = False) -> None:
         raise SystemExit(f"No soil layers ({', '.join(sorted(_SOURCES))}) found in catalog.json")
 
     LAYERS_DIR.mkdir(parents=True, exist_ok=True)
-    catalog_dirty = False
 
     for layer in layers:
         layer_id = layer["id"]
@@ -150,57 +142,20 @@ def main(force: bool = False) -> None:
         if VARS_TO_DOWNLOAD is not None and layer_id not in VARS_TO_DOWNLOAD:
             continue
 
-        needs_stats = layer.get("value_type") not in ("nominal", "ordinal") and (
-            layer.get("render_min") is None or layer.get("render_max") is None
-        )
-        needs_download = not out_path.exists() or force
-
-        if not needs_download and not needs_stats:
+        if out_path.exists() and not force:
             print(f"[skip] {layer_id} already exists: {out_path}  (--force to rebuild)")
             continue
 
         vrt_url = layer["vrt_url"]
 
-        if needs_download:
-            print(f"\nDownloading {layer_id} → {out_path}")
-            print(f"  VRT: {vrt_url}")
-            if source == SOURCE_ID_SAL:
-                _gdal_translate(vrt_url, out_path)
-            else:
-                resampling = layer.get("resampling", "bilinear")
-                _gdalwarp(vrt_url, out_path, resampling)
-            print(f"  Done: {out_path}")
+        print(f"\nDownloading {layer_id} → {out_path}")
+        print(f"  VRT: {vrt_url}")
+        if source == SOURCE_ID_SAL:
+            _gdal_translate(vrt_url, out_path)
         else:
-            print(f"\n[stats only] {layer_id} — {out_path}")
-
-        if needs_stats:
-            scale  = layer.get("scale_factor") or 1.0
-            offset = layer.get("add_offset")   or 0.0
-            rmin, rmax = _compute_render_range(out_path, scale, offset)
-            out_path.with_name(out_path.name + ".aux.xml").unlink(missing_ok=True)
-            for key, val in [("render_min", round(rmin, 4)), ("render_max", round(rmax, 4))]:
-                if layer.get(key) is None:
-                    print(f"  {key}: null → {val}")
-                    layer[key] = val
-                    catalog_dirty = True
-
-    if catalog_dirty:
-        updates = {
-            layer["id"]: {k: layer[k] for k in ("render_min", "render_max")}
-            for cat in catalog["categories"]
-            for layer in cat["layers"]
-            if layer.get("source") in _SOURCES
-        }
-        with open(CATALOG_PATH) as f:
-            on_disk = json.load(f)
-        for cat in on_disk["categories"]:
-            for layer in cat["layers"]:
-                if layer["id"] in updates:
-                    layer.update(updates[layer["id"]])
-        with open(CATALOG_PATH, "w") as f:
-            json.dump(on_disk, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        print(f"Catalog updated: {CATALOG_PATH}")
+            resampling = layer.get("resampling", "bilinear")
+            _gdalwarp(vrt_url, out_path, resampling)
+        print(f"  Done: {out_path}")
 
     print("\nAll soil layers complete.")
 

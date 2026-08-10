@@ -44,7 +44,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import numpy as np
 import rasterio
 
 _raw_vars = os.environ.get("VARS_TO_DOWNLOAD", "")
@@ -253,35 +252,6 @@ def _build_cog(subdataset: str, out_path: Path, *, band: int | None = None, nomi
     dest_tmp.replace(out_path)
 
 
-def _compute_stats(path: Path, nodata: float | None, scale: float, offset: float) -> tuple[float, float]:
-    """Read the full raster and return (real_min, real_max) in display
-    units — same nodata-masking + scale/offset logic as download_chelsa.py's
-    _compute_stats, so a hand-typed render_min/render_max never silently
-    disagrees with what the actual data contains (the bug this replaces:
-    scdur was shipped with a hardcoded, unverified 0-365 guess).
-    """
-    print("  Computing statistics (full raster read)...", flush=True)
-    with rasterio.open(path) as ds:
-        dtype_str = ds.dtypes[0]
-        raw_native = ds.read(1)
-    if np.issubdtype(np.dtype(dtype_str), np.integer):
-        iinfo = np.iinfo(dtype_str)
-        dtype_max = iinfo.max
-        nd_int = round(nodata) if nodata is not None else dtype_max
-        if nd_int == dtype_max:
-            nodata_mask = raw_native >= dtype_max - 3
-        else:
-            nodata_mask = (raw_native == nd_int) | (raw_native >= dtype_max - 3)
-        raw = raw_native.astype(np.float32)
-        raw[nodata_mask] = np.nan
-    else:
-        raw = raw_native.astype(np.float32)
-        if nodata is not None:
-            raw[raw == nodata] = np.nan
-    raw = raw * scale + offset
-    return float(np.nanmin(raw)), float(np.nanmax(raw))
-
-
 def _most_recent_band(subdataset: str) -> int:
     """Return the last band index (1-based) of a per-year (time, lat, lon)
     subdataset — GDAL exposes the netCDF time dimension as sequential bands
@@ -300,61 +270,36 @@ def main(force: bool = False) -> None:
     catalog = _load_catalog()
     layers = _nsidc_layers(catalog)
     RAW_DIR.mkdir(parents=True, exist_ok=True)
-    catalog_dirty = False
 
     for layer_id, param, use_climatology in _TARGETS:
         if VARS_TO_DOWNLOAD is not None and layer_id not in VARS_TO_DOWNLOAD:
             continue
         layer = layers[layer_id]
         out_path = LAYERS_DIR / layer["filename"]
-        built = out_path.exists()
-        if built and not force:
+        if out_path.exists() and not force:
             print(f"[skip] {layer_id} — already at {out_path} (--force to rebuild)")
+            continue
+
+        raw_path = RAW_DIR / f"NSIDC-0791_{param}_0.01Deg_WY2001-2023_V01.0.nc"
+        print(f"[download_snow] {layer_id} ({param})")
+        _download(param, raw_path)
+
+        base_sub, clim_sub = _find_variable_pair(raw_path)
+
+        if use_climatology:
+            print(f"  Building COG (climatology) -> {out_path}")
+            _build_cog(clim_sub, out_path, nominal=False)
         else:
-            raw_path = RAW_DIR / f"NSIDC-0791_{param}_0.01Deg_WY2001-2023_V01.0.nc"
-            print(f"[download_snow] {layer_id} ({param})")
-            _download(param, raw_path)
+            band = _most_recent_band(base_sub)
+            print(f"  Building COG (most recent year, band {band}) -> {out_path}")
+            _build_cog(base_sub, out_path, band=band, nominal=True)
 
-            base_sub, clim_sub = _find_variable_pair(raw_path)
-
-            if use_climatology:
-                print(f"  Building COG (climatology) -> {out_path}")
-                _build_cog(clim_sub, out_path, nominal=False)
-            else:
-                band = _most_recent_band(base_sub)
-                print(f"  Building COG (most recent year, band {band}) -> {out_path}")
-                _build_cog(base_sub, out_path, band=band, nominal=True)
-
-        if layer.get("render_min") is None or layer.get("render_max") is None:
-            nodata = _detect_nodata(str(out_path))
-            scale = layer.get("scale_factor") or 1.0
-            offset = layer.get("add_offset") or 0.0
-            real_min, real_max = _compute_stats(out_path, nodata, scale, offset)
-            real_min, real_max = round(real_min, 6), round(real_max, 6)
-            print(f"  render_min/render_max: null -> {real_min} / {real_max} (computed from data)")
-            layer["render_min"] = real_min
-            layer["render_max"] = real_max
-            catalog_dirty = True
-
-    if catalog_dirty:
-        # Re-read from disk before writing so external edits made while this
-        # ran aren't clobbered — same pattern as download_chelsa.py.
-        updates = {
-            lid: {"render_min": layers[lid]["render_min"], "render_max": layers[lid]["render_max"]}
-            for lid in layers
-            if layers[lid].get("render_min") is not None
-        }
-        with open(CATALOG_PATH) as f:
-            on_disk = json.load(f)
-        for cat in on_disk["categories"]:
-            for layer in cat["layers"]:
-                if layer["id"] in updates:
-                    layer.update(updates[layer["id"]])
-        with open(CATALOG_PATH, "w") as f:
-            json.dump(on_disk, f, indent=2, ensure_ascii=False)
-            f.write("\n")
-        print(f"Catalog updated: {CATALOG_PATH}")
-
+    # render_min/render_max aren't computed here — scripts/gis/build_overviews.py
+    # computes those for every continuous layer as a percentile of valid pixel
+    # values (config.PERCENTILE_RENDER_BOUNDS) and runs right after this stage
+    # in the rebuild pipeline, so anything set here would be immediately
+    # overwritten. sreg's fixed 0-4 ordinal bounds are set directly in
+    # catalog.json and untouched by either script.
     print("[download_snow] done.")
 
 

@@ -27,6 +27,20 @@ script needing its own special-casing.
     (e.g. precipitation) compressing the bulk of "normal" values into a
     narrow slice of the color range under a linear scale. Never applied to
     nominal/ordinal layers.
+
+Also builds the equivalent of "overviews" for native vector-source layers
+(catalog entries with a "vector_field", e.g. ecoregions/biome — see
+scripts/gis/download_ecoregions.py): a pre-simplified sibling file per zoom
+level 0-VECTOR_PYRAMID_MAX_ZOOM, via GeoSeries.simplify_coverage(). Without
+this, util/tiles.py's per-tile vector rasterizer would have to simplify (or
+worse, burn full-detail geometry) on every request — full-detail RESOLVE
+ecoregion polygons can carry tens of thousands of vertices each, and a
+zoomed-out tile's bbox typically overlaps dozens of them, so paying that
+cost live made low-zoom tiles painfully slow. simplify_coverage (rather
+than simplifying each polygon independently) treats the layer as a
+coverage and simplifies its shared boundary network jointly, so adjacent
+polygons — ecoregions share a lot of borders — don't drift apart into
+gaps/overlaps.
 """
 
 from __future__ import annotations
@@ -50,6 +64,13 @@ MAX_OVERVIEW_FACTOR = 2048
 
 OVERVIEW_FACTOR_TOLERANCE_RATIO = 0.03
 OVERVIEW_FACTOR_TOLERANCE_MIN   = 2
+
+# Must match util.tiles.VECTOR_PYRAMID_MAX_ZOOM (which picks these files at
+# request time) — zoom levels 0..N are precomputed here; above N the
+# full-detail source is used directly, since tolerance is sub-meter by then
+# and RESOLVE's own source data isn't that precise to begin with.
+VECTOR_PYRAMID_MAX_ZOOM = 10
+_WEB_MERCATOR_HALF_CIRCUMFERENCE_M = 2 * math.pi * 6378137 / 2.0
 
 
 def _load_layer_meta() -> dict[str, dict]:
@@ -219,7 +240,42 @@ def _build_cog(src_path: Path, dst_path: Path, *, nominal: bool, overview_factor
         base_tif.unlink(missing_ok=True)
 
 
-def main() -> None:
+def _vector_layer_filenames(layer_meta: dict[str, dict]) -> set[str]:
+    return {fname for fname, layer in layer_meta.items() if layer.get("vector_field")}
+
+
+def _tolerance_for_zoom(z: int) -> float:
+    """Web Mercator meters-per-pixel at zoom `z` (256px tiles) — the same
+    "don't remove detail finer than one screen pixel" tolerance Mapnik/
+    GeoServer/Tippecanoe use for scale-dependent generalization.
+    """
+    return (2 * _WEB_MERCATOR_HALF_CIRCUMFERENCE_M) / (256 * (2 ** z))
+
+
+def _build_vector_pyramid(path: Path) -> bool:
+    """Precompute simplify_coverage()'d siblings of a vector layer source at
+    each zoom in [0, VECTOR_PYRAMID_MAX_ZOOM] — see util.tiles._vector_pyramid_path
+    for how the tile renderer picks between them.
+    """
+    import geopandas as gpd
+
+    gdf = gpd.read_parquet(path)
+    src_mtime = path.stat().st_mtime
+    built_any = False
+    for z in range(VECTOR_PYRAMID_MAX_ZOOM + 1):
+        out_path = path.with_name(f"{path.stem}.z{z:02d}{path.suffix}")
+        if out_path.exists() and out_path.stat().st_mtime >= src_mtime:
+            continue
+        simplified = gdf.copy()
+        simplified["geometry"] = gdf.geometry.simplify_coverage(_tolerance_for_zoom(z))
+        tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+        simplified.to_parquet(tmp, compression="zstd")
+        os.replace(tmp, out_path)
+        built_any = True
+    return built_any
+
+
+def main(fill: bool = False) -> None:
     if not LAYERS_DIR.exists():
         raise FileNotFoundError(f"Layers directory not found: {LAYERS_DIR}")
 
@@ -236,11 +292,12 @@ def main() -> None:
 
         try:
             force_rebuild = False
-            if layer_id in ZERO_NODATA_LAYERS and _fill_nodata_with_zero(path):
+            if fill and layer_id in ZERO_NODATA_LAYERS and _fill_nodata_with_zero(path):
                 print(f"[overview] zero-filled nodata -> {path.name}")
                 force_rebuild = True
 
-            if layer_id and value_type not in ("nominal", "ordinal"):
+            has_render_bounds = bool(layer) and layer.get("render_min") is not None and layer.get("render_max") is not None
+            if layer_id and value_type not in ("nominal", "ordinal") and not has_render_bounds:
                 new_min, new_max = _compute_percentile_bounds(path, layer)
                 if (layer.get("render_min"), layer.get("render_max")) != (new_min, new_max):
                     print(
@@ -272,6 +329,20 @@ def main() -> None:
             path.with_suffix(".tif.tmp").unlink(missing_ok=True)
             path.with_suffix(".base.tif").unlink(missing_ok=True)
 
+    for filename in sorted(_vector_layer_filenames(layer_meta)):
+        path = LAYERS_DIR / filename
+        if not path.exists():
+            continue
+        total += 1
+        try:
+            if _build_vector_pyramid(path):
+                print(f"[overview] vector pyramid built -> {path.name}")
+                updated += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            print(f"[overview] failed vector pyramid {path.name}: {exc}")
+
     if catalog_updates:
         # Re-read from disk before writing so external edits made while this
         # ran aren't clobbered — same pattern as download_chelsa.py.
@@ -292,4 +363,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--fill", action="store_true",
+        help="Also zero-fill nodata pixels for ZERO_NODATA_LAYERS (reads each "
+             "matching layer's full band every run until its nodata flag is "
+             "cleared — off by default, opt in when actually needed).",
+    )
+    args = parser.parse_args()
+    main(fill=args.fill)

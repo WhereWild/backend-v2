@@ -43,6 +43,7 @@ from util.gis import (
     sample_elevation_terrain_batch,
     sample_slope_batch,
     sample_soil_texture_batch,
+    sample_vector_batch,
 )
 from util.stats import (
     CIRCULAR_STATS_FILE,
@@ -405,6 +406,12 @@ def enrich_with_gis(df: pd.DataFrame) -> pd.DataFrame:
             elif layer_id in DERIVED_FROM_SOIL:
                 sorted_vals = sample_soil_texture_batch(s_lats, s_lons)
                 result[layer_id] = [sorted_vals[i] for i in restore]
+            elif layer.get("vector_field"):
+                vec_path = resolve_layer_path(LAYERS_DIR, layer["filename"])
+                if not vec_path.exists():
+                    continue
+                sorted_arr = sample_vector_batch(vec_path, layer["vector_field"], s_lats, s_lons)
+                result[layer_id] = [None if np.isnan(sorted_arr[i]) else sorted_arr[i] for i in restore]
             else:
                 cog_path = resolve_layer_path(LAYERS_DIR, layer["filename"])
                 if not cog_path.exists():

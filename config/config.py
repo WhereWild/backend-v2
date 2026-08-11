@@ -57,9 +57,6 @@ METRICS_BY_TYPE: dict[ValueType, tuple[str, ...]] = {
 ZERO_NODATA_LAYERS: frozenset[str] = frozenset({
     "swe", "scd", "fcf",
     "gdd0", "gdd5", "gdd10",
-    "gddlgd0", "gddlgd5", "gddlgd10",
-    "ngd0", "ngd5", "ngd10",
-    "gsl",
     "scdur", "scsl", "sfsl", "sper", "ssper", "sreg",
 })
 
@@ -70,11 +67,10 @@ ZERO_NODATA_LAYERS: frozenset[str] = frozenset({
 # sits). Render bounds are instead the 1st/99th percentile of valid pixel
 # values for every continuous (interval/ratio) layer, computed once in
 # scripts/gis/build_overviews.py (same single-source-of-truth reasoning as
-# ZERO_NODATA_LAYERS above) — deliberately OVERWRITES whatever render_min/
-# render_max a layer's download script already set, rather than filling
-# only when null, since replacing the true-extremes convention is the whole
-# point. Never applied to nominal/ordinal layers — percentile bounds are
-# meaningless for discrete classes.
+# ZERO_NODATA_LAYERS above) — only fills render_min/render_max when a
+# layer's download script left them null, never overwrites values that are
+# already set. Never applied to nominal/ordinal layers — percentile bounds
+# are meaningless for discrete classes.
 PERCENTILE_RENDER_BOUNDS: tuple[float, float] = (1.0, 99.0)
 
 _REGISTRY: dict[str, type] = {}

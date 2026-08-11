@@ -3,9 +3,27 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
-Download the RESOLVE Ecoregions2017 shapefile and rasterize it into two
-global nominal COGs: fine-grained ecoregions (ECO_ID, 847 classes) and
-coarse biomes (BIOME_NUM, 15 classes).
+Download the RESOLVE Ecoregions2017 shapefile and prepare it as a native
+vector source — fine-grained ecoregions (ECO_ID, 847 classes) and coarse
+biomes (BIOME_NUM, 15 classes) both live in one file, rendered directly from
+polygon geometry at request time (see util/tiles.py's vector dispatch)
+instead of a pre-baked global raster.
+
+A prior version of this script rasterized the shapefile globally at 1
+arcsec (~30m) via gdal_rasterize — a multi-hour job producing an ~840B
+pixel grid — and still showed visible mismatches against real coastlines
+near the poles and around small islands. Neither problem is really about
+resolution: gdal_rasterize burns onto a *fixed-degree* WGS84 grid, whose
+real ground size shrinks by cos(latitude) toward the poles (cells become
+tall slivers there, which a fixed lon/lat sampling grid handles poorly
+regardless of how fine it is), and it doesn't split geometries that cross
+the antimeridian (~180°E/W), which silently corrupts them once the raster
+is later warped into a projection like Web Mercator that also has a seam
+there. Serving straight from the original polygon boundaries, at whatever
+resolution each tile actually needs, sidesteps both: there's no
+intermediate discretized grid to introduce sampling artifacts, and the
+polygons are pre-split at the seam once here instead of relying on a
+raster to represent something that crosses it.
 
 Source: https://storage.googleapis.com/teow2016/Ecoregions2017.zip (~150MB,
 EPSG:4326, CC-BY 4.0). Every polygon record carries both a unique ECO_ID
@@ -18,11 +36,13 @@ biome class id (15) here so ice-sheet area doesn't get counted as Tundra.
 Steps:
   1. Download the zip via aria2c (skips if already present)
   2. Extract the shapefile components (.shp/.shx/.dbf/.prj)
-  3. gdal_rasterize -a ECO_ID              → layers/ecoregions.tif (UInt16)
-     gdal_rasterize -sql <biome remap>     → layers/biome.tif      (Byte)
-  4. Rebuild config/gis/legends/{ecoregions,biome}_legend.json from the same
+  3. ogr2ogr -wrapdateline           → split antimeridian-crossing polygons
+  4. Compute BIOME_ID (rock & ice remap), reproject to EPSG:3857, write
+     layers/ecoregions_vector.parquet (ECO_ID + BIOME_ID + geometry, one
+     file backs both layers since the polygons are shared)
+  5. Rebuild config/gis/legends/{ecoregions,biome}_legend.json from the same
      shapefile attributes (ECO_NAME/BIOME_NAME/COLOR/COLOR_BIO), so the
-     legend always matches what got burned into the rasters.
+     legend always matches what's in the vector file.
 
 Usage (inside the gdal container):
     uv run python -m scripts.gis.download_ecoregions [--force]
@@ -60,12 +80,10 @@ LEGENDS_DIR = Path("config/gis/legends")
 # every layer gets independently warped to the requested tile at serve time.
 # ~840B pixels globally (vs. ~933M before) — expect a much longer rasterize
 # and a much larger (if still well-compressed) output file.
-RESOLUTION_DEG = 1.0 / 3600.0
 ROCK_AND_ICE_ECO_ID  = 0
 ROCK_AND_ICE_BIOME_ID = 15
 
-ECOREGIONS_OUT = LAYERS_DIR / "ecoregions.tif"
-BIOME_OUT      = LAYERS_DIR / "biome.tif"
+VECTOR_OUT = LAYERS_DIR / "ecoregions_vector.parquet"
 
 CITATION = (
     "Dinerstein et al. (2017). An Ecoregion-Based Approach to Protecting Half "
@@ -119,82 +137,50 @@ def _extract_shapefile(zip_path: Path, out_dir: Path) -> Path:
     return shp_path
 
 
-# ── rasterize ────────────────────────────────────────────────────────────────
+# ── vectorize ────────────────────────────────────────────────────────────────
 #
-# gdal_rasterize writes tiled/BigTIFF output out of row order (it seeks back
-# to patch the TIFF directory as tiles complete). That fails silently and
-# instantly on this host's data/gis/layers/ mount (a WSL2 bind mount) even
-# though the directory is otherwise perfectly writable — confirmed by the
-# identical command succeeding both untiled to that same directory and fully
-# tiled to /tmp. So: rasterize into a local tempdir (proven reliable), then
-# land the finished file in data/gis/layers/ with a plain sequential copy,
-# which is a completely different (append-only) I/O pattern that the mount
-# handles fine.
+# No rasterization at all: the tile renderer (util/tiles.py) burns these
+# polygons directly onto each requested tile's own grid, in its own
+# projection, on demand. This step just needs to hand it clean geometry —
+# split at the antimeridian and reprojected once — plus the two attribute
+# columns (ECO_ID, BIOME_ID) it needs to color by.
 
-def _rasterize(
-    shp_path: Path,
-    out_path: Path,
-    *,
-    field: str,
-    sql: str | None = None,
-    dtype: str,
-    nodata: str,
-) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def _wrapdateline_shapefile(shp_path: Path, tmp_dir: Path) -> Path:
+    """Split polygons crossing the antimeridian (~180°E/W) so none of them
+    wrap the long way around the globe once reprojected. Source ecoregions
+    genuinely do cross it (e.g. Bering Sea / Chukotka), and a projection
+    with a seam there (Web Mercator included) renders an unsplit crossing
+    polygon as a shape spanning nearly the whole map width instead of a
+    normal-looking region hugging the seam on both sides.
+    """
+    out_path = tmp_dir / f"{SHP_STEM}_wrapped.shp"
+    _run(["ogr2ogr", "-wrapdateline", "-datelineoffset", "10", str(out_path), str(shp_path)])
+    return out_path
+
+
+def _build_vector_source(shp_path: Path, out_path: Path) -> None:
+    import geopandas as gpd
+
     with tempfile.TemporaryDirectory() as tmp_dir:
-        scratch = Path(tmp_dir) / out_path.name
-        cmd = ["gdal_rasterize"]
-        if sql is not None:
-            # OGR's default SQL dialect has no CASE WHEN — needs SQLite's.
-            cmd += ["-sql", sql, "-dialect", "SQLite"]
-        cmd += [
-            "-a", field,
-            "-ot", dtype,
-            "-a_nodata", nodata,
-            "-init", nodata,
-            # Without this, gdal_rasterize only burns a pixel whose *center*
-            # falls inside a polygon. Cells are fixed-size in degrees, so
-            # their real-world width shrinks by cos(latitude) while height
-            # stays constant — near the poles each cell is a tall, narrow
-            # sliver, and center-only testing misses much more of what's
-            # actually under it than it would near the equator. That's what
-            # was producing gappy, offset-looking boundaries at high
-            # latitude. -at burns every pixel the polygon touches at all.
-            "-at",
-            "-te", "-180", "-90", "180", "90",
-            "-tr", str(RESOLUTION_DEG), str(RESOLUTION_DEG),
-            "-a_srs", "EPSG:4326",
-            "-co", "COMPRESS=DEFLATE",
-            "-co", "TILED=YES",
-            "-co", "BLOCKXSIZE=256",
-            "-co", "BLOCKYSIZE=256",
-            "-co", "BIGTIFF=YES",
-            str(shp_path), str(scratch),
-        ]
-        _run(cmd)
+        wrapped_path = _wrapdateline_shapefile(shp_path, Path(tmp_dir))
+        gdf = gpd.read_file(wrapped_path)
 
-        dest_tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-        dest_tmp.unlink(missing_ok=True)
-        with scratch.open("rb") as src, dest_tmp.open("wb") as dst:
-            shutil.copyfileobj(src, dst, length=64 * 1024 * 1024)
+    gdf["geometry"] = gdf["geometry"].make_valid()
+    gdf = gdf[gdf["geometry"].notna() & ~gdf["geometry"].is_empty]
+
+    rock_and_ice = gdf["ECO_ID"].astype(int) == ROCK_AND_ICE_ECO_ID
+    gdf["ECO_ID"] = gdf["ECO_ID"].astype("int32")
+    gdf["BIOME_ID"] = gdf["BIOME_NUM"].astype("int32")
+    gdf.loc[rock_and_ice, "BIOME_ID"] = ROCK_AND_ICE_BIOME_ID
+
+    gdf = gdf[["ECO_ID", "BIOME_ID", "geometry"]].to_crs(epsg=3857)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_out = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp_out.unlink(missing_ok=True)
+    gdf.to_parquet(tmp_out, compression="zstd")
     out_path.unlink(missing_ok=True)
-    dest_tmp.replace(out_path)
-
-
-def _rasterize_ecoregions(shp_path: Path, out_path: Path) -> None:
-    _rasterize(shp_path, out_path, field="ECO_ID", dtype="UInt16", nodata="65535")
-
-
-def _rasterize_biome(shp_path: Path, out_path: Path) -> None:
-    # SELECT * (not just the computed column) — an OGR SQL query that only
-    # names the computed column drops the geometry entirely, silently
-    # producing an all-nodata raster with no error from gdal_rasterize.
-    remap_sql = (
-        f"SELECT *, (CASE WHEN ECO_ID={ROCK_AND_ICE_ECO_ID} "
-        f"THEN {ROCK_AND_ICE_BIOME_ID} ELSE CAST(BIOME_NUM AS INTEGER) END) "
-        f"AS BIOME_ID FROM {SHP_STEM}"
-    )
-    _rasterize(shp_path, out_path, field="BIOME_ID", sql=remap_sql, dtype="Byte", nodata="255")
+    tmp_out.replace(out_path)
 
 
 # ── legends ──────────────────────────────────────────────────────────────────
@@ -409,9 +395,8 @@ def main(force: bool = False) -> None:
         print("[download_ecoregions] skipped (ecoregions/biome not in VARS_TO_DOWNLOAD)")
         return
 
-    rasters_done = ECOREGIONS_OUT.exists() and BIOME_OUT.exists()
-    if rasters_done and not force:
-        print(f"[skip] rasters already exist: {ECOREGIONS_OUT}, {BIOME_OUT} (--force to rebuild)")
+    if VECTOR_OUT.exists() and not force:
+        print(f"[skip] vector source already exists: {VECTOR_OUT} (--force to rebuild)")
         return
 
     zip_dest = RAW_ZIP_DIR / ZIP_FILENAME
@@ -424,11 +409,8 @@ def main(force: bool = False) -> None:
     print("Extracting shapefile...")
     shp_path = _extract_shapefile(zip_dest, RAW_DIR)
 
-    print(f"Rasterizing ecoregions (ECO_ID) → {ECOREGIONS_OUT}")
-    _rasterize_ecoregions(shp_path, ECOREGIONS_OUT)
-
-    print(f"Rasterizing biome (BIOME_NUM, Rock & Ice → {ROCK_AND_ICE_BIOME_ID}) → {BIOME_OUT}")
-    _rasterize_biome(shp_path, BIOME_OUT)
+    print(f"Building vector source (ECO_ID + BIOME_ID, dateline-split, EPSG:3857) → {VECTOR_OUT}")
+    _build_vector_source(shp_path, VECTOR_OUT)
 
     print("Building legends from shapefile attributes...")
     _build_legends(shp_path)

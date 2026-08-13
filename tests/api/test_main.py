@@ -49,6 +49,37 @@ def test_health():
     assert response.json() == {"status": "ok"}
 
 
+def test_version_reports_crawl_date_and_build_date(tmp_path):
+    sync_state = tmp_path / "sync_state.json"
+    sync_state.write_text(json.dumps({
+        "gbif_occurrences": {"crawl_finished": "2026-08-01T00:00:00.000Z"},
+    }))
+    build_date = tmp_path / "build_date.txt"
+    build_date.write_text("2026-08-10T12:00:00Z\n")
+
+    with patch.object(main_module, "_SYNC_STATE_PATH", sync_state), \
+         patch.object(main_module, "_BUILD_DATE_PATH", build_date):
+        response = client.get("/version")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "version": "2026-08-01T00:00:00.000Z",
+        "api_build_date": "2026-08-10T12:00:00Z",
+    }
+
+
+def test_version_omits_build_date_when_file_missing(tmp_path):
+    sync_state = tmp_path / "sync_state.json"
+    missing_build_date = tmp_path / "build_date.txt"
+
+    with patch.object(main_module, "_SYNC_STATE_PATH", sync_state), \
+         patch.object(main_module, "_BUILD_DATE_PATH", missing_build_date):
+        response = client.get("/version")
+
+    assert response.status_code == 200
+    assert response.json() == {"version": None, "api_build_date": None}
+
+
 def test_get_taxon_by_id():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \

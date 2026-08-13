@@ -63,6 +63,9 @@ _CONFIG = load_config("global")
 _SYNC_STATE_PATH = Path("data/sync_state.json")
 _PIPELINE_STATE_PATH = Path("data/pipeline_state.json")
 _TEMPORAL_STATE_PATH = Path("data/temporal_state.json")
+# Deliberately outside data/, which gets wiped locally to clear bad state; this file is
+# only ever rewritten by the deploy workflow, so a restart or a data/ wipe can't touch it.
+_BUILD_DATE_PATH = Path("build_date.txt")
 _storage = ParquetStorageProxy(
     data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
     project_root=Path(__file__).parent,
@@ -337,7 +340,13 @@ def version():
         )
     except Exception:
         crawl_ts = None
-    return {"version": crawl_ts}
+    try:
+        api_build_date = (
+            _BUILD_DATE_PATH.read_text().strip() if _BUILD_DATE_PATH.exists() else None
+        )
+    except Exception:
+        api_build_date = None
+    return {"version": crawl_ts, "api_build_date": api_build_date or None}
 
 
 @app.get("/status")

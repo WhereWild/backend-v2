@@ -263,7 +263,7 @@ def _iter_worklist_batches(
         f"SELECT {col_list} FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') "
         f"WHERE {where} ORDER BY hilbertIdx"
     )
-    con = duckdb.connect()
+    con = _duckdb_connect()
     try:
         con.register("scope_keys", pa.table({"taxon_key": pa.array(scope_keys, type=pa.string())}))
         reader = con.execute(sql).to_arrow_reader(row_limit)

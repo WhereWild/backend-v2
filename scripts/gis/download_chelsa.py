@@ -16,7 +16,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import numpy as np
 import rasterio
 
 CATALOG_PATH = Path("config/gis/catalog.json")

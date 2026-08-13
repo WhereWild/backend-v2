@@ -3,13 +3,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
-Download Hengl 2018 global landform and lithology classified TIFs from Zenodo
-and convert each to a Cloud-Optimised GeoTIFF.
+Download the Hengl 2018 global lithology classified TIF from Zenodo and
+convert it to a Cloud-Optimised GeoTIFF.
 
 Source: https://zenodo.org/records/1464846
-Two files are fetched — the composite classified rasters (suffix _c_):
-  dtm_landform_usgs.ecotapestry_c_250m_s0..0cm_2014_v1.0.tif   (~683 MB)
   dtm_lithology_usgs.ecotapestry_c_250m_s0..0cm_2014_v1.0.tif  (~232 MB)
+
+(This record also has a landform composite, but that layer was dropped from
+the catalog — pending a better replacement — so it's no longer fetched here.)
 
 Steps:
   1. Query Zenodo API for per-file download URLs (cached in raw_dir)
@@ -40,7 +41,7 @@ RAW_DIR      = Path("data/gis/hengl_raw")
 ZENODO_API   = "https://zenodo.org/api/records"
 RECORD_ID    = "1464846"
 
-_TARGET_LAYERS = ("landform", "lithology")
+_TARGET_LAYERS = ("lithology",)
 _COMPOSITE_STEM = "_c_250m_s0..0cm_2014_v1.0.tif"
 _CSV_STEM       = "_c_250m_s0..0cm_2014_v1.0.tif.csv"  # RAT: class id → name mapping
 _UA = "wherewild-download-hengl/1.0"

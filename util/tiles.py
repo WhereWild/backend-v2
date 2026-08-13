@@ -102,7 +102,27 @@ def _open_raster(path: Path):
 
 WEB_MERCATOR      = CRS.from_epsg(3857)
 WGS84             = CRS.from_epsg(4326)
-_MERCATOR_HALF    = 2 * math.pi * 6378137 / 2.0
+_MERCATOR_R       = 6378137.0
+_MERCATOR_HALF    = 2 * math.pi * _MERCATOR_R / 2.0
+
+
+def wgs84_to_mercator(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized WGS84 lon/lat (degrees) -> EPSG:3857 Web Mercator x/y (meters).
+
+    EPSG:3857 is itself a spherical (not ellipsoidal) projection — the exact
+    formula here matches pyproj's to_crs(epsg=3857) bit-for-bit (verified
+    directly), so point batches can be reprojected without round-tripping
+    through a pyproj Transformer. Used by util/gis.py and
+    scripts/enrich_tree.py to reproject occurrence lat/lon points into the
+    same CRS the native vector layer sources (e.g. ecoregions/biome) were
+    written in, for point-in-polygon sampling.
+    """
+    lon = np.asarray(lon, dtype=np.float64)
+    lat = np.asarray(lat, dtype=np.float64)
+    x = np.radians(lon) * _MERCATOR_R
+    y = np.log(np.tan(np.pi / 4.0 + np.radians(lat) / 2.0)) * _MERCATOR_R
+    return x, y
+
 
 SUPPORTED_COLORMAPS = frozenset({"viridis", "plasma", "inferno", "magma", "cividis", "gray"})
 _DEFAULT_COLORMAP = "viridis"
@@ -641,7 +661,8 @@ def _render_temporal_tile_rgba(
     var_id = layer["var_id"]
     window_label = layer["window_label"]
     model = layer.get("model", "copernicus_era5")
-    nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
+    value_type = str(layer.get("value_type") or "").lower()
+    nominal = value_type in ("nominal", "ordinal")
 
     npy_path = TEMPORAL_RASTERS_DIR / f"{var_id}_{window_label}{forecast_suffix}.npy"
     arr = _load_temporal_npy(npy_path)
@@ -673,7 +694,18 @@ def _render_temporal_tile_rgba(
         vmin = vmin if vmin is not None else 0.0
         vmax = vmax if vmax is not None else 1.0
 
-    if nominal:
+    if value_type == "ordinal":
+        # Ordinal classes have no separate accessibility variant — the
+        # selected continuous colormap doubles as a cb_colors.json "mode"
+        # key (see gen_colors.py's generate_ordinal_variable), stepped into
+        # one swatch per class instead of smoothly interpolated.
+        ordinal_cmap = _cb_colormap_for_layer(layer_id, colormap)
+        rgba = (
+            _colorize_nominal(dest, ordinal_cmap, class_filter)
+            if ordinal_cmap
+            else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap, value_ranges)
+        )
+    elif value_type == "nominal":
         if cb_mode in SUPPORTED_CB_MODES:
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
@@ -683,7 +715,7 @@ def _render_temporal_tile_rgba(
             if nominal_cmap
             else _colorize(dest, vmin or 0.0, vmax or 1.0, colormap, value_ranges)
         )
-    elif str(layer.get("value_type") or "").lower() == "circular":
+    elif value_type == "circular":
         circular_colormap = (
             colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP
         )
@@ -762,6 +794,23 @@ def _nominal_tile_range_classes_temporal(
     return counts
 
 
+def _nominal_tile_range_classes_vector(layer: dict, z: int, x0: int, y0: int, x1: int, y1: int) -> dict[int, int]:
+    """Class-count variant for native vector-source layers (e.g. ecoregions/biome)."""
+    counts: dict[int, int] = {}
+    for tx in range(x0, x1 + 1):
+        for ty in range(y0, y1 + 1):
+            mx0, my0, mx1, my1 = tile_bounds_mercator(z, tx, ty)
+            dst_transform = from_bounds(mx0, my0, mx1, my1, 256, 256)
+            dest = _sample_vector_layer_to_tile(layer, z, tx, ty, 256, dst_transform)
+            finite = np.isfinite(dest)
+            if not finite.any():
+                continue
+            vals, tile_counts = np.unique(np.round(dest[finite]).astype(np.int32), return_counts=True)
+            for v, c in zip(vals.tolist(), tile_counts.tolist()):
+                counts[int(v)] = counts.get(int(v), 0) + int(c)
+    return counts
+
+
 def _nominal_tile_range_classes_soil(z: int, x0: int, y0: int, x1: int, y1: int) -> dict[int, int]:
     """Class-count variant for the soil_texture derived nominal layer."""
     from util.gis import _SOIL_TEXTURE_INPUT_FILES, derive_soil_texture_array
@@ -804,6 +853,8 @@ def nominal_tile_range_classes(
     from util.gis import DERIVED_FROM_SOIL
     if layer_id in DERIVED_FROM_SOIL:
         return _nominal_tile_range_classes_soil(z, x0, y0, x1, y1)
+    if layer.get("vector_field"):
+        return _nominal_tile_range_classes_vector(layer, z, x0, y0, x1, y1)
 
     path = resolve_layer_path(LAYERS_DIR, layer["filename"])
     counts: dict[int, int] = {}
@@ -1087,6 +1138,85 @@ def _render_derived_soil_texture_tile_bytes(
     return _encode_png(rgba)
 
 
+VECTOR_PYRAMID_MAX_ZOOM = 10  # beyond this, full-detail source geometry is used directly
+
+
+def _vector_pyramid_path(base_path: Path, z: int) -> Path:
+    """Return the pre-simplified sibling file for zoom `z`, if one was built.
+
+    Siblings (<stem>.z{NN}.parquet) are precomputed once by
+    scripts/gis/build_overviews.py via GeoSeries.simplify_coverage() — a
+    topology-aware simplification that keeps shared borders between
+    polygons seamless, unlike simplifying each polygon independently. This
+    function only picks a file; no simplification happens at request time.
+    Falls back to the full-detail source if the pyramid hasn't been built
+    yet, so rendering still works before that build step has run.
+    """
+    bucket = min(z, VECTOR_PYRAMID_MAX_ZOOM)
+    candidate = base_path.with_name(f"{base_path.stem}.z{bucket:02d}{base_path.suffix}")
+    return candidate if candidate.exists() else base_path
+
+
+@lru_cache(maxsize=32)
+def _load_vector_layer(path: Path):
+    """Load+cache a native vector layer source (GeoDataFrame, EPSG:3857).
+
+    Written by scripts/gis/download_ecoregions.py already reprojected and
+    split at the antimeridian, so no per-request geometry fixups are needed
+    here — just build the spatial index once at load time rather than on
+    the first tile request.
+    """
+    import geopandas as gpd
+    if not path.exists():
+        return None
+    gdf = gpd.read_parquet(path)
+    _ = gdf.sindex
+    return gdf
+
+
+def _sample_vector_layer_to_tile(
+    layer: dict, z: int, x: int, y: int, tile_size: int, dst_transform,
+) -> np.ndarray:
+    """Rasterize a native vector source layer directly onto a tile's grid.
+
+    For layers whose real source is polygon geometry (RESOLVE
+    ecoregions/biome) rather than a pre-baked raster: burns each tile's
+    intersecting polygons straight from `layer["vector_field"]` at exactly
+    the resolution this tile needs, so there's no discretized intermediate
+    grid to introduce sampling artifacts — see
+    scripts/gis/download_ecoregions.py's module docstring for why that
+    replaced a global gdal_rasterize pre-bake.
+    """
+    from rasterio.features import rasterize as rio_rasterize
+    from shapely.geometry import box
+
+    dest = np.full((tile_size, tile_size), np.nan, dtype=np.float32)
+    path = _vector_pyramid_path(resolve_layer_path(LAYERS_DIR, layer["filename"]), z)
+    gdf = _load_vector_layer(path)
+    if gdf is None or gdf.empty:
+        return dest
+
+    mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
+    hits = list(gdf.sindex.query(box(mx0, my0, mx1, my1), predicate="intersects"))
+    if not hits:
+        return dest
+
+    subset = gdf.iloc[hits]
+    field = layer["vector_field"]
+    shapes = list(zip(subset.geometry, subset[field].astype("int32"), strict=True))
+    burned = rio_rasterize(
+        shapes,
+        out_shape=(tile_size, tile_size),
+        transform=dst_transform,
+        fill=-1,
+        all_touched=True,
+        dtype="int32",
+    )
+    dest = burned.astype(np.float32)
+    dest[burned < 0] = np.nan
+    return dest
+
+
 def _sample_static_cog_to_tile(
     layer: dict, z: int, x: int, y: int, tile_size: int, dst_transform,
     resampling: Resampling = Resampling.nearest,
@@ -1208,20 +1338,29 @@ def _render_static_layer_tile_rgba(
     value_ranges: list[tuple[float | None, float | None]] | None = None,
 ) -> np.ndarray:
     layer_id = layer["id"]
-    nominal = str(layer.get("value_type") or "").lower() in ("nominal", "ordinal")
+    value_type = str(layer.get("value_type") or "").lower()
     mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
     dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
-    dest, vmin, vmax = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
+    if layer.get("vector_field"):
+        dest = _sample_vector_layer_to_tile(layer, z, x, y, tile_size, dst_transform)
+        vmin, vmax = layer.get("render_min"), layer.get("render_max")
+    else:
+        dest, vmin, vmax = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
     vmin = vmin if vmin is not None else 0.0
     vmax = vmax if vmax is not None else 1.0
 
-    if nominal:
+    if value_type == "ordinal":
+        # See _render_temporal_tile_rgba for why ordinal reuses the
+        # colormap-name-as-cb-mode lookup instead of legend-file colors.
+        ordinal_cmap = _cb_colormap_for_layer(layer_id, colormap)
+        return _colorize_nominal(dest, ordinal_cmap, class_filter) if ordinal_cmap else _colorize(dest, vmin, vmax, colormap, value_ranges)
+    if value_type == "nominal":
         if cb_mode in SUPPORTED_CB_MODES:
             nominal_cmap = _cb_colormap_for_layer(layer_id, cb_mode) or _load_nominal_colormap(layer_id)
         else:
             nominal_cmap = _load_nominal_colormap(layer_id)
         return _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap, value_ranges)
-    if str(layer.get("value_type") or "").lower() == "circular":
+    if value_type == "circular":
         return _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_ranges)
     return _colorize(dest, vmin, vmax, colormap, value_ranges)
 
@@ -1255,6 +1394,8 @@ def _sample_layer_to_tile(
         return _sample_elevation_derived_to_tile(z, x, y, tile_size, derive_fn, dst_transform)
     if layer_id in DERIVED_FROM_SOIL:
         return _sample_soil_texture_to_tile(z, x, y, tile_size, dst_transform)
+    if layer.get("vector_field"):
+        return _sample_vector_layer_to_tile(layer, z, x, y, tile_size, dst_transform)
     dest, _vmin, _vmax = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
     return dest
 

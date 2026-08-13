@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -854,7 +856,7 @@ def test_load_gid_levels_bad_level_value(tmp_path, monkeypatch):
 # stats straight into one sorted file per type.
 # ---------------------------------------------------------------------------
 
-def test_accumulate_numerical_or_circular_numerical(tmp_path):
+def test_wide_seen_and_counts_numerical(tmp_path):
     path = tmp_path / "numerical_stats.parquet"
     pq.write_table(pa.table({
         "taxon_key": ["100", "200"],
@@ -862,16 +864,13 @@ def test_accumulate_numerical_or_circular_numerical(tmp_path):
         "count": [10, 20],
         "mean": [5.0, 7.5],
     }), path)
-    raw: dict[str, dict] = {}
-    rk._accumulate_numerical_or_circular(
-        raw, path, "numerical", {"bio1"}, {"bio1": ("mean", "count")},
-    )
-    assert raw["100"]["bio1::mean"] == pytest.approx(5.0)
-    assert raw["100"]["__sample_count__"] == 10
-    assert raw["200"]["bio1::mean"] == pytest.approx(7.5)
+    seen, sample_counts = rk._wide_seen_and_counts(path, "numerical", {"bio1"})
+    assert seen == {"100", "200"}
+    assert sample_counts["100"] == 10
+    assert sample_counts["200"] == 20
 
 
-def test_accumulate_numerical_or_circular_ignores_unknown_variable(tmp_path):
+def test_wide_seen_and_counts_ignores_unknown_variable(tmp_path):
     path = tmp_path / "numerical_stats.parquet"
     pq.write_table(pa.table({
         "taxon_key": ["100"],
@@ -879,18 +878,44 @@ def test_accumulate_numerical_or_circular_ignores_unknown_variable(tmp_path):
         "count": [10],
         "mean": [5.0],
     }), path)
-    raw: dict[str, dict] = {}
-    rk._accumulate_numerical_or_circular(raw, path, "numerical", {"bio1"}, {"bio1": ("mean",)})
-    assert raw == {}
+    seen, sample_counts = rk._wide_seen_and_counts(path, "numerical", {"bio1"})
+    assert seen == set()
+    assert sample_counts is None
 
 
-def test_accumulate_numerical_or_circular_missing_file_is_noop(tmp_path):
-    raw: dict[str, dict] = {}
-    rk._accumulate_numerical_or_circular(raw, tmp_path / "nope.parquet", "numerical", {"bio1"}, {})
-    assert raw == {}
+def test_wide_seen_and_counts_missing_file_is_noop(tmp_path):
+    seen, sample_counts = rk._wide_seen_and_counts(tmp_path / "nope.parquet", "numerical", {"bio1"})
+    assert seen == set()
+    assert sample_counts is None
 
 
-def test_accumulate_numerical_or_circular_circular(tmp_path):
+def test_wide_fill_numerical(tmp_path):
+    path = tmp_path / "numerical_stats.parquet"
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "200"],
+        "variable": ["bio1", "bio1"],
+        "count": [10, 20],
+        "mean": [5.0, 7.5],
+    }), path)
+    row_idx = pd.Index(["100", "200"])
+    taxon_pos = pd.Series([0, 1], index=row_idx)
+    metric_pos = pd.Series([0], index=["bio1::mean"])
+    values = np.full((2, 1), np.nan, dtype=np.float32)
+    rk._wide_fill(values, taxon_pos, metric_pos, path, "numerical", {"bio1"}, {"bio1": ("mean",)})
+    assert values[0, 0] == pytest.approx(5.0)
+    assert values[1, 0] == pytest.approx(7.5)
+
+
+def test_wide_fill_missing_file_is_noop(tmp_path):
+    row_idx = pd.Index(["100"])
+    taxon_pos = pd.Series([0], index=row_idx)
+    metric_pos = pd.Series([0], index=["bio1::mean"])
+    values = np.full((1, 1), np.nan, dtype=np.float32)
+    rk._wide_fill(values, taxon_pos, metric_pos, tmp_path / "nope.parquet", "numerical", {"bio1"}, {})
+    assert np.isnan(values[0, 0])
+
+
+def test_wide_fill_circular(tmp_path):
     path = tmp_path / "circular_stats.parquet"
     pq.write_table(pa.table({
         "taxon_key": ["100"],
@@ -898,15 +923,17 @@ def test_accumulate_numerical_or_circular_circular(tmp_path):
         "circular_mean": [180.0],
         "rbar": [0.9],
     }), path)
-    raw: dict[str, dict] = {}
-    rk._accumulate_numerical_or_circular(
-        raw, path, "circular", {"aspect_deg"}, None, circ_metrics=("circular_mean", "rbar"),
-    )
-    assert raw["100"]["aspect_deg::circular_mean"] == pytest.approx(180.0)
-    assert raw["100"]["aspect_deg::rbar"] == pytest.approx(0.9)
+    row_idx = pd.Index(["100"])
+    taxon_pos = pd.Series([0], index=row_idx)
+    metric_pos = pd.Series([0, 1], index=["aspect_deg::circular_mean", "aspect_deg::rbar"])
+    values = np.full((1, 2), np.nan, dtype=np.float32)
+    rk._wide_fill(values, taxon_pos, metric_pos, path, "circular", {"aspect_deg"}, None,
+                  circ_metrics=("circular_mean", "rbar"))
+    assert values[0, 0] == pytest.approx(180.0)
+    assert values[0, 1] == pytest.approx(0.9)
 
 
-def test_accumulate_tall_nominal(tmp_path):
+def test_tall_seen_counts_and_vocab_nominal(tmp_path):
     path = tmp_path / "nominal_stats.parquet"
     pq.write_table(pa.table({
         "taxon_key": ["100", "100"],
@@ -914,13 +941,13 @@ def test_accumulate_tall_nominal(tmp_path):
         "metric": ["total_samples", "class_1"],
         "value": [50.0, 0.6],
     }), path)
-    raw: dict[str, dict] = {}
-    rk._accumulate_tall(raw, path, {"kg2"}, {"total_samples"})
-    assert raw["100"]["__sample_count__"] == 50
-    assert raw["100"]["kg2::class_1"] == pytest.approx(0.6)
+    seen, sample_counts, vocab = rk._tall_seen_counts_and_vocab(path, {"kg2"}, {"total_samples"})
+    assert seen == {"100"}
+    assert sample_counts["100"] == 50
+    assert vocab == {"kg2::total_samples", "kg2::class_1"}
 
 
-def test_accumulate_tall_ignores_unknown_variable(tmp_path):
+def test_tall_seen_counts_and_vocab_ignores_unknown_variable(tmp_path):
     path = tmp_path / "nominal_stats.parquet"
     pq.write_table(pa.table({
         "taxon_key": ["100"],
@@ -928,9 +955,26 @@ def test_accumulate_tall_ignores_unknown_variable(tmp_path):
         "metric": ["total_samples"],
         "value": [50.0],
     }), path)
-    raw: dict[str, dict] = {}
-    rk._accumulate_tall(raw, path, {"kg2"}, {"total_samples"})
-    assert raw == {}
+    seen, sample_counts, vocab = rk._tall_seen_counts_and_vocab(path, {"kg2"}, {"total_samples"})
+    assert seen == set()
+    assert sample_counts is None
+    assert vocab == set()
+
+
+def test_tall_fill_nominal(tmp_path):
+    path = tmp_path / "nominal_stats.parquet"
+    pq.write_table(pa.table({
+        "taxon_key": ["100", "100"],
+        "variable": ["kg2", "kg2"],
+        "metric": ["total_samples", "class_1"],
+        "value": [50.0, 0.6],
+    }), path)
+    row_idx = pd.Index(["100"])
+    taxon_pos = pd.Series([0], index=row_idx)
+    metric_pos = pd.Series([0, 1], index=["kg2::total_samples", "kg2::class_1"])
+    values = np.full((1, 2), np.nan, dtype=np.float32)
+    rk._tall_fill(values, taxon_pos, metric_pos, path, {"kg2"}, {"total_samples"})
+    assert values[0, 1] == pytest.approx(0.6)
 
 
 def test_preload_stats_cache_end_to_end(tmp_path, monkeypatch):

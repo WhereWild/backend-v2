@@ -45,13 +45,33 @@ METRICS_BY_TYPE: dict[ValueType, tuple[str, ...]] = {
 
 # GIS layers where the raster nodata value means the property is absent (= 0),
 # not that the data is missing. E.g. scd=nodata at the equator → 0 snow cover days.
+#
+# The single source of truth for which layers get this treatment — the
+# actual fill (burn 0 into nodata pixels, clear the nodata flag) happens
+# once, in scripts/gis/build_overviews.py, before overviews are built from
+# the corrected data. That covers every consumer (map tiles, the /gis/point
+# background-point endpoint, and enrich_tree.py's per-observation sampling)
+# from one place, rather than each caller needing its own nodata-aware
+# special-casing (enrich_tree.py's is a harmless no-op once a layer's
+# nodata has actually been cleared, since ds.nodata reads back as None).
 ZERO_NODATA_LAYERS: frozenset[str] = frozenset({
     "swe", "scd", "fcf",
     "gdd0", "gdd5", "gdd10",
-    "gddlgd0", "gddlgd5", "gddlgd10",
-    "ngd0", "ngd5", "ngd10",
-    "gsl",
+    "scdur", "scsl", "sfsl", "sper", "ssper", "sreg",
 })
+
+# A linear color scale over a layer's TRUE global min/max compresses the
+# bulk of "normal" values into a narrow slice of the color range whenever
+# there's a long tail (e.g. precipitation — a handful of rainforest pixels
+# stretch the top of the scale far past where almost all the data actually
+# sits). Render bounds are instead the 1st/99th percentile of valid pixel
+# values for every continuous (interval/ratio) layer, computed once in
+# scripts/gis/build_overviews.py (same single-source-of-truth reasoning as
+# ZERO_NODATA_LAYERS above) — only fills render_min/render_max when a
+# layer's download script left them null, never overwrites values that are
+# already set. Never applied to nominal/ordinal layers — percentile bounds
+# are meaningless for discrete classes.
+PERCENTILE_RENDER_BOUNDS: tuple[float, float] = (1.0, 99.0)
 
 _REGISTRY: dict[str, type] = {}
 _CACHE: dict[str, Any] = {}

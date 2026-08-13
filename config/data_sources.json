@@ -196,6 +196,46 @@
       }
     ]
   },
+  "glwd_v2": {
+    "name": "Global Lakes and Wetlands Database (GLWD) v2",
+    "url": "https://www.hydrosheds.org/products/glwd",
+    "download_url": "https://doi.org/10.6084/m9.figshare.28519994",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Lehner, B., Anand, M., Fluet-Chouinard, E., Tan, F., Aires, F., Allen, G.H., Bousquet, P., Canadell, J.G., Davidson, N., Ding, M., Finlayson, C.M., Gumbricht, T., Hilarides, L., Hugelius, G., Jackson, R.B., Korver, M.C., Liu, L., McIntyre, P.B., Nagy, S., Olefeldt, D., Pavelsky, T.M., Pekel, J.-F., Poulter, B., Prigent, C., Wang, J., Worthington, T.A., Yamazaki, D., Zhang, X., and Thieme, M. (2025). Mapping the world's inland surface waters: an upgrade to the Global Lakes and Wetlands Database (GLWD v2). Earth System Science Data, 17, 2277–2329.",
+    "doi": "https://doi.org/10.5194/essd-17-2277-2025",
+    "references": [
+      {
+        "authors": "Lehner, B., Anand, M., Fluet-Chouinard, E., Tan, F., Aires, F., Allen, G.H., Bousquet, P., Canadell, J.G., Davidson, N., Ding, M., Finlayson, C.M., Gumbricht, T., Hilarides, L., Hugelius, G., Jackson, R.B., Korver, M.C., Liu, L., McIntyre, P.B., Nagy, S., Olefeldt, D., Pavelsky, T.M., Pekel, J.-F., Poulter, B., Prigent, C., Wang, J., Worthington, T.A., Yamazaki, D., Zhang, X., and Thieme, M.",
+        "year": 2025,
+        "title": "Mapping the world's inland surface waters: an upgrade to the Global Lakes and Wetlands Database (GLWD v2)",
+        "journal": "Earth System Science Data",
+        "volume_issue": "17",
+        "pages": "2277-2329",
+        "doi": "https://doi.org/10.5194/essd-17-2277-2025"
+      }
+    ]
+  },
+  "nsidc_0791": {
+    "name": "MODIS/Terra Global Annual 0.01Deg CMG Snow Cover Climatology",
+    "url": "https://nsidc.org/data/nsidc-0791",
+    "download_url": "https://doi.org/10.5067/9R1AM6NNZLTV",
+    "license": "CC0 1.0 (NASA default for SMD-funded data with no use constraints stated in its CMR record)",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "citation": "Johnston, J.M., Jacobs, J.M., and Cho, E. (2024). MODIS/Terra Global Annual 0.01Deg CMG Snow Cover Climatology, Version 1. Boulder, Colorado USA. NASA National Snow and Ice Data Center Distributed Active Archive Center.",
+    "doi": "https://doi.org/10.5067/9R1AM6NNZLTV",
+    "references": [
+      {
+        "authors": "Johnston, J., Jacobs, J.M., and Cho, E.",
+        "year": 2024,
+        "title": "Global Snow Seasonality Regimes from Satellite Records of Snow Cover",
+        "journal": "Journal of Hydrometeorology",
+        "volume_issue": "25(1)",
+        "pages": "65-88",
+        "doi": "https://doi.org/10.1175/JHM-D-23-0047.1"
+      }
+    ]
+  },
   "chelsa_v2_1": {
     "name": "CHELSA v2.1",
     "url": "https://chelsa-climate.org/",

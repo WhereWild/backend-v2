@@ -54,6 +54,7 @@ from util.gis import (
     sample_elevation_terrain_batch,
     sample_slope_batch,
     sample_soil_texture_batch,
+    sample_vector_batch,
 )
 from util.taxa import load_catalog
 from util.tiles import resolve_layer_path
@@ -262,7 +263,7 @@ def _iter_worklist_batches(
         f"SELECT {col_list} FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') "
         f"WHERE {where} ORDER BY hilbertIdx"
     )
-    con = duckdb.connect()
+    con = _duckdb_connect()
     try:
         con.register("scope_keys", pa.table({"taxon_key": pa.array(scope_keys, type=pa.string())}))
         reader = con.execute(sql).to_arrow_reader(row_limit)
@@ -413,6 +414,19 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> pa.Table | None:
         elif layer_id in DERIVED_FROM_SOIL:
             raw = sample_soil_texture_batch(lats[arr], lons[arr])
             vals = np.array([v if v is not None else np.nan for v in raw], dtype=np.float64)
+        elif layer.get("vector_field"):
+            vec_path = resolve_layer_path(LAYERS_DIR, layer["filename"])
+            if not vec_path.exists():
+                print(f"[warn] {vec_path.name} not found; skipping {layer_id}")
+                return layer_id, np.full(len(lats), np.nan)
+            vals = sample_vector_batch(vec_path, layer["vector_field"], lats[arr], lons[arr])
+            vtype = layer.get("value_type", "")
+            if vtype in ("nominal", "ordinal"):
+                valid = _valid_class_ids(layer_id)
+                if valid is not None:
+                    finite = np.isfinite(vals)
+                    int_vals = np.rint(np.where(finite, vals, 0)).astype(np.int64)
+                    vals[finite & ~np.isin(int_vals, np.array(sorted(valid), dtype=np.int64))] = np.nan
         else:
             cog_path = resolve_layer_path(LAYERS_DIR, layer["filename"])
             if not cog_path.exists():

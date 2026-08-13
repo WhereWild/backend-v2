@@ -6,9 +6,22 @@ import json
 import math
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 import scripts.gis.build_overviews as bo
+
+
+def _configure_mock_dataset_for_read(mock_ds: MagicMock) -> None:
+    """Give a mocked rasterio dataset enough real substance for
+    _compute_percentile_bounds' ds.read(1)/dtype checks to run for real
+    instead of crashing on a bare MagicMock (which np.dtype()/array ops
+    can't handle) — used by every main() test whose "bio1" fixture layer
+    has no render_min/render_max set, so percentile computation always runs.
+    """
+    mock_ds.dtypes = ["float32"]
+    mock_ds.nodata = None
+    mock_ds.read.return_value = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
 
 CATALOG = {
     "categories": [
@@ -221,6 +234,7 @@ def test_main_skips_files_with_sufficient_overviews(tmp_path, monkeypatch):
     mock_ds.transform.e = -0.008333
     mock_ds.width = 43200
     mock_ds.height = 20880
+    _configure_mock_dataset_for_read(mock_ds)
 
     with patch("scripts.gis.build_overviews.rasterio.open", return_value=mock_ds), \
          patch("scripts.gis.build_overviews._build_cog") as mock_build:
@@ -241,6 +255,7 @@ def test_main_upgrades_file_with_insufficient_overviews(tmp_path, monkeypatch, c
     mock_ds.transform.e = -0.008333
     mock_ds.width = 43200
     mock_ds.height = 20880
+    _configure_mock_dataset_for_read(mock_ds)
 
     with patch("scripts.gis.build_overviews.rasterio.open", return_value=mock_ds), \
          patch("scripts.gis.build_overviews._build_cog") as mock_build, \
@@ -264,6 +279,7 @@ def test_main_builds_cog_for_file_without_overviews(tmp_path, monkeypatch):
     mock_ds.transform.e = -0.008333
     mock_ds.width = 43200
     mock_ds.height = 20880
+    _configure_mock_dataset_for_read(mock_ds)
 
     with patch("scripts.gis.build_overviews.rasterio.open", return_value=mock_ds), \
          patch("scripts.gis.build_overviews._build_cog") as mock_build, \
@@ -293,6 +309,7 @@ def test_main_continues_after_failed_file(tmp_path, monkeypatch, capsys):
         mock_ds.transform.e = -0.008333
         mock_ds.width = 43200
         mock_ds.height = 20880
+        _configure_mock_dataset_for_read(mock_ds)
         return mock_ds
 
     with patch("scripts.gis.build_overviews.rasterio.open", side_effect=fake_open):
@@ -300,4 +317,7 @@ def test_main_continues_after_failed_file(tmp_path, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "failed" in out
-    assert call_count == 2
+    # bad.tif: 1 open (raises immediately). bio1.tif: 2 opens — one inside
+    # _compute_percentile_bounds (no render_min/render_max set), one for
+    # main()'s own overview check.
+    assert call_count == 3

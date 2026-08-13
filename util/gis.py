@@ -27,7 +27,9 @@ from util.tiles import (
     LAYERS_DIR,
     TEMPORAL_RASTERS_DIR,
     _load_temporal_npy,
+    _load_vector_layer,
     resolve_layer_path,
+    wgs84_to_mercator,
 )
 
 # ---------------------------------------------------------------------------
@@ -106,7 +108,92 @@ def sample_point(layer: dict, lat: float, lon: float, forecast_suffix: str = "")
         return compute_aspect_at_point(lat, lon)
     if layer["id"] == "soil_texture":
         return compute_soil_texture_at_point(lat, lon)
+    if layer.get("vector_field"):
+        return _sample_vector_point(layer, lat, lon)
     return _sample_cog_point(layer, lat, lon)
+
+
+def _sample_vector_point(layer: dict, lat: float, lon: float) -> float | None:
+    """Point-in-polygon lookup for a native vector layer source (e.g. ecoregions/biome).
+
+    Uses the same cached, full-detail (non-simplified) GeoDataFrame + spatial
+    index util.tiles builds for tile rendering's high-zoom fallback — full
+    precision matters here since this backs both the live /gis/point API and
+    (via scripts/enrich_tree.py's equivalent) the canonical enrichment data
+    written to occurrences.parquet, unlike tile rendering where a
+    zoom-appropriate simplified copy is the right tradeoff.
+    """
+    path = resolve_layer_path(LAYERS_DIR, layer["filename"])
+    val = sample_vector_batch(path, layer["vector_field"], np.array([lat]), np.array([lon]))[0]
+    return None if np.isnan(val) else float(val)
+
+
+_VECTOR_BATCH_CHUNK_SIZE = 5000
+
+
+def sample_vector_batch(path: Path, field: str, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Point-in-polygon sample a native vector layer source (e.g. ecoregions/
+    biome) for a batch of coordinates. Returns float64 array (NaN = no match).
+
+    Shared by scripts/enrich_tree.py (tree enrichment) and util/upload.py
+    (custom observation upload enrichment) — one implementation instead of
+    two independently-written point-in-polygon samplers.
+
+    Callers pass points in hilbert-curve order (enrich_tree.py sorts the
+    whole batch by hilbertIdx before sampling any layer — see
+    _process_batch), so consecutive points here are almost always spatially
+    tight clusters. Exploits that: instead of querying the spatial index
+    once per point (each paying its own independent tree descent even
+    though a whole run of nearby points is likely to land in the very same
+    one or two polygons), points are processed in contiguous chunks — one
+    cheap bbox query per chunk narrows the candidate-polygon set, then only
+    those few candidates get the real exact intersects test against the
+    whole chunk. Same exact GEOS test either way, just against a much
+    smaller, locality-derived candidate set instead of re-deriving it from
+    scratch per point. If the input isn't actually hilbert-ordered (e.g. a
+    scattered batch), this degrades gracefully to roughly the same cost as
+    the flat per-point query, never worse in correctness.
+
+    A point can land on a shared edge and match >1 polygon; only the first
+    matching candidate (in the chunk's query order) is kept (harmless —
+    both polygons carry the same boundary, so either's attribute value is
+    correct there).
+    """
+    import shapely
+
+    n = len(lats)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return out
+    gdf = _load_vector_layer(path)
+    if gdf is None or gdf.empty:
+        return out
+
+    x, y = wgs84_to_mercator(lons, lats)
+    geoms = gdf.geometry.values
+    field_vals = gdf[field].to_numpy(dtype=np.float64)
+
+    for start in range(0, n, _VECTOR_BATCH_CHUNK_SIZE):
+        end = min(start + _VECTOR_BATCH_CHUNK_SIZE, n)
+        cx, cy = x[start:end], y[start:end]
+        bbox = shapely.box(cx.min(), cy.min(), cx.max(), cy.max())
+        candidates = gdf.sindex.query(bbox, predicate="intersects")
+        if candidates.size == 0:
+            continue
+
+        chunk_pts = shapely.points(cx, cy)
+        chunk_out = np.full(end - start, np.nan, dtype=np.float64)
+        unresolved = np.ones(end - start, dtype=bool)
+        for cand_idx in candidates:
+            if not unresolved.any():
+                break
+            hit = shapely.intersects(geoms[cand_idx], chunk_pts) & unresolved
+            if hit.any():
+                chunk_out[hit] = field_vals[cand_idx]
+                unresolved &= ~hit
+        out[start:end] = chunk_out
+
+    return out
 
 
 def _sample_cog_point(layer: dict, lat: float, lon: float) -> float | None:

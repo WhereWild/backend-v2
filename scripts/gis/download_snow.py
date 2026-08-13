@@ -128,6 +128,19 @@ def _netrc_path() -> Path:
     return path
 
 
+def _cleanup_credentials() -> None:
+    """Remove the local .netrc/.cookies files written for NASA Earthdata
+    auth once they're no longer needed for this run, rather than leaving
+    them on disk indefinitely. Minimizes how long the plaintext credential
+    file actually exists — chmod 0o600 already restricts who can read it,
+    and it's gitignored (under data/), but curl's --netrc-file mechanism
+    has no alternative that avoids a plaintext file existing at all while
+    a download is in flight.
+    """
+    (RAW_DIR / ".netrc").unlink(missing_ok=True)
+    (RAW_DIR / ".cookies").unlink(missing_ok=True)
+
+
 def _download(param: str, dest: Path) -> None:
     if dest.exists():
         print(f"  Already downloaded: {dest}")
@@ -271,28 +284,31 @@ def main(force: bool = False) -> None:
     layers = _nsidc_layers(catalog)
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-    for layer_id, param, use_climatology in _TARGETS:
-        if VARS_TO_DOWNLOAD is not None and layer_id not in VARS_TO_DOWNLOAD:
-            continue
-        layer = layers[layer_id]
-        out_path = LAYERS_DIR / layer["filename"]
-        if out_path.exists() and not force:
-            print(f"[skip] {layer_id} — already at {out_path} (--force to rebuild)")
-            continue
+    try:
+        for layer_id, param, use_climatology in _TARGETS:
+            if VARS_TO_DOWNLOAD is not None and layer_id not in VARS_TO_DOWNLOAD:
+                continue
+            layer = layers[layer_id]
+            out_path = LAYERS_DIR / layer["filename"]
+            if out_path.exists() and not force:
+                print(f"[skip] {layer_id} — already at {out_path} (--force to rebuild)")
+                continue
 
-        raw_path = RAW_DIR / f"NSIDC-0791_{param}_0.01Deg_WY2001-2023_V01.0.nc"
-        print(f"[download_snow] {layer_id} ({param})")
-        _download(param, raw_path)
+            raw_path = RAW_DIR / f"NSIDC-0791_{param}_0.01Deg_WY2001-2023_V01.0.nc"
+            print(f"[download_snow] {layer_id} ({param})")
+            _download(param, raw_path)
 
-        base_sub, clim_sub = _find_variable_pair(raw_path)
+            base_sub, clim_sub = _find_variable_pair(raw_path)
 
-        if use_climatology:
-            print(f"  Building COG (climatology) -> {out_path}")
-            _build_cog(clim_sub, out_path, nominal=False)
-        else:
-            band = _most_recent_band(base_sub)
-            print(f"  Building COG (most recent year, band {band}) -> {out_path}")
-            _build_cog(base_sub, out_path, band=band, nominal=True)
+            if use_climatology:
+                print(f"  Building COG (climatology) -> {out_path}")
+                _build_cog(clim_sub, out_path, nominal=False)
+            else:
+                band = _most_recent_band(base_sub)
+                print(f"  Building COG (most recent year, band {band}) -> {out_path}")
+                _build_cog(base_sub, out_path, band=band, nominal=True)
+    finally:
+        _cleanup_credentials()
 
     # render_min/render_max aren't computed here — scripts/gis/build_overviews.py
     # computes those for every continuous layer as a percentile of valid pixel

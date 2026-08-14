@@ -145,7 +145,7 @@ _ORDINAL_SKIP_RANK_METRICS: frozenset[str] = frozenset({
 def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
     """Return rankable metric names for a value type.
 
-    Returns () for types with no ranking metrics (AGGREGATE, etc.).
+    Returns () for any value type not explicitly matched below.
     """
     match vtype:
         case ValueType.RATIO | ValueType.INTERVAL:

@@ -322,6 +322,12 @@ def _image_fields(taxon: dict) -> dict:
     }
 
 
+# Coarse UI-rendering-mode bucket used elsewhere in this file (legend_classes
+# gating, etc.) — collapses the precise measurement level down to whether the
+# frontend should render it as a slider, a category picker, or a compass.
+# /variables also returns the precise, unbucketed level as raw_value_type
+# (nominal/ordinal/interval/ratio/circular) for anything that needs it —
+# e.g. distinguishing interval from ratio — since this map is lossy.
 _VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "categorical", "ordinal": "ordinal", "circular": "circular"}
 
 
@@ -577,6 +583,7 @@ def list_variables(unit_system: str | None = Query(None), forecast_h: int = Quer
             "name": layer.get("display_name"),
             "units": units.display_units(layer, unit_system),
             "value_type": value_type,
+            "raw_value_type": layer.get("value_type") or None,
             "domain": layer.get("domain") or None,
             "category": category.get("display_name", "Other"),
             "source_ids": list(dict.fromkeys(filter(None, [layer.get("source"), layer.get("model")]))) or None,

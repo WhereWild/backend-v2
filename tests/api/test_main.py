@@ -537,6 +537,7 @@ def test_list_variables():
     assert body[0]["id"] == "bio1"
     assert body[0]["category"] == "Bioclimatic"
     assert body[0]["value_type"] == "continuous"
+    assert body[0]["raw_value_type"] == "interval"
 
 
 def test_list_layers():

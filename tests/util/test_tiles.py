@@ -443,6 +443,54 @@ def test_render_tile_returns_png():
     assert result[:4] == b"\x89PNG"
 
 
+def test_render_tile_render_range_overrides_colorization():
+    """The `render_range` override changes colorization independently of the
+    layer's catalog render_min/render_max — same varying-pixel raw array,
+    different rendered colors depending on which range it's clipped/scaled
+    against."""
+    raw = np.array([[2431, 2731, 3031, 3331]], dtype=np.uint16)
+    mock_ds = _make_mock_ds(raw)
+    with patch("rasterio.open", return_value=mock_ds):
+        default_bytes = tiles.render_layer_tile_bytes("bio1", z=2, x=2, y=1, tile_size=4)
+        overridden_bytes = tiles.render_layer_tile_bytes(
+            "bio1", z=2, x=2, y=1, tile_size=4, render_range=(-30.0, -1.0),
+        )
+    assert default_bytes != overridden_bytes
+
+
+def test_finite_value_range_all_nan_returns_none():
+    values = np.full((4, 4), np.nan, dtype=np.float32)
+    assert tiles._finite_value_range(values) is None
+
+
+def test_finite_value_range_basic():
+    values = np.array([[1.0, np.nan, -5.0, 10.0]], dtype=np.float32)
+    assert tiles._finite_value_range(values) == (-5.0, 10.0)
+
+
+def test_layer_tile_range_stats_aggregates_across_tiles():
+    # bio1: scale_factor 0.1, add_offset -273.15 -> 2731 * 0.1 - 273.15 == -0.05.
+    # Uniform raw value (not a spatially-varying array) so every sampled
+    # tile in the range reprojects to the same value regardless of which
+    # sub-window of the mocked raster each individual tile lands on.
+    raw = np.full((4, 4), 2731, dtype=np.uint16)
+    mock_ds = _make_mock_ds(raw)
+    with patch("rasterio.open", return_value=mock_ds):
+        result = tiles.layer_tile_range_stats("bio1", z=2, x0=2, y0=1, x1=3, y1=1, tile_size=4)
+    assert result is not None
+    vmin, vmax = result
+    assert vmin == pytest.approx(-0.05, abs=1e-3)
+    assert vmax == pytest.approx(-0.05, abs=1e-3)
+
+
+def test_layer_tile_range_stats_all_nodata_returns_none():
+    raw = np.full((4, 4), 65535, dtype=np.uint16)
+    mock_ds = _make_mock_ds(raw, nodata=65535.0)
+    with patch("rasterio.open", return_value=mock_ds):
+        result = tiles.layer_tile_range_stats("bio1", z=2, x0=2, y0=1, x1=2, y1=1, tile_size=4)
+    assert result is None
+
+
 def test_render_tile_nodata_masked():
     raw = np.full((4, 4), 65535, dtype=np.uint16)
     mock_ds = _make_mock_ds(raw, nodata=65535.0)

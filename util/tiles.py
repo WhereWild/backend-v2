@@ -656,6 +656,7 @@ def _render_temporal_tile_rgba(
     forecast_suffix: str = "",
     class_filter: Collection[int] | None = None,
     value_ranges: list[tuple[float | None, float | None]] | None = None,
+    render_range: tuple[float, float] | None = None,
 ) -> np.ndarray:
     layer = get_layer(layer_id)
     var_id = layer["var_id"]
@@ -693,6 +694,9 @@ def _render_temporal_tile_rgba(
     else:
         vmin = vmin if vmin is not None else 0.0
         vmax = vmax if vmax is not None else 1.0
+
+    if render_range is not None:
+        vmin, vmax = render_range
 
     if value_type == "ordinal":
         # Ordinal classes have no separate accessibility variant — the
@@ -993,9 +997,12 @@ def _render_derived_elevation_tile_rgba(
     derive_fn,
     colormap: str = _DEFAULT_COLORMAP,
     value_ranges: list[tuple[float | None, float | None]] | None = None,
+    render_range: tuple[float, float] | None = None,
 ) -> np.ndarray:
     vmin = layer.get("render_min", 0.0)
     vmax = layer.get("render_max", 90.0)
+    if render_range is not None:
+        vmin, vmax = render_range
 
     mx0,  my0,  mx1,  my1  = tile_bounds_mercator(z, x, y)
     dst_transform = from_bounds(mx0, my0, mx1, my1, tile_size, tile_size)
@@ -1336,6 +1343,7 @@ def _render_static_layer_tile_rgba(
     cb_mode: str = "",
     class_filter: Collection[int] | None = None,
     value_ranges: list[tuple[float | None, float | None]] | None = None,
+    render_range: tuple[float, float] | None = None,
 ) -> np.ndarray:
     layer_id = layer["id"]
     value_type = str(layer.get("value_type") or "").lower()
@@ -1348,6 +1356,8 @@ def _render_static_layer_tile_rgba(
         dest, vmin, vmax = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
     vmin = vmin if vmin is not None else 0.0
     vmax = vmax if vmax is not None else 1.0
+    if render_range is not None:
+        vmin, vmax = render_range
 
     if value_type == "ordinal":
         # See _render_temporal_tile_rgba for why ordinal reuses the
@@ -1398,6 +1408,48 @@ def _sample_layer_to_tile(
         return _sample_vector_layer_to_tile(layer, z, x, y, tile_size, dst_transform)
     dest, _vmin, _vmax = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
     return dest
+
+
+def _finite_value_range(values: np.ndarray) -> tuple[float, float] | None:
+    """The array's own (min, max) over its finite pixels, or None if it's
+    all nodata."""
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return None
+    return float(np.min(values[finite])), float(np.max(values[finite]))
+
+
+def layer_tile_range_stats(
+    layer_id: str, z: int, x0: int, y0: int, x1: int, y1: int, forecast_suffix: str = "",
+    tile_size: int = 256,
+) -> tuple[float, float] | None:
+    """Return the (min, max) of a numeric layer's raw values across a
+    viewport tile range — the numeric-gradient counterpart to
+    nominal_tile_range_classes, for the maps page's "auto-adapt" mode to
+    discover a fitting colorization range. Deliberately skips colorizing
+    and PNG-encoding each tile (see render_layer_tile_bytes) — reuses the
+    same generic per-tile raw sampling chain masking already relies on
+    (_sample_layer_to_tile), so this works for any layer type at the cost
+    of a reproject per tile rather than one raw native-resolution read, a
+    simplicity trade worth it for a stats-only endpoint.
+    """
+    layer = get_layer(layer_id)
+    overall_min: float | None = None
+    overall_max: float | None = None
+    for tx in range(x0, x1 + 1):
+        for ty in range(y0, y1 + 1):
+            dest = _sample_layer_to_tile(layer, z, tx, ty, tile_size, forecast_suffix)
+            tile_range = _finite_value_range(dest)
+            if tile_range is None:
+                continue
+            tmin, tmax = tile_range
+            if overall_min is None or tmin < overall_min:
+                overall_min = tmin
+            if overall_max is None or tmax > overall_max:
+                overall_max = tmax
+    if overall_min is None or overall_max is None:
+        return None
+    return overall_min, overall_max
 
 
 def _apply_chain_mask(
@@ -1460,18 +1512,19 @@ def render_layer_tile_bytes(
     class_filter: Collection[int] | None = None,
     value_ranges: list[tuple[float | None, float | None]] | None = None,
     chain: list[dict] | None = None,
+    render_range: tuple[float, float] | None = None,
 ) -> bytes:
     from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, derive_aspect_array, derive_slope_array
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
-        rgba = _render_temporal_tile_rgba(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter, value_ranges)
+        rgba = _render_temporal_tile_rgba(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter, value_ranges, render_range)
     elif layer_id in DERIVED_FROM_ELEVATION:
         derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
-        rgba = _render_derived_elevation_tile_rgba(layer, z, x, y, tile_size, derive_fn, colormap, value_ranges)
+        rgba = _render_derived_elevation_tile_rgba(layer, z, x, y, tile_size, derive_fn, colormap, value_ranges, render_range)
     elif layer_id in DERIVED_FROM_SOIL:
         rgba = _render_derived_soil_texture_tile_rgba(layer, z, x, y, tile_size, colormap, cb_mode, class_filter)
     else:
-        rgba = _render_static_layer_tile_rgba(layer, z, x, y, tile_size, colormap, cb_mode, class_filter, value_ranges)
+        rgba = _render_static_layer_tile_rgba(layer, z, x, y, tile_size, colormap, cb_mode, class_filter, value_ranges, render_range)
 
     if chain:
         _apply_chain_mask(rgba, chain, z, x, y, tile_size, forecast_suffix)

@@ -526,6 +526,7 @@ FAKE_LAYER = {
     "render_max": 35.0,
 }
 FAKE_CATEGORY = {"id": "bioclimate", "display_name": "Bioclimatic"}
+FAKE_LAYER_WITH_IMPERIAL = {**FAKE_LAYER, "imperial_unit": "°F"}
 
 
 def test_list_variables():
@@ -656,7 +657,7 @@ def test_layer_tile_with_chain_param():
         response = client.get(f"/api/layers/bio1/tiles/4/8/5.png?chain={chain_json}")
     assert response.status_code == 200
     call_args = mock_render.call_args
-    passed_chain = call_args.args[-1]
+    passed_chain = call_args.args[-2]
     assert passed_chain == [
         {"layer_id": "kg2", "class_filter": [3, 4], "value_ranges": None},
         {"layer_id": "bio2", "class_filter": None, "value_ranges": [(1.0, 2.0), (5.0, 6.0)]},
@@ -669,7 +670,83 @@ def test_layer_tile_no_chain_param_passes_none():
          patch.object(tiles, "render_layer_tile_bytes", return_value=png) as mock_render:
         response = client.get("/api/layers/bio1/tiles/4/8/5.png")
     assert response.status_code == 200
+    assert mock_render.call_args.args[-2] is None
+
+
+def test_layer_tile_with_render_range_param_forwards_parsed_tuple():
+    """The `render_range` query param (JSON [min,max]) is parsed, unit-
+    converted, and forwarded to render_layer_tile_bytes as a raw tuple —
+    same convention as value_ranges/chain."""
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    render_range_json = json.dumps([32.0, 50.0])
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER_WITH_IMPERIAL), \
+         patch.object(tiles, "render_layer_tile_bytes", return_value=png) as mock_render:
+        response = client.get(
+            f"/api/layers/bio1/tiles/4/8/5.png?render_range={render_range_json}&unit_system=imperial",
+        )
+    assert response.status_code == 200
+    passed_min, passed_max = mock_render.call_args.args[-1]
+    assert passed_min == pytest.approx(0.0)
+    assert passed_max == pytest.approx(10.0)
+
+
+def test_layer_tile_no_render_range_param_passes_none():
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "render_layer_tile_bytes", return_value=png) as mock_render:
+        response = client.get("/api/layers/bio1/tiles/4/8/5.png")
+    assert response.status_code == 200
     assert mock_render.call_args.args[-1] is None
+
+
+def test_layer_tile_malformed_render_range_param_passes_none():
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "render_layer_tile_bytes", return_value=png) as mock_render:
+        response = client.get("/api/layers/bio1/tiles/4/8/5.png?render_range=not-json")
+    assert response.status_code == 200
+    assert mock_render.call_args.args[-1] is None
+
+
+def test_layer_tile_range_stats_converts_to_display_units():
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER_WITH_IMPERIAL), \
+         patch.object(tiles, "layer_tile_range_stats", return_value=(0.0, 10.0)) as mock_stats:
+        response = client.get(
+            "/api/layers/bio1/tile-range/stats?z=4&x0=8&y0=5&x1=9&y1=6&unit_system=imperial",
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["min"] == pytest.approx(32.0)
+    assert body["max"] == pytest.approx(50.0)
+    mock_stats.assert_called_once_with("bio1", 4, 8, 5, 9, 6, "")
+
+
+def test_layer_tile_range_stats_all_nodata_returns_null_range():
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "layer_tile_range_stats", return_value=None):
+        response = client.get(
+            "/api/layers/bio1/tile-range/stats?z=4&x0=8&y0=5&x1=9&y1=6",
+        )
+    assert response.status_code == 200
+    assert response.json() == {"min": None, "max": None}
+
+
+def test_layer_tile_range_stats_not_found():
+    with patch.object(tiles, "get_layer", side_effect=KeyError("nope")):
+        response = client.get(
+            "/api/layers/nope/tile-range/stats?z=4&x0=8&y0=5&x1=9&y1=6",
+        )
+    assert response.status_code == 404
+
+
+def test_layer_tile_range_stats_forecast_h_forwarded():
+    with patch.object(tiles, "get_layer", return_value=FAKE_LAYER), \
+         patch.object(tiles, "layer_tile_range_stats", return_value=(0.0, 10.0)) as mock_stats:
+        response = client.get(
+            "/api/layers/bio1/tile-range/stats?z=4&x0=8&y0=5&x1=9&y1=6&forecast_h=24",
+        )
+    assert response.status_code == 200
+    mock_stats.assert_called_once_with("bio1", 4, 8, 5, 9, 6, "__f024h")
 
 
 def test_layer_tile_with_value_ranges_param():

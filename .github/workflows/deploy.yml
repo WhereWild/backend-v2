@@ -21,6 +21,7 @@ jobs:
         run: |
           cd ~/wherewild/backend-v2
           git fetch origin main && git reset --hard origin/main
+          date -u +%Y-%m-%dT%H:%M:%SZ > build_date.txt
           docker compose -f docker-compose.optiplex.yml build api
           docker compose -f docker-compose.optiplex.yml rm -sf api
           docker compose -f docker-compose.optiplex.yml up -d api

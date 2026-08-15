@@ -403,8 +403,7 @@
           "scale_factor": null,
           "add_offset": null,
           "render_min": 0.0,
-          "render_max": 4.0,
-          "domain": "discrete"
+          "render_max": 4.0
         },
         {
           "id": "swe",
@@ -1331,7 +1330,6 @@
           "display_name": "Soil Texture",
           "units": "",
           "value_type": "nominal",
-          "domain": "categorical",
           "derived": true,
           "filename": null,
           "download_url": null,
@@ -1696,7 +1694,6 @@
           "display_name": "Weather Code",
           "units": "",
           "value_type": "nominal",
-          "domain": "discrete",
           "agg": "mode",
           "sources": [
             "temperature_2m",

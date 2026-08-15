@@ -63,6 +63,9 @@ _CONFIG = load_config("global")
 _SYNC_STATE_PATH = Path("data/sync_state.json")
 _PIPELINE_STATE_PATH = Path("data/pipeline_state.json")
 _TEMPORAL_STATE_PATH = Path("data/temporal_state.json")
+# Deliberately outside data/, which gets wiped locally to clear bad state; this file is
+# only ever rewritten by the deploy workflow, so a restart or a data/ wipe can't touch it.
+_BUILD_DATE_PATH = Path("build_date.txt")
 _storage = ParquetStorageProxy(
     data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
     project_root=Path(__file__).parent,
@@ -319,6 +322,12 @@ def _image_fields(taxon: dict) -> dict:
     }
 
 
+# Coarse UI-rendering-mode bucket used elsewhere in this file (legend_classes
+# gating, etc.) — collapses the precise measurement level down to whether the
+# frontend should render it as a slider, a category picker, or a compass.
+# /variables also returns the precise, unbucketed level as raw_value_type
+# (nominal/ordinal/interval/ratio/circular) for anything that needs it —
+# e.g. distinguishing interval from ratio — since this map is lossy.
 _VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "categorical", "ordinal": "ordinal", "circular": "circular"}
 
 
@@ -337,7 +346,13 @@ def version():
         )
     except Exception:
         crawl_ts = None
-    return {"version": crawl_ts}
+    try:
+        api_build_date = (
+            _BUILD_DATE_PATH.read_text().strip() if _BUILD_DATE_PATH.exists() else None
+        )
+    except Exception:
+        api_build_date = None
+    return {"version": crawl_ts, "api_build_date": api_build_date or None}
 
 
 @app.get("/status")
@@ -568,6 +583,7 @@ def list_variables(unit_system: str | None = Query(None), forecast_h: int = Quer
             "name": layer.get("display_name"),
             "units": units.display_units(layer, unit_system),
             "value_type": value_type,
+            "raw_value_type": layer.get("value_type") or None,
             "domain": layer.get("domain") or None,
             "category": category.get("display_name", "Other"),
             "source_ids": list(dict.fromkeys(filter(None, [layer.get("source"), layer.get("model")]))) or None,
@@ -773,6 +789,33 @@ def _parse_value_ranges(
     return parsed or None
 
 
+def _parse_render_range(
+    render_range: str | None, layer: dict, unit_system: str | None,
+) -> tuple[float, float] | None:
+    """Parse the `render_range` query param (JSON `[min, max]`) — the maps
+    page's "auto-adapt" mode overriding a numeric layer's colorization scale
+    to the range it discovered (via GET .../tile-range/stats below) across
+    the currently-visible tiles, instead of the layer's fixed catalog
+    render_min/render_max. Same display-unit-system convention as
+    value_ranges above — converted back to raw/metric here.
+    """
+    if not render_range:
+        return None
+    try:
+        pair = json.loads(render_range)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(pair, list) or len(pair) != 2:
+        return None
+    value_min, value_max = pair
+    if not isinstance(value_min, (int, float)) or not isinstance(value_max, (int, float)):
+        return None
+    return (
+        units.convert_value_from_display(value_min, layer, unit_system),
+        units.convert_value_from_display(value_max, layer, unit_system),
+    )
+
+
 def _parse_and_convert_chain(chain: str | None, unit_system: str | None) -> list[dict] | None:
     """Parse the `chain` query param (JSON list of {layer_id, class_filter?, value_ranges?})
     and convert each entry's value_ranges from the display unit system to
@@ -822,10 +865,11 @@ async def variable_tile_compat(
     value_ranges: str | None = Query(None),
     unit_system: str | None = Query(None),
     chain: str | None = Query(None),
+    render_range: str | None = Query(None),
 ):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter, value_ranges, unit_system, chain)
+    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter, value_ranges, unit_system, chain, render_range)
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
@@ -839,6 +883,7 @@ async def layer_tile(
     value_ranges: str | None = Query(None),
     unit_system: str | None = Query(None),
     chain: str | None = Query(None),
+    render_range: str | None = Query(None),
 ):
     if colormap not in tiles.SUPPORTED_COLORMAPS and colormap not in tiles.SUPPORTED_CIRCULAR_COLORMAPS:
         colormap = "viridis"
@@ -861,12 +906,13 @@ async def layer_tile(
     parsed_value_ranges = _parse_value_ranges(value_ranges, layer, unit_system)
 
     parsed_chain = _parse_and_convert_chain(chain, unit_system)
+    parsed_render_range = _parse_render_range(render_range, layer, unit_system)
 
     forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h > 0 else ""
     payload = await run_in_threadpool(
         tiles.render_layer_tile_bytes,
         layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter,
-        parsed_value_ranges, parsed_chain,
+        parsed_value_ranges, parsed_chain, parsed_render_range,
     )
     is_temporal = layer.get("window_hours") is not None
     # URLs are versioned client-side with the layer's mtime-derived version token
@@ -963,6 +1009,47 @@ async def layer_tile_range_classes(
     )
     ordered = sorted(class_counts.keys(), key=lambda k: class_counts[k], reverse=True)
     return {"classes": ordered}
+
+
+@app.get("/api/layers/{layer_id}/tile-range/stats")
+async def layer_tile_range_stats(
+    layer_id: str,
+    z: int = Query(...),
+    x0: int = Query(...),
+    y0: int = Query(...),
+    x1: int = Query(...),
+    y1: int = Query(...),
+    forecast_h: int = Query(0, ge=0),
+    unit_system: str | None = Query(None),
+):
+    """Numeric-gradient counterpart to tile-range/classes above — the maps
+    page's "auto-adapt" mode calls this to discover a fitting colorization
+    range for the current viewport BEFORE requesting any colorized tiles
+    (see layer_tile's render_range param), rather than discovering it from
+    tiles it already rendered — deliberately skips colorizing/PNG-encoding
+    each tile (see tiles.layer_tile_range_stats).
+    """
+    # The frontend's selected variable can be either form (e.g. "bio_1" from
+    # the old compat URL pattern, or "bio1") — same resolution
+    # variable_tile_compat applies for the tile endpoint itself, applied
+    # here too so this endpoint accepts whichever one it's given.
+    layer_id = _resolve_variable_id(layer_id)
+    try:
+        layer = tiles.get_layer(layer_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Layer '{layer_id}' not found")
+    if forecast_h not in _VALID_FORECAST_HOURS:
+        forecast_h = 0
+    forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h > 0 else ""
+    value_range = await run_in_threadpool(
+        tiles.layer_tile_range_stats, layer_id, z, x0, y0, x1, y1, forecast_suffix,
+    )
+    if value_range is None:
+        return {"min": None, "max": None}
+    return {
+        "min": units.convert_value(value_range[0], layer, unit_system),
+        "max": units.convert_value(value_range[1], layer, unit_system),
+    }
 
 
 @app.get("/api/taxon/{taxon_id}")

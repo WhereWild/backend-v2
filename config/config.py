@@ -14,7 +14,6 @@ class ValueType(StrEnum):
     INTERVAL = "interval"
     ORDINAL = "ordinal"
     CIRCULAR = "circular"
-    AGGREGATE = "aggregate"
     NOMINAL = "nominal"
 
 
@@ -40,7 +39,6 @@ METRICS_BY_TYPE: dict[ValueType, tuple[str, ...]] = {
     ValueType.NOMINAL:   _NOMINAL_METRICS,
     ValueType.ORDINAL:   _ORDINAL_METRICS,
     ValueType.CIRCULAR:  ("count", "unique_samples", "circular_mean", "rbar", "circular_var", "circular_std", "entropy", "mode"),
-    ValueType.AGGREGATE: (),
 }
 
 # GIS layers where the raster nodata value means the property is absent (= 0),

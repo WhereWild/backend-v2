@@ -11,6 +11,7 @@ __pycache__/
 htmlcov/
 data/
 logs/
+build_date.txt
 docker/rclone.conf
 tests/temporal/fixtures/*.json
 .cache/

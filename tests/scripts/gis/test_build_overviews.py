@@ -14,10 +14,10 @@ import scripts.gis.build_overviews as bo
 
 def _configure_mock_dataset_for_read(mock_ds: MagicMock) -> None:
     """Give a mocked rasterio dataset enough real substance for
-    _compute_percentile_bounds' ds.read(1)/dtype checks to run for real
+    _compute_minmax_bounds' ds.read(1)/dtype checks to run for real
     instead of crashing on a bare MagicMock (which np.dtype()/array ops
     can't handle) — used by every main() test whose "bio1" fixture layer
-    has no render_min/render_max set, so percentile computation always runs.
+    has no render_min/render_max set, so min/max computation always runs.
     """
     mock_ds.dtypes = ["float32"]
     mock_ds.nodata = None
@@ -318,6 +318,6 @@ def test_main_continues_after_failed_file(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "failed" in out
     # bad.tif: 1 open (raises immediately). bio1.tif: 2 opens — one inside
-    # _compute_percentile_bounds (no render_min/render_max set), one for
+    # _compute_minmax_bounds (no render_min/render_max set), one for
     # main()'s own overview check.
     assert call_count == 3

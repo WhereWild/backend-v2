@@ -22,10 +22,7 @@ script needing its own special-casing.
     enrich_tree.py's own nodata check becomes a harmless no-op.
 
   - Every continuous (interval/ratio) layer's render_min/render_max is
-    recomputed as the 1st/99th percentile of valid pixel values
-    (PERCENTILE_RENDER_BOUNDS) instead of true min/max — avoids a long tail
-    (e.g. precipitation) compressing the bulk of "normal" values into a
-    narrow slice of the color range under a linear scale. Never applied to
+    computed as the true min/max of valid pixel values. Never applied to
     nominal/ordinal layers.
 
 Also builds the equivalent of "overviews" for native vector-source layers
@@ -54,7 +51,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 
-from config.config import PERCENTILE_RENDER_BOUNDS, ZERO_NODATA_LAYERS
+from config.config import ZERO_NODATA_LAYERS
 
 CATALOG_PATH        = Path("config/gis/catalog.json")
 LAYERS_DIR          = Path("data/gis/layers")
@@ -170,11 +167,10 @@ def _fill_nodata_with_zero(path: Path) -> bool:
         return changed
 
 
-def _compute_percentile_bounds(path: Path, layer: dict) -> tuple[float, float]:
-    """Return (render_min, render_max) as the PERCENTILE_RENDER_BOUNDS
-    percentiles of valid pixel values, in display units (scale_factor/
-    add_offset applied) — same nodata-masking logic as download_chelsa.py's
-    _compute_stats, just np.percentile instead of nanmin/nanmax.
+def _compute_minmax_bounds(path: Path, layer: dict) -> tuple[float, float]:
+    """Return (render_min, render_max) as the true min/max of valid pixel
+    values, in display units (scale_factor/add_offset applied) — same
+    nodata-masking logic as download_chelsa.py's _compute_stats.
     """
     scale = layer.get("scale_factor") or 1.0
     offset = layer.get("add_offset") or 0.0
@@ -200,8 +196,8 @@ def _compute_percentile_bounds(path: Path, layer: dict) -> tuple[float, float]:
     valid = raw[np.isfinite(raw)]
     if valid.size == 0:
         return 0.0, 1.0
-    lo, hi = np.percentile(valid, list(PERCENTILE_RENDER_BOUNDS))
-    return round(float(lo), 6), round(float(hi), 6)
+    lo, hi = float(np.min(valid)), float(np.max(valid))
+    return round(lo, 6), round(hi, 6)
 
 
 def _build_cog(src_path: Path, dst_path: Path, *, nominal: bool, overview_factors: list[int]) -> None:
@@ -298,10 +294,10 @@ def main(fill: bool = False) -> None:
 
             has_render_bounds = bool(layer) and layer.get("render_min") is not None and layer.get("render_max") is not None
             if layer_id and value_type not in ("nominal", "ordinal") and not has_render_bounds:
-                new_min, new_max = _compute_percentile_bounds(path, layer)
+                new_min, new_max = _compute_minmax_bounds(path, layer)
                 if (layer.get("render_min"), layer.get("render_max")) != (new_min, new_max):
                     print(
-                        f"[overview] percentile render bounds -> {path.name}: "
+                        f"[overview] min/max render bounds -> {path.name}: "
                         f"{layer.get('render_min')}/{layer.get('render_max')} -> {new_min}/{new_max}"
                     )
                     catalog_updates[layer_id] = (new_min, new_max)

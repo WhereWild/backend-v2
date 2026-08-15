@@ -108,11 +108,11 @@ def _sync_catalog(layer: dict, meta: dict) -> bool:
     """Patch null catalog fields from file metadata. Returns True if anything changed.
 
     render_min/render_max are deliberately NOT synced here — scripts/gis/
-    build_overviews.py now computes those for every continuous layer as a
-    percentile of valid pixel values (see PERCENTILE_RENDER_BOUNDS), and
-    runs unconditionally as the next rebuild stage after this one, so
-    anything set here would just be immediately overwritten. Leaving it out
-    avoids a second full-raster read for the exact same fields.
+    build_overviews.py now computes those for every continuous layer as the
+    true min/max of valid pixel values, and runs unconditionally as the
+    next rebuild stage after this one, so anything set here would just be
+    immediately overwritten. Leaving it out avoids a second full-raster
+    read for the exact same fields.
     """
     changed = False
 

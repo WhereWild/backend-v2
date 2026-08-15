@@ -311,11 +311,11 @@ def main(force: bool = False) -> None:
         _cleanup_credentials()
 
     # render_min/render_max aren't computed here — scripts/gis/build_overviews.py
-    # computes those for every continuous layer as a percentile of valid pixel
-    # values (config.PERCENTILE_RENDER_BOUNDS) and runs right after this stage
-    # in the rebuild pipeline, so anything set here would be immediately
-    # overwritten. sreg's fixed 0-4 ordinal bounds are set directly in
-    # catalog.json and untouched by either script.
+    # computes those for every continuous layer as the true min/max of
+    # valid pixel values, and runs right after this stage in the rebuild
+    # pipeline, so anything set here would be immediately overwritten.
+    # sreg's fixed 0-4 ordinal bounds are set directly in catalog.json and
+    # untouched by either script.
     print("[download_snow] done.")
 
 

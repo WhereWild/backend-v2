@@ -21,10 +21,14 @@ from pathlib import Path
 
 import httpx
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
+import psutil
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from shapely.geometry.base import BaseGeometry
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
@@ -95,20 +99,84 @@ _ARCGIS_NO_DATA_TILE_MAX_BYTES = 3000
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
+# ---------------------------------------------------------------------------
+# Rate limiting — per-IP, in-memory (single-host deployment, no shared state
+# needed across processes). Tiers are grouped by how expensive/abusable each
+# endpoint is, from an audit of every route against real data — see
+# 2026-08-16 planning notes. `default_limits` is the floor every route not
+# given a more specific `@limiter.limit(...)` falls back to.
+# ---------------------------------------------------------------------------
 
-def _reject_if_large_taxon(taxon: dict) -> None:
-    """Block per-observation aggregation (filtering, slicing, raw sample/value
-    listing, downloading) for taxa too large to do it live — matches the
-    frontend's large-taxon map/filter/download disable threshold."""
+_RATE_LIMIT_DEFAULT = "300/minute"
+_RATE_LIMIT_STATUS = "12/minute"
+_RATE_LIMIT_CHEAP = "120/minute"
+_RATE_LIMIT_DETAIL = "60/minute"
+_RATE_LIMIT_SEARCH = "30/minute"
+_RATE_LIMIT_SUBTREE_RAW = "20/minute"
+_RATE_LIMIT_DOWNLOAD = "5/minute"
+_RATE_LIMIT_UPLOAD = "5/minute"
+_RATE_LIMIT_TILES = "1000/minute"
+_RATE_LIMIT_SATELLITE = "120/minute"
+_RATE_LIMIT_TILE_RANGE = "30/minute"
+
+
+def _client_key(request: Request) -> str:
+    """Real client IP — this app sits behind cloudflared in prod, so the
+    socket peer is always the tunnel, not the actual requester. Cloudflare
+    sets cf-connecting-ip on every proxied request; falls back to
+    X-Forwarded-For's first hop, then the raw socket address for direct
+    local/dev access."""
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+limiter = Limiter(key_func=_client_key, default_limits=[_RATE_LIMIT_DEFAULT])
+
+
+# Ranks at/above GENUS whose raw-occurrence-subtree endpoints
+# (occurrences/download/observation-values/slice/class-samples/obscured/
+# filtered environment) get rejected outright, regardless of observation
+# count — the actual cost driver for those endpoints is collect_taxon_df's/
+# _read_occurrences_scoped's subtree traversal (reading + deduping every
+# descendant leaf's rows), which is slow at genus-and-above even well under
+# the observation-count threshold below.
+_EXPENSIVE_SUBTREE_RANKS = frozenset({"KINGDOM", "PHYLUM", "CLASS", "ORDER", "FAMILY", "GENUS"})
+
+
+def _taxon_observation_count(taxon: dict) -> int:
     try:
         _num_rows = _storage.read_table(
             GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
             filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
         ).to_pylist()
-        _obs_count = max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
+        return max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
     except Exception:
-        _obs_count = 0
-    if _obs_count >= _LARGE_TAXON_THRESHOLD:
+        return 0
+
+
+def _is_expensive_subtree_taxon(taxon: dict, observation_count: int | None = None) -> bool:
+    """True if this taxon's raw-occurrence-subtree endpoints should be
+    rejected: rank at/above GENUS (see _EXPENSIVE_SUBTREE_RANKS), or —
+    belt-and-suspenders for a pathologically large SPECIES/SUBSPECIES-rank
+    taxon — an observation count at/above _LARGE_TAXON_THRESHOLD."""
+    if taxon["rank"] in _EXPENSIVE_SUBTREE_RANKS:
+        return True
+    if observation_count is None:
+        observation_count = _taxon_observation_count(taxon)
+    return observation_count >= _LARGE_TAXON_THRESHOLD
+
+
+def _reject_if_large_taxon(taxon: dict) -> None:
+    """Block per-observation aggregation (filtering, slicing, raw sample/value
+    listing, downloading) for taxa too large/broad to do it live — matches the
+    frontend's large-taxon map/filter/download disable threshold (see
+    get_taxon's large_taxon field, which uses the same helper)."""
+    if _is_expensive_subtree_taxon(taxon):
         raise HTTPException(status_code=400, detail="large_taxon")
 
 
@@ -214,6 +282,8 @@ def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 _MAX_UPLOAD_ROWS = 50_000
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # well above what 50k CSV/TSV/Parquet rows needs
+_MAX_CONCURRENT_UPLOAD_JOBS = 20  # bounds worst-case memory (up to 50k-row DataFrame each) between TTL sweeps
 _DONE_TTL_SECONDS = 3600  # archive stays available for 1 hour after completion
 
 
@@ -275,12 +345,16 @@ async def _cleanup_old_jobs() -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    psutil.cpu_percent(interval=None)  # prime the delta tracker — see _status_server
     asyncio.create_task(_upload_consumer())
     asyncio.create_task(_cleanup_old_jobs())
     yield
 
 
 app = FastAPI(lifespan=_lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -332,12 +406,14 @@ _VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "
 
 
 @app.get("/")
-def root():
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def root(request: Request):
     return {"status": "ok"}
 
 
 @app.get("/version")
-def version():
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def version(request: Request):
     try:
         state = json.loads(_SYNC_STATE_PATH.read_text()) if _SYNC_STATE_PATH.exists() else {}
         crawl_ts = (
@@ -355,8 +431,11 @@ def version():
     return {"version": crawl_ts, "api_build_date": api_build_date or None}
 
 
-@app.get("/status")
-async def status():
+_STATUS_CACHE_TTL_S = 2.0
+_status_cache: tuple[float, dict] | None = None
+
+
+async def _compute_status() -> dict:
     pipeline = await run_in_threadpool(_status_pipeline)
     temporal = await run_in_threadpool(_status_temporal)
     server = await run_in_threadpool(_status_server)
@@ -372,6 +451,22 @@ async def status():
         },
         "server": server,
     }
+
+
+@app.get("/status")
+@limiter.limit(_RATE_LIMIT_STATUS)
+async def status(request: Request):
+    """Short TTL cache on top of _compute_status — a burst of concurrent
+    callers within the same window shares one computation instead of each
+    re-running /proc reads, psutil.sensors_temperatures(), and two
+    state-file reads."""
+    global _status_cache
+    now = time.monotonic()
+    if _status_cache is not None and (now - _status_cache[0]) < _STATUS_CACHE_TTL_S:
+        return _status_cache[1]
+    payload = await _compute_status()
+    _status_cache = (now, payload)
+    return payload
 
 
 @app.post("/internal/pipeline-state", status_code=200)
@@ -470,27 +565,23 @@ def _status_temporal() -> dict | None:
 
 
 def _status_server() -> dict:
-    import time as _time
     result: dict = {}
 
-    # CPU usage — two samples 300ms apart
+    # CPU usage — psutil.cpu_percent(interval=None) is non-blocking: it
+    # reports the delta since the *last* call using psutil's own internal
+    # timestamp, rather than this function sleeping 300ms itself. Primed
+    # once at startup (see _lifespan) so the first real request doesn't
+    # read 0.0. Non-blocking matters here specifically because this route
+    # runs in FastAPI's shared sync threadpool — a blocking sleep here
+    # occupies a worker thread doing nothing, and a burst of concurrent
+    # /status calls could starve every other sync endpoint.
     try:
-        def _read_cpu():
-            with open("/proc/stat") as f:
-                parts = f.readline().split()
-            vals = list(map(int, parts[1:8]))
-            return vals[3] + vals[4], sum(vals)  # idle, total
-
-        i1, t1 = _read_cpu()
-        _time.sleep(0.3)
-        i2, t2 = _read_cpu()
-        result["cpu_percent"] = round((1 - (i2 - i1) / (t2 - t1)) * 100, 1)
+        result["cpu_percent"] = round(psutil.cpu_percent(interval=None), 1)
     except Exception:
         result["cpu_percent"] = None
 
     # CPU temp
     try:
-        import psutil
         temps = psutil.sensors_temperatures()
         cpu_temp = None
         for name, entries in temps.items():
@@ -555,12 +646,14 @@ def _status_server() -> dict:
 
 
 @app.get("/data-sources")
-def data_sources():
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def data_sources(request: Request):
     return citations.load_data_sources()
 
 
 @app.get("/variables")
-def list_variables(unit_system: str | None = Query(None), forecast_h: int = Query(0, ge=0)):
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def list_variables(request: Request, unit_system: str | None = Query(None), forecast_h: int = Query(0, ge=0)):
     forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h in _VALID_FORECAST_HOURS and forecast_h > 0 else ""
     result = []
     for layer, category in tiles.load_layers_with_category():
@@ -602,12 +695,14 @@ def list_variables(unit_system: str | None = Query(None), forecast_h: int = Quer
 
 
 @app.get("/api/layers")
-def list_layers():
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def list_layers(request: Request):
     return tiles.load_layers()
 
 
 @app.get("/phenology_values")
-def list_phenology_values():
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def list_phenology_values(request: Request):
     return [
         {"value": v, "label": v.capitalize()}
         for v in sorted(_CONFIG.phenology_values)
@@ -665,7 +760,9 @@ def _lookup_temporal_value_at_timestamp(
 
 
 @app.get("/gis/point")
+@limiter.limit(_RATE_LIMIT_DETAIL)
 async def gis_point_value(
+    request: Request,
     lat: float = Query(...),
     lon: float = Query(...),
     variable: str = Query(...),
@@ -857,7 +954,9 @@ def _parse_and_convert_chain(chain: str | None, unit_system: str | None) -> list
 
 
 @app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
+@limiter.limit(_RATE_LIMIT_TILES)
 async def variable_tile_compat(
+    request: Request,
     variable_id: str, z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis"),
     cb_mode: str = Query(""), forecast_h: int = Query(0, ge=0),
@@ -869,11 +968,16 @@ async def variable_tile_compat(
 ):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter, value_ranges, unit_system, chain, render_range)
+    return await layer_tile(
+        request, layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h,
+        class_filter, value_ranges, unit_system, chain, render_range,
+    )
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
+@limiter.limit(_RATE_LIMIT_TILES)
 async def layer_tile(
+    request: Request,
     layer_id: str, z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024),
     colormap: str = Query("viridis"),
@@ -930,7 +1034,9 @@ async def layer_tile(
 
 
 @app.get("/api/layers/elevation/terrain-tiles/{z}/{x}/{y}.png")
+@limiter.limit(_RATE_LIMIT_TILES)
 async def elevation_terrain_tile(
+    request: Request,
     z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024),
 ):
@@ -979,7 +1085,8 @@ def _fetch_satellite_tile_bytes(z: int, x: int, y: int) -> bytes:
 
 
 @app.get("/api/tiles/satellite/{z}/{x}/{y}.jpg")
-async def satellite_tile(z: int, x: int, y: int):
+@limiter.limit(_RATE_LIMIT_SATELLITE)
+async def satellite_tile(request: Request, z: int, x: int, y: int):
     """Proxies Esri World Imagery tiles — see _fetch_satellite_tile_bytes for why."""
     payload = await run_in_threadpool(_fetch_satellite_tile_bytes, z, x, y)
     # Shorter/mutable TTL than the DEM/derived-layer tiles above: this is
@@ -992,7 +1099,9 @@ async def satellite_tile(z: int, x: int, y: int):
 
 
 @app.get("/api/layers/{layer_id}/tile-range/classes")
+@limiter.limit(_RATE_LIMIT_TILE_RANGE)
 async def layer_tile_range_classes(
+    request: Request,
     layer_id: str,
     z: int = Query(...),
     x0: int = Query(...),
@@ -1012,7 +1121,9 @@ async def layer_tile_range_classes(
 
 
 @app.get("/api/layers/{layer_id}/tile-range/stats")
+@limiter.limit(_RATE_LIMIT_TILE_RANGE)
 async def layer_tile_range_stats(
+    request: Request,
     layer_id: str,
     z: int = Query(...),
     x0: int = Query(...),
@@ -1054,7 +1165,8 @@ async def layer_tile_range_stats(
 
 @app.get("/api/taxon/{taxon_id}")
 @app.get("/api/species/{taxon_id}")
-def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
+@limiter.limit(_RATE_LIMIT_DETAIL)
+def get_taxon(request: Request, taxon_id: str, unit_system: str | None = Query(None)):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -1142,7 +1254,7 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
         "",
     )
     observation_count = max((int(r["count"]) for r in numerical_rows if r.get("count")), default=0)
-    large_taxon = observation_count >= _LARGE_TAXON_THRESHOLD
+    large_taxon = _is_expensive_subtree_taxon(taxon, observation_count)
     return {
         **taxon,
         "scientific_name": sci.replace("_", " "),
@@ -1171,13 +1283,16 @@ def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
 
 
 @app.get("/api/species/{taxon_id}/obscured")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_species_obscured(
+    request: Request,
     taxon_id: str,
     location: str | None = Query(None, description="Optional location GID to scope the obscured check"),
 ):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
+    _reject_if_large_taxon(taxon)
     location_gid = location.strip() if location else None
     all_obscured = _check_all_obscured(taxon, location_gid)
     return {
@@ -1189,7 +1304,8 @@ def get_species_obscured(
 
 
 @app.get("/api/taxon/{taxon_id}/env-stats")
-def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
+@limiter.limit(_RATE_LIMIT_DETAIL)
+def get_taxon_env_stats(request: Request, taxon_id: str, unit_system: str | None = Query(None)):
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -1421,7 +1537,9 @@ def _class_samples_from_raw_occ(
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_species_environment(
+    request: Request,
     taxon_id: str, variable_id: str, unit_system: str | None = None,
     location: str | None = None, phenology: str | None = None,
     start_ts: int | None = None, end_ts: int | None = None,
@@ -1870,7 +1988,8 @@ def _lookup_inat_observation(catalog_number: str) -> dict | None:
 
 
 @app.get("/occurrence/{catalog_number}")
-def get_occurrence(catalog_number: str):
+@limiter.limit(_RATE_LIMIT_DETAIL)
+def get_occurrence(request: Request, catalog_number: str):
     """Resolve an iNaturalist observation id (catalogNumber) to its taxon + location.
 
     Powers deep links like /occurrence/{id} on the frontend: given just an
@@ -1921,7 +2040,9 @@ def get_occurrence(catalog_number: str):
 
 
 @app.get("/species/{taxon_id}/occurrences")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_species_occurrences(
+    request: Request,
     taxon_id: str,
     location: str | None = None,
     phenology: str | None = None,
@@ -2120,7 +2241,8 @@ def get_species_locations(taxon_id: str, level: int | None = None, parent: str |
 
 
 @app.get("/species/{taxon_id}/download")
-async def download_species_data(background_tasks: BackgroundTasks, taxon_id: str) -> FileResponse:
+@limiter.limit(_RATE_LIMIT_DOWNLOAD)
+async def download_species_data(request: Request, background_tasks: BackgroundTasks, taxon_id: str) -> FileResponse:
     """Download a taxon's occurrence data + stats as a ZIP, same shape as the
     custom-upload archive so it can be mounted offline the same way.
 
@@ -2148,7 +2270,9 @@ async def download_species_data(background_tasks: BackgroundTasks, taxon_id: str
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/observation-values")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_observation_variable_values(
+    request: Request,
     taxon_id: str,
     variable_id: str,
     unit_system: str | None = None,
@@ -2293,7 +2417,9 @@ def _parse_display_range(variable_id: str, layer: dict, entry: dict, unit_system
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/slice")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_species_environment_slice(
+    request: Request,
     taxon_id: str,
     variable_id: str,
     min_value: float = Query(..., alias="min"),
@@ -2358,7 +2484,9 @@ def get_species_environment_slice(
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/class/{class_value}/samples")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_species_environment_class_samples(
+    request: Request,
     taxon_id: str,
     variable_id: str,
     class_value: str,
@@ -2430,7 +2558,9 @@ _METRIC_RANK = {m: i for i, m in enumerate(_METRIC_ORDER)}
 
 
 @app.get("/api/taxa/ranking-options")
+@limiter.limit(_RATE_LIMIT_DETAIL)
 def list_taxa_ranking_options(
+    request: Request,
     within_taxon: str = Query(...),
     descendant_rank: str = Query(...),
 ):
@@ -2511,7 +2641,9 @@ def list_taxa_ranking_options(
 
 
 @app.get("/api/taxa/query")
+@limiter.limit(_RATE_LIMIT_SEARCH)
 def query_taxa(
+    request: Request,
     q: str | None = Query(None, min_length=1),
     within_taxon: str | None = Query(None),
     descendant_rank: str | None = Query(None),
@@ -2651,7 +2783,9 @@ def query_taxa(
 
 
 @app.post("/upload/raw-observations")
+@limiter.limit(_RATE_LIMIT_UPLOAD)
 async def upload_raw_observations(
+    request: Request,
     file: UploadFile = File(...),
 ) -> JSONResponse:
     """Accept a CSV, TSV, or Parquet file and queue it for processing.
@@ -2667,7 +2801,33 @@ async def upload_raw_observations(
             detail=f"Unsupported file type '{suffix}'. Accepted: CSV, TSV, Parquet.",
         )
 
+    # Reject on the client-declared size before buffering anything into
+    # memory — the row-count check below only runs after a full
+    # `await file.read()`, which would otherwise buffer an arbitrarily
+    # large body first.
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > _MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Upload exceeds the {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB size limit.",
+                )
+        except ValueError:
+            pass
+
+    if len(_upload_jobs) >= _MAX_CONCURRENT_UPLOAD_JOBS:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many uploads are already being processed. Try again shortly.",
+        )
+
     contents = await file.read()
+    if len(contents) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Upload exceeds the {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB size limit.",
+        )
     buf = io.BytesIO(contents)
     try:
         if suffix == ".parquet":

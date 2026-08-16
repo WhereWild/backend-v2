@@ -23,6 +23,17 @@ from main import app
 
 client = TestClient(app)
 
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Rate limiting is per-IP, in-memory, and shared across the whole test
+    session (all tests share one TestClient/client identity) — without this,
+    tests that legitimately hit the same tiered endpoint multiple times
+    (e.g. several upload tests) accumulate against one bucket and start
+    getting 429s that have nothing to do with what each test is actually
+    checking."""
+    main_module.limiter.reset()
+
 TAXON = {
     "taxon_key": "2923970",
     "path": "Plantae_6/Opuntia_2923968/Opuntia_humifusa_2923970",
@@ -1118,15 +1129,20 @@ def test_get_species_occurrences_subspecies():
     assert len(r.json()["occurrences"]) == 2
 
 
-def test_get_species_occurrences_nonleaf():
+def test_get_species_occurrences_nonleaf_rejected_as_large_taxon():
+    """GENUS-and-above taxa are rejected outright by the raw-occurrence-subtree
+    endpoints regardless of observation count — the actual cost driver is the
+    subtree traversal itself (reading/deduping every descendant leaf's rows),
+    which is slow at genus-and-above even well under the observation-count
+    threshold. See _is_expensive_subtree_taxon."""
     with patch.object(taxa, "get_taxon_by_id", return_value=NONLEAF_TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch("main.iter_descendants", return_value=[DESC_TAXON]), \
          patch.object(pq, "read_schema", return_value=_OCC_TABLE.schema), \
          patch.object(pq, "read_table", return_value=_OCC_TABLE):
         r = client.get("/species/2923968/occurrences")
-    assert r.status_code == 200
-    assert len(r.json()["occurrences"]) == 2
+    assert r.status_code == 400
+    assert r.json()["detail"] == "large_taxon"
 
 
 def test_get_species_occurrences_species_includes_subspecies():

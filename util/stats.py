@@ -1394,7 +1394,10 @@ def _circ_stats_streaming(
 ) -> dict:
     xbar = cos_sum / n
     ybar = sin_sum / n
-    rbar = float(np.sqrt(xbar ** 2 + ybar ** 2))
+    # Clamp to 1.0: mathematically rbar can't exceed it, but floating-point
+    # error on a near-unanimous direction can push it a hair over, which
+    # then feeds log() a value > 1 and sqrt() a negative one below.
+    rbar = min(float(np.sqrt(xbar ** 2 + ybar ** 2)), 1.0)
     mean_deg = float(np.degrees(np.arctan2(ybar, xbar)) % 360.0)
     var_ = 1.0 - rbar
     std_deg = float(np.degrees(np.sqrt(-2.0 * np.log(max(rbar, 1e-10)))))

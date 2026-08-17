@@ -67,6 +67,7 @@ _CONFIG = load_config("global")
 _SYNC_STATE_PATH = Path("data/sync_state.json")
 _PIPELINE_STATE_PATH = Path("data/pipeline_state.json")
 _TEMPORAL_STATE_PATH = Path("data/temporal_state.json")
+_BASEMAP_STATE_PATH = Path("data/basemap_state.json")
 # Deliberately outside data/, which gets wiped locally to clear bad state; this file is
 # only ever rewritten by the deploy workflow, so a restart or a data/ wipe can't touch it.
 _BUILD_DATE_PATH = Path("build_date.txt")
@@ -438,6 +439,7 @@ _status_cache: tuple[float, dict] | None = None
 async def _compute_status() -> dict:
     pipeline = await run_in_threadpool(_status_pipeline)
     temporal = await run_in_threadpool(_status_temporal)
+    basemap = await run_in_threadpool(_status_basemap)
     server = await run_in_threadpool(_status_server)
     active_job = next(
         (j for j in _upload_jobs.values() if j.status == "processing"), None
@@ -445,6 +447,7 @@ async def _compute_status() -> dict:
     return {
         "pipeline": pipeline,
         "temporal": temporal,
+        "basemap": basemap,
         "upload_queue": {
             "depth": len(_upload_queue),
             "active": active_job is not None,
@@ -505,6 +508,17 @@ async def push_temporal_state(body: dict):
     return {"ok": True}
 
 
+@app.post("/internal/basemap-state", status_code=200)
+async def push_basemap_state(body: dict):
+    from datetime import UTC
+    from datetime import datetime as _dt
+    body["received_at"] = _dt.now(UTC).isoformat()
+    await run_in_threadpool(
+        lambda: _BASEMAP_STATE_PATH.write_text(json.dumps(body))
+    )
+    return {"ok": True}
+
+
 def _status_pipeline() -> dict | None:
     # Prefer push-populated file (gambaby); fall back to local sync_state.json (GamBase)
     path = _PIPELINE_STATE_PATH if _PIPELINE_STATE_PATH.exists() else _SYNC_STATE_PATH
@@ -557,6 +571,33 @@ def _status_temporal() -> dict | None:
                 pass
     return {
         "status": state.get("status"),
+        "elapsed_s": elapsed_s,
+        "last_finished_at": state.get("completed_at"),
+        "last_duration_s": state.get("duration_s"),
+        "received_at": state.get("received_at"),
+    }
+
+
+def _status_basemap() -> dict | None:
+    if not _BASEMAP_STATE_PATH.exists():
+        return None
+    try:
+        state = json.loads(_BASEMAP_STATE_PATH.read_text())
+    except Exception:
+        return None
+    from datetime import UTC
+    from datetime import datetime as _dt
+    elapsed_s = None
+    if state.get("status") == "running":
+        started = state.get("started_at")
+        if started:
+            try:
+                elapsed_s = int((_dt.now(UTC) - _dt.fromisoformat(started)).total_seconds())
+            except Exception:
+                pass
+    return {
+        "status": state.get("status"),
+        "stage": state.get("stage"),
         "elapsed_s": elapsed_s,
         "last_finished_at": state.get("completed_at"),
         "last_duration_s": state.get("duration_s"),

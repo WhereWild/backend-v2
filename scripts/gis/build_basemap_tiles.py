@@ -23,6 +23,11 @@ Steps:
      ready-to-render style.json files.
   5. Download/cache the OpenMapTiles font glyphs used by the styles.
 
+Progress is tracked in data/basemap_state.json and pushed to
+WHEREWILD_STATUS_PUSH_URL (same mechanism as scripts/build_temporal.py) so
+it shows up on the /status page — but only for real (--area planet) runs,
+not --area test builds.
+
 The finished artifacts (basemap.pmtiles, styles/, fonts/) land under
 data/gis/tiles/, so they ride the *existing* rebuild.py `push` stage
 (rclone sync of data/ → gambaby) — no separate deploy path needed, and
@@ -59,7 +64,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
+from datetime import UTC, datetime
 from pathlib import Path
+
+import httpx
 
 # Pin deliberately, like the GDAL/uv base images in Dockerfile — bump by
 # hand when picking up a new planetiler release, don't float. Verify against
@@ -105,6 +114,15 @@ FONTS_OUT_DIR  = TILES_DIR / "fonts"
 STYLES_SRC_DIR = Path("config/gis/tile_styles")
 BASE_STYLES = ("standard-light", "standard-dark")
 
+# State tracking, same shape/mechanism as scripts/build_temporal.py's
+# _TEMPORAL_STATE_PATH/_push_temporal_state — a local file for `/status` to
+# read directly (GamBase) plus a push to WHEREWILD_STATUS_PUSH_URL for when
+# this runs on gambaby and the API needs it pushed rather than read locally.
+# Only written for real (--area planet) runs — a --area monaco test build
+# isn't something the status page should show.
+BASEMAP_STATE_PATH = Path("data/basemap_state.json")
+STATUS_PUSH_URL = os.environ.get("WHEREWILD_STATUS_PUSH_URL", "")
+
 # OpenMapTiles source layers to hide for the "variable" (background+labels)
 # theme — the vector-tile equivalent of Stadia's Toner "background" tile:
 # shapes and place names stay, road network/buildings/POI clutter goes, so
@@ -119,6 +137,18 @@ VARIABLE_MODE_HIDDEN_SOURCE_LAYERS = frozenset({
     "housenumber",
     "aeroway",
 })
+
+
+def _run_streaming(cmd: list[str]) -> None:
+    """Like _run, but for long enough commands that swallowing stdout/stderr
+    until exit (as _run does) would leave a multi-hour job's own progress
+    logging invisible the whole time it's running. Lets the child inherit our
+    stdout/stderr directly — since run_basemap_tiles.sh redirects the whole
+    script's output to logs/basemap_tiles.log, that's where it lands, live.
+    """
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed (exit {result.returncode}): {' '.join(cmd)}")
 
 
 def _run(cmd: list[str], **kwargs) -> None:
@@ -155,6 +185,16 @@ def _verify_sha256(path: Path, expected: str) -> None:
         print(f"  WARNING: no checksum configured for {path.name} — skipping verification")
         return
     _run(["sha256sum", "-c", "-"], input=f"{expected}  {path}\n")
+
+
+def _push_basemap_state(state: dict) -> None:
+    if not STATUS_PUSH_URL:
+        return
+    try:
+        url = STATUS_PUSH_URL.rstrip("/") + "/internal/basemap-state"
+        httpx.post(url, json=state, timeout=5)
+    except Exception as exc:
+        print(f"basemap status push: failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -214,8 +254,8 @@ def _build_pmtiles(force: bool, area: str) -> Path:
         cmd = ["java", f"-Xmx{heap_gb}g", "-jar", str(JAR_PATH), "--osm-path", str(PLANET_PBF)]
     cmd += ["--output", str(tmp_out), "--force"]
 
-    print(f"  Running planetiler ({' '.join(cmd[1:3])}...) → {tmp_out}")
-    _run(cmd)
+    print(f"  Running planetiler ({' '.join(cmd[1:3])}...) → {tmp_out}", flush=True)
+    _run_streaming(cmd)
 
     tmp_out.replace(out_path)
     print(f"  Wrote {out_path} ({out_path.stat().st_size / 1024**2:.1f} MB)")
@@ -231,11 +271,27 @@ def _derive_variable_style(standard: dict) -> dict:
     return variable
 
 
-def _build_styles() -> None:
+# Required credit per CARTO's CC-BY 4.0 design license (config/gis/tile_styles/
+# standard-*.json's metadata) plus OpenMapTiles'/OSM's own attribution
+# requirements — see LICENSE.md at github.com/CartoDB/basemap-styles. Placed
+# on the vector source itself so MapLibre's AttributionControl picks it up
+# automatically in the globe view with no frontend wiring; the Leaflet path's
+# static MAP_TILE_ATTRIBUTION_SELF_HOSTED constant carries the same credits
+# separately since Leaflet doesn't read style-source metadata.
+_ATTRIBUTION_HTML = (
+    '&copy; <a href="https://carto.com/" target="_blank">CARTO</a>, '
+    '&copy; <a href="https://openmaptiles.org/" target="_blank">OpenMapTiles</a> '
+    '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a>'
+)
+
+
+def _build_styles(build_date: str) -> None:
     STYLES_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    attribution = f"{_ATTRIBUTION_HTML} &middot; Basemap built {build_date}"
     for name in BASE_STYLES:
         src = STYLES_SRC_DIR / f"{name}.json"
         style = json.loads(src.read_text())
+        style["sources"]["openmaptiles"]["attribution"] = attribution
 
         (STYLES_OUT_DIR / f"{name}.json").write_text(json.dumps(style, indent=2))
 
@@ -268,26 +324,59 @@ def _build_fonts(force: bool) -> None:
 
 def main(force: bool = False, skip_download: bool = False, area: str = "planet") -> None:
     is_test = area != "planet"
+    started_at = datetime.now(UTC)
+    t_start = time.perf_counter()
 
-    if not is_test:
-        print("--- Planet PBF ---")
-        if not skip_download:
-            _download_planet(force)
-        elif not PLANET_PBF.exists():
-            raise RuntimeError(f"--skip-download passed but {PLANET_PBF} doesn't exist")
+    def _write_state(status: str, *, stage: str | None = None, error: str | None = None) -> None:
+        if is_test:
+            return
+        state: dict = {
+            "status": status,
+            "pid": os.getpid() if status == "running" else None,
+            "started_at": started_at.isoformat(),
+            "stage": stage,
+            "area": area,
+        }
+        if status in ("completed", "failed"):
+            state["completed_at"] = datetime.now(UTC).isoformat()
+            state["duration_s"] = round(time.perf_counter() - t_start)
+        if error is not None:
+            state["error"] = error
+        BASEMAP_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BASEMAP_STATE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(BASEMAP_STATE_PATH)
+        _push_basemap_state(state)
 
-    print("--- planetiler jar ---")
-    _download_planetiler_jar()
+    try:
+        _write_state("running", stage="planet_download")
+        if not is_test:
+            print("--- Planet PBF ---")
+            if not skip_download:
+                _download_planet(force)
+            elif not PLANET_PBF.exists():
+                raise RuntimeError(f"--skip-download passed but {PLANET_PBF} doesn't exist")
 
-    print(f"--- PMTiles build ({area}) ---")
-    out_path = _build_pmtiles(force, area)
+        _write_state("running", stage="planetiler_jar")
+        print("--- planetiler jar ---")
+        _download_planetiler_jar()
 
-    print("--- Styles ---")
-    _build_styles()
+        _write_state("running", stage="pmtiles_build")
+        print(f"--- PMTiles build ({area}) ---")
+        out_path = _build_pmtiles(force, area)
 
-    print("--- Fonts ---")
-    _build_fonts(force)
+        _write_state("running", stage="styles")
+        print("--- Styles ---")
+        _build_styles(started_at.date().isoformat())
 
+        _write_state("running", stage="fonts")
+        print("--- Fonts ---")
+        _build_fonts(force)
+    except Exception as exc:
+        _write_state("failed", error=str(exc))
+        raise
+
+    _write_state("completed")
     print(f"\nDone. {out_path} + styles + fonts under {TILES_DIR}")
     if is_test:
         print("Test build — not the real basemap.pmtiles, won't be picked up by anything automatically.")

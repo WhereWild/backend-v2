@@ -12,7 +12,6 @@
   "styles": {
     "standard-light": { "style": "standard-light.json", "tilejson": { "type": "raster" } },
     "standard-dark": { "style": "standard-dark.json", "tilejson": { "type": "raster" } },
-    "variable-light": { "style": "variable-light.json", "tilejson": { "type": "raster" } },
-    "variable-dark": { "style": "variable-dark.json", "tilejson": { "type": "raster" } }
+    "variable-light": { "style": "variable-light.json", "tilejson": { "type": "raster" } }
   }
 }

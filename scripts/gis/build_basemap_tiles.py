@@ -112,7 +112,17 @@ STYLES_OUT_DIR = TILES_DIR / "styles"
 FONTS_OUT_DIR  = TILES_DIR / "fonts"
 
 STYLES_SRC_DIR = Path("config/gis/tile_styles")
-BASE_STYLES = ("standard-light", "standard-dark")
+# All independent hand-authored files now — variable-light.json is NOT
+# derived from standard-*.json (it used to be, hiding clutter layers, but
+# Toner-style "variable" is a genuinely different monochrome design: light
+# land/dark water vs. standard's full-color CARTO-derived look, confirmed
+# against openmaptiles/maptiler-toner-gl-style's real values — see
+# variable-light.json's metadata note). No variable-dark: 'variable' mode is
+# always the light/dark-water Toner look regardless of app theme — it reads
+# best under the heatmap overlay in both, and matches the old Stadia
+# background's behavior (never split by mode either). See
+# getBackgroundTileUrl in speciesOccurrenceMapHelpers.ts.
+ALL_STYLES = ("standard-light", "standard-dark", "variable-light")
 
 # State tracking, same shape/mechanism as scripts/build_temporal.py's
 # _TEMPORAL_STATE_PATH/_push_temporal_state — a local file for `/status` to
@@ -122,22 +132,6 @@ BASE_STYLES = ("standard-light", "standard-dark")
 # isn't something the status page should show.
 BASEMAP_STATE_PATH = Path("data/basemap_state.json")
 STATUS_PUSH_URL = os.environ.get("WHEREWILD_STATUS_PUSH_URL", "")
-
-# OpenMapTiles source layers to hide for the "variable" (background+labels)
-# theme — the vector-tile equivalent of Stadia's Toner "background" tile:
-# shapes and place names stay, road network/buildings/POI clutter goes, so
-# the heatmap overlay has something to sit on top of without competing for
-# attention. Matches the SATELLITE/VARIABLE mode comment in
-# speciesOccurrenceMapHelpers.ts.
-VARIABLE_MODE_HIDDEN_SOURCE_LAYERS = frozenset({
-    "transportation",
-    "transportation_name",
-    "building",
-    "poi",
-    "housenumber",
-    "aeroway",
-})
-
 
 def _run_streaming(cmd: list[str]) -> None:
     """Like _run, but for long enough commands that swallowing stdout/stderr
@@ -262,15 +256,6 @@ def _build_pmtiles(force: bool, area: str) -> Path:
     return out_path
 
 
-def _derive_variable_style(standard: dict) -> dict:
-    """Same style, clutter layers hidden — see VARIABLE_MODE_HIDDEN_SOURCE_LAYERS."""
-    variable = json.loads(json.dumps(standard))  # deep copy
-    for layer in variable.get("layers", []):
-        if layer.get("source-layer") in VARIABLE_MODE_HIDDEN_SOURCE_LAYERS:
-            layer.setdefault("layout", {})["visibility"] = "none"
-    return variable
-
-
 # Required credit per CARTO's CC-BY 4.0 design license (config/gis/tile_styles/
 # standard-*.json's metadata) plus OpenMapTiles'/OSM's own attribution
 # requirements — see LICENSE.md at github.com/CartoDB/basemap-styles. Placed
@@ -288,17 +273,12 @@ _ATTRIBUTION_HTML = (
 def _build_styles(build_date: str) -> None:
     STYLES_OUT_DIR.mkdir(parents=True, exist_ok=True)
     attribution = f"{_ATTRIBUTION_HTML} &middot; Basemap built {build_date}"
-    for name in BASE_STYLES:
+    for name in ALL_STYLES:
         src = STYLES_SRC_DIR / f"{name}.json"
         style = json.loads(src.read_text())
         style["sources"]["openmaptiles"]["attribution"] = attribution
-
         (STYLES_OUT_DIR / f"{name}.json").write_text(json.dumps(style, indent=2))
-
-        variable_name = name.replace("standard-", "variable-")
-        variable_style = _derive_variable_style(style)
-        (STYLES_OUT_DIR / f"{variable_name}.json").write_text(json.dumps(variable_style, indent=2))
-        print(f"  Wrote {name}.json + {variable_name}.json")
+        print(f"  Wrote {name}.json")
 
 
 def _build_fonts(force: bool) -> None:

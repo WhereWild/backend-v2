@@ -104,7 +104,9 @@ _ARCGIS_NO_DATA_TILE_MAX_BYTES = 3000
 # every other tile type, and so tileserver-gl itself never needs to be
 # publicly reachable.
 _TILESERVER_BASE = os.environ.get("WW_TILESERVER_BASE", "http://localhost:8791")
-_BASEMAP_THEMES = frozenset({"standard-light", "standard-dark", "variable-light"})
+_BASEMAP_THEMES = frozenset(
+    {"standard-light", "standard-dark", "standard-voyager", "variable-light", "labels"}
+)
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 

@@ -122,7 +122,13 @@ STYLES_SRC_DIR = Path("config/gis/tile_styles")
 # best under the heatmap overlay in both, and matches the old Stadia
 # background's behavior (never split by mode either). See
 # getBackgroundTileUrl in speciesOccurrenceMapHelpers.ts.
-ALL_STYLES = ("standard-light", "standard-dark", "variable-light")
+ALL_STYLES = (
+    "standard-light",
+    "standard-dark",
+    "standard-voyager",
+    "variable-light",
+    "labels",
+)
 
 # State tracking, same shape/mechanism as scripts/build_temporal.py's
 # _TEMPORAL_STATE_PATH/_push_temporal_state — a local file for `/status` to

@@ -29,22 +29,28 @@ it shows up on the /status page — but only for real (--area planet) runs,
 not --area test builds.
 
 The finished artifacts (basemap.pmtiles, styles/, fonts/) land under
-data/gis/tiles/, so they ride the *existing* rebuild.py `push` stage
-(rclone sync of data/ → gambaby) — no separate deploy path needed, and
-since it's part of the normal data/ tree this box's own WHEREWILD_DATA_ROOT
-already points at, it's immediately usable for local dev/testing without
-pushing anywhere. Not part of rebuild.py's STAGES: OSM data doesn't need
-daily freshness, so this runs on its own cron (e.g. monthly), independently
-of the GBIF-crawl-triggered taxonomy rebuild.
+data/gis/tiles/, which is part of the normal data/ tree this box's own
+WHEREWILD_DATA_ROOT already points at, so it's immediately usable for
+local dev/testing without pushing anywhere. Pushing to prod is this
+pipeline's *own* scoped rclone sync (_push_basemap_files, step 6 below) —
+deliberately NOT rebuild.py's `push` stage, even though that stage's own
+rclone sync of the whole data/ tree would technically pick these files up
+too (it now excludes gis/tiles/** entirely, see its _push_stage). This
+pipeline runs on its own cron (e.g. quarterly), entirely independent of the
+GBIF-crawl-triggered taxonomy rebuild — going through rebuild.py's stage
+runner instead would fire the taxonomy pipeline's own alert/notification
+channel for a rebuild that never happened, and couple two unrelated
+pipelines' failure modes together (a taxonomy-side push failure — e.g. a
+stray root-owned file on the remote — has no reason to ever block or get
+blamed on a basemap tile build, and vice versa).
 
 The raw planet PBF / planetiler jar / font zip are cached under
-data/gis/tiles/_src/ rather than data/tmp/ — _push_stage() in rebuild.py
+data/gis/tiles/_src/ rather than data/tmp/ — wipe_data_dir() in rebuild.py
 deletes data/tmp/ on *every* push (it's meant as pure scratch space), which
-would force a re-download of the ~94GB planet file after each push if the
-cache lived there. data/gis/tiles/_src/ is instead added to _push_stage()'s
-rclone --exclude list (alongside elevation.tif/temporal) so it never leaves
-this box — it survives both the wipe (wipe_data_dir() skips "gis" entirely)
-and the push, staying warm for the next rebuild.
+would force a re-download of the ~94GB planet file after each taxonomy
+rebuild if the cache lived there. data/gis/tiles/_src/ (and _test/) are
+instead excluded from _push_basemap_files()'s own rclone sync below, so
+they never leave this box — staying warm for the next build.
 
 Requires a JRE — see Dockerfile (openjdk-21-jre-headless).
 
@@ -97,10 +103,9 @@ FONT_STACKS = ("Noto Sans Regular", "Noto Sans Bold", "Noto Sans Italic")
 
 TILES_DIR     = Path("data/gis/tiles")
 
-# Raw/intermediate downloads — kept out of data/tmp/ (wiped on every push,
-# see module docstring) and out of the rclone push itself (see
-# rebuild.py's _push_stage exclude list, which needs "gis/tiles/_src/**"
-# added alongside the existing elevation.tif/temporal excludes).
+# Raw/intermediate downloads — kept out of data/tmp/ (wiped on every
+# taxonomy-pipeline push, see module docstring) and out of this module's own
+# push (_push_basemap_files excludes "_src/**"/"_test/**" below).
 SRC_DIR       = TILES_DIR / "_src"
 PLANET_PBF    = SRC_DIR / "planet-latest.osm.pbf"
 JAR_PATH      = SRC_DIR / "planetiler.jar"
@@ -195,6 +200,52 @@ def _push_basemap_state(state: dict) -> None:
         httpx.post(url, json=state, timeout=5)
     except Exception as exc:
         print(f"basemap status push: failed: {exc}")
+
+
+def _push_basemap_files() -> None:
+    """Syncs just data/gis/tiles/ (basemap.pmtiles, styles/, fonts/) to
+    prod. Deliberately its own rclone invocation rather than rebuild.py's
+    `push` stage — see this module's docstring for why the two pipelines'
+    pushes need to stay fully separate. Reuses the same WW_SYNC_DEST/
+    WW_PUSH_MIN_FREE_GB/WW_RCLONE_TRANSFERS env vars as rebuild.py's
+    _push_stage for consistency, but is otherwise independent: no data/tmp
+    cleanup (irrelevant here) and no /internal/reload ping (nothing on the
+    API side caches basemap tiles in memory — they're proxied straight
+    through to tileserver-gl per request, and the separate
+    /internal/basemap-state push already tells the API about the new
+    build_date for cache-busting).
+    """
+    dest = os.environ.get("WW_SYNC_DEST")
+    if not dest:
+        raise RuntimeError("WW_SYNC_DEST env var must be set (e.g. gambaby:/path/to/data)")
+    tiles_dest = dest.rstrip("/") + "/gis/tiles"
+
+    min_free_gb = float(os.environ.get("WW_PUSH_MIN_FREE_GB", "50"))
+    check = subprocess.run(
+        ["rclone", "about", "--json", dest.split(":")[0] + ":"],
+        capture_output=True, text=True,
+    )
+    if check.returncode == 0:
+        info = json.loads(check.stdout)
+        free_gb = info.get("free", 0) / 1024 ** 3
+        if free_gb < min_free_gb:
+            raise RuntimeError(
+                f"Destination has only {free_gb:.1f} GB free (minimum {min_free_gb} GB). "
+                "Free up space before pushing."
+            )
+        print(f"  Destination free space: {free_gb:.1f} GB")
+
+    transfers = os.environ.get("WW_RCLONE_TRANSFERS", "16")
+    flags = [
+        "--exclude", "_src/**",
+        "--exclude", "_test/**",
+        "--transfers", transfers,
+        "--stats-one-line", "--stats", "1m",
+    ]
+    print(f"  rclone sync {TILES_DIR} → {tiles_dest}")
+    r = subprocess.run(["rclone", "sync", str(TILES_DIR), tiles_dest, *flags])
+    if r.returncode != 0:
+        raise RuntimeError(f"rclone sync failed with exit code {r.returncode}")
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +409,11 @@ def main(force: bool = False, skip_download: bool = False, area: str = "planet")
         _write_state("running", stage="fonts")
         print("--- Fonts ---")
         _build_fonts(force)
+
+        if not is_test:
+            _write_state("running", stage="push")
+            print("--- Push ---")
+            _push_basemap_files()
     except Exception as exc:
         _write_state("failed", error=str(exc))
         raise
@@ -367,7 +423,7 @@ def main(force: bool = False, skip_download: bool = False, area: str = "planet")
     if is_test:
         print("Test build — not the real basemap.pmtiles, won't be picked up by anything automatically.")
     else:
-        print("Next: rebuild.py --stage push (or the next scheduled --push run) syncs this to gambaby.")
+        print(f"Pushed to prod ({os.environ.get('WW_SYNC_DEST', '<WW_SYNC_DEST>')}/gis/tiles).")
 
 
 if __name__ == "__main__":

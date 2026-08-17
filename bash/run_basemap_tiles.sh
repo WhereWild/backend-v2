@@ -13,9 +13,10 @@
 # Runs quarterly, not on the taxonomy rebuild's monthly/GBIF-crawl cadence —
 # OSM data doesn't need that freshness, and a full planet build is a multi-hour
 # job (~94GB download, 4-7hrs on this box's specs) that shouldn't ride along
-# with run_rebuild.sh's stages. Pushes on its own via `rebuild.py --stage
-# push` (same rclone sync + API reload every other push uses) rather than
-# waiting for the next monthly rebuild to happen to pick up the new tiles.
+# with run_rebuild.sh's stages. build_basemap_tiles.py pushes its own result
+# to gambaby as its final step (_push_basemap_files) — deliberately NOT
+# `rebuild.py --stage push`, which is the taxonomy pipeline's own stage
+# runner (alert channel included) and has nothing to do with this pipeline.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,6 +38,3 @@ fi
 docker compose -f "$REPO_DIR/docker-compose.yml" up -d gdal
 docker compose -f "$REPO_DIR/docker-compose.yml" exec -T --user ubuntu -e PYTHONUNBUFFERED=1 gdal \
     bash -lc ". /etc/wherewild_aliases.sh; cd /workspace && uv run --env-file /workspace/.env python -u -m scripts.gis.build_basemap_tiles --area planet"
-
-docker compose -f "$REPO_DIR/docker-compose.yml" exec -T --user ubuntu -e PYTHONUNBUFFERED=1 gdal \
-    bash -lc ". /etc/wherewild_aliases.sh; cd /workspace && uv run --env-file /workspace/.env python -u -m scripts.rebuild --stage push"

@@ -27,3 +27,22 @@ jobs:
           docker compose -f docker-compose.optiplex.yml up -d api
           docker image prune -f
           docker builder prune -f --reserved-space 500mb
+
+      # Regenerates data/gis/tiles/styles/*.json from config/gis/tile_styles/
+      # (whatever this deploy's git checkout has) and restarts tileserver-gl
+      # so it picks up both the new style files and any config.json changes
+      # (tileserver-gl only reads config.json/styles once at startup, not
+      # per-request). Cheap — no planetiler/PMTiles rebuild involved, unlike
+      # scripts/gis/build_basemap_tiles.py's full run — so this runs on
+      # every deploy unconditionally rather than trying to detect whether
+      # style files actually changed. Without this step, a deploy that adds
+      # or edits a basemap style (as opposed to the quarterly full-planet
+      # rebuild, which already does this as its own last step) leaves
+      # tileserver-gl serving stale/missing styles until someone notices and
+      # fixes it by hand.
+      - name: Sync basemap styles
+        run: |
+          cd ~/wherewild/backend-v2
+          docker compose -f docker-compose.optiplex.yml exec -T api bash -lc \
+            "cd /workspace && uv run python -c \"from scripts.gis.build_basemap_tiles import _build_styles; from datetime import date; _build_styles(date.today().isoformat())\""
+          docker compose -f docker-compose.optiplex.yml up -d tileserver --force-recreate

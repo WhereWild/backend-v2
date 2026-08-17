@@ -202,6 +202,22 @@ def _push_stage() -> None:
         # every taxonomy push instead of just leaving them alone.
         "--exclude", "gis/tiles/**",
         "--exclude", "tmp/**",
+        # pipeline_state.json/temporal_state.json/basemap_state.json are
+        # each already kept current on prod via their own dedicated HTTP
+        # push endpoints (_push_pipeline_state here, plus main.py's
+        # /internal/temporal-state and /internal/basemap-state) — those
+        # run *inside* the prod api container, which runs as root, so any
+        # copy they write lands root-owned on the host. Syncing the local
+        # copies here too meant this rclone sync (running as the deploy's
+        # own unprivileged SFTP user, not root) would then fail outright
+        # trying to overwrite a file it doesn't own — real incident, not
+        # theoretical. /status's
+        # _status_pipeline() already prefers the push-populated file over
+        # a synced one anyway, so excluding these from the sync loses
+        # nothing.
+        "--exclude", "pipeline_state.json",
+        "--exclude", "temporal_state.json",
+        "--exclude", "basemap_state.json",
         "--transfers", transfers,
         "--stats-one-line", "--stats", "1m",
     ]

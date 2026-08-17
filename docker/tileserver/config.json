@@ -14,6 +14,8 @@
     "standard-dark": { "style": "standard-dark.json", "tilejson": { "type": "raster" } },
     "standard-versatiles-light": { "style": "standard-versatiles-light.json", "tilejson": { "type": "raster" } },
     "standard-versatiles-dark": { "style": "standard-versatiles-dark.json", "tilejson": { "type": "raster" } },
+    "standard-openfreemap-light": { "style": "standard-openfreemap-light.json", "tilejson": { "type": "raster" } },
+    "standard-openfreemap-dark": { "style": "standard-openfreemap-dark.json", "tilejson": { "type": "raster" } },
     "variable-light": { "style": "variable-light.json", "tilejson": { "type": "raster" } },
     "labels": { "style": "labels.json", "tilejson": { "type": "raster" } }
   }

@@ -132,6 +132,8 @@ ALL_STYLES = (
     "standard-dark",
     "standard-versatiles-light",
     "standard-versatiles-dark",
+    "standard-openfreemap-light",
+    "standard-openfreemap-dark",
     "variable-light",
     "labels",
 )

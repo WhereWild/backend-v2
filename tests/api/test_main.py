@@ -34,6 +34,34 @@ def _reset_rate_limiter():
     checking."""
     main_module.limiter.reset()
 
+
+_RESPONSE_CACHED_FUNCTIONS = [
+    main_module._cached_data_sources,
+    main_module._cached_list_variables,
+    main_module._cached_list_layers,
+    main_module._cached_list_phenology_values,
+    main_module._cached_get_taxon,
+    main_module._cached_get_species_obscured,
+    main_module._cached_get_taxon_env_stats,
+    main_module._cached_get_species_environment_base,
+    main_module._cached_get_species_occurrences,
+    main_module._cached_get_species_locations,
+    main_module._cached_list_taxa_ranking_options,
+    main_module._cached_query_taxa,
+]
+
+
+@pytest.fixture(autouse=True)
+def _reset_response_caches():
+    """Same reasoning as _reset_rate_limiter above: these lru_cache-backed
+    response caches are keyed by (params..., version_tag), and many tests
+    reuse the same taxon_id/variable_id/unit_system across different mocked
+    scenarios — without clearing between tests, a later test can silently
+    get served an earlier test's cached response instead of exercising its
+    own mocks."""
+    for fn in _RESPONSE_CACHED_FUNCTIONS:
+        fn.cache_clear()
+
 TAXON = {
     "taxon_key": "2923970",
     "path": "Plantae_6/Opuntia_2923968/Opuntia_humifusa_2923970",
@@ -2949,3 +2977,201 @@ def test_environment_with_invalid_polygon_returns_400():
          patch.object(tiles, "load_layers", return_value=[FAKE_DISC_LAYER]):
         r = client.get("/species/2923970/environment/bio1?polygon=!!!not-valid")
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Response caching — version-tagged lru_cache layer (main.py's
+# _DEPLOY_VERSION/_DATA_VERSION/_TEMPORAL_VERSION + _cached_* functions) and
+# its invalidation via /internal/reload and /internal/temporal-state.
+# ---------------------------------------------------------------------------
+
+def test_get_taxon_is_cached_across_repeat_requests():
+    """Second call for the same taxon/unit_system must not re-hit storage."""
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(main_module._storage, "read_table", return_value=pa.table({})) as mock_read:
+        r1 = client.get("/api/taxon/2923970")
+        first_call_reads = mock_read.call_count
+        r2 = client.get("/api/taxon/2923970")
+    assert r1.status_code == r2.status_code == 200
+    assert r1.json() == r2.json()
+    assert first_call_reads > 0
+    # Second call must be served entirely from cache — no additional reads.
+    assert mock_read.call_count == first_call_reads
+
+
+def test_get_taxon_cache_is_keyed_by_unit_system():
+    """A different unit_system is a different cache entry, not a cache hit."""
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(main_module._storage, "read_table", return_value=pa.table({})) as mock_read:
+        client.get("/api/taxon/2923970?unit_system=metric")
+        first_call_reads = mock_read.call_count
+        client.get("/api/taxon/2923970?unit_system=imperial")
+    # A distinct unit_system must trigger its own independent set of reads,
+    # not reuse the metric entry's cached result.
+    assert mock_read.call_count == first_call_reads * 2
+
+
+def test_internal_reload_invalidates_data_versioned_cache():
+    """/internal/reload must bump _DATA_VERSION and clear data-versioned
+    caches so the next request re-reads from storage — the actual mechanism
+    scripts/rebuild.py relies on to make a rebuild visible without a
+    container restart."""
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(main_module._storage, "read_table", return_value=pa.table({})) as mock_read, \
+         patch.object(main_module, "reload_catalog"), \
+         patch.object(main_module.gis, "clear_dataset_cache"):
+        client.get("/api/taxon/2923970")
+        first_call_reads = mock_read.call_count
+        assert first_call_reads > 0
+
+        reload_resp = client.post("/internal/reload")
+        assert reload_resp.status_code == 200
+
+        client.get("/api/taxon/2923970")
+        # A fresh cache entry (new data_version) forces storage to be read again.
+        assert mock_read.call_count == first_call_reads * 2
+
+
+def test_internal_reload_does_not_bump_deploy_or_temporal_version():
+    """reload_data() is scoped to the rebuild signal only — it must not
+    touch _DEPLOY_VERSION or _TEMPORAL_VERSION, which have their own
+    separate triggers (a container restart, and the temporal cron's push)."""
+    deploy_before, temporal_before = main_module._DEPLOY_VERSION, main_module._TEMPORAL_VERSION
+    with patch.object(main_module, "reload_catalog"), \
+         patch.object(main_module.gis, "clear_dataset_cache"):
+        client.post("/internal/reload")
+    assert main_module._DEPLOY_VERSION == deploy_before
+    assert main_module._TEMPORAL_VERSION == temporal_before
+
+
+def test_internal_temporal_state_invalidates_variables_only():
+    """/internal/temporal-state (the 30-min temporal cron's push) must bump
+    _TEMPORAL_VERSION and clear /variables' cache — but must NOT touch
+    _DATA_VERSION or any data-versioned cache (e.g. taxon detail), since a
+    temporal-layer refresh and a full data rebuild are independent events."""
+    with patch.object(tiles, "load_layers_with_category", return_value=[]):
+        client.get("/variables")
+        info_before = main_module._cached_list_variables.cache_info()
+        assert info_before.currsize == 1
+
+    data_version_before = main_module._DATA_VERSION
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(main_module._storage, "read_table", return_value=pa.table({})):
+        client.get("/api/taxon/2923970")
+        taxon_cache_before = main_module._cached_get_taxon.cache_info().currsize
+        assert taxon_cache_before == 1
+
+        resp = client.post("/internal/temporal-state", json={"status": "completed"})
+        assert resp.status_code == 200
+
+        # /variables cache was cleared...
+        assert main_module._cached_list_variables.cache_info().currsize == 0
+        # ...but the taxon cache and _DATA_VERSION are untouched.
+        assert main_module._cached_get_taxon.cache_info().currsize == taxon_cache_before
+        assert main_module._DATA_VERSION == data_version_before
+
+
+def test_deploy_tagged_caches_survive_reload_and_temporal_state():
+    """/api/layers, /phenology_values, /data-sources, and /variables' deploy
+    component are keyed on _DEPLOY_VERSION, which only changes at process
+    start (see _read_deploy_version) — neither /internal/reload nor
+    /internal/temporal-state should evict them."""
+    with patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]):
+        client.get("/api/layers")
+    assert main_module._cached_list_layers.cache_info().currsize == 1
+
+    with patch.object(main_module, "reload_catalog"), \
+         patch.object(main_module.gis, "clear_dataset_cache"):
+        client.post("/internal/reload")
+    assert main_module._cached_list_layers.cache_info().currsize == 1
+
+    client.post("/internal/temporal-state", json={"status": "completed"})
+    assert main_module._cached_list_layers.cache_info().currsize == 1
+
+
+def test_species_environment_unfiltered_case_is_cached():
+    """The base (no location/phenology/ts/extra/polygon) case reads
+    precomputed stats and must be servable from cache on repeat requests."""
+    _tk_var_table = pa.table({
+        "taxon_key": ["2923970"], "variable": ["bio1"], "count": [10],
+        "min": [1.0], "mean": [2.0], "max": [3.0], "median": [2.0], "mode": [2.0],
+        "std": [0.5], "variance": [0.25], "range": [2.0],
+        "10th_percentile": [1.2], "25th_percentile": [1.5], "75th_percentile": [2.5],
+        "90th_percentile": [2.8], "iqr": [1.0], "10_90_range": [1.6], "entropy": [0.1],
+    })
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch.object(pq, "read_table", side_effect=lambda path, **kw: (
+             _tk_var_table if "numerical_stats" in str(path) else pa.table({})
+         )) as mock_read:
+        r1 = client.get("/species/2923970/environment/bio1")
+        r2 = client.get("/species/2923970/environment/bio1")
+    assert r1.status_code == r2.status_code == 200
+    assert r1.json() == r2.json()
+    first_call_reads = mock_read.call_count
+    assert first_call_reads > 0
+    # Second request must not have issued any additional storage reads.
+    assert mock_read.call_count == first_call_reads
+
+
+def test_species_environment_filtered_case_is_never_cached(monkeypatch):
+    """The filtered branch (location/phenology/ts/extra/polygon) has an
+    unbounded key space (arbitrary WKT/JSON) and must stay live on every
+    call — never served from the base-case cache."""
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    call_count = {"n": 0}
+
+    def _fake_compute_location_filtered_stats(*args, **kwargs):
+        call_count["n"] += 1
+        return None
+
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch.object(main_module, "compute_location_filtered_stats", side_effect=_fake_compute_location_filtered_stats), \
+         patch.object(main_module, "_check_all_obscured", return_value=False):
+        client.get("/species/2923970/environment/bio1?location=USA")
+        client.get("/species/2923970/environment/bio1?location=USA")
+    assert call_count["n"] == 2  # live on every call, not cached after the first
+
+
+def test_get_species_occurrences_bounded_lru_cached():
+    """Repeat identical requests must not re-scan occurrences."""
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(pq, "read_schema", return_value=_OCC_TABLE.schema), \
+         patch.object(pq, "read_table", return_value=_OCC_TABLE) as mock_read:
+        r1 = client.get("/species/2923970/occurrences")
+        r2 = client.get("/species/2923970/occurrences")
+    assert r1.status_code == r2.status_code == 200
+    assert r1.json() == r2.json()
+    first_reads = mock_read.call_count
+    assert first_reads > 0
+    assert mock_read.call_count == first_reads
+
+
+def test_query_taxa_is_cached_across_repeat_requests():
+    """Repeat identical search requests must not re-run the search."""
+    with patch.object(rankings_module, "search_taxa_by_name", return_value=[(TAXON, 95.0, "opuntia humifusa")]) as mock_search, \
+         patch.object(rankings_module, "_batch_sample_counts", return_value={"2923970": 100}):
+        r1 = client.get("/api/taxa/query?q=opuntia")
+        r2 = client.get("/api/taxa/query?q=opuntia")
+    assert r1.status_code == r2.status_code == 200
+    assert r1.json() == r2.json()
+    mock_search.assert_called_once()
+
+
+def test_query_taxa_cache_keyed_by_filter_params():
+    """Distinct `filter` query params must produce distinct cache entries,
+    not collide (filter_params is converted to a tuple for the cache key —
+    this guards against that conversion accidentally losing information)."""
+    with patch.object(rankings_module, "search_taxa_by_name", return_value=[]) as mock_search:
+        client.get("/api/taxa/query?q=opuntia&filter=bio1:mean:lt:25")
+        client.get("/api/taxa/query?q=opuntia&filter=bio1:mean:lt:30")
+    assert mock_search.call_count == 2

@@ -3,6 +3,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 services:
+  # No separate "tileserver" service here — tileserver-gl is installed
+  # directly into this image (see Dockerfile) and runs in-process inside
+  # whichever container needs it: automatically in the `api` service (MODE=
+  # api, see docker/entrypoint.sh's _start_tileserver), or manually inside
+  # this `gdal` container's shell (`tileserver-gl --config
+  # docker/tileserver/config.json --port 8791 &`, after `Xvfb :99 &
+  # export DISPLAY=:99` — see entrypoint.sh's _start_tileserver for the
+  # exact invocation) for local testing.
   gdal:
     build: .
     network_mode: host
@@ -21,17 +29,6 @@ services:
       - apparmor:unconfined
     stdin_open: true
     tty: true
-
-  tileserver:
-    image: maptiler/tileserver-gl:latest
-    network_mode: host
-    command: ["--config", "/data/config.json", "--port", "8791"]
-    volumes:
-      - ./data/gis/tiles:/data
-      - ./docker/tileserver/config.json:/data/config.json:ro
-    restart: unless-stopped
-    profiles:
-      - tileserver
 
 volumes:
   root-home:

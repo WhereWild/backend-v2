@@ -141,11 +141,13 @@ _ARCGIS_REFERER = "https://wherewild.net"
 # across zoom/region without coming anywhere near a real tile's size.
 _ARCGIS_NO_DATA_TILE_MAX_BYTES = 3000
 # Self-hosted OpenMapTiles basemap — tileserver-gl reads the PMTiles + styles
-# scripts/gis/build_basemap_tiles.py produces (see docker-compose.yml's
-# `tileserver` service, docker/tileserver/config.json). Proxied through here
-# rather than hit directly so it rides the same domain/Cloudflare zone as
-# every other tile type, and so tileserver-gl itself never needs to be
-# publicly reachable.
+# scripts/gis/build_basemap_tiles.py produces. It runs as a background
+# process inside this same container (see docker/entrypoint.sh's
+# _start_tileserver, docker/tileserver/config.json), not a separate service,
+# so the default here just works via loopback in both dev and prod. Proxied
+# through here rather than hit directly so it rides the same domain/
+# Cloudflare zone as every other tile type, and so tileserver-gl itself
+# never needs to be publicly reachable on its own.
 _TILESERVER_BASE = os.environ.get("WW_TILESERVER_BASE", "http://localhost:8791")
 _BASEMAP_THEMES = frozenset(
     {"standard-light", "standard-dark", "standard-voyager", "variable-light", "labels"}

@@ -22,5 +22,16 @@ services:
     stdin_open: true
     tty: true
 
+  tileserver:
+    image: maptiler/tileserver-gl:latest
+    network_mode: host
+    command: ["--config", "/data/config.json", "--port", "8791"]
+    volumes:
+      - ./data/gis/tiles:/data
+      - ./docker/tileserver/config.json:/data/config.json:ro
+    restart: unless-stopped
+    profiles:
+      - tileserver
+
 volumes:
   root-home:

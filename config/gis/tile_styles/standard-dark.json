@@ -4,11 +4,11 @@
   "metadata": {
     "ww:note": "Fork of CARTO Dark Matter (github.com/CartoDB/basemap-styles/blob/master/mapboxgl/dark-matter.json) — the actual open-source style CARTO publishes: code under BSD-3-Clause, visual design under CC-BY 4.0 (see LICENSE.md in that repo). Paint values below are ported directly from that file (fetched 2026-08-16), not from Stadia's Alidade Smooth Dark — that's a further, non-redistributable customization of this same CARTO base, and Stadia's specific tuning isn't ours to copy. Layers with NO CARTO equivalent — the extra landcover classes (grass/scrub/wetland/ice/sand/rock; CARTO's own landcover only distinguishes wood/park and renders them near-invisible against the dark background), ferry, and mountain-peak — are WhereWild's own additions using the same low-opacity-tint idiom as CARTO's wood/park layers, not upstream values. Required attribution per CC-BY 4.0: 'CARTO', 'OpenMapTiles', 'OpenStreetMap contributors', all linked, visible on or reasonably reachable from the map (see TILE_ATTRIBUTION in the frontend). 'variable-dark.json' is derived from this file by build_basemap_tiles.py (clutter source-layers hidden). Deviations from upstream CARTO values: CARTO gives each place/label tier its own independently-tuned brightness (city/state/country/road all differ, several near-white — e.g. place-state was rgba(203,230,230,1)), which reads as inconsistent and too bright against this dark background. All place (city/town-village/state/country), road-label, and water-name text-color are unified here to a single flat rgba(150,150,150,1) instead. road-label-major (#383838) and mountain-peak (#515151) are deliberately kept darker/more subdued as distinct secondary-annotation tones, not oversights."
   },
-  "glyphs": "/tiles/fonts/{fontstack}/{range}.pbf",
+  "glyphs": "{fontstack}/{range}.pbf",
   "sources": {
     "openmaptiles": {
       "type": "vector",
-      "url": "/tiles/data/openmaptiles.json"
+      "url": "mbtiles://{openmaptiles}"
     }
   },
   "layers": [

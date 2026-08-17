@@ -4,11 +4,11 @@
   "metadata": {
     "ww:note": "Fork of CARTO Voyager (github.com/CartoDB/basemap-styles/blob/master/mapboxgl/voyager.json) — same BSD-3-Clause/CC-BY 4.0 license as Positron/Dark Matter, same required attribution (CARTO + OpenMapTiles + OpenStreetMap). Demo/preview style, not currently wired into build_basemap_tiles.py's BASE_STYLES — proves theme-swapping is just another style.json against the same PMTiles data, no rebuild. Extra landcover classes (grass/scrub/wetland/ice/sand/rock), ferry, and mountain-peak are WhereWild additions with no CARTO equivalent, same idiom as standard-light/dark."
   },
-  "glyphs": "/tiles/fonts/{fontstack}/{range}.pbf",
+  "glyphs": "{fontstack}/{range}.pbf",
   "sources": {
     "openmaptiles": {
       "type": "vector",
-      "url": "/tiles/data/openmaptiles.json"
+      "url": "mbtiles://{openmaptiles}"
     }
   },
   "layers": [

@@ -97,6 +97,14 @@ _ARCGIS_REFERER = "https://wherewild.net"
 # imagery. A little slack above that exact size covers minor variation
 # across zoom/region without coming anywhere near a real tile's size.
 _ARCGIS_NO_DATA_TILE_MAX_BYTES = 3000
+# Self-hosted OpenMapTiles basemap — tileserver-gl reads the PMTiles + styles
+# scripts/gis/build_basemap_tiles.py produces (see docker-compose.yml's
+# `tileserver` service, docker/tileserver/config.json). Proxied through here
+# rather than hit directly so it rides the same domain/Cloudflare zone as
+# every other tile type, and so tileserver-gl itself never needs to be
+# publicly reachable.
+_TILESERVER_BASE = os.environ.get("WW_TILESERVER_BASE", "http://localhost:8791")
+_BASEMAP_THEMES = frozenset({"standard-light", "standard-dark", "variable-light", "variable-dark"})
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
@@ -1136,6 +1144,61 @@ async def satellite_tile(request: Request, z: int, x: int, y: int):
     return Response(
         content=payload, media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=604800"},
+    )
+
+
+@app.get("/api/basemap/version")
+async def basemap_version():
+    """Current basemap build date for the frontend's cache-busting URL
+    builder (see MAP_TILE_URL_TEMPLATE_LIGHT/DARK in
+    speciesOccurrenceMapHelpers.ts). No caching — same reasoning as
+    /variables serving GIS layers' version tokens uncached: staleness here
+    means the frontend keeps using an old (still-valid, just not-newest)
+    build_date, not broken tiles, but there's no reason to add that lag.
+    """
+    if not _BASEMAP_STATE_PATH.exists():
+        return {"build_date": None}
+    try:
+        state = json.loads(_BASEMAP_STATE_PATH.read_text())
+    except Exception:
+        return {"build_date": None}
+    completed_at = state.get("completed_at")
+    return {"build_date": completed_at[:10] if completed_at else None}
+
+
+def _fetch_basemap_tile_bytes(theme: str, z: int, x: int, y: int) -> bytes:
+    """Fetch one rendered raster tile from tileserver-gl for the given theme."""
+    url = f"{_TILESERVER_BASE}/styles/{theme}/{z}/{x}/{y}.png"
+    try:
+        resp = httpx.get(url, timeout=10.0)
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Basemap tile fetch failed: {e}") from e
+    return resp.content
+
+
+@app.get("/api/basemap/{theme}/{build_date}/tiles/{z}/{x}/{y}.png")
+@limiter.limit(_RATE_LIMIT_TILES)
+async def basemap_tile(request: Request, theme: str, build_date: str, z: int, x: int, y: int):
+    """Proxies the self-hosted OpenMapTiles basemap (tileserver-gl) — see
+    scripts/gis/build_basemap_tiles.py and docker-compose.yml's `tileserver`
+    service.
+
+    build_date is a pure cache-busting token (matches basemap_state.json's
+    completed_at, see the frontend's basemap URL builder) — it isn't used to
+    select data here, since tileserver-gl only ever has one current
+    basemap.pmtiles loaded. The long immutable TTL is safe not because this
+    content never changes, but because a new build produces a URL nobody has
+    requested before; old build_date values just stop being requested and
+    age out of cache on their own, same scheme /api/layers/{layer_id}/tiles
+    already uses with its mtime-derived version token.
+    """
+    if theme not in _BASEMAP_THEMES:
+        raise HTTPException(status_code=404, detail=f"Unknown basemap theme '{theme}'")
+    payload = await run_in_threadpool(_fetch_basemap_tile_bytes, theme, z, x, y)
+    return Response(
+        content=payload, media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
 
 

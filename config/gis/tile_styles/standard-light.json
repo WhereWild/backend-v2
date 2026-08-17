@@ -4,11 +4,11 @@
   "metadata": {
     "ww:note": "Fork of CARTO Positron (github.com/CartoDB/basemap-styles/blob/master/mapboxgl/positron.json) — the actual open-source style CARTO publishes: code under BSD-3-Clause, visual design under CC-BY 4.0 (see LICENSE.md in that repo). Paint values below are ported directly from that file (fetched 2026-08-16), not from Stadia's Alidade Smooth — that's a further, non-redistributable customization of this same CARTO base. Layers with NO CARTO equivalent — the extra landcover classes (grass/scrub/wetland/ice/sand/rock), ferry, and mountain-peak — are WhereWild's own additions using the same tint idiom as CARTO's wood/park layers, not upstream values. Required attribution per CC-BY 4.0: 'CARTO', 'OpenMapTiles', 'OpenStreetMap contributors', all linked, visible on or reasonably reachable from the map (see TILE_ATTRIBUTION in the frontend). 'variable-light.json' is derived from this file by build_basemap_tiles.py (clutter source-layers hidden)."
   },
-  "glyphs": "/tiles/fonts/{fontstack}/{range}.pbf",
+  "glyphs": "{fontstack}/{range}.pbf",
   "sources": {
     "openmaptiles": {
       "type": "vector",
-      "url": "/tiles/data/openmaptiles.json"
+      "url": "mbtiles://{openmaptiles}"
     }
   },
   "layers": [

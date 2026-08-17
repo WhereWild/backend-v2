@@ -192,8 +192,16 @@ def _push_stage() -> None:
         "--exclude", "taxonomy/cache/**",
         "--exclude", "gis/temporal/**",
         "--exclude", "gis/layers/elevation.tif",
+        # The whole basemap tile tree (basemap.pmtiles, styles/, fonts/,
+        # _src/, _test/) is pushed by scripts/gis/build_basemap_tiles.py's
+        # own _push_basemap_files, on its own cron — entirely separate from
+        # this pipeline (see that module's docstring for why). Excluded
+        # here so a taxonomy rebuild's push never touches it — deliberately
+        # NOT paired with --delete-excluded below, since that would delete
+        # the basemap pipeline's already-pushed files from the remote on
+        # every taxonomy push instead of just leaving them alone.
+        "--exclude", "gis/tiles/**",
         "--exclude", "tmp/**",
-        "--delete-excluded",
         "--transfers", transfers,
         "--stats-one-line", "--stats", "1m",
     ]

@@ -26,6 +26,7 @@ RUN apt-get update \
     psmisc \
     python3-venv \
     rclone \
+    openjdk-21-jre-headless \
  && rm -rf /var/lib/apt/lists/*
 
 RUN echo '\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr/share/bash-completion/bash_completion\nfi' >> /etc/bash.bashrc \

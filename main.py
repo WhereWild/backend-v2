@@ -21,10 +21,14 @@ from pathlib import Path
 
 import httpx
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
+import psutil
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from shapely.geometry.base import BaseGeometry
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from starlette.concurrency import run_in_threadpool
 
 import util.rankings as rankings
@@ -63,9 +67,53 @@ _CONFIG = load_config("global")
 _SYNC_STATE_PATH = Path("data/sync_state.json")
 _PIPELINE_STATE_PATH = Path("data/pipeline_state.json")
 _TEMPORAL_STATE_PATH = Path("data/temporal_state.json")
+_BASEMAP_STATE_PATH = Path("data/basemap_state.json")
 # Deliberately outside data/, which gets wiped locally to clear bad state; this file is
 # only ever rewritten by the deploy workflow, so a restart or a data/ wipe can't touch it.
 _BUILD_DATE_PATH = Path("build_date.txt")
+
+# ---------------------------------------------------------------------------
+# Response caching — two explicit version tags rather than relying on a
+# restart happening to coincide with a deploy (the box can restart for
+# reasons that have nothing to do with either). Each cached endpoint below
+# takes whichever version it actually depends on as an extra lru_cache key
+# component, so a version bump makes old entries simply unreachable —
+# correct even if reload is ever missed/delayed.
+#
+# _DEPLOY_VERSION: fixed once at process start. build_date.txt is
+# deploy-workflow-write-only (see comment above), and a deploy always
+# rebuilds+restarts the container (see .github/workflows/deploy.yml), so
+# reading it once at import time is safe — it cannot change without a
+# restart re-running this line anyway.
+#
+# _DATA_VERSION: NOT startup-time — a data rebuild can complete while this
+# process keeps running (that's the whole reason /internal/reload exists
+# without a restart). Bumped inside reload_data() to the wall-clock time
+# reload fired, which is already the authoritative "pipeline just pushed
+# fresh data" signal (scripts/rebuild.py POSTs here unconditionally after
+# every sync).
+#
+# _TEMPORAL_VERSION: separate from both of the above — build_temporal.py's
+# 30-minute cron pushes to /internal/temporal-state, not /internal/reload,
+# and updates temporal-layer raster mtimes (see util.tiles.get_layer_version
+# and get_layer_render_range's temporal-meta fallback) independently of both
+# deploys and full data rebuilds. Anything whose response depends on a
+# temporal layer's version/render-range needs this tag, not just the two
+# above.
+# ---------------------------------------------------------------------------
+
+
+def _read_deploy_version() -> str:
+    try:
+        return _BUILD_DATE_PATH.read_text().strip() if _BUILD_DATE_PATH.exists() else "unknown"
+    except Exception:
+        return "unknown"
+
+
+_DEPLOY_VERSION: str = _read_deploy_version()
+_DATA_VERSION: str = "unknown"
+_TEMPORAL_VERSION: str = "unknown"
+
 _storage = ParquetStorageProxy(
     data_root=Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")),
     project_root=Path(__file__).parent,
@@ -92,23 +140,106 @@ _ARCGIS_REFERER = "https://wherewild.net"
 # imagery. A little slack above that exact size covers minor variation
 # across zoom/region without coming anywhere near a real tile's size.
 _ARCGIS_NO_DATA_TILE_MAX_BYTES = 3000
+# Self-hosted OpenMapTiles basemap — tileserver-gl reads the PMTiles + styles
+# scripts/gis/build_basemap_tiles.py produces (see docker-compose.yml's
+# `tileserver` service, docker/tileserver/config.json). Proxied through here
+# rather than hit directly so it rides the same domain/Cloudflare zone as
+# every other tile type, and so tileserver-gl itself never needs to be
+# publicly reachable.
+_TILESERVER_BASE = os.environ.get("WW_TILESERVER_BASE", "http://localhost:8791")
+_BASEMAP_THEMES = frozenset(
+    {
+        "standard-light",
+        "standard-dark",
+        "standard-versatiles-light",
+        "standard-versatiles-dark",
+        "standard-openfreemap-light",
+        "standard-openfreemap-dark",
+        "variable-light",
+        "labels",
+    }
+)
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
 
+# ---------------------------------------------------------------------------
+# Rate limiting — per-IP, in-memory (single-host deployment, no shared state
+# needed across processes). Tiers are grouped by how expensive/abusable each
+# endpoint is, from an audit of every route against real data — see
+# 2026-08-16 planning notes. `default_limits` is the floor every route not
+# given a more specific `@limiter.limit(...)` falls back to.
+# ---------------------------------------------------------------------------
 
-def _reject_if_large_taxon(taxon: dict) -> None:
-    """Block per-observation aggregation (filtering, slicing, raw sample/value
-    listing, downloading) for taxa too large to do it live — matches the
-    frontend's large-taxon map/filter/download disable threshold."""
+_RATE_LIMIT_DEFAULT = "300/minute"
+_RATE_LIMIT_STATUS = "12/minute"
+_RATE_LIMIT_CHEAP = "120/minute"
+_RATE_LIMIT_DETAIL = "60/minute"
+_RATE_LIMIT_SEARCH = "30/minute"
+_RATE_LIMIT_SUBTREE_RAW = "20/minute"
+_RATE_LIMIT_DOWNLOAD = "5/minute"
+_RATE_LIMIT_UPLOAD = "5/minute"
+_RATE_LIMIT_TILES = "1000/minute"
+_RATE_LIMIT_SATELLITE = "120/minute"
+_RATE_LIMIT_TILE_RANGE = "30/minute"
+
+
+def _client_key(request: Request) -> str:
+    """Real client IP — this app sits behind cloudflared in prod, so the
+    socket peer is always the tunnel, not the actual requester. Cloudflare
+    sets cf-connecting-ip on every proxied request; falls back to
+    X-Forwarded-For's first hop, then the raw socket address for direct
+    local/dev access."""
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+limiter = Limiter(key_func=_client_key, default_limits=[_RATE_LIMIT_DEFAULT])
+
+
+# Ranks at/above GENUS whose raw-occurrence-subtree endpoints
+# (occurrences/download/observation-values/slice/class-samples/obscured/
+# filtered environment) get rejected outright, regardless of observation
+# count — the actual cost driver for those endpoints is collect_taxon_df's/
+# _read_occurrences_scoped's subtree traversal (reading + deduping every
+# descendant leaf's rows), which is slow at genus-and-above even well under
+# the observation-count threshold below.
+_EXPENSIVE_SUBTREE_RANKS = frozenset({"KINGDOM", "PHYLUM", "CLASS", "ORDER", "FAMILY", "GENUS"})
+
+
+def _taxon_observation_count(taxon: dict) -> int:
     try:
         _num_rows = _storage.read_table(
             GLOBAL_STATS_DIR / NUMERICAL_STATS_FILE,
             filters=[("taxon_key", "=", str(taxon["taxon_key"]))],
         ).to_pylist()
-        _obs_count = max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
+        return max((int(r["count"]) for r in _num_rows if r.get("count")), default=0)
     except Exception:
-        _obs_count = 0
-    if _obs_count >= _LARGE_TAXON_THRESHOLD:
+        return 0
+
+
+def _is_expensive_subtree_taxon(taxon: dict, observation_count: int | None = None) -> bool:
+    """True if this taxon's raw-occurrence-subtree endpoints should be
+    rejected: rank at/above GENUS (see _EXPENSIVE_SUBTREE_RANKS), or —
+    belt-and-suspenders for a pathologically large SPECIES/SUBSPECIES-rank
+    taxon — an observation count at/above _LARGE_TAXON_THRESHOLD."""
+    if taxon["rank"] in _EXPENSIVE_SUBTREE_RANKS:
+        return True
+    if observation_count is None:
+        observation_count = _taxon_observation_count(taxon)
+    return observation_count >= _LARGE_TAXON_THRESHOLD
+
+
+def _reject_if_large_taxon(taxon: dict) -> None:
+    """Block per-observation aggregation (filtering, slicing, raw sample/value
+    listing, downloading) for taxa too large/broad to do it live — matches the
+    frontend's large-taxon map/filter/download disable threshold (see
+    get_taxon's large_taxon field, which uses the same helper)."""
+    if _is_expensive_subtree_taxon(taxon):
         raise HTTPException(status_code=400, detail="large_taxon")
 
 
@@ -214,6 +345,8 @@ def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 _MAX_UPLOAD_ROWS = 50_000
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # well above what 50k CSV/TSV/Parquet rows needs
+_MAX_CONCURRENT_UPLOAD_JOBS = 20  # bounds worst-case memory (up to 50k-row DataFrame each) between TTL sweeps
 _DONE_TTL_SECONDS = 3600  # archive stays available for 1 hour after completion
 
 
@@ -275,12 +408,16 @@ async def _cleanup_old_jobs() -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    psutil.cpu_percent(interval=None)  # prime the delta tracker — see _status_server
     asyncio.create_task(_upload_consumer())
     asyncio.create_task(_cleanup_old_jobs())
     yield
 
 
 app = FastAPI(lifespan=_lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -332,12 +469,14 @@ _VALUE_TYPE_MAP = {"interval": "continuous", "ratio": "continuous", "nominal": "
 
 
 @app.get("/")
-def root():
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def root(request: Request):
     return {"status": "ok"}
 
 
 @app.get("/version")
-def version():
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def version(request: Request):
     try:
         state = json.loads(_SYNC_STATE_PATH.read_text()) if _SYNC_STATE_PATH.exists() else {}
         crawl_ts = (
@@ -355,10 +494,14 @@ def version():
     return {"version": crawl_ts, "api_build_date": api_build_date or None}
 
 
-@app.get("/status")
-async def status():
+_STATUS_CACHE_TTL_S = 2.0
+_status_cache: tuple[float, dict] | None = None
+
+
+async def _compute_status() -> dict:
     pipeline = await run_in_threadpool(_status_pipeline)
     temporal = await run_in_threadpool(_status_temporal)
+    basemap = await run_in_threadpool(_status_basemap)
     server = await run_in_threadpool(_status_server)
     active_job = next(
         (j for j in _upload_jobs.values() if j.status == "processing"), None
@@ -366,12 +509,29 @@ async def status():
     return {
         "pipeline": pipeline,
         "temporal": temporal,
+        "basemap": basemap,
         "upload_queue": {
             "depth": len(_upload_queue),
             "active": active_job is not None,
         },
         "server": server,
     }
+
+
+@app.get("/status")
+@limiter.limit(_RATE_LIMIT_STATUS)
+async def status(request: Request):
+    """Short TTL cache on top of _compute_status — a burst of concurrent
+    callers within the same window shares one computation instead of each
+    re-running /proc reads, psutil.sensors_temperatures(), and two
+    state-file reads."""
+    global _status_cache
+    now = time.monotonic()
+    if _status_cache is not None and (now - _status_cache[0]) < _STATUS_CACHE_TTL_S:
+        return _status_cache[1]
+    payload = await _compute_status()
+    _status_cache = (now, payload)
+    return payload
 
 
 @app.post("/internal/pipeline-state", status_code=200)
@@ -389,6 +549,7 @@ async def push_pipeline_state(body: dict):
 async def reload_data():
     """Clear all in-process caches so the next request reads fresh data from disk.
     Called after a rebuild push so the API picks up the new catalog without a restart."""
+    global _DATA_VERSION
     reload_catalog()
     _load_legend.cache_clear()
     _load_hierarchy.cache_clear()
@@ -396,17 +557,39 @@ async def reload_data():
     tiles._load_nominal_colormap.cache_clear()
     build_ternary_classification_overlay.cache_clear()
     gis.clear_dataset_cache()
+    _DATA_VERSION = datetime.now(UTC).isoformat()
+    _clear_data_versioned_caches()
     return {"ok": True}
 
 
 @app.post("/internal/temporal-state", status_code=200)
 async def push_temporal_state(body: dict):
+    global _TEMPORAL_VERSION
     from datetime import UTC
     from datetime import datetime as _dt
     body["received_at"] = _dt.now(UTC).isoformat()
-    await run_in_threadpool(
-        lambda: _TEMPORAL_STATE_PATH.write_text(json.dumps(body))
-    )
+
+    def _write():
+        _TEMPORAL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _TEMPORAL_STATE_PATH.write_text(json.dumps(body))
+
+    await run_in_threadpool(_write)
+    _TEMPORAL_VERSION = _dt.now(UTC).isoformat()
+    _clear_temporal_versioned_caches()
+    return {"ok": True}
+
+
+@app.post("/internal/basemap-state", status_code=200)
+async def push_basemap_state(body: dict):
+    from datetime import UTC
+    from datetime import datetime as _dt
+    body["received_at"] = _dt.now(UTC).isoformat()
+
+    def _write():
+        _BASEMAP_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _BASEMAP_STATE_PATH.write_text(json.dumps(body))
+
+    await run_in_threadpool(_write)
     return {"ok": True}
 
 
@@ -469,28 +652,51 @@ def _status_temporal() -> dict | None:
     }
 
 
+def _status_basemap() -> dict | None:
+    if not _BASEMAP_STATE_PATH.exists():
+        return None
+    try:
+        state = json.loads(_BASEMAP_STATE_PATH.read_text())
+    except Exception:
+        return None
+    from datetime import UTC
+    from datetime import datetime as _dt
+    elapsed_s = None
+    if state.get("status") == "running":
+        started = state.get("started_at")
+        if started:
+            try:
+                elapsed_s = int((_dt.now(UTC) - _dt.fromisoformat(started)).total_seconds())
+            except Exception:
+                pass
+    return {
+        "status": state.get("status"),
+        "stage": state.get("stage"),
+        "elapsed_s": elapsed_s,
+        "last_finished_at": state.get("completed_at"),
+        "last_duration_s": state.get("duration_s"),
+        "received_at": state.get("received_at"),
+    }
+
+
 def _status_server() -> dict:
-    import time as _time
     result: dict = {}
 
-    # CPU usage — two samples 300ms apart
+    # CPU usage — psutil.cpu_percent(interval=None) is non-blocking: it
+    # reports the delta since the *last* call using psutil's own internal
+    # timestamp, rather than this function sleeping 300ms itself. Primed
+    # once at startup (see _lifespan) so the first real request doesn't
+    # read 0.0. Non-blocking matters here specifically because this route
+    # runs in FastAPI's shared sync threadpool — a blocking sleep here
+    # occupies a worker thread doing nothing, and a burst of concurrent
+    # /status calls could starve every other sync endpoint.
     try:
-        def _read_cpu():
-            with open("/proc/stat") as f:
-                parts = f.readline().split()
-            vals = list(map(int, parts[1:8]))
-            return vals[3] + vals[4], sum(vals)  # idle, total
-
-        i1, t1 = _read_cpu()
-        _time.sleep(0.3)
-        i2, t2 = _read_cpu()
-        result["cpu_percent"] = round((1 - (i2 - i1) / (t2 - t1)) * 100, 1)
+        result["cpu_percent"] = round(psutil.cpu_percent(interval=None), 1)
     except Exception:
         result["cpu_percent"] = None
 
     # CPU temp
     try:
-        import psutil
         temps = psutil.sensors_temperatures()
         cpu_temp = None
         for name, entries in temps.items():
@@ -554,13 +760,22 @@ def _status_server() -> dict:
     return result
 
 
-@app.get("/data-sources")
-def data_sources():
+@lru_cache(maxsize=4)
+def _cached_data_sources(deploy_version: str):
     return citations.load_data_sources()
 
 
-@app.get("/variables")
-def list_variables(unit_system: str | None = Query(None), forecast_h: int = Query(0, ge=0)):
+@app.get("/data-sources")
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def data_sources(request: Request):
+    return _cached_data_sources(_DEPLOY_VERSION)
+
+
+@lru_cache(maxsize=32)
+def _cached_list_variables(
+    unit_system: str | None, forecast_h: int,
+    deploy_version: str, data_version: str, temporal_version: str,
+) -> list:
     forecast_suffix = f"__f{forecast_h:03d}h" if forecast_h in _VALID_FORECAST_HOURS and forecast_h > 0 else ""
     result = []
     for layer, category in tiles.load_layers_with_category():
@@ -601,17 +816,38 @@ def list_variables(unit_system: str | None = Query(None), forecast_h: int = Quer
     return result
 
 
-@app.get("/api/layers")
-def list_layers():
+@app.get("/variables")
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def list_variables(request: Request, unit_system: str | None = Query(None), forecast_h: int = Query(0, ge=0)):
+    # Mixes deploy-only catalog/legend content with layer version/render-range
+    # values that can change on either the main data rebuild (static layers)
+    # or the 30-min temporal cron (temporal layers) — needs all three tags.
+    return _cached_list_variables(unit_system, forecast_h, _DEPLOY_VERSION, _DATA_VERSION, _TEMPORAL_VERSION)
+
+
+@lru_cache(maxsize=4)
+def _cached_list_layers(deploy_version: str):
     return tiles.load_layers()
 
 
-@app.get("/phenology_values")
-def list_phenology_values():
+@app.get("/api/layers")
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def list_layers(request: Request):
+    return _cached_list_layers(_DEPLOY_VERSION)
+
+
+@lru_cache(maxsize=4)
+def _cached_list_phenology_values(deploy_version: str):
     return [
         {"value": v, "label": v.capitalize()}
         for v in sorted(_CONFIG.phenology_values)
     ]
+
+
+@app.get("/phenology_values")
+@limiter.limit(_RATE_LIMIT_CHEAP)
+def list_phenology_values(request: Request):
+    return _cached_list_phenology_values(_DEPLOY_VERSION)
 
 
 def _lookup_temporal_value_at_timestamp(
@@ -665,7 +901,9 @@ def _lookup_temporal_value_at_timestamp(
 
 
 @app.get("/gis/point")
+@limiter.limit(_RATE_LIMIT_DETAIL)
 async def gis_point_value(
+    request: Request,
     lat: float = Query(...),
     lon: float = Query(...),
     variable: str = Query(...),
@@ -857,7 +1095,9 @@ def _parse_and_convert_chain(chain: str | None, unit_system: str | None) -> list
 
 
 @app.get("/api/variables/{variable_id}/tiles/{z}/{x}/{y}.png")
+@limiter.limit(_RATE_LIMIT_TILES)
 async def variable_tile_compat(
+    request: Request,
     variable_id: str, z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024), colormap: str = Query("viridis"),
     cb_mode: str = Query(""), forecast_h: int = Query(0, ge=0),
@@ -869,11 +1109,16 @@ async def variable_tile_compat(
 ):
     """Compatibility shim for old frontend URL pattern (/api/variables/bio_1/ → bio1)."""
     layer_id = _resolve_variable_id(variable_id)
-    return await layer_tile(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h, class_filter, value_ranges, unit_system, chain, render_range)
+    return await layer_tile(
+        request, layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_h,
+        class_filter, value_ranges, unit_system, chain, render_range,
+    )
 
 
 @app.get("/api/layers/{layer_id}/tiles/{z}/{x}/{y}.png")
+@limiter.limit(_RATE_LIMIT_TILES)
 async def layer_tile(
+    request: Request,
     layer_id: str, z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024),
     colormap: str = Query("viridis"),
@@ -930,7 +1175,9 @@ async def layer_tile(
 
 
 @app.get("/api/layers/elevation/terrain-tiles/{z}/{x}/{y}.png")
+@limiter.limit(_RATE_LIMIT_TILES)
 async def elevation_terrain_tile(
+    request: Request,
     z: int, x: int, y: int,
     tile_size: int = Query(256, ge=32, le=1024),
 ):
@@ -979,7 +1226,8 @@ def _fetch_satellite_tile_bytes(z: int, x: int, y: int) -> bytes:
 
 
 @app.get("/api/tiles/satellite/{z}/{x}/{y}.jpg")
-async def satellite_tile(z: int, x: int, y: int):
+@limiter.limit(_RATE_LIMIT_SATELLITE)
+async def satellite_tile(request: Request, z: int, x: int, y: int):
     """Proxies Esri World Imagery tiles — see _fetch_satellite_tile_bytes for why."""
     payload = await run_in_threadpool(_fetch_satellite_tile_bytes, z, x, y)
     # Shorter/mutable TTL than the DEM/derived-layer tiles above: this is
@@ -991,8 +1239,65 @@ async def satellite_tile(z: int, x: int, y: int):
     )
 
 
+@app.get("/api/basemap/version")
+async def basemap_version():
+    """Current basemap build date for the frontend's cache-busting URL
+    builder (see MAP_TILE_URL_TEMPLATE_LIGHT/DARK in
+    speciesOccurrenceMapHelpers.ts). No caching — same reasoning as
+    /variables serving GIS layers' version tokens uncached: staleness here
+    means the frontend keeps using an old (still-valid, just not-newest)
+    build_date, not broken tiles, but there's no reason to add that lag.
+    """
+    if not _BASEMAP_STATE_PATH.exists():
+        return {"build_date": None}
+    try:
+        state = json.loads(_BASEMAP_STATE_PATH.read_text())
+    except Exception:
+        return {"build_date": None}
+    completed_at = state.get("completed_at")
+    return {"build_date": completed_at[:10] if completed_at else None}
+
+
+def _fetch_basemap_tile_bytes(theme: str, z: int, x: int, y: int) -> bytes:
+    """Fetch one rendered raster tile from tileserver-gl for the given theme."""
+    url = f"{_TILESERVER_BASE}/styles/{theme}/{z}/{x}/{y}.png"
+    try:
+        resp = httpx.get(url, timeout=10.0)
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Basemap tile fetch failed: {e}") from e
+    return resp.content
+
+
+@app.get("/api/basemap/{theme}/{build_date}/tiles/{z}/{x}/{y}.png")
+@limiter.limit(_RATE_LIMIT_TILES)
+async def basemap_tile(request: Request, theme: str, build_date: str, z: int, x: int, y: int):
+    """Proxies the self-hosted OpenMapTiles basemap (tileserver-gl) — see
+    scripts/gis/build_basemap_tiles.py and docker-compose.yml's `tileserver`
+    service.
+
+    build_date is a pure cache-busting token (matches basemap_state.json's
+    completed_at, see the frontend's basemap URL builder) — it isn't used to
+    select data here, since tileserver-gl only ever has one current
+    basemap.pmtiles loaded. The long immutable TTL is safe not because this
+    content never changes, but because a new build produces a URL nobody has
+    requested before; old build_date values just stop being requested and
+    age out of cache on their own, same scheme /api/layers/{layer_id}/tiles
+    already uses with its mtime-derived version token.
+    """
+    if theme not in _BASEMAP_THEMES:
+        raise HTTPException(status_code=404, detail=f"Unknown basemap theme '{theme}'")
+    payload = await run_in_threadpool(_fetch_basemap_tile_bytes, theme, z, x, y)
+    return Response(
+        content=payload, media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
 @app.get("/api/layers/{layer_id}/tile-range/classes")
+@limiter.limit(_RATE_LIMIT_TILE_RANGE)
 async def layer_tile_range_classes(
+    request: Request,
     layer_id: str,
     z: int = Query(...),
     x0: int = Query(...),
@@ -1012,7 +1317,9 @@ async def layer_tile_range_classes(
 
 
 @app.get("/api/layers/{layer_id}/tile-range/stats")
+@limiter.limit(_RATE_LIMIT_TILE_RANGE)
 async def layer_tile_range_stats(
+    request: Request,
     layer_id: str,
     z: int = Query(...),
     x0: int = Query(...),
@@ -1052,9 +1359,8 @@ async def layer_tile_range_stats(
     }
 
 
-@app.get("/api/taxon/{taxon_id}")
-@app.get("/api/species/{taxon_id}")
-def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
+@lru_cache(maxsize=4096)
+def _cached_get_taxon(taxon_id: str, unit_system: str | None, data_version: str) -> dict:
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -1142,7 +1448,7 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
         "",
     )
     observation_count = max((int(r["count"]) for r in numerical_rows if r.get("count")), default=0)
-    large_taxon = observation_count >= _LARGE_TAXON_THRESHOLD
+    large_taxon = _is_expensive_subtree_taxon(taxon, observation_count)
     return {
         **taxon,
         "scientific_name": sci.replace("_", " "),
@@ -1154,6 +1460,13 @@ def get_taxon(taxon_id: str, unit_system: str | None = Query(None)):
         "observation_count": observation_count,
         "large_taxon": large_taxon,
     }
+
+
+@app.get("/api/taxon/{taxon_id}")
+@app.get("/api/species/{taxon_id}")
+@limiter.limit(_RATE_LIMIT_DETAIL)
+def get_taxon(request: Request, taxon_id: str, unit_system: str | None = Query(None)):
+    return _cached_get_taxon(taxon_id, unit_system, _DATA_VERSION)
 
 
 def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
@@ -1170,14 +1483,12 @@ def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
     return not (df["obscured"] == "No").any()
 
 
-@app.get("/api/species/{taxon_id}/obscured")
-def get_species_obscured(
-    taxon_id: str,
-    location: str | None = Query(None, description="Optional location GID to scope the obscured check"),
-):
+@lru_cache(maxsize=4096)
+def _cached_get_species_obscured(taxon_id: str, location: str | None, data_version: str) -> dict:
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
+    _reject_if_large_taxon(taxon)
     location_gid = location.strip() if location else None
     all_obscured = _check_all_obscured(taxon, location_gid)
     return {
@@ -1188,8 +1499,20 @@ def get_species_obscured(
     }
 
 
-@app.get("/api/taxon/{taxon_id}/env-stats")
-def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
+@app.get("/api/species/{taxon_id}/obscured")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
+def get_species_obscured(
+    request: Request,
+    taxon_id: str,
+    location: str | None = Query(None, description="Optional location GID to scope the obscured check"),
+):
+    return _cached_get_species_obscured(taxon_id, location, _DATA_VERSION)
+
+
+@lru_cache(maxsize=4096)
+def _cached_get_taxon_env_stats(
+    taxon_id: str, unit_system: str | None, data_version: str, deploy_version: str,
+) -> dict:
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -1278,6 +1601,12 @@ def get_taxon_env_stats(taxon_id: str, unit_system: str | None = Query(None)):
         variables.append(entry)
 
     return {"variables": variables}
+
+
+@app.get("/api/taxon/{taxon_id}/env-stats")
+@limiter.limit(_RATE_LIMIT_DETAIL)
+def get_taxon_env_stats(request: Request, taxon_id: str, unit_system: str | None = Query(None)):
+    return _cached_get_taxon_env_stats(taxon_id, unit_system, _DATA_VERSION, _DEPLOY_VERSION)
 
 
 # ---------------------------------------------------------------------------
@@ -1420,158 +1749,31 @@ def _class_samples_from_raw_occ(
     ]
 
 
-@app.get("/species/{taxon_id}/environment/{variable_id}")
-def get_species_environment(
-    taxon_id: str, variable_id: str, unit_system: str | None = None,
-    location: str | None = None, phenology: str | None = None,
-    start_ts: int | None = None, end_ts: int | None = None,
-    extra: str | None = None, polygon: str | None = None,
-):
-    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
-    if taxon is None:
-        raise HTTPException(status_code=404, detail="Taxon not found")
-
-    phenology_norm = phenology.strip().lower() if phenology else None
-    if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
-        raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
-    try:
-        polygon_geom = parse_polygon_param(polygon)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid polygon: {exc}") from exc
-
-    variable_id = _resolve_variable_id(variable_id)
-    layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
-    variable_metadata = {
+def _build_variable_metadata(layer: dict | None, variable_id: str, unit_system: str | None) -> dict:
+    return {
         "name": layer["display_name"] if layer else variable_id,
         "units": units.display_units(layer, unit_system) if layer else None,
         "value_type": layer.get("value_type") if layer else None,
         "domain": (layer.get("domain") or None) if layer else None,
     }
-    value_type = layer.get("value_type") if layer else None
-    extra_filters = _parse_extra_variable_filters(extra, unit_system)
 
-    if (
-        location is not None or phenology_norm is not None or start_ts is not None
-        or end_ts is not None or extra_filters or polygon_geom is not None
-    ) and layer is not None:
-        _reject_if_large_taxon(taxon)
-        filter_col = _location_filter_col(location) if location is not None else None
-        if location is None or filter_col is not None:
-            all_layers_by_id = {lyr["id"]: lyr for lyr in tiles.load_layers()}
-            result = compute_location_filtered_stats(
-                taxon, variable_id, filter_col, location, layer,
-                phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
-                storage=_storage, layer_meta=all_layers_by_id,
-                extra_filters=extra_filters, polygon=polygon_geom,
-            )
-            if result is not None:
-                if result["type"] == "continuous":
-                    stats = result["stats"]
-                    raw_summary = {
-                        "count": stats["count"],
-                        "min": stats.get("min"),
-                        "mean": stats.get("mean"),
-                        "max": stats.get("max"),
-                        "median": stats.get("median"),
-                        "mode": stats.get("mode"),
-                        "std": stats.get("std"),
-                        "stddev": stats.get("std"),
-                        "variance": stats.get("variance"),
-                        "range": stats.get("range"),
-                        "q10": stats.get("10th_percentile"),
-                        "q25": stats.get("25th_percentile"),
-                        "q75": stats.get("75th_percentile"),
-                        "q90": stats.get("90th_percentile"),
-                        "iqr": stats.get("iqr"),
-                        "10_90_range": stats.get("10_90_range"),
-                        "entropy": stats.get("entropy"),
-                    }
-                    return {
-                        "species_id": taxon.get("taxon_key"),
-                        "variable": variable_id,
-                        "variable_metadata": variable_metadata,
-                        "observation_count": result["observation_count"],
-                        "summary": units.convert_summary(raw_summary, layer, unit_system),
-                        "density_curve": units.convert_density_curve(result["density_curve"], layer, unit_system),
-                        "categorical_distribution": None,
-                        "relative_ranks": [],
-                    }
-                if result["type"] == "circular":
-                    stats = result["stats"]
-                    return {
-                        "species_id": taxon.get("taxon_key"),
-                        "variable": variable_id,
-                        "variable_metadata": variable_metadata,
-                        "observation_count": result["observation_count"],
-                        "summary": {
-                            "count": stats["count"],
-                            "circular_mean": stats.get("circular_mean"),
-                            "rbar": stats.get("rbar"),
-                            "circular_std": stats.get("circular_std"),
-                            "circular_var": stats.get("circular_var"),
-                            "entropy": stats.get("entropy"),
-                            "mode": stats.get("mode"),
-                        },
-                        "density_curve": result["density_curve"],
-                        "categorical_distribution": None,
-                        "relative_ranks": [],
-                    }
-                total_samples = result["observation_count"]
-                class_index = {c["id"]: c for c in _load_legend(variable_id)}
-                categorical_distribution = [
-                    {
-                        "value": item["class_id"],
-                        "class_name": class_index.get(item["class_id"], {}).get("name", str(item["class_id"])),
-                        "description": "",
-                        "color": (class_index.get(item["class_id"], {}).get("traits") or {}).get("color"),
-                        "count": round(total_samples * item["fraction"]),
-                        "fraction": item["fraction"],
-                    }
-                    for item in result["distribution"]
-                ]
-                ternary_composition_density = result.get("ternary_composition_density")
-                if ternary_composition_density is not None:
-                    classifier = gis.COMPOSITION_CLASSIFIERS.get(variable_id)
-                    group = (layer or {}).get("composition_group")
-                    if classifier is not None and group:
-                        axis_columns = tuple(composition_group_members(all_layers_by_id).get(group, ()))
-                        if len(axis_columns) == 3:
-                            overlay = build_ternary_classification_overlay(
-                                ternary_composition_density["resolution"], classifier, axis_columns,
-                            )
-                            ternary_composition_density["class_ids"] = overlay["class_ids"]
-                            ternary_composition_density["class_boundary_a"] = overlay["boundary_a"]
-                            ternary_composition_density["class_boundary_b"] = overlay["boundary_b"]
-                return {
-                    "species_id": taxon.get("taxon_key"),
-                    "variable": variable_id,
-                    "variable_metadata": variable_metadata,
-                    "observation_count": total_samples,
-                    "summary": {
-                        "count": total_samples,
-                        "min": None,
-                        "mean": None,
-                        "max": None,
-                        "entropy": result.get("summary", {}).get("entropy"),
-                        "unique_classes": result.get("summary", {}).get("unique_classes"),
-                        "mode": result.get("summary", {}).get("mode"),
-                    },
-                    "density_curve": None,
-                    "categorical_distribution": categorical_distribution,
-                    "ternary_composition_density": ternary_composition_density,
-                    "relative_ranks": [],
-                }
-            else:
-                if _check_all_obscured(taxon, location):
-                    return {
-                        "all_obscured": True,
-                        "species_id": taxon.get("taxon_key"),
-                        "variable": variable_id,
-                    }
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}' with the active filters.",
-                )
+
+@lru_cache(maxsize=4096)
+def _cached_get_species_environment_base(
+    taxon_id: str, variable_id: str, unit_system: str | None, data_version: str,
+) -> dict:
+    """Unfiltered case only — no location/phenology/timestamp/extra/polygon —
+    reads precomputed global stats, bounded by (taxon, variable, unit_system).
+    The filtered branch (compute_location_filtered_stats) stays live in the
+    route below: extra/polygon are arbitrary JSON/WKT, an unbounded key
+    space not worth caching."""
+    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+    if taxon is None:
+        raise HTTPException(status_code=404, detail="Taxon not found")
+    variable_id = _resolve_variable_id(variable_id)
+    layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
+    variable_metadata = _build_variable_metadata(layer, variable_id, unit_system)
+    value_type = layer.get("value_type") if layer else None
 
     if value_type in ("nominal", "ordinal"):
         stats_file = ORDINAL_STATS_FILE if value_type == "ordinal" else NOMINAL_STATS_FILE
@@ -1743,6 +1945,158 @@ def get_species_environment(
     }
 
 
+@app.get("/species/{taxon_id}/environment/{variable_id}")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
+def get_species_environment(
+    request: Request,
+    taxon_id: str, variable_id: str, unit_system: str | None = None,
+    location: str | None = None, phenology: str | None = None,
+    start_ts: int | None = None, end_ts: int | None = None,
+    extra: str | None = None, polygon: str | None = None,
+):
+    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+    if taxon is None:
+        raise HTTPException(status_code=404, detail="Taxon not found")
+
+    phenology_norm = phenology.strip().lower() if phenology else None
+    if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
+        raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+    try:
+        polygon_geom = parse_polygon_param(polygon)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid polygon: {exc}") from exc
+
+    variable_id = _resolve_variable_id(variable_id)
+    layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == variable_id), None)
+    variable_metadata = _build_variable_metadata(layer, variable_id, unit_system)
+    extra_filters = _parse_extra_variable_filters(extra, unit_system)
+
+    if (
+        location is not None or phenology_norm is not None or start_ts is not None
+        or end_ts is not None or extra_filters or polygon_geom is not None
+    ) and layer is not None:
+        _reject_if_large_taxon(taxon)
+        filter_col = _location_filter_col(location) if location is not None else None
+        if location is None or filter_col is not None:
+            all_layers_by_id = {lyr["id"]: lyr for lyr in tiles.load_layers()}
+            result = compute_location_filtered_stats(
+                taxon, variable_id, filter_col, location, layer,
+                phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+                storage=_storage, layer_meta=all_layers_by_id,
+                extra_filters=extra_filters, polygon=polygon_geom,
+            )
+            if result is not None:
+                if result["type"] == "continuous":
+                    stats = result["stats"]
+                    raw_summary = {
+                        "count": stats["count"],
+                        "min": stats.get("min"),
+                        "mean": stats.get("mean"),
+                        "max": stats.get("max"),
+                        "median": stats.get("median"),
+                        "mode": stats.get("mode"),
+                        "std": stats.get("std"),
+                        "stddev": stats.get("std"),
+                        "variance": stats.get("variance"),
+                        "range": stats.get("range"),
+                        "q10": stats.get("10th_percentile"),
+                        "q25": stats.get("25th_percentile"),
+                        "q75": stats.get("75th_percentile"),
+                        "q90": stats.get("90th_percentile"),
+                        "iqr": stats.get("iqr"),
+                        "10_90_range": stats.get("10_90_range"),
+                        "entropy": stats.get("entropy"),
+                    }
+                    return {
+                        "species_id": taxon.get("taxon_key"),
+                        "variable": variable_id,
+                        "variable_metadata": variable_metadata,
+                        "observation_count": result["observation_count"],
+                        "summary": units.convert_summary(raw_summary, layer, unit_system),
+                        "density_curve": units.convert_density_curve(result["density_curve"], layer, unit_system),
+                        "categorical_distribution": None,
+                        "relative_ranks": [],
+                    }
+                if result["type"] == "circular":
+                    stats = result["stats"]
+                    return {
+                        "species_id": taxon.get("taxon_key"),
+                        "variable": variable_id,
+                        "variable_metadata": variable_metadata,
+                        "observation_count": result["observation_count"],
+                        "summary": {
+                            "count": stats["count"],
+                            "circular_mean": stats.get("circular_mean"),
+                            "rbar": stats.get("rbar"),
+                            "circular_std": stats.get("circular_std"),
+                            "circular_var": stats.get("circular_var"),
+                            "entropy": stats.get("entropy"),
+                            "mode": stats.get("mode"),
+                        },
+                        "density_curve": result["density_curve"],
+                        "categorical_distribution": None,
+                        "relative_ranks": [],
+                    }
+                total_samples = result["observation_count"]
+                class_index = {c["id"]: c for c in _load_legend(variable_id)}
+                categorical_distribution = [
+                    {
+                        "value": item["class_id"],
+                        "class_name": class_index.get(item["class_id"], {}).get("name", str(item["class_id"])),
+                        "description": "",
+                        "color": (class_index.get(item["class_id"], {}).get("traits") or {}).get("color"),
+                        "count": round(total_samples * item["fraction"]),
+                        "fraction": item["fraction"],
+                    }
+                    for item in result["distribution"]
+                ]
+                ternary_composition_density = result.get("ternary_composition_density")
+                if ternary_composition_density is not None:
+                    classifier = gis.COMPOSITION_CLASSIFIERS.get(variable_id)
+                    group = (layer or {}).get("composition_group")
+                    if classifier is not None and group:
+                        axis_columns = tuple(composition_group_members(all_layers_by_id).get(group, ()))
+                        if len(axis_columns) == 3:
+                            overlay = build_ternary_classification_overlay(
+                                ternary_composition_density["resolution"], classifier, axis_columns,
+                            )
+                            ternary_composition_density["class_ids"] = overlay["class_ids"]
+                            ternary_composition_density["class_boundary_a"] = overlay["boundary_a"]
+                            ternary_composition_density["class_boundary_b"] = overlay["boundary_b"]
+                return {
+                    "species_id": taxon.get("taxon_key"),
+                    "variable": variable_id,
+                    "variable_metadata": variable_metadata,
+                    "observation_count": total_samples,
+                    "summary": {
+                        "count": total_samples,
+                        "min": None,
+                        "mean": None,
+                        "max": None,
+                        "entropy": result.get("summary", {}).get("entropy"),
+                        "unique_classes": result.get("summary", {}).get("unique_classes"),
+                        "mode": result.get("summary", {}).get("mode"),
+                    },
+                    "density_curve": None,
+                    "categorical_distribution": categorical_distribution,
+                    "ternary_composition_density": ternary_composition_density,
+                    "relative_ranks": [],
+                }
+            else:
+                if _check_all_obscured(taxon, location):
+                    return {
+                        "all_obscured": True,
+                        "species_id": taxon.get("taxon_key"),
+                        "variable": variable_id,
+                    }
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No samples available for taxon {taxon_id} and variable '{variable_id}' with the active filters.",
+                )
+
+    return _cached_get_species_environment_base(taxon_id, variable_id, unit_system, _DATA_VERSION)
+
+
 def _occurrence_response(
     catalog_number: str,
     taxon: dict,
@@ -1870,7 +2224,8 @@ def _lookup_inat_observation(catalog_number: str) -> dict | None:
 
 
 @app.get("/occurrence/{catalog_number}")
-def get_occurrence(catalog_number: str):
+@limiter.limit(_RATE_LIMIT_DETAIL)
+def get_occurrence(request: Request, catalog_number: str):
     """Resolve an iNaturalist observation id (catalogNumber) to its taxon + location.
 
     Powers deep links like /occurrence/{id} on the frontend: given just an
@@ -1920,14 +2275,19 @@ def get_occurrence(catalog_number: str):
     )
 
 
-@app.get("/species/{taxon_id}/occurrences")
-def get_species_occurrences(
+@lru_cache(maxsize=2048)
+def _cached_get_species_occurrences(
     taxon_id: str,
-    location: str | None = None,
-    phenology: str | None = None,
-    start_ts: int | None = None,
-    end_ts: int | None = None,
-):
+    location: str | None,
+    phenology: str | None,
+    start_ts: int | None,
+    end_ts: int | None,
+    data_version: str,
+) -> dict:
+    """Bounded LRU rather than caching every param combo unconditionally —
+    start_ts/end_ts are near-continuous, so this evicts gracefully instead
+    of growing unbounded; the common unfiltered "show me the map" call
+    (all params None) always wins a cache slot on repeat."""
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -2011,6 +2371,19 @@ def get_species_occurrences(
     }
 
 
+@app.get("/species/{taxon_id}/occurrences")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
+def get_species_occurrences(
+    request: Request,
+    taxon_id: str,
+    location: str | None = None,
+    phenology: str | None = None,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+):
+    return _cached_get_species_occurrences(taxon_id, location, phenology, start_ts, end_ts, _DATA_VERSION)
+
+
 @lru_cache(maxsize=1)
 def _load_hierarchy() -> dict[str, dict]:
     """Return gid → {name, level, parent_gid} from hierarchy.csv."""
@@ -2071,8 +2444,10 @@ def _ancestor_gids(gid: str, by_gid: dict[str, dict]) -> set[str]:
     return chain
 
 
-@app.get("/species/{taxon_id}/locations")
-def get_species_locations(taxon_id: str, level: int | None = None, parent: str | None = None, limit: int = 500):
+@lru_cache(maxsize=4096)
+def _cached_get_species_locations(
+    taxon_id: str, level: int | None, parent: str | None, limit: int, data_version: str,
+) -> list:
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
@@ -2119,8 +2494,19 @@ def get_species_locations(taxon_id: str, level: int | None = None, parent: str |
     return results[:limit]
 
 
+@app.get("/species/{taxon_id}/locations")
+@limiter.limit(_RATE_LIMIT_DETAIL)
+def get_species_locations(
+    request: Request, taxon_id: str, level: int | None = None, parent: str | None = None, limit: int = 500,
+):
+    # Was missing a rate limit entirely until now — a gap from the earlier
+    # hardening pass, not a deliberate omission.
+    return _cached_get_species_locations(taxon_id, level, parent, limit, _DATA_VERSION)
+
+
 @app.get("/species/{taxon_id}/download")
-async def download_species_data(background_tasks: BackgroundTasks, taxon_id: str) -> FileResponse:
+@limiter.limit(_RATE_LIMIT_DOWNLOAD)
+async def download_species_data(request: Request, background_tasks: BackgroundTasks, taxon_id: str) -> FileResponse:
     """Download a taxon's occurrence data + stats as a ZIP, same shape as the
     custom-upload archive so it can be mounted offline the same way.
 
@@ -2148,7 +2534,9 @@ async def download_species_data(background_tasks: BackgroundTasks, taxon_id: str
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/observation-values")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_observation_variable_values(
+    request: Request,
     taxon_id: str,
     variable_id: str,
     unit_system: str | None = None,
@@ -2293,7 +2681,9 @@ def _parse_display_range(variable_id: str, layer: dict, entry: dict, unit_system
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/slice")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_species_environment_slice(
+    request: Request,
     taxon_id: str,
     variable_id: str,
     min_value: float = Query(..., alias="min"),
@@ -2358,7 +2748,9 @@ def get_species_environment_slice(
 
 
 @app.get("/species/{taxon_id}/environment/{variable_id}/class/{class_value}/samples")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_species_environment_class_samples(
+    request: Request,
     taxon_id: str,
     variable_id: str,
     class_value: str,
@@ -2429,11 +2821,8 @@ _METRIC_ORDER = ["mean", "median", "min", "max", "std"]
 _METRIC_RANK = {m: i for i, m in enumerate(_METRIC_ORDER)}
 
 
-@app.get("/api/taxa/ranking-options")
-def list_taxa_ranking_options(
-    within_taxon: str = Query(...),
-    descendant_rank: str = Query(...),
-):
+@lru_cache(maxsize=4096)
+def _cached_list_taxa_ranking_options(within_taxon: str, descendant_rank: str, data_version: str) -> dict:
     resolved = taxa.get_taxon_by_id(within_taxon) or taxa.get_taxon_by_slug(within_taxon)
     if resolved is None:
         raise HTTPException(status_code=404, detail=f"Taxon not found: {within_taxon}")
@@ -2510,24 +2899,40 @@ def list_taxa_ranking_options(
     return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": options}
 
 
-@app.get("/api/taxa/query")
-def query_taxa(
-    q: str | None = Query(None, min_length=1),
-    within_taxon: str | None = Query(None),
-    descendant_rank: str | None = Query(None),
-    sort_variable: str | None = Query(None),
-    sort_metric: str | None = Query(None),
-    sort_order: str = Query("asc", pattern="^(asc|desc)$"),
-    limit: int = Query(10, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    min_samples: int = Query(10, ge=0),
-    include_species_like: bool = Query(False),
-    location: str | None = Query(None),
-    unit_system: str | None = Query(None),
-    sort_reference: float | None = Query(None),
-    min_rbar: float | None = Query(None, ge=0.0, le=1.0),
-    filter_params: list[str] = Query([], alias="filter"),
+@app.get("/api/taxa/ranking-options")
+@limiter.limit(_RATE_LIMIT_DETAIL)
+def list_taxa_ranking_options(
+    request: Request,
+    within_taxon: str = Query(...),
+    descendant_rank: str = Query(...),
 ):
+    return _cached_list_taxa_ranking_options(within_taxon, descendant_rank, _DATA_VERSION)
+
+
+@lru_cache(maxsize=2048)
+def _cached_query_taxa(
+    q: str | None,
+    within_taxon: str | None,
+    descendant_rank: str | None,
+    sort_variable: str | None,
+    sort_metric: str | None,
+    sort_order: str,
+    limit: int,
+    offset: int,
+    min_samples: int,
+    include_species_like: bool,
+    location: str | None,
+    unit_system: str | None,
+    sort_reference: float | None,
+    min_rbar: float | None,
+    filter_params: tuple[str, ...],
+    data_version: str,
+) -> dict:
+    """Bounded LRU — real traffic clusters on a handful of common
+    browse/sort/filter combos even though the full param space is
+    combinatorial; a size cap captures the hot set without unbounded
+    growth. filter_params is a tuple here (hashable cache key) rather than
+    the list FastAPI hands the route — see query_taxa below."""
     normalized_q = normalize_name(q or "") or None
 
     resolved_taxon: taxa.TaxonRecord | None = None
@@ -2650,8 +3055,62 @@ def query_taxa(
     }
 
 
+@app.get("/api/taxa/query")
+@limiter.limit(_RATE_LIMIT_SEARCH)
+def query_taxa(
+    request: Request,
+    q: str | None = Query(None, min_length=1),
+    within_taxon: str | None = Query(None),
+    descendant_rank: str | None = Query(None),
+    sort_variable: str | None = Query(None),
+    sort_metric: str | None = Query(None),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$"),
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    min_samples: int = Query(10, ge=0),
+    include_species_like: bool = Query(False),
+    location: str | None = Query(None),
+    unit_system: str | None = Query(None),
+    sort_reference: float | None = Query(None),
+    min_rbar: float | None = Query(None, ge=0.0, le=1.0),
+    filter_params: list[str] = Query([], alias="filter"),
+):
+    return _cached_query_taxa(
+        q, within_taxon, descendant_rank, sort_variable, sort_metric, sort_order,
+        limit, offset, min_samples, include_species_like, location, unit_system,
+        sort_reference, min_rbar, tuple(filter_params), _DATA_VERSION,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Response-cache invalidation — called from reload_data()/push_temporal_state()
+# whenever their respective version tag bumps, purely to drop now-unreachable
+# stale-version entries before LRU pressure would otherwise evict them.
+# Not load-bearing for correctness: each cached function's version tag is
+# already baked into its lru_cache key, so a version bump alone makes old
+# entries unreachable even if these clears are ever skipped.
+# ---------------------------------------------------------------------------
+
+def _clear_data_versioned_caches() -> None:
+    _cached_get_taxon.cache_clear()
+    _cached_get_species_obscured.cache_clear()
+    _cached_get_taxon_env_stats.cache_clear()
+    _cached_get_species_environment_base.cache_clear()
+    _cached_get_species_occurrences.cache_clear()
+    _cached_get_species_locations.cache_clear()
+    _cached_list_taxa_ranking_options.cache_clear()
+    _cached_query_taxa.cache_clear()
+    _cached_list_variables.cache_clear()  # also temporal-tagged, see below
+
+
+def _clear_temporal_versioned_caches() -> None:
+    _cached_list_variables.cache_clear()
+
+
 @app.post("/upload/raw-observations")
+@limiter.limit(_RATE_LIMIT_UPLOAD)
 async def upload_raw_observations(
+    request: Request,
     file: UploadFile = File(...),
 ) -> JSONResponse:
     """Accept a CSV, TSV, or Parquet file and queue it for processing.
@@ -2667,7 +3126,33 @@ async def upload_raw_observations(
             detail=f"Unsupported file type '{suffix}'. Accepted: CSV, TSV, Parquet.",
         )
 
+    # Reject on the client-declared size before buffering anything into
+    # memory — the row-count check below only runs after a full
+    # `await file.read()`, which would otherwise buffer an arbitrarily
+    # large body first.
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > _MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Upload exceeds the {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB size limit.",
+                )
+        except ValueError:
+            pass
+
+    if len(_upload_jobs) >= _MAX_CONCURRENT_UPLOAD_JOBS:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many uploads are already being processed. Try again shortly.",
+        )
+
     contents = await file.read()
+    if len(contents) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Upload exceeds the {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB size limit.",
+        )
     buf = io.BytesIO(contents)
     try:
         if suffix == ".parquet":

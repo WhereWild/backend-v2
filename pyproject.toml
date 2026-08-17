@@ -24,6 +24,7 @@ dependencies = [
     "pyogrio>=0.10.0",
     "matplotlib>=3.8.0",
     "duckdb>=1.5.4",
+    "slowapi>=0.1.9",
 ]
 
 [tool.ruff]

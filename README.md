@@ -81,3 +81,7 @@ It may take a while for the GBIF export to process, but once that is done the re
 ## Temporal Rebuild Pipeline
 
 Adjacent to the taxonomy data pipeline, there is the pipeline for temporal rasters being built and updated in `build_temporal.py`. The current setup is that the script is ran every 30 minutes via a cronjob that targets `bash/run_temporal.sh`. Initial builds will take ~15 minutes but incrimental changes afterwards should complete within only a few seconds.
+
+## Tile Build Pipeline
+
+There is also the tile building pipeline as there is an option for self-hosted vector basemaps. An offline fallback should automatically work without any of this being touched, but there is also a `bash/run_basemap_tiles.sh` script that can generate them for local use, however this takes a few hours, may need up to 200 GB of disk headroom, and a decent amount of RAM.

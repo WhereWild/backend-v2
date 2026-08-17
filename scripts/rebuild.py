@@ -192,6 +192,8 @@ def _push_stage() -> None:
         "--exclude", "taxonomy/cache/**",
         "--exclude", "gis/temporal/**",
         "--exclude", "gis/layers/elevation.tif",
+        "--exclude", "gis/tiles/_src/**",
+        "--exclude", "gis/tiles/_test/**",
         "--exclude", "tmp/**",
         "--delete-excluded",
         "--transfers", transfers,

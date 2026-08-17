@@ -1,0 +1,80 @@
+{
+  "version": 8,
+  "name": "WhereWild Standard Voyager",
+  "metadata": {
+    "ww:note": "Fork of CARTO Voyager (github.com/CartoDB/basemap-styles/blob/master/mapboxgl/voyager.json) — same BSD-3-Clause/CC-BY 4.0 license as Positron/Dark Matter, same required attribution (CARTO + OpenMapTiles + OpenStreetMap). Demo/preview style, not currently wired into build_basemap_tiles.py's BASE_STYLES — proves theme-swapping is just another style.json against the same PMTiles data, no rebuild. Extra landcover classes (grass/scrub/wetland/ice/sand/rock), ferry, and mountain-peak are WhereWild additions with no CARTO equivalent, same idiom as standard-light/dark."
+  },
+  "glyphs": "/tiles/fonts/{fontstack}/{range}.pbf",
+  "sources": {
+    "openmaptiles": {
+      "type": "vector",
+      "url": "/tiles/data/openmaptiles.json"
+    }
+  },
+  "layers": [
+    { "id": "background", "type": "background", "paint": { "background-color": "#fbf8f3" } },
+    { "id": "landcover-wood", "type": "fill", "source": "openmaptiles", "source-layer": "landcover", "filter": ["==", ["get", "class"], "wood"], "paint": { "fill-color": "rgba(197, 225, 178, 0.35)" } },
+    { "id": "landcover-grass", "type": "fill", "source": "openmaptiles", "source-layer": "landcover", "filter": ["==", ["get", "class"], "grass"], "paint": { "fill-color": "rgba(197, 225, 178, 0.3)" } },
+    { "id": "landcover-scrub", "type": "fill", "source": "openmaptiles", "source-layer": "landcover", "filter": ["==", ["get", "class"], "scrub"], "paint": { "fill-color": "rgba(210, 220, 165, 0.3)" } },
+    { "id": "landcover-wetland", "type": "fill", "source": "openmaptiles", "source-layer": "landcover", "filter": ["==", ["get", "class"], "wetland"], "paint": { "fill-color": "rgba(178, 214, 210, 0.35)" } },
+    { "id": "landcover-ice", "type": "fill", "source": "openmaptiles", "source-layer": "landcover", "filter": ["==", ["get", "class"], "ice"], "paint": { "fill-color": "rgba(224, 236, 240, 0.7)" } },
+    { "id": "landcover-sand", "type": "fill", "source": "openmaptiles", "source-layer": "landcover", "filter": ["==", ["get", "class"], "sand"], "paint": { "fill-color": "rgba(240, 227, 190, 0.4)" } },
+    { "id": "landcover-rock", "type": "fill", "source": "openmaptiles", "source-layer": "landcover", "filter": ["==", ["get", "class"], "rock"], "paint": { "fill-color": "rgba(214, 208, 195, 0.35)" } },
+    { "id": "landuse-residential", "type": "fill", "source": "openmaptiles", "source-layer": "landuse", "filter": ["==", ["get", "class"], "residential"], "paint": { "fill-color": "rgba(243, 234, 220, 0.35)" } },
+    { "id": "landuse-park", "type": "fill", "source": "openmaptiles", "source-layer": "park", "paint": { "fill-color": "rgba(197, 225, 178, 0.4)" } },
+    { "id": "water", "type": "fill", "source": "openmaptiles", "source-layer": "water", "filter": ["!=", ["get", "brunnel"], "tunnel"], "paint": { "fill-color": "#b0d0d6" } },
+    { "id": "waterway", "type": "line", "source": "openmaptiles", "source-layer": "waterway", "paint": { "line-color": "#cce7ea", "line-width": ["interpolate", ["linear"], ["zoom"], 8, 0.5, 16, 3] } },
+    { "id": "building", "type": "fill", "source": "openmaptiles", "source-layer": "building", "minzoom": 13, "paint": { "fill-color": "#f3eadc", "fill-outline-color": "#e9d8be" } },
+    { "id": "aeroway", "type": "line", "source": "openmaptiles", "source-layer": "aeroway", "minzoom": 11, "paint": { "line-color": "#e8e8e8", "line-width": 1 } },
+    { "id": "boundary-state", "type": "line", "source": "openmaptiles", "source-layer": "boundary", "filter": ["==", ["get", "admin_level"], 4], "paint": { "line-color": "#e1c5c7", "line-width": 1 } },
+    { "id": "boundary-country", "type": "line", "source": "openmaptiles", "source-layer": "boundary", "filter": ["==", ["get", "admin_level"], 2], "paint": { "line-color": "#ebd6d8", "line-width": 1.5 } },
+    { "id": "ferry", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["==", ["get", "class"], "ferry"], "minzoom": 6, "paint": { "line-color": "#8fb9c2", "line-width": 1, "line-dasharray": [2, 2] } },
+    { "id": "rail", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["==", ["get", "class"], "rail"], "minzoom": 8, "paint": { "line-color": "#dddddd", "line-width": ["interpolate", ["linear"], ["zoom"], 8, 0.5, 16, 2] } },
+    { "id": "rail-dashline", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["==", ["get", "class"], "rail"], "minzoom": 8, "paint": { "line-color": "#ffffff", "line-width": ["interpolate", ["linear"], ["zoom"], 8, 0.5, 16, 2], "line-dasharray": [4, 2] } },
+    { "id": "road-path", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["in", ["get", "class"], ["literal", ["path", "track"]]], "minzoom": 14, "paint": { "line-color": "#d7d7d7", "line-width": 0.75, "line-dasharray": [1, 1] } },
+    { "id": "road-service", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["==", ["get", "class"], "service"], "minzoom": 14, "paint": { "line-color": "#ffffff", "line-width": 1 } },
+    { "id": "road-minor", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["==", ["get", "class"], "minor"], "minzoom": 13, "paint": { "line-color": "#ffffff", "line-width": ["interpolate", ["linear"], ["zoom"], 13, 0.5, 18, 4] } },
+    { "id": "road-major-casing", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["in", ["get", "class"], ["literal", ["primary", "secondary", "tertiary"]]], "minzoom": 7, "paint": { "line-color": "#ffeabb", "line-width": ["interpolate", ["linear"], ["zoom"], 7, 1.5, 18, 14] } },
+    { "id": "road-major-fill", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["in", ["get", "class"], ["literal", ["primary", "secondary", "tertiary"]]], "minzoom": 7, "paint": { "line-color": "#fefdd7", "line-width": ["interpolate", ["linear"], ["zoom"], 7, 0.75, 18, 11] } },
+    { "id": "road-trunk-motorway-casing", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["in", ["get", "class"], ["literal", ["trunk", "motorway"]]], "minzoom": 5, "paint": { "line-color": "#fbdb98", "line-width": ["interpolate", ["linear"], ["zoom"], 5, 1.5, 18, 16] } },
+    { "id": "road-trunk-motorway-fill", "type": "line", "source": "openmaptiles", "source-layer": "transportation", "filter": ["in", ["get", "class"], ["literal", ["trunk", "motorway"]]], "minzoom": 5, "paint": { "line-color": "#FFE9A5", "line-width": ["interpolate", ["linear"], ["zoom"], 5, 0.75, 18, 13] } },
+    {
+      "id": "road-label", "type": "symbol", "source": "openmaptiles", "source-layer": "transportation_name", "minzoom": 13,
+      "layout": { "symbol-placement": "line", "text-field": ["get", "name"], "text-font": ["Noto Sans Regular"], "text-size": 10 },
+      "paint": { "text-color": "#87919e", "text-halo-color": "#fbf8f3", "text-halo-width": 1 }
+    },
+    {
+      "id": "water-name", "type": "symbol", "source": "openmaptiles", "source-layer": "water_name", "minzoom": 3,
+      "layout": { "text-field": ["get", "name"], "text-font": ["Noto Sans Italic"], "text-size": ["interpolate", ["linear"], ["zoom"], 3, 10, 10, 14], "text-letter-spacing": 0.05 },
+      "paint": { "text-color": "#51909c", "text-halo-color": "#e2eef0", "text-halo-width": 1 }
+    },
+    {
+      "id": "mountain-peak", "type": "symbol", "source": "openmaptiles", "source-layer": "mountain_peak", "minzoom": 8,
+      "layout": {
+        "text-field": ["case", ["has", "ele"], ["concat", "▲ ", ["get", "name"], " (", ["to-string", ["get", "ele"]], "m)"], ["concat", "▲ ", ["get", "name"]]],
+        "text-font": ["Noto Sans Regular"], "text-size": 10
+      },
+      "paint": { "text-color": "#666666", "text-halo-color": "#fbf8f3", "text-halo-width": 1 }
+    },
+    {
+      "id": "place-city", "type": "symbol", "source": "openmaptiles", "source-layer": "place", "filter": ["==", ["get", "class"], "city"], "maxzoom": 12,
+      "layout": { "text-field": ["get", "name"], "text-font": ["Noto Sans Bold"], "text-size": ["interpolate", ["linear"], ["zoom"], 4, 10, 12, 16] },
+      "paint": { "text-color": "#405c78", "text-halo-color": "#f2f5f8", "text-halo-width": 1.2 }
+    },
+    {
+      "id": "place-town-village", "type": "symbol", "source": "openmaptiles", "source-layer": "place", "filter": ["in", ["get", "class"], ["literal", ["town", "village"]]], "minzoom": 8,
+      "layout": { "text-field": ["get", "name"], "text-font": ["Noto Sans Regular"], "text-size": 12 },
+      "paint": { "text-color": "#405c78", "text-halo-color": "#f2f5f8", "text-halo-width": 1 }
+    },
+    {
+      "id": "place-state", "type": "symbol", "source": "openmaptiles", "source-layer": "place", "filter": ["==", ["get", "class"], "state"], "minzoom": 3, "maxzoom": 12,
+      "layout": { "text-field": ["get", "name"], "text-font": ["Noto Sans Bold"], "text-size": ["interpolate", ["linear"], ["zoom"], 3, 9, 8, 13], "text-transform": "uppercase", "text-letter-spacing": 0.08 },
+      "paint": { "text-color": "#7c8a9b", "text-halo-color": "#fbf8f3", "text-halo-width": 1 }
+    },
+    {
+      "id": "place-country", "type": "symbol", "source": "openmaptiles", "source-layer": "place", "filter": ["==", ["get", "class"], "country"], "minzoom": 1, "maxzoom": 10,
+      "layout": { "text-field": ["get", "name"], "text-font": ["Noto Sans Bold"], "text-size": ["interpolate", ["linear"], ["zoom"], 1, 9, 6, 14], "text-transform": "uppercase", "text-letter-spacing": 0.1 },
+      "paint": { "text-color": ["interpolate", ["linear"], ["zoom"], 3, "#6b7d91", 5, "#8894a3", 6, "#a3abb5"], "text-halo-color": "#fbf8f3", "text-halo-width": 1 }
+    }
+  ]
+}

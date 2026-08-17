@@ -27,47 +27,7 @@ RUN apt-get update \
     python3-venv \
     rclone \
     openjdk-21-jre-headless \
-    gnupg \
-    ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-
-# tileserver-gl (the self-hosted basemap tile renderer, see
-# scripts/gis/build_basemap_tiles.py) runs in-process inside this same
-# image/container rather than as a separate service — see
-# docker/entrypoint.sh's _start_tileserver. It's a completely different
-# runtime (Node.js + native MapLibre GL rendering) from everything else
-# here, so it needs its own apt/npm install: the package list below is
-# tileserver-gl's own official Dockerfile's dependency set (both its
-# build-time and runtime libs, since we build+run in one image) —
-# https://github.com/maptiler/tileserver-gl/blob/master/Dockerfile.
-# Pin the Node major version (nodesource) and the tileserver-gl npm version
-# together deliberately, same reasoning as the GDAL/uv image pins above —
-# bump both together, not independently.
-RUN mkdir -p /etc/apt/keyrings \
- && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
- && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
- && apt-get update \
- && apt-get install -y --no-install-recommends \
-    nodejs \
-    pkg-config \
-    xvfb \
-    libglfw3-dev \
-    libuv1-dev \
-    libcairo2-dev \
-    libpango1.0-dev \
-    libpng-dev \
-    libjpeg-dev \
-    libgif-dev \
-    librsvg2-dev \
-    libcurl4-openssl-dev \
-    libicu-dev \
-    libopengl0 \
- && rm -rf /var/lib/apt/lists/*
-
-# npm resolves a prebuilt `canvas` binary if one matches this platform/Node
-# ABI; otherwise node-gyp compiles it from source using the -dev headers
-# just installed above — either way this needs no extra flag.
-RUN npm install -g tileserver-gl@5.6.0
 
 RUN echo '\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr/share/bash-completion/bash_completion\nfi' >> /etc/bash.bashrc \
  && git config --global --add safe.directory /workspace

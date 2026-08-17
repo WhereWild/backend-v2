@@ -24,4 +24,9 @@ needs_rebuild() {
 if ! docker compose --project-directory "$project_dir" ps --status running gdal 2>/dev/null | grep -q gdal || needs_rebuild; then
     docker compose --project-directory "$project_dir" up -d --build gdal
 fi
+# tileserver-gl serves the self-hosted basemap tiles (see
+# scripts/gis/build_basemap_tiles.py) as its own standalone container —
+# started here too so it's always up whenever gt.sh is, instead of relying
+# on remembering a separate `docker compose up -d tileserver`.
+docker compose --project-directory "$project_dir" up -d tileserver
 docker compose --project-directory "$project_dir" exec -it --user "$(id -u):$(id -g)" gdal bash -lc ". /workspace/docker/aliases.sh 2>/dev/null || true; exec /bin/bash"

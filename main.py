@@ -148,7 +148,14 @@ _ARCGIS_NO_DATA_TILE_MAX_BYTES = 3000
 # publicly reachable.
 _TILESERVER_BASE = os.environ.get("WW_TILESERVER_BASE", "http://localhost:8791")
 _BASEMAP_THEMES = frozenset(
-    {"standard-light", "standard-dark", "standard-voyager", "variable-light", "labels"}
+    {
+        "standard-light",
+        "standard-dark",
+        "standard-versatiles-light",
+        "standard-versatiles-dark",
+        "variable-light",
+        "labels",
+    }
 )
 _LOCATIONS_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "gis" / "locations"
 _LOC_TAXA_PATH = _LOCATIONS_DIR / "location_taxa.parquet"
@@ -559,9 +566,12 @@ async def push_temporal_state(body: dict):
     from datetime import UTC
     from datetime import datetime as _dt
     body["received_at"] = _dt.now(UTC).isoformat()
-    await run_in_threadpool(
-        lambda: _TEMPORAL_STATE_PATH.write_text(json.dumps(body))
-    )
+
+    def _write():
+        _TEMPORAL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _TEMPORAL_STATE_PATH.write_text(json.dumps(body))
+
+    await run_in_threadpool(_write)
     _TEMPORAL_VERSION = _dt.now(UTC).isoformat()
     _clear_temporal_versioned_caches()
     return {"ok": True}
@@ -572,9 +582,12 @@ async def push_basemap_state(body: dict):
     from datetime import UTC
     from datetime import datetime as _dt
     body["received_at"] = _dt.now(UTC).isoformat()
-    await run_in_threadpool(
-        lambda: _BASEMAP_STATE_PATH.write_text(json.dumps(body))
-    )
+
+    def _write():
+        _BASEMAP_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _BASEMAP_STATE_PATH.write_text(json.dumps(body))
+
+    await run_in_threadpool(_write)
     return {"ok": True}
 
 

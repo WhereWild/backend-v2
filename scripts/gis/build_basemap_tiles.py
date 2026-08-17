@@ -130,7 +130,8 @@ STYLES_SRC_DIR = Path("config/gis/tile_styles")
 ALL_STYLES = (
     "standard-light",
     "standard-dark",
-    "standard-voyager",
+    "standard-versatiles-light",
+    "standard-versatiles-dark",
     "variable-light",
     "labels",
 )

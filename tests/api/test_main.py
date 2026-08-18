@@ -1361,13 +1361,35 @@ def test_get_species_occurrences_genus_reachable_with_zoom(tmp_path):
     assert r.status_code == 200
 
 
-def test_get_species_occurrences_order_still_blocked_with_zoom():
-    """KINGDOM/PHYLUM/CLASS/ORDER stay blocked even with zoom+bbox — never a
-    sane map scope regardless of query mechanism, per plan scope."""
+def test_get_species_occurrences_order_reachable_with_zoom(tmp_path):
+    """ORDER (and every rank up to KINGDOM) is reachable via the viewport
+    path — the SEMI JOIN fix (see _get_species_occurrences_viewport) removed
+    the cost driver that made broad ranks slow, verified directly against
+    real KINGDOM-scope data (Plantae, ~188K descendant species) at ~50ms/query
+    regardless of zoom. _reject_if_large_taxon(zoom_scoped=True) no longer
+    carves out an exception by rank; it skips the guard unconditionally."""
+    table = _viewport_table()
+    table = table.append_column("minZoomOrder", table.column("minZoomSpecies"))
+    path = tmp_path / "occurrences_by_hilbert.parquet"
+    pq.write_table(table, path)
+
     order_taxon = {**NONLEAF_TAXON, "rank": "ORDER"}
     with patch.object(taxa, "get_taxon_by_id", return_value=order_taxon), \
-         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[DESC_TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
         r = client.get("/species/2923968/occurrences", params={"zoom": 15, **_BBOX})
+    assert r.status_code == 200
+
+
+def test_get_species_occurrences_kingdom_still_blocked_without_zoom():
+    """The no-zoom (legacy full-dump) path is unaffected by the viewport
+    path's SEMI JOIN fix — KINGDOM and every other broad rank still hits the
+    slow collect_taxon_df subtree walk there, so the guard still applies."""
+    kingdom_taxon = {**NONLEAF_TAXON, "rank": "KINGDOM"}
+    with patch.object(taxa, "get_taxon_by_id", return_value=kingdom_taxon), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/2923968/occurrences")
     assert r.status_code == 400
     assert r.json()["detail"] == "large_taxon"
 

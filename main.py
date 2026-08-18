@@ -243,16 +243,21 @@ def _reject_if_large_taxon(taxon: dict, *, zoom_scoped: bool = False) -> None:
     get_taxon's large_taxon field, which uses the same helper).
 
     zoom_scoped=True — passed only by the zoom/bbox occurrence viewport path
-    (see _get_species_occurrences_viewport) — skips this guard for GENUS/
-    FAMILY specifically. The guard exists because collect_taxon_df's/
-    _read_occurrences_scoped's subtree traversal (opening every descendant
-    leaf's own parquet file) is slow at that scope; the viewport path queries
-    occurrences_by_hilbert.parquet in one bulk query instead and doesn't have
-    that cost driver. KINGDOM/PHYLUM/CLASS/ORDER stay blocked regardless —
-    not a performance question, just never a sane map scope — and the
-    SPECIES/INFRA observation-count threshold is unaffected either way.
+    (see _get_species_occurrences_viewport) — skips this guard entirely,
+    for every rank including KINGDOM. The guard exists because
+    collect_taxon_df's/_read_occurrences_scoped's subtree traversal (opening
+    every descendant leaf's own parquet file) is slow at genus-and-above;
+    the viewport path queries occurrences_by_hilbert.parquet in one bulk
+    query (SEMI JOIN against the descendant-key set, not the subtree walk)
+    instead and doesn't have that cost driver — measured directly against
+    KINGDOM-scope data (Plantae, ~188K descendant species): ~50ms per query
+    regardless of zoom/viewport size, same order as GENUS/FAMILY. The
+    per-request cost that does scale with taxon breadth (resolving the
+    descendant-key set itself, ~300ms for Plantae) is independent of rank —
+    it's the same call for every level, not specifically a broad-rank
+    problem.
     """
-    if zoom_scoped and taxon["rank"] in ("GENUS", "FAMILY"):
+    if zoom_scoped:
         return
     if _is_expensive_subtree_taxon(taxon):
         raise HTTPException(status_code=400, detail="large_taxon")
@@ -2361,22 +2366,31 @@ def _get_species_occurrences_viewport(
         return {"occurrences": []}
 
     hilbert_lo, hilbert_hi = _hilbert_range_for_bbox(min_lat, min_lon, max_lat, max_lon)
-    key_placeholders = ",".join("?" for _ in descendant_keys)
 
     con = duckdb.connect()
     try:
+        # SEMI JOIN against a registered table, not `taxon_key IN (...)` with
+        # one bound parameter per descendant: measured directly against
+        # KINGDOM-scope data (Plantae, ~188K descendant species) — a giant
+        # literal IN-list adds ~1.4s of fixed overhead per query regardless
+        # of viewport size (DuckDB doesn't get a hash-join plan for it), a
+        # SEMI JOIN against even that many rows resolves the same query in
+        # ~50ms. This is what actually makes every taxonomic level workable,
+        # not just GENUS/FAMILY — bbox/zoom pruning was already fine on its
+        # own; the descendant-membership check was the real bottleneck.
+        con.register("descendants", pd.DataFrame({"taxon_key": descendant_keys}))
         df = con.execute(
             f"""
-            SELECT "catalogNumber", "decimalLatitude", "decimalLongitude",
-                   "mediaUrl", "mediaAttribution", "mediaLicense"
-            FROM read_parquet('{OCCURRENCES_BY_HILBERT_FILE.as_posix()}')
-            WHERE "taxon_key" IN ({key_placeholders})
-              AND "hilbertIdx" BETWEEN ? AND ?
-              AND "{zoom_col}" <= ?
-              AND "decimalLatitude" BETWEEN ? AND ?
-              AND "decimalLongitude" BETWEEN ? AND ?
+            SELECT o."catalogNumber", o."decimalLatitude", o."decimalLongitude",
+                   o."mediaUrl", o."mediaAttribution", o."mediaLicense"
+            FROM read_parquet('{OCCURRENCES_BY_HILBERT_FILE.as_posix()}') o
+            SEMI JOIN descendants d ON o."taxon_key" = d."taxon_key"
+            WHERE o."hilbertIdx" BETWEEN ? AND ?
+              AND o."{zoom_col}" <= ?
+              AND o."decimalLatitude" BETWEEN ? AND ?
+              AND o."decimalLongitude" BETWEEN ? AND ?
             """,
-            [*descendant_keys, hilbert_lo, hilbert_hi, zoom, min_lat, max_lat, min_lon, max_lon],
+            [hilbert_lo, hilbert_hi, zoom, min_lat, max_lat, min_lon, max_lon],
         ).fetchdf()
     finally:
         con.close()

@@ -940,6 +940,49 @@ def test_get_species_obscured_not_found():
     assert r.status_code == 404
 
 
+def test_get_species_obscured_genus_reachable(tmp_path, monkeypatch):
+    """GENUS is rejected outright by most raw-subtree endpoints (see
+    test_get_species_occurrences_nonleaf_rejected_as_large_taxon) but
+    reachable here — _check_all_obscured is a bounded EXISTS check, not a
+    full materialize-then-scan, so the large-taxon guard doesn't apply."""
+    occ_dir = tmp_path / "taxonomy"
+    occ_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "catalogNumber": ["A1", "A2"],
+        "taxon_key": ["2923970", "2923970"],
+        "obscured": ["Yes", "No"],
+    }
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False),
+                    occ_dir / "occurrences.parquet")
+    monkeypatch.setattr(main_module, "OCCURRENCES_FILE", occ_dir / "occurrences.parquet")
+    with patch.object(taxa, "get_taxon_by_id", return_value=NONLEAF_TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[DESC_TAXON]):
+        r = client.get("/api/species/2923968/obscured")
+    assert r.status_code == 200
+    assert not r.json()["allObscured"]
+
+
+def test_check_all_obscured_true_when_no_unobscured_row(tmp_path, monkeypatch):
+    occ_dir = tmp_path / "taxonomy"
+    occ_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "catalogNumber": ["A1", "A2"],
+        "taxon_key": ["2923970", "2923970"],
+        "obscured": ["Yes", "Yes"],
+    }
+    pq.write_table(pa.Table.from_pandas(pd.DataFrame(data), preserve_index=False),
+                    occ_dir / "occurrences.parquet")
+    monkeypatch.setattr(main_module, "OCCURRENCES_FILE", occ_dir / "occurrences.parquet")
+    with patch("main.iter_descendants", return_value=[TAXON]):
+        assert main_module._check_all_obscured(TAXON, None) is True
+
+
+def test_check_all_obscured_false_for_empty_scope(monkeypatch):
+    with patch("main.iter_descendants", return_value=[]):
+        assert main_module._check_all_obscured(TAXON, None) is False
+
+
 # ---------------------------------------------------------------------------
 # /api/taxon/{id}/env-stats (lines 128-184)
 # ---------------------------------------------------------------------------

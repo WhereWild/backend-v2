@@ -243,7 +243,7 @@ def _reject_if_large_taxon(taxon: dict, *, zoom_scoped: bool = False) -> None:
     get_taxon's large_taxon field, which uses the same helper).
 
     zoom_scoped=True skips this guard entirely, for every rank including
-    KINGDOM. Two callers, two different reasons it's safe:
+    KINGDOM. Three callers, three different reasons it's safe:
 
     - The zoom/bbox occurrence viewport path (_get_species_occurrences_viewport)
       queries occurrences_by_hilbert.parquet in one bulk query (SEMI JOIN
@@ -258,6 +258,10 @@ def _reject_if_large_taxon(taxon: dict, *, zoom_scoped: bool = False) -> None:
       pandas before any filter/cap applied. collect_taxon_df_bounded caps
       that volume up front (see util/stats.py), which is what actually
       makes the zoom_scoped bypass safe there.
+    - get_species_obscured's _check_all_obscured is a yes/no question
+      answered with a bounded EXISTS-style LIMIT 1 query, not a full
+      materialize-then-scan — cost is "how fast does a counterexample turn
+      up," not taxon size.
 
     Either way, the guard being skipped doesn't mean "this scales for
     free" — it means the specific cost driver the guard exists to catch has
@@ -1497,17 +1501,48 @@ def get_taxon(request: Request, taxon_id: str, unit_system: str | None = Query(N
 
 
 def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
-    """Return True when every observation in scope has obscured coordinates."""
+    """Return True when every observation in scope has obscured coordinates.
+
+    An EXISTS-style bounded check (LIMIT 1), not _read_occurrences_scoped's
+    full materialize-then-.any() — that loaded every matching row (up to
+    the taxon's entire size) just to answer a yes/no question, which is
+    exactly the "unbounded volume" problem the large-taxon guard elsewhere
+    in this file exists to catch. Short-circuiting on the first
+    non-obscured row found (or the first row found at all, for the
+    empty-scope case) means this scales with how quickly a counterexample
+    turns up, not with taxon size — safe for any rank, no guard needed."""
+    keys = _scope_taxon_keys(taxon)
+    if not keys:
+        return False
     filter_col = _location_filter_col(location_gid) if location_gid else None
-    needed = ["obscured"] + ([filter_col] if filter_col else [])
-    df = _read_occurrences_scoped(taxon, columns=needed)
-    if "obscured" not in df.columns:
-        return False
-    if filter_col and filter_col in df.columns:
-        df = df[df[filter_col].astype(str) == str(location_gid)]
-    if df.empty:
-        return False
-    return not (df["obscured"] == "No").any()
+    loc_clause = f'AND o."{filter_col}" = ?' if filter_col else ""
+    loc_params = [location_gid] if filter_col else []
+    con = duckdb.connect()
+    try:
+        con.register("descendants", pd.DataFrame({"taxon_key": keys}))
+        has_any_row = con.execute(
+            f"""
+            SELECT 1 FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') o
+            SEMI JOIN descendants d ON o."taxon_key" = d."taxon_key"
+            WHERE 1=1 {loc_clause}
+            LIMIT 1
+            """,
+            loc_params,
+        ).fetchone()
+        if has_any_row is None:
+            return False
+        has_unobscured_row = con.execute(
+            f"""
+            SELECT 1 FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') o
+            SEMI JOIN descendants d ON o."taxon_key" = d."taxon_key"
+            WHERE o."obscured" = 'No' {loc_clause}
+            LIMIT 1
+            """,
+            loc_params,
+        ).fetchone()
+    finally:
+        con.close()
+    return has_unobscured_row is None
 
 
 @lru_cache(maxsize=4096)
@@ -1515,7 +1550,10 @@ def _cached_get_species_obscured(taxon_id: str, location: str | None, data_versi
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    _reject_if_large_taxon(taxon)
+    # zoom_scoped=True: _check_all_obscured is a bounded EXISTS check now,
+    # not the old load-everything-then-.any() — safe for any taxon size,
+    # see its own docstring.
+    _reject_if_large_taxon(taxon, zoom_scoped=True)
     location_gid = location.strip() if location else None
     all_obscured = _check_all_obscured(taxon, location_gid)
     return {

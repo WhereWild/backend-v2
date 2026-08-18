@@ -2453,12 +2453,15 @@ def _get_species_occurrences_viewport(
 ) -> dict:
     """Zoom/bbox-scoped occurrence query against occurrences_by_hilbert.parquet
     (see scripts/observation_ranks.py, which builds it) instead of the full
-    per-taxon read the unfiltered path uses. Not cached — the existing
-    _cached_get_species_occurrences LRU keying works because its params are
-    discrete; a continuous bbox would defeat it (every pan = a new key,
-    cache never hits). The whole point of the hilbert index is that this
-    query should be fast enough uncached; revisit if profiling says
-    otherwise.
+    per-taxon read the unfiltered path uses. This function itself isn't
+    cached — its caller, _cached_get_species_occurrences_tile, caches the
+    whole request by (taxon_id, z, x, y, filters) instead, since tile
+    coordinates are discrete (unlike an earlier version's raw bbox param).
+    Confirmed live this query is NOT reliably fast enough to run
+    uncached on every request: at low zoom, a huge bbox's hilbert range
+    spans most of the file regardless of taxon size, so neither the
+    hilbertIdx filter nor the taxon SEMI JOIN prune much — ~0.2-0.4s even
+    for a modest family-scale taxon, not just a dominant kingdom.
 
     location/phenology/start_ts/end_ts reuse the exact same filter
     semantics as the flat endpoint (_location_filter_col,
@@ -2646,6 +2649,44 @@ def get_species_occurrences(
 _MAX_TILE_ZOOM = 24  # generous sane bound — well past any zoom this app's map ever reaches
 
 
+@lru_cache(maxsize=4096)
+def _cached_get_species_occurrences_tile(
+    taxon_id: str, z: int, x: int, y: int,
+    location: str | None, phenology: str | None,
+    start_ts: int | None, end_ts: int | None,
+    variable: str | None, unit_system: str | None,
+    data_version: str,
+) -> dict:
+    """Bounded LRU — tile coordinates are discrete (1 tile at z=0, 4 at
+    z=1, 16 at z=2, ...), unlike the raw bbox param an earlier version of
+    this endpoint took (see get_species_occurrences_tile's docstring),
+    which is exactly why _get_species_occurrences_viewport's own docstring
+    used to say this didn't need caching — that reasoning assumed the
+    hilbert index would always prune well. Confirmed live it doesn't at
+    low zoom: neither the hilbertIdx range nor the taxon SEMI JOIN
+    meaningfully prune occurrences_by_hilbert.parquet when the bbox is
+    huge (measured ~0.2-0.4s even for a modest family-scale taxon, not
+    just a dominant kingdom) — that's close to a full scan of the file
+    regardless of taxon size. A cache hit turns that into a dict lookup;
+    users revisiting the same low-zoom tile while panning/zooming is the
+    common case this is built for, not an edge case."""
+    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+    if taxon is None:
+        raise HTTPException(status_code=404, detail="Taxon not found")
+    _reject_if_large_taxon(taxon, zoom_scoped=True)
+
+    phenology_norm = phenology.strip().lower() if phenology else None
+    if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
+        raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+
+    min_lon, min_lat, max_lon, max_lat = tiles.tile_bounds_wgs84(z, x, y)
+    return _get_species_occurrences_viewport(
+        taxon, z, min_lat, min_lon, max_lat, max_lon,
+        location=location, phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+        variable_id=variable, unit_system=unit_system,
+    )
+
+
 @app.get("/species/{taxon_id}/occurrences/{z}/{x}/{y}")
 @limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
 def get_species_occurrences_tile(
@@ -2667,7 +2708,8 @@ def get_species_occurrences_tile(
     bbox is a deterministic function of (z, x, y) — world_size / 2^z per
     tile, by construction — so "huge area at high zoom" isn't just bad
     practice under this contract, it's inexpressible: no (z, x, y) means
-    that.
+    that. It also makes this endpoint cacheable in a way the old bbox
+    param wasn't — see _cached_get_species_occurrences_tile.
 
     location/phenology/start_ts/end_ts match the flat endpoint's query
     params exactly (same validation, same semantics) — see
@@ -2688,20 +2730,8 @@ def get_species_occurrences_tile(
     if not (0 <= x < tiles_per_axis) or not (0 <= y < tiles_per_axis):
         raise HTTPException(status_code=400, detail=f"x and y must be in [0, {tiles_per_axis})")
 
-    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
-    if taxon is None:
-        raise HTTPException(status_code=404, detail="Taxon not found")
-    _reject_if_large_taxon(taxon, zoom_scoped=True)
-
-    phenology_norm = phenology.strip().lower() if phenology else None
-    if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
-        raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
-
-    min_lon, min_lat, max_lon, max_lat = tiles.tile_bounds_wgs84(z, x, y)
-    return _get_species_occurrences_viewport(
-        taxon, z, min_lat, min_lon, max_lat, max_lon,
-        location=location, phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
-        variable_id=variable, unit_system=unit_system,
+    return _cached_get_species_occurrences_tile(
+        taxon_id, z, x, y, location, phenology, start_ts, end_ts, variable, unit_system, _DATA_VERSION,
     )
 
 
@@ -3418,6 +3448,7 @@ def _clear_data_versioned_caches() -> None:
     _cached_get_taxon_env_stats.cache_clear()
     _cached_get_species_environment_base.cache_clear()
     _cached_get_species_occurrences.cache_clear()
+    _cached_get_species_occurrences_tile.cache_clear()
     _cached_get_species_locations.cache_clear()
     _cached_list_taxa_ranking_options.cache_clear()
     _cached_query_taxa.cache_clear()

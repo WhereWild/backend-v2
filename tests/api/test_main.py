@@ -45,6 +45,7 @@ _RESPONSE_CACHED_FUNCTIONS = [
     main_module._cached_get_taxon_env_stats,
     main_module._cached_get_species_environment_base,
     main_module._cached_get_species_occurrences,
+    main_module._cached_get_species_occurrences_tile,
     main_module._cached_get_species_locations,
     main_module._cached_list_taxa_ranking_options,
     main_module._cached_query_taxa,

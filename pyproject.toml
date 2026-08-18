@@ -40,6 +40,15 @@ pythonpath = ["."]
 markers = [
     "live: end-to-end tests against real S3 .om files — run with: pt --temporal",
 ]
+filterwarnings = [
+    # starlette.testclient nags for httpx2 on every import; httpx is a real
+    # runtime dependency (main.py's iNat lookups) so it isn't going anywhere,
+    # and TestClient still works fine on plain httpx — just silence the noise.
+    # (StarletteDeprecationWarning subclasses UserWarning, not
+    # DeprecationWarning — the category has to match exactly or the ignore
+    # filter is a silent no-op.)
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]
 
 [tool.coverage.run]
 source = ["."]

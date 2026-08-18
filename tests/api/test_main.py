@@ -1962,7 +1962,7 @@ def test_get_species_environment_with_location_nominal(tmp_path, monkeypatch):
 
 def test_get_species_environment_with_location_no_data_falls_through(monkeypatch):
     """compute_location_filtered_stats returns None → 404 (no fallback to precomputed)."""
-    monkeypatch.setattr(st_module, "collect_taxon_df", lambda t, **kwargs: None)
+    monkeypatch.setattr(st_module, "collect_taxon_df_bounded", lambda t, **kwargs: None)
     _patch_hierarchy(monkeypatch, {"USA": _USA})
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
@@ -1993,6 +1993,38 @@ def test_get_species_environment_with_location_filter_col_none(monkeypatch):
         r = client.get("/species/2923970/environment/bio1?location=WEIRD")
     assert r.status_code == 200
     assert r.json()["observation_count"] == 100  # from precomputed
+
+
+def test_get_species_environment_genus_reachable_with_location_filter(tmp_path, monkeypatch):
+    """GENUS+ location-filtered stats were rejected outright before
+    collect_taxon_df_bounded (see util/stats.py) capped the row volume —
+    now reachable, mirroring the occurrence tile endpoint's GENUS/KINGDOM
+    unblock."""
+    monkeypatch.setattr(st_module, "TREE_ROOT", tmp_path)
+    monkeypatch.setattr(st_module, "OCCURRENCES_FILE", tmp_path / "taxonomy" / "occurrences.parquet")
+    monkeypatch.setattr(
+        st_module, "load_catalog",
+        lambda: {NONLEAF_TAXON["taxon_key"]: NONLEAF_TAXON, DESC_TAXON["taxon_key"]: DESC_TAXON},
+    )
+    _make_occ_with_loc(tmp_path, DESC_TAXON["taxon_key"], "level0Gid", "USA", "bio1", [10.0] * 5)
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    with patch.object(taxa, "get_taxon_by_id", return_value=NONLEAF_TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]):
+        r = client.get("/species/2923968/environment/bio1?location=USA")
+    assert r.status_code == 200
+    assert r.json()["observation_count"] == 5
+
+
+def test_get_species_environment_genus_unfiltered_unaffected(monkeypatch):
+    """No location/phenology/etc. active -> still the precomputed-file path,
+    untouched by this change (it never calls _reject_if_large_taxon at all)."""
+    with patch.object(taxa, "get_taxon_by_id", return_value=NONLEAF_TAXON), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch.object(pq, "read_table", side_effect=_env_stats_read):
+        r = client.get("/species/2923968/environment/bio1")
+    assert r.status_code == 200
+    assert r.json()["observation_count"] == 100  # from precomputed, same as any other rank
 
 
 def test_get_species_environment_with_extra_filter_reflects_chained_slice(tmp_path, monkeypatch):

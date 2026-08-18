@@ -874,6 +874,44 @@ def test_collect_taxon_df_nonleaf_skips_empty_and_filtered(tmp_path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# collect_taxon_df_bounded
+# ---------------------------------------------------------------------------
+
+def test_collect_taxon_df_bounded_caps_rows(tmp_path, monkeypatch):
+    occurrences_file = tmp_path / "occurrences.parquet"
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
+    _write_occ_rows(occurrences_file, CHILD_TAXON, extra_cols={"bio1": [1.0] * 20}, n=20)
+    df = st.collect_taxon_df_bounded(FAKE_TAXON, limit=5)
+    assert df is not None
+    assert len(df) == 5
+
+
+def test_collect_taxon_df_bounded_deterministic_across_calls(tmp_path, monkeypatch):
+    occurrences_file = tmp_path / "occurrences.parquet"
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
+    _write_occ_rows(occurrences_file, CHILD_TAXON, extra_cols={"bio1": [1.0] * 20}, n=20)
+    first = st.collect_taxon_df_bounded(FAKE_TAXON, limit=5)
+    second = st.collect_taxon_df_bounded(FAKE_TAXON, limit=5)
+    assert sorted(first["catalogNumber"]) == sorted(second["catalogNumber"])
+
+
+def test_collect_taxon_df_bounded_noop_below_limit(tmp_path, monkeypatch):
+    """Below the cap, behaves identically to collect_taxon_df — same rows,
+    same order-independent content."""
+    occurrences_file = tmp_path / "occurrences.parquet"
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
+    _write_occ_rows(occurrences_file, CHILD_TAXON, extra_cols={"bio1": [1.0] * 10}, n=10)
+    bounded = st.collect_taxon_df_bounded(FAKE_TAXON, limit=1_000_000)
+    unbounded = st.collect_taxon_df(FAKE_TAXON)
+    assert sorted(bounded["catalogNumber"]) == sorted(unbounded["catalogNumber"])
+
+
+def test_collect_taxon_df_bounded_no_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", tmp_path / "nonexistent.parquet")
+    assert st.collect_taxon_df_bounded(FAKE_TAXON) is None
+
+
+# ---------------------------------------------------------------------------
 # compute_location_filtered_stats
 # ---------------------------------------------------------------------------
 
@@ -881,6 +919,26 @@ def test_compute_loc_stats_no_data(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "OCCURRENCES_FILE", tmp_path / "nonexistent.parquet")
     result = st.compute_location_filtered_stats(SPECIES_TAXON, "bio1", "level0Gid", "USA", _CONTINUOUS_LAYER)
     assert result is None
+
+
+def test_compute_loc_stats_bounded_for_large_taxon(tmp_path, monkeypatch):
+    """A taxon whose row count exceeds the pre-filter cap still returns a
+    valid stats result reflecting the capped count, not the true total —
+    proof the cap is actually applied before stats are built, not just
+    present in the code path unused."""
+    occurrences_file = tmp_path / "occurrences.parquet"
+    monkeypatch.setattr(st, "OCCURRENCES_FILE", occurrences_file)
+    monkeypatch.setattr(st, "_FILTERED_STATS_PRE_CAP", 10)
+    monkeypatch.setattr(st, "_KDE_MAX_SAMPLES", 10)
+    _write_occ_rows(occurrences_file, CHILD_TAXON, extra_cols={"bio1": list(range(50))}, n=50)
+    # extra_filters=[] (falsy, same as "no chained filter") still routes
+    # through compute_location_filtered_stats's collect_taxon_df_bounded
+    # call — no location/phenology/timestamp/polygon needed to exercise it.
+    result = st.compute_location_filtered_stats(
+        FAKE_TAXON, "bio1", None, None, _CONTINUOUS_LAYER, extra_filters=[],
+    )
+    assert result is not None
+    assert result["observation_count"] == 10
 
 
 # ---------------------------------------------------------------------------

@@ -242,20 +242,27 @@ def _reject_if_large_taxon(taxon: dict, *, zoom_scoped: bool = False) -> None:
     frontend's large-taxon map/filter/download disable threshold (see
     get_taxon's large_taxon field, which uses the same helper).
 
-    zoom_scoped=True — passed only by the zoom/bbox occurrence viewport path
-    (see _get_species_occurrences_viewport) — skips this guard entirely,
-    for every rank including KINGDOM. The guard exists because
-    collect_taxon_df's/_read_occurrences_scoped's subtree traversal (opening
-    every descendant leaf's own parquet file) is slow at genus-and-above;
-    the viewport path queries occurrences_by_hilbert.parquet in one bulk
-    query (SEMI JOIN against the descendant-key set, not the subtree walk)
-    instead and doesn't have that cost driver — measured directly against
-    KINGDOM-scope data (Plantae, ~188K descendant species): ~50ms per query
-    regardless of zoom/viewport size, same order as GENUS/FAMILY. The
-    per-request cost that does scale with taxon breadth (resolving the
-    descendant-key set itself, ~300ms for Plantae) is independent of rank —
-    it's the same call for every level, not specifically a broad-rank
-    problem.
+    zoom_scoped=True skips this guard entirely, for every rank including
+    KINGDOM. Two callers, two different reasons it's safe:
+
+    - The zoom/bbox occurrence viewport path (_get_species_occurrences_viewport)
+      queries occurrences_by_hilbert.parquet in one bulk query (SEMI JOIN
+      against the descendant-key set) instead of collect_taxon_df's/
+      _read_occurrences_scoped's per-leaf-file subtree walk — measured
+      directly against KINGDOM-scope data (Plantae, ~188K descendant
+      species): ~50ms per query regardless of zoom/viewport size.
+    - get_species_environment's filtered branch still goes through
+      collect_taxon_df (now collect_taxon_df_bounded), whose read plan was
+      never the problem — what made it unsafe at broad ranks was loading
+      every matching row (tens of millions for something like Plantae) into
+      pandas before any filter/cap applied. collect_taxon_df_bounded caps
+      that volume up front (see util/stats.py), which is what actually
+      makes the zoom_scoped bypass safe there.
+
+    Either way, the guard being skipped doesn't mean "this scales for
+    free" — it means the specific cost driver the guard exists to catch has
+    been addressed by the caller's own query path, not that broad-rank
+    requests are free in general.
     """
     if zoom_scoped:
         return
@@ -1995,7 +2002,13 @@ def get_species_environment(
         location is not None or phenology_norm is not None or start_ts is not None
         or end_ts is not None or extra_filters or polygon_geom is not None
     ) and layer is not None:
-        _reject_if_large_taxon(taxon)
+        # zoom_scoped=True is safe here specifically because
+        # compute_location_filtered_stats now reads via
+        # collect_taxon_df_bounded (see util/stats.py), which caps the row
+        # volume before any filter runs — without that, this would just
+        # reintroduce collect_taxon_df's unbounded-volume problem at
+        # guard-bypass scale.
+        _reject_if_large_taxon(taxon, zoom_scoped=True)
         filter_col = _location_filter_col(location) if location is not None else None
         if location is None or filter_col is not None:
             all_layers_by_id = {lyr["id"]: lyr for lyr in tiles.load_layers()}

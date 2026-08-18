@@ -47,8 +47,9 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 from config.config import ValueType, load_config
+from scripts.observation_ranks import _BANDS, OCCURRENCES_BY_HILBERT_FILE
 from util.storage import ParquetStorage, atomic_write_parquet
-from util.taxa import TaxonRecord, get_children, load_catalog
+from util.taxa import TaxonRecord, display_level_for_rank, get_children, load_catalog, zoom_column
 from util.ternary import build_ternary_density_grid, composition_group_members
 
 CONFIG = load_config("global")
@@ -320,6 +321,93 @@ def _read_rows_for_keys(keys: list[str], columns: list[str] | None = None) -> pa
         f"SELECT {col_list} FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') "
         'WHERE "taxon_key" IN (SELECT "taxon_key" FROM scope_keys)'
     ).to_arrow_table()
+
+
+def _minzoom_threshold(keys: list[str], level: str, target: int) -> int:
+    """Smallest band zoom (from observation_ranks._BANDS) whose cumulative
+    row count for `keys`, at zoom_column(level) <= zoom, stays at or under
+    `target` — counted against the narrow occurrences_by_hilbert.parquet
+    instead of the wide occurrences.parquet. That narrowness is the whole
+    reason this is cheap even for a kingdom-sized `keys` set: confirmed
+    live, this count for Plantae (187,805 descendant keys, 93% of all
+    64.6M rows) took well under a second.
+
+    minZoom<level> only ever takes one of _BANDS' zoom values, and rows at
+    a coarser (lower) zoom are a strict subset of rows at any finer (higher)
+    zoom the ranking assigned, so summing counts in increasing zoom order
+    gives the exact row count "visible" at each threshold, cheaply, without
+    ever touching the wide file.
+
+    Falls back to the coarsest band (zoom 0) if even that alone exceeds
+    target — can't go any coarser than that; the caller's own LIMIT is the
+    backstop for that rare case."""
+    if not keys or not OCCURRENCES_BY_HILBERT_FILE.exists():
+        return _BANDS[-1][0]
+    col = zoom_column(level)
+    con = _get_connection()
+    con.register("zoom_threshold_keys", pa.table({"taxon_key": pa.array(keys, type=pa.string())}))
+    try:
+        rows = con.execute(
+            f'SELECT "{col}" AS z, COUNT(*) AS n '
+            f"FROM read_parquet('{OCCURRENCES_BY_HILBERT_FILE.as_posix()}') o "
+            'SEMI JOIN zoom_threshold_keys k ON o."taxon_key" = k."taxon_key" '
+            f'GROUP BY "{col}"'
+        ).fetchall()
+    finally:
+        con.unregister("zoom_threshold_keys")
+    counts = dict(rows)
+    cumulative = 0
+    chosen_zoom = _BANDS[0][0]
+    for zoom, _cell_size in _BANDS:
+        n = counts.get(zoom, 0)
+        if cumulative + n > target and cumulative > 0:
+            break
+        cumulative += n
+        chosen_zoom = zoom
+    return chosen_zoom
+
+
+def _read_rows_for_keys_by_zoom(
+    keys: list[str], level: str, zoom: int, limit: int, columns: list[str] | None = None
+) -> pa.Table:
+    """Same shape as _read_rows_for_keys, but the primary bound is a
+    minZoom<level> <= zoom filter (from _minzoom_threshold) rather than an
+    unbounded fetch. The zoom filter is what actually keeps
+    this cheap: it trims the matched set to (approximately) `limit` rows
+    *before* DuckDB has anything to rank, instead of ranking every matched
+    row (which for a whole kingdom can be tens of millions) to find the top
+    `limit`. Confirmed live against Plantae: this path ran in ~0.9s with a
+    single-digit-GB memory footprint vs ~2.6s and a much larger, still
+    climbing footprint for the hash-only approach. ORDER BY hash(...) LIMIT
+    is kept as a backstop, not the primary mechanism — for the rare case
+    _minzoom_threshold couldn't bring the count under `limit` on its own
+    (see its docstring).
+
+    Silently omits the zoom filter (falling back to the old hash-only
+    behavior) if this occurrences file doesn't have the column — e.g. a
+    test fixture built without minZoom columns, or a pre-pipeline-upgrade
+    file. Real production data always has it (scripts/observation_ranks.py
+    writes it into every row); this is defense against querying a file
+    where it's genuinely absent, not something callers need to check for
+    themselves."""
+    if not keys:
+        return pa.table({})
+    col = zoom_column(level)
+    col_list = _select_cols(columns)
+    con = _get_connection()
+    con.register("scope_keys_by_zoom", pa.table({"taxon_key": pa.array(keys, type=pa.string())}))
+    has_zoom_col = col in _occurrences_schema_names()
+    zoom_clause = f'AND "{col}" <= ? ' if has_zoom_col else ""
+    params = [zoom, limit] if has_zoom_col else [limit]
+    result = con.execute(
+        f"SELECT {col_list} FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') "
+        'WHERE "taxon_key" IN (SELECT "taxon_key" FROM scope_keys_by_zoom) '
+        f"{zoom_clause}"
+        'ORDER BY hash("catalogNumber") LIMIT ?',
+        params,
+    ).to_arrow_table()
+    con.unregister("scope_keys_by_zoom")
+    return result
 
 
 def preload_stats_occurrence_cache(layer_meta: dict[str, dict]) -> bool:
@@ -2211,6 +2299,135 @@ def collect_taxon_df(taxon: TaxonRecord, storage: ParquetStorage | None = None) 
     return df.drop_duplicates(subset=["catalogNumber"])
 
 
+# Pre-filter row cap for compute_location_filtered_stats on large taxa — see
+# collect_taxon_df_bounded. Deliberately much larger than _KDE_MAX_SAMPLES:
+# this bounds worst-case pandas volume before apply_phenology_filter/
+# apply_polygon_filter/apply_chained_filters run (none of which are cheaply
+# pushable into the SQL fetch itself), not the final stats sample size —
+# _post_filter_cap below handles that after filtering.
+_FILTERED_STATS_PRE_CAP = 1_000_000
+
+
+def collect_taxon_df_bounded(
+    taxon: TaxonRecord,
+    storage: ParquetStorage | None = None,
+    limit: int = _FILTERED_STATS_PRE_CAP,
+    columns: list[str] | None = None,
+) -> pd.DataFrame | None:
+    """Same contract and scoping as collect_taxon_df, but caps the row count
+    via a stable hash order before converting to pandas, and (unlike
+    collect_taxon_df) accepts an explicit narrow `columns` list.
+
+    Two distinct memory problems, both real, both needed:
+    1. Row count. collect_taxon_df's own read (_read_rows_for_keys et al.)
+       already plans fine as a join — not the giant-literal-IN-list problem
+       scripts/observation_ranks.py's viewport query had. But for a taxon
+       like an entire kingdom, the *matched row count* itself can be tens
+       of millions, and every apply_*_filter step in
+       compute_location_filtered_stats runs in pandas over all of it before
+       any cap applies. Bounding the row count (below) fixes this.
+    2. Column width. `columns=None` (the default, matching collect_taxon_df)
+       means SELECT * — every one of the ~194 environmental columns, for
+       every matched row. compute_location_filtered_stats only ever needs a
+       handful (base columns, the one requested variable_id, whatever a
+       location/phenology/timestamp/extra filter references) — pulling all
+       194 for a million rows is itself enough to exhaust memory even with
+       the row cap in place (confirmed live: this happened even after (1)
+       alone was fixed). Callers computing stats for one variable should
+       always pass an explicit narrow `columns` list; leaving it None is
+       only correct for a small/leaf-scale taxon.
+
+    Ordered by DuckDB's hash(), not Python's built-in hash() — the builtin
+    is randomized per-process (PYTHONHASHSEED), which would make the kept
+    rows different across server restarts; DuckDB's hash() is deterministic,
+    matching the same stable-selection approach scripts/observation_ranks.py
+    already uses for minZoom assignment. A no-op (identical result to
+    collect_taxon_df) whenever the true row count is already under `limit`.
+    """
+    rank = taxon["rank"]
+    is_leaf = rank in CONFIG.subspecies_equivalents
+    is_species = rank == CONFIG.species_rank
+    include_self = is_leaf or is_species
+
+    if storage is not None and storage.is_remote:
+        # No DuckDB pushdown available here (_read_subtree_rows_via_storage
+        # already reads the whole file then masks in Arrow — an existing
+        # tradeoff of the remote-storage fallback, not a new one this
+        # introduces), so bound it post-fetch same as before. Remote storage
+        # isn't this deployment's primary path; the local branch below is
+        # where the real fix (bounding the SQL fetch itself) matters.
+        table = _read_subtree_rows_via_storage(storage, taxon, include_self=include_self)
+        if table is None:
+            return None
+        if table.num_rows > limit and "catalogNumber" in table.schema.names:
+            con = _get_connection()
+            con.register("_bounded_src", table)
+            table = con.execute(
+                'SELECT * FROM _bounded_src ORDER BY hash("catalogNumber") LIMIT ?', [limit]
+            ).to_arrow_table()
+            con.unregister("_bounded_src")
+    else:
+        # Deliberately NOT _read_own_rows/_read_species_rows/_read_subtree_rows
+        # here — those (via _read_rows_for_keys) do an unbounded `SELECT *
+        # WHERE taxon_key IN (...)`, fully materializing every matching row
+        # (tens of millions, every column, for something like an entire
+        # kingdom) *before* any cap could apply. That defeats the entire
+        # point — the cap has to be inside the SQL query itself, not applied
+        # to a table that's already fully fetched.
+        #
+        # The primary bound is a minZoom<level> <= zoom filter
+        # (_minzoom_threshold / _read_rows_for_keys_by_zoom), not a bare
+        # ORDER BY hash(...) LIMIT (_read_rows_for_keys_bounded, still kept
+        # as the fallback below). The zoom filter trims the matched set
+        # *before* DuckDB has anything to rank; a hash-order LIMIT alone
+        # still has to rank every matched row first — for a whole kingdom
+        # that's tens of millions of rows to rank just to keep the top
+        # `limit`. Confirmed live for Plantae: the zoom-filtered path ran in
+        # ~0.9s with a single-digit-GB footprint vs ~2.6s and a much larger,
+        # still-climbing footprint for the hash-only path.
+        if not OCCURRENCES_FILE.exists():
+            return None
+        if is_leaf:
+            keys = [str(taxon["taxon_key"])]
+        elif is_species:
+            catalog = load_catalog()
+            child_keys = _children_index(catalog).get(str(taxon["taxon_key"]), [])
+            keys = [str(taxon["taxon_key"]), *child_keys]
+        else:
+            keys = _scope_taxon_keys(taxon, include_self=include_self)
+        if not keys:
+            return None
+        level = display_level_for_rank(rank)
+        zoom = _minzoom_threshold(keys, level, limit)
+        table = _read_rows_for_keys_by_zoom(keys, level, zoom, limit, columns=columns)
+        if table.num_rows == 0:
+            return None
+
+    df = _filter_df(table.to_pandas())
+    if df.empty:
+        return None
+    return df.drop_duplicates(subset=["catalogNumber"])
+
+
+def _post_filter_cap(df: pd.DataFrame, limit: int = _KDE_MAX_SAMPLES) -> pd.DataFrame:
+    """Truncate an already-filtered DataFrame to `limit` rows, by the same
+    stable hash order collect_taxon_df_bounded uses — applied after
+    apply_chained_filters (the last filter step) in
+    compute_location_filtered_stats, so the final input to KDE/stats
+    building matches the same bound the rest of the pipeline already
+    assumes (_KDE_MAX_SAMPLES), regardless of how large the pre-filter set
+    was. No-op below `limit` rows."""
+    if len(df) <= limit or "catalogNumber" not in df.columns:
+        return df
+    con = _get_connection()
+    con.register("_post_filter_src", df)
+    result = con.execute(
+        'SELECT * FROM _post_filter_src ORDER BY hash("catalogNumber") LIMIT ?', [limit]
+    ).df()
+    con.unregister("_post_filter_src")
+    return result
+
+
 def compute_location_filtered_stats(
     taxon: TaxonRecord,
     variable_id: str,
@@ -2241,7 +2458,26 @@ def compute_location_filtered_stats(
     reflect a chained filter exactly like they already do for location/
     phenology/timestamp, instead of only the highlighted map markers doing so.
     """
-    df = collect_taxon_df(taxon, storage=storage)
+    # Narrow column list — SELECT * (194 environmental columns) for a
+    # million bounded rows is itself enough to exhaust memory, confirmed
+    # live against a real KINGDOM-scope taxon even with the row cap already
+    # in place. Only fetch what this call can actually use: base columns,
+    # the one requested variable, whatever a location/extra-filter
+    # references, and (if it's a ternary composition's classifier) its
+    # sibling composition columns.
+    needed_cols = set(_OCC_BASE_COLS) | {variable_id}
+    if filter_col:
+        needed_cols.add(filter_col)
+    if extra_filters:
+        needed_cols.update(f["variable"] for f in extra_filters if "variable" in f)
+    if layer_meta is not None:
+        composition_cols = composition_group_members(layer_meta).get(variable_id)
+        if composition_cols:
+            needed_cols.update(composition_cols)
+
+    df = collect_taxon_df_bounded(
+        taxon, storage=storage, limit=_FILTERED_STATS_PRE_CAP, columns=sorted(needed_cols),
+    )
     if df is None:
         return None
     if filter_col is not None:
@@ -2266,6 +2502,7 @@ def compute_location_filtered_stats(
         df = apply_chained_filters(df, extra_filters)
         if df.empty:
             return None
+    df = _post_filter_cap(df, limit=_KDE_MAX_SAMPLES)
     if variable_id not in df.columns:
         return None
     vtype = _layer_value_type(layer)

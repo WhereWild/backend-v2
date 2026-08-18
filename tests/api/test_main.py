@@ -49,6 +49,8 @@ _RESPONSE_CACHED_FUNCTIONS = [
     main_module._cached_get_species_locations,
     main_module._cached_list_taxa_ranking_options,
     main_module._cached_query_taxa,
+    main_module._cached_scope_taxon_keys,
+    main_module._cached_hilbert_file_columns,
 ]
 
 
@@ -1498,26 +1500,23 @@ def test_get_species_occurrences_tile_applies_quality_filter(tmp_path):
 def test_get_species_occurrences_tile_includes_variable_values(tmp_path, monkeypatch):
     """variable= attaches a per-point "value" to each entry, plus a
     tile-scoped variable_min/max/q01/q99 — the fix for dots rendering
-    with no color data at genus+ rank (see main.py:_viewport_variable_values)."""
-    hilbert_path = _write_viewport_fixture(tmp_path)
-    occ_dir = tmp_path / "taxonomy"
-    occ_dir.mkdir(parents=True, exist_ok=True)
-    occ_data = {
-        "catalogNumber": ["VIS001", "HID001", "OUT001"],
-        "taxon_key": ["2923970"] * 3,
-        "bio1": [10.0, 20.0, 30.0],
-    }
-    pq.write_table(
-        pa.Table.from_pandas(pd.DataFrame(occ_data), preserve_index=False),
-        occ_dir / "occurrences.parquet",
-    )
+    with no color data at genus+ rank (see main.py:_summarize_variable_column).
+    The variable's own column now lives directly on
+    occurrences_by_hilbert.parquet (see build_spatial_index in
+    scripts/observation_ranks.py) rather than a separate query against
+    occurrences.parquet — this fixture reflects that by adding bio1 straight
+    onto the viewport table instead of writing a second parquet file."""
+    table = _viewport_table()
+    table = table.append_column("bio1", pa.array([10.0, 20.0, 30.0], type=pa.float64()))
+    path = tmp_path / "occurrences_by_hilbert.parquet"
+    pq.write_table(table, path)
+
     z = 15
     x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch("main.iter_descendants", return_value=[TAXON]), \
-         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", hilbert_path), \
-         patch("main.OCCURRENCES_FILE", occ_dir / "occurrences.parquet"), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path), \
          patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]):
         r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}?variable=bio1")
     assert r.status_code == 200
@@ -1528,6 +1527,27 @@ def test_get_species_occurrences_tile_includes_variable_values(tmp_path, monkeyp
     assert "OUT001" not in by_catalog  # outside this tile's bbox, per the zoom/location test above
     assert body["variable_min"] == pytest.approx(10.0)
     assert body["variable_max"] == pytest.approx(20.0)
+
+
+def test_get_species_occurrences_tile_omits_variable_values_when_column_missing(tmp_path):
+    """A variable requested whose column isn't (yet) present in
+    occurrences_by_hilbert.parquet — e.g. an older file from before a regen
+    picked it up — degrades to no per-point values instead of erroring,
+    matching the pre-existing layer-not-found behavior."""
+    path = _write_viewport_fixture(tmp_path)  # no bio1 column on this fixture
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]):
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}?variable=bio1")
+    assert r.status_code == 200
+    body = r.json()
+    assert "variable_min" not in body
+    for entry in body["occurrences"]:
+        assert "value" not in entry
 
 
 def test_occurrence_entries_from_df_resolves_each_rows_own_taxon():

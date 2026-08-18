@@ -59,6 +59,7 @@ from util.taxa import (
     load_catalog,
     zoom_column,
 )
+from util.tiles import load_layers
 
 CONFIG = load_config("global")
 
@@ -324,32 +325,60 @@ def build_spatial_index() -> None:
     without repeating the ranking passes. Plain in-memory connection is
     enough — a straight scan + sort + write over a narrow projection, no
     persistent mutated table like the ranking passes need.
+
+    Every environmental variable column (load_layers()' ids — bio1, elevation,
+    landcover, ...) is included too, not just the display/filter columns —
+    this is what lets main.py:_get_species_occurrences_viewport resolve a
+    tile's per-point variable values as extra SELECT columns on its own
+    already hilbertIdx-pruned query, instead of a second query against the
+    full, taxon_key-sorted OCCURRENCES_FILE keyed by catalogNumber. That
+    second query had no useful pruning available to it for a dominant taxon
+    (confirmed live: 1.1-1.8s per tile, regardless of tile size, for
+    Plantae) — the taxon SEMI JOIN barely narrows a kingdom-scale scan, and
+    catalogNumber has zero correlation with taxon_key sort order. Reusing
+    THIS file's hilbert sort order for variable lookups too costs some
+    extra disk (every variable column duplicated here) but turns that
+    lookup into a near-free extra column read on an already-small,
+    already-pruned result set.
     """
     print(f"[observation_ranks] building spatial index {OCCURRENCES_BY_HILBERT_FILE}")
     con = duckdb.connect()
+    # Previously unset here (unlike _duckdb_connect's main ranking
+    # connection, which has always capped at _DUCKDB_MEMORY_LIMIT) — with
+    # only the ~15 narrow columns this file used to carry, an unbounded
+    # ORDER BY + COPY got away with it. Once every variable column (168 of
+    # them) got added to the same sort+write, that stopped being true:
+    # confirmed live, this ran the box up to 83% RAM with swap fully
+    # exhausted. Same cap and settings as the main connection now.
+    con.execute(f"PRAGMA memory_limit='{_DUCKDB_MEMORY_LIMIT}'")
     con.execute(f"PRAGMA temp_directory='{_DUCKDB_SPILL_DIR.as_posix()}'")
+    con.execute("PRAGMA threads=4")
+    con.execute("PRAGMA preserve_insertion_order=false")
     zoom_cols_out_sql = ", ".join(f'"{zoom_column(level)}"' for level in _ALL_LEVELS)
     # Restricted to columns actually present — older fixtures/snapshots may
-    # predate _FILTER_COLS being added; not every one is load-bearing for
-    # the columns build_spatial_index has always required (zoom/media/hilbert).
+    # predate _FILTER_COLS/variable columns being added; not every one is
+    # load-bearing for the columns build_spatial_index has always required
+    # (zoom/media/hilbert).
     existing_cols = set(con.sql(f"SELECT * FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')").columns)
     filter_cols_out_sql = ", ".join(f'"{col}"' for col in _FILTER_COLS if col in existing_cols)
     if filter_cols_out_sql:
         filter_cols_out_sql = ", " + filter_cols_out_sql
+    variable_ids = [lyr["id"] for lyr in load_layers() if lyr["id"] in existing_cols]
+    variable_cols_out_sql = "".join(f', "{col}"' for col in variable_ids)
     tmp_dest = OCCURRENCES_BY_HILBERT_FILE.with_suffix(".parquet.tmp")
     con.execute(f"""
         COPY (
             SELECT
                 "catalogNumber", "taxon_key", "decimalLatitude", "decimalLongitude",
                 "mediaUrl", "mediaAttribution", "mediaLicense", "hilbertIdx",
-                {zoom_cols_out_sql}{filter_cols_out_sql}
+                {zoom_cols_out_sql}{filter_cols_out_sql}{variable_cols_out_sql}
             FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')
             ORDER BY "hilbertIdx"
         ) TO '{tmp_dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 50000)
     """)
     con.close()
     tmp_dest.replace(OCCURRENCES_BY_HILBERT_FILE)
-    print(f"[observation_ranks] wrote {OCCURRENCES_BY_HILBERT_FILE}")
+    print(f"[observation_ranks] wrote {OCCURRENCES_BY_HILBERT_FILE}  (variables={len(variable_ids)})")
 
 
 if __name__ == "__main__":  # pragma: no cover

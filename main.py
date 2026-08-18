@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from collections import Counter
@@ -319,17 +320,63 @@ def _load_legend_full(layer_id: str) -> dict:
     return json.loads(Path(path).read_text())
 
 
+@lru_cache(maxsize=4096)
+def _cached_scope_taxon_keys(taxon_key: str, rank: str, data_version: str) -> tuple[str, ...]:
+    """The real work behind _scope_taxon_keys, cached by (taxon_key, rank,
+    data_version) — the DFS in iter_descendants is a pure function of the
+    catalog tree, but was being re-walked from scratch on every single
+    call with no memoization at all. For a kingdom-scale taxon (e.g.
+    Plantae, ~188K descendants) this DFS alone measured ~300ms — and every
+    occurrence-tile request calls it fresh, so an 8-tile viewport batch
+    paid that 300ms EIGHT TIMES over (confirmed live: an 8-tile z=2 batch
+    took ~2.25s total, almost entirely this). The descendant set never
+    changes between calls for the same taxon short of a data reload, which
+    is exactly what data_version already exists to invalidate against
+    (matches every other _cached_* function in this file).
+
+    Takes rank directly rather than re-resolving the taxon via
+    taxa.get_taxon_by_id(taxon_key) — the caller already has a resolved
+    taxon dict (_scope_taxon_keys(taxon) below), and re-looking it up here
+    would silently diverge from whatever that dict actually says whenever
+    the two don't agree (e.g. a caller working from a taxon resolved by
+    slug, or in tests, a mocked/synthetic taxon that doesn't round-trip
+    through get_taxon_by_id at all). iter_descendants only ever reads
+    taxon["taxon_key"] off what it's given (see its own implementation), so
+    a minimal single-key dict is a complete, correct stand-in — no need for
+    the rest of the taxon record here."""
+    minimal_taxon = {"taxon_key": taxon_key}
+    if rank == _CONFIG.species_rank:
+        return tuple(str(t["taxon_key"]) for t in iter_descendants(minimal_taxon, include_self=True))
+    if rank in _CONFIG.leaf_rank_set:
+        return (taxon_key,)
+    return tuple(str(t["taxon_key"]) for t in iter_descendants(minimal_taxon, include_self=False))
+
+
+# Route handlers here are plain `def`, not `async def` — FastAPI runs each
+# one on its own real OS thread (its threadpool), not serialized on the
+# event loop. lru_cache's dict isn't corrupted by concurrent access (the
+# GIL protects that), but it does nothing to stop a genuine stampede: if
+# several tile requests for the same taxon race in before any of them has
+# stored a result, every one of them independently sees a miss and redoes
+# the ~300-800ms DFS. Confirmed live in [tile-timing] logs right after a
+# data reload — several consecutive requests all paying 300-800ms for
+# scope_ms before it suddenly drops to ~2ms once the race resolves. A
+# single lock around the whole lookup is enough: contention only exists
+# during that first, short-lived cold burst per (taxon_key, rank,
+# data_version) — every request after that is a cache hit and the lock is
+# held only as long as a dict lookup takes.
+_scope_taxon_keys_lock = threading.Lock()
+
+
 def _scope_taxon_keys(taxon: dict) -> list[str]:
     """taxon_keys in scope for occurrence-level queries: species rolls up
     subspecies/variety/form; a leaf is itself; other ranks read only their
     descendant leaves (not any stray direct-to-ancestor observations) —
-    mirrors util.stats.collect_taxon_df's own scope dispatch."""
-    rank = taxon["rank"]
-    if rank == _CONFIG.species_rank:
-        return [str(t["taxon_key"]) for t in iter_descendants(taxon, include_self=True)]
-    if rank in _CONFIG.leaf_rank_set:
-        return [str(taxon["taxon_key"])]
-    return [str(t["taxon_key"]) for t in iter_descendants(taxon, include_self=False)]
+    mirrors util.stats.collect_taxon_df's own scope dispatch. See
+    _cached_scope_taxon_keys for why the actual DFS is memoized, and
+    _scope_taxon_keys_lock for why a lock wraps it too."""
+    with _scope_taxon_keys_lock:
+        return list(_cached_scope_taxon_keys(str(taxon["taxon_key"]), taxon["rank"], _DATA_VERSION))
 
 
 def _read_occurrences_scoped(taxon: dict, columns: list[str] | None = None) -> pd.DataFrame:
@@ -2410,48 +2457,38 @@ def _hilbert_range_for_bbox(min_lat: float, min_lon: float, max_lat: float, max_
     return min(corners), max(corners)
 
 
-def _viewport_variable_values(
-    con: duckdb.DuckDBPyConnection, descendant_keys: list[str], catalog_numbers: list[str],
-    variable_id: str, unit_system: str | None,
+def _summarize_variable_column(
+    df: pd.DataFrame, resolved_id: str, layer: dict, unit_system: str | None,
 ) -> dict:
-    """Per-point values for one variable, for exactly the (small — one
-    tile's worth) set of catalogNumbers already resolved by the occurrence
-    query above. Mirrors get_observation_variable_values, but scoped to
-    that small set instead of the whole taxon — the same
-    taxon_key-SEMI-JOIN + occurrences.parquet read, just with an added
-    `catalogNumber IN (...)` filter, so the cost here is proportional to
-    one tile, not the taxon's total size. min/max/q01/q99 are computed
-    over this tile's values only — like phenology_counts/min_timestamp/
-    max_timestamp elsewhere in this endpoint, that's not an honest
-    whole-taxon aggregate, but there isn't a whole-taxon-cheap equivalent
-    for a resolved-and-unit-converted numeric scale the way there is for
-    those (see get_species_environment's precomputed-stats path, which
-    isn't itself in per-point value form)."""
-    resolved_id = _resolve_variable_id(variable_id)
-    layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == resolved_id), None)
-    if layer is None or not catalog_numbers:
-        return {}
-    con.register("viewport_catalogs", pd.DataFrame({"catalogNumber": catalog_numbers}))
-    try:
-        df = con.execute(
-            f"""
-            SELECT o."catalogNumber", o."{resolved_id}"
-            FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') o
-            SEMI JOIN descendants d ON o."taxon_key" = d."taxon_key"
-            WHERE o."catalogNumber" IN (SELECT "catalogNumber" FROM viewport_catalogs)
-            """
-        ).fetchdf()
-    finally:
-        con.unregister("viewport_catalogs")
-    if resolved_id not in df.columns:
-        return {}
+    """Per-point unit-converted values + min/max/q01/q99 for one variable,
+    computed directly from an already-fetched, already-filtered viewport
+    DataFrame — the tile-viewport counterpart to
+    get_observation_variable_values' whole-taxon scale, scoped to just this
+    tile's rows (like phenology_counts/min_timestamp/max_timestamp
+    elsewhere in this endpoint, not an honest whole-taxon aggregate, but
+    there's no whole-taxon-cheap equivalent for a resolved-and-unit-
+    converted numeric scale the way there is for those).
+
+    This used to be a SEPARATE query against occurrences.parquet (~65M
+    rows, taxon_key-sorted) keyed by `catalogNumber IN (...)` — confirmed
+    live that query alone cost 1.1-1.8s PER TILE regardless of tile size,
+    because neither filter it had to work with actually pruned anything for
+    a dominant taxon: the taxon SEMI JOIN barely narrows the scan when the
+    queried taxon (e.g. a whole kingdom) already covers most of the file,
+    and catalogNumber has no correlation with the file's taxon_key sort
+    order, so there's no row-group pruning for that IN-filter either.
+    occurrences_by_hilbert.parquet's build (see build_spatial_index in
+    scripts/observation_ranks.py) now carries every variable column too, so
+    the caller can just add resolved_id to its own already-hilbert-pruned
+    SELECT and hand the result straight here — no second query, no second
+    scan."""
     collected: dict[str, float] = {}
-    for cat, val in zip(df["catalogNumber"].tolist(), df[resolved_id].tolist()):
+    for cat, val in zip(df["catalogNumber"].astype(str).tolist(), df[resolved_id].tolist()):
         if val is None or (isinstance(val, float) and math.isnan(val)):
             continue
         converted = units.convert_value(float(val), layer, unit_system)
         if converted is not None:
-            collected[str(cat)] = converted
+            collected[cat] = converted
     vals = list(collected.values())
     if not vals:
         return {"values": collected}
@@ -2462,6 +2499,18 @@ def _viewport_variable_values(
     else:
         obs_q01, obs_q99 = obs_min, obs_max
     return {"values": collected, "min": obs_min, "max": obs_max, "q01": obs_q01, "q99": obs_q99}
+
+
+@lru_cache(maxsize=1)
+def _cached_hilbert_file_columns(data_version: str) -> frozenset[str]:
+    """Schema-only read (parquet footer metadata, not a data scan) of
+    occurrences_by_hilbert.parquet's columns, cached per data_version —
+    called on every viewport query that requests a variable (to check the
+    variable's column actually made it into this file — see
+    build_spatial_index in scripts/observation_ranks.py), so this is worth
+    memoizing the same way _cached_scope_taxon_keys is, rather than paying
+    even a cheap I/O call on every single request."""
+    return frozenset(_storage.read_schema(OCCURRENCES_BY_HILBERT_FILE).names)
 
 
 def _get_species_occurrences_viewport(
@@ -2498,13 +2547,31 @@ def _get_species_occurrences_viewport(
     response) are still deliberately omitted — they're whole-taxon
     aggregates and don't have an honest meaning computed over a partial
     viewport slice, filtered or not.
+
+    variable_id: resolved and added to this SAME SELECT (not a separate
+    query) when its column is present in this file — see
+    _summarize_variable_column's docstring for why a second query against
+    occurrences.parquet used to cost 1-1.8s per tile on its own, regardless
+    of tile size. If the column isn't present (an old file from before a
+    variable was added, or before a regen picked up a new one), this
+    degrades to no per-point values rather than erroring — matches the
+    layer-not-found case, which already returned no values too.
     """
+    # TEMPORARY diagnostic — remove once the remaining per-tile latency
+    # variance is understood. Only reaches here on a cache MISS (a hit
+    # short-circuits inside _cached_get_species_occurrences_tile's
+    # lru_cache before this function ever runs), which is exactly the case
+    # worth breaking down — a cache hit is already ~free.
+    _t_start = time.monotonic()
+
     level = taxa.display_level_for_rank(taxon["rank"])
     if level not in taxa.DISPLAY_LEVELS:
         raise HTTPException(status_code=400, detail="unsupported_rank")
     zoom_col = taxa.zoom_column(level)
 
+    _t_scope0 = time.monotonic()
     descendant_keys = _scope_taxon_keys(taxon)
+    _t_scope1 = time.monotonic()
     if not descendant_keys:
         return {"occurrences": []}
 
@@ -2518,9 +2585,36 @@ def _get_species_occurrences_viewport(
         extra_cols.append("rcs")
     if start_ts is not None or end_ts is not None:
         extra_cols.append("eventTimestamp")
+
+    resolved_var_id: str | None = None
+    layer: dict | None = None
+    if variable_id is not None:
+        resolved_var_id = _resolve_variable_id(variable_id)
+        layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == resolved_var_id), None)
+        if layer is not None:
+            if resolved_var_id in _cached_hilbert_file_columns(_DATA_VERSION):
+                extra_cols.append(resolved_var_id)
+            else:
+                layer = None
     extra_cols_sql = "".join(f', o."{c}"' for c in extra_cols)
 
+    _t_query0 = time.monotonic()
     con = duckdb.connect()
+    # A fresh, unconfigured duckdb.connect() defaults to using every
+    # available core for its own thread pool. That's fine for one query at
+    # a time, but this function runs on a real OS thread per concurrent
+    # request (see _scope_taxon_keys_lock's comment — these routes are
+    # sync def, not async def), and a single viewport fetch is routinely a
+    # batch of several tiles firing concurrently, each opening its own
+    # connection. Confirmed live in [tile-timing] logs: query_ms ballooned
+    # under a real concurrent batch (700-1100ms) versus the same query
+    # measured alone (~100-250ms) — several full-core connections were
+    # oversubscribing the same physical cores against each other. Capping
+    # each connection well below the box's core count (see nproc) lets
+    # several concurrent tile queries coexist without one connection
+    # starving the others; a single tile's own scan is small enough that 2
+    # threads is still plenty for it individually.
+    con.execute("PRAGMA threads=2")
     try:
         # SEMI JOIN against a registered table, not `taxon_key IN (...)` with
         # one bound parameter per descendant: measured directly against
@@ -2545,32 +2639,45 @@ def _get_species_occurrences_viewport(
             """,
             [hilbert_lo, hilbert_hi, zoom, min_lat, max_lat, min_lon, max_lon],
         ).fetchdf()
-
-        df = _filter_occ_df(df)
-        if filter_col is not None and filter_col in df.columns:
-            df = df[df[filter_col].astype(str) == str(location)]
-        if phenology is not None:
-            df = apply_phenology_filter(df, phenology)
-        if start_ts is not None or end_ts is not None:
-            df = apply_timestamp_filter(df, start_ts, end_ts)
-
-        result: dict = {"occurrences": _occurrence_entries_from_df(df)}
-        if variable_id is not None and not df.empty:
-            var_result = _viewport_variable_values(
-                con, descendant_keys, df["catalogNumber"].astype(str).tolist(),
-                variable_id, unit_system,
-            )
-            values = var_result.get("values", {})
-            for entry in result["occurrences"]:
-                if entry["catalogNumber"] in values:
-                    entry["value"] = values[entry["catalogNumber"]]
-            if "min" in var_result:
-                result["variable_min"] = var_result["min"]
-                result["variable_max"] = var_result["max"]
-                result["variable_q01"] = var_result["q01"]
-                result["variable_q99"] = var_result["q99"]
     finally:
         con.close()
+    _t_query1 = time.monotonic()
+
+    df = _filter_occ_df(df)
+    if filter_col is not None and filter_col in df.columns:
+        df = df[df[filter_col].astype(str) == str(location)]
+    if phenology is not None:
+        df = apply_phenology_filter(df, phenology)
+    if start_ts is not None or end_ts is not None:
+        df = apply_timestamp_filter(df, start_ts, end_ts)
+    _t_filter1 = time.monotonic()
+
+    result: dict = {"occurrences": _occurrence_entries_from_df(df)}
+    _t_entries1 = time.monotonic()
+    _t_variable1 = _t_entries1
+    if layer is not None and resolved_var_id in df.columns and not df.empty:
+        var_result = _summarize_variable_column(df, resolved_var_id, layer, unit_system)
+        values = var_result.get("values", {})
+        for entry in result["occurrences"]:
+            if entry["catalogNumber"] in values:
+                entry["value"] = values[entry["catalogNumber"]]
+        if "min" in var_result:
+            result["variable_min"] = var_result["min"]
+            result["variable_max"] = var_result["max"]
+            result["variable_q01"] = var_result["q01"]
+            result["variable_q99"] = var_result["q99"]
+        _t_variable1 = time.monotonic()
+
+    print(
+        "[tile-timing] "
+        f"taxon={taxon['taxon_key']} zoom={zoom} rows={len(df)} "
+        f"scope_ms={round((_t_scope1 - _t_scope0) * 1000)} "
+        f"query_ms={round((_t_query1 - _t_query0) * 1000)} "
+        f"filter_ms={round((_t_filter1 - _t_query1) * 1000)} "
+        f"entries_ms={round((_t_entries1 - _t_filter1) * 1000)} "
+        f"variable_ms={round((_t_variable1 - _t_entries1) * 1000)} "
+        f"total_ms={round((_t_variable1 - _t_start) * 1000)}"
+    )
 
     return result
 
@@ -2737,7 +2844,7 @@ def get_species_occurrences_tile(
     variable (+ unit_system): when given, each occurrence entry gets a
     "value" field (that variable's value at this observation, unit-
     converted) and the response gets variable_min/max/q01/q99 — this tile's
-    own values, see _viewport_variable_values for why that's not the same
+    own values, see _summarize_variable_column for why that's not the same
     thing as get_observation_variable_values' whole-taxon scale.
     get_species_occurrences (the flat/unfiltered-size endpoint) has no
     equivalent of this — small taxa still get per-point values from the
@@ -3462,6 +3569,8 @@ def query_taxa(
 # ---------------------------------------------------------------------------
 
 def _clear_data_versioned_caches() -> None:
+    _cached_scope_taxon_keys.cache_clear()
+    _cached_hilbert_file_columns.cache_clear()
     _cached_get_taxon.cache_clear()
     _cached_get_species_obscured.cache_clear()
     _cached_get_taxon_env_stats.cache_clear()

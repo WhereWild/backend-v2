@@ -2353,10 +2353,65 @@ def _hilbert_range_for_bbox(min_lat: float, min_lon: float, max_lat: float, max_
     return min(corners), max(corners)
 
 
+def _viewport_variable_values(
+    con: duckdb.DuckDBPyConnection, descendant_keys: list[str], catalog_numbers: list[str],
+    variable_id: str, unit_system: str | None,
+) -> dict:
+    """Per-point values for one variable, for exactly the (small — one
+    tile's worth) set of catalogNumbers already resolved by the occurrence
+    query above. Mirrors get_observation_variable_values, but scoped to
+    that small set instead of the whole taxon — the same
+    taxon_key-SEMI-JOIN + occurrences.parquet read, just with an added
+    `catalogNumber IN (...)` filter, so the cost here is proportional to
+    one tile, not the taxon's total size. min/max/q01/q99 are computed
+    over this tile's values only — like phenology_counts/min_timestamp/
+    max_timestamp elsewhere in this endpoint, that's not an honest
+    whole-taxon aggregate, but there isn't a whole-taxon-cheap equivalent
+    for a resolved-and-unit-converted numeric scale the way there is for
+    those (see get_species_environment's precomputed-stats path, which
+    isn't itself in per-point value form)."""
+    resolved_id = _resolve_variable_id(variable_id)
+    layer = next((lyr for lyr in tiles.load_layers() if lyr["id"] == resolved_id), None)
+    if layer is None or not catalog_numbers:
+        return {}
+    con.register("viewport_catalogs", pd.DataFrame({"catalogNumber": catalog_numbers}))
+    try:
+        df = con.execute(
+            f"""
+            SELECT o."catalogNumber", o."{resolved_id}"
+            FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') o
+            SEMI JOIN descendants d ON o."taxon_key" = d."taxon_key"
+            WHERE o."catalogNumber" IN (SELECT "catalogNumber" FROM viewport_catalogs)
+            """
+        ).fetchdf()
+    finally:
+        con.unregister("viewport_catalogs")
+    if resolved_id not in df.columns:
+        return {}
+    collected: dict[str, float] = {}
+    for cat, val in zip(df["catalogNumber"].tolist(), df[resolved_id].tolist()):
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            continue
+        converted = units.convert_value(float(val), layer, unit_system)
+        if converted is not None:
+            collected[str(cat)] = converted
+    vals = list(collected.values())
+    if not vals:
+        return {"values": collected}
+    obs_min, obs_max = min(vals), max(vals)
+    if len(vals) >= 2:
+        import numpy as _np
+        obs_q01, obs_q99 = _np.percentile(vals, [0.1, 99.9]).tolist()
+    else:
+        obs_q01, obs_q99 = obs_min, obs_max
+    return {"values": collected, "min": obs_min, "max": obs_max, "q01": obs_q01, "q99": obs_q99}
+
+
 def _get_species_occurrences_viewport(
     taxon: dict, zoom: int, min_lat: float, min_lon: float, max_lat: float, max_lon: float,
     *, location: str | None = None, phenology: str | None = None,
     start_ts: int | None = None, end_ts: int | None = None,
+    variable_id: str | None = None, unit_system: str | None = None,
 ) -> dict:
     """Zoom/bbox-scoped occurrence query against occurrences_by_hilbert.parquet
     (see scripts/observation_ranks.py, which builds it) instead of the full
@@ -2430,18 +2485,34 @@ def _get_species_occurrences_viewport(
             """,
             [hilbert_lo, hilbert_hi, zoom, min_lat, max_lat, min_lon, max_lon],
         ).fetchdf()
+
+        df = _filter_occ_df(df)
+        if filter_col is not None and filter_col in df.columns:
+            df = df[df[filter_col].astype(str) == str(location)]
+        if phenology is not None:
+            df = apply_phenology_filter(df, phenology)
+        if start_ts is not None or end_ts is not None:
+            df = apply_timestamp_filter(df, start_ts, end_ts)
+
+        result: dict = {"occurrences": _occurrence_entries_from_df(df)}
+        if variable_id is not None and not df.empty:
+            var_result = _viewport_variable_values(
+                con, descendant_keys, df["catalogNumber"].astype(str).tolist(),
+                variable_id, unit_system,
+            )
+            values = var_result.get("values", {})
+            for entry in result["occurrences"]:
+                if entry["catalogNumber"] in values:
+                    entry["value"] = values[entry["catalogNumber"]]
+            if "min" in var_result:
+                result["variable_min"] = var_result["min"]
+                result["variable_max"] = var_result["max"]
+                result["variable_q01"] = var_result["q01"]
+                result["variable_q99"] = var_result["q99"]
     finally:
         con.close()
 
-    df = _filter_occ_df(df)
-    if filter_col is not None and filter_col in df.columns:
-        df = df[df[filter_col].astype(str) == str(location)]
-    if phenology is not None:
-        df = apply_phenology_filter(df, phenology)
-    if start_ts is not None or end_ts is not None:
-        df = apply_timestamp_filter(df, start_ts, end_ts)
-
-    return {"occurrences": _occurrence_entries_from_df(df)}
+    return result
 
 
 @lru_cache(maxsize=2048)
@@ -2543,6 +2614,7 @@ def get_species_occurrences_tile(
     request: Request, taxon_id: str, z: int, x: int, y: int,
     location: str | None = None, phenology: str | None = None,
     start_ts: int | None = None, end_ts: int | None = None,
+    variable: str | None = None, unit_system: str | None = None,
 ):
     """Tile-coordinate-addressed viewport occurrences — same JSON shape as
     /species/{taxon_id}/occurrences (a list of individual, still-interactive
@@ -2562,6 +2634,15 @@ def get_species_occurrences_tile(
     location/phenology/start_ts/end_ts match the flat endpoint's query
     params exactly (same validation, same semantics) — see
     _get_species_occurrences_viewport for how they're applied.
+
+    variable (+ unit_system): when given, each occurrence entry gets a
+    "value" field (that variable's value at this observation, unit-
+    converted) and the response gets variable_min/max/q01/q99 — this tile's
+    own values, see _viewport_variable_values for why that's not the same
+    thing as get_observation_variable_values' whole-taxon scale.
+    get_species_occurrences (the flat/unfiltered-size endpoint) has no
+    equivalent of this — small taxa still get per-point values from the
+    separate get_observation_variable_values endpoint instead.
     """
     if z < 0 or z > _MAX_TILE_ZOOM:
         raise HTTPException(status_code=400, detail=f"z must be between 0 and {_MAX_TILE_ZOOM}")
@@ -2582,6 +2663,7 @@ def get_species_occurrences_tile(
     return _get_species_occurrences_viewport(
         taxon, z, min_lat, min_lon, max_lat, max_lon,
         location=location, phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+        variable_id=variable, unit_system=unit_system,
     )
 
 

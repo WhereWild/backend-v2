@@ -1451,6 +1451,41 @@ def test_get_species_occurrences_tile_applies_quality_filter(tmp_path):
     assert "HID001" in catalog_numbers
 
 
+def test_get_species_occurrences_tile_includes_variable_values(tmp_path, monkeypatch):
+    """variable= attaches a per-point "value" to each entry, plus a
+    tile-scoped variable_min/max/q01/q99 — the fix for dots rendering
+    with no color data at genus+ rank (see main.py:_viewport_variable_values)."""
+    hilbert_path = _write_viewport_fixture(tmp_path)
+    occ_dir = tmp_path / "taxonomy"
+    occ_dir.mkdir(parents=True, exist_ok=True)
+    occ_data = {
+        "catalogNumber": ["VIS001", "HID001", "OUT001"],
+        "taxon_key": ["2923970"] * 3,
+        "bio1": [10.0, 20.0, 30.0],
+    }
+    pq.write_table(
+        pa.Table.from_pandas(pd.DataFrame(occ_data), preserve_index=False),
+        occ_dir / "occurrences.parquet",
+    )
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", hilbert_path), \
+         patch("main.OCCURRENCES_FILE", occ_dir / "occurrences.parquet"), \
+         patch.object(tiles, "load_layers", return_value=[FAKE_LAYER]):
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}?variable=bio1")
+    assert r.status_code == 200
+    body = r.json()
+    by_catalog = {o["catalogNumber"]: o for o in body["occurrences"]}
+    assert by_catalog["VIS001"]["value"] == pytest.approx(10.0)
+    assert by_catalog["HID001"]["value"] == pytest.approx(20.0)
+    assert "OUT001" not in by_catalog  # outside this tile's bbox, per the zoom/location test above
+    assert body["variable_min"] == pytest.approx(10.0)
+    assert body["variable_max"] == pytest.approx(20.0)
+
+
 def test_get_species_occurrences_tile_rejects_bad_zoom():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None):

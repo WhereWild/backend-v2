@@ -51,11 +51,19 @@ import duckdb
 import pandas as pd
 
 from config.config import load_config
-from util.taxa import ANCESTOR_RANK_LEVELS, ancestor_keys_by_rank, load_catalog
+from util.taxa import (
+    ANCESTOR_RANK_LEVELS,
+    DISPLAY_LEVELS,
+    LEVEL_LABELS,
+    ancestor_keys_by_rank,
+    load_catalog,
+    zoom_column,
+)
 
 CONFIG = load_config("global")
 
 OCCURRENCES_FILE = Path("data/taxonomy/occurrences.parquet")
+OCCURRENCES_BY_HILBERT_FILE = Path("data/taxonomy/occurrences_by_hilbert.parquet")
 
 _DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
 # Deliberately conservative, not just "under total RAM": the working table
@@ -66,11 +74,10 @@ _DUCKDB_SPILL_DIR = Path("data/tmp/duckdb_spill")
 # even on a box running other things concurrently.
 _DUCKDB_MEMORY_LIMIT = "20GB"
 
-# Display label per level, used for both the grouping-key column
-# ("{label.lower()}Key") and the output column ("minZoom{label}").
-_LEVEL_LABELS: dict[str, str] = {rank: rank.capitalize() for rank in ANCESTOR_RANK_LEVELS}
-_LEVEL_LABELS["INFRA"] = "Infra"
-_ALL_LEVELS: tuple[str, ...] = (*ANCESTOR_RANK_LEVELS, "INFRA")
+# Level list and the minZoom<Label> column-naming convention live in
+# util.taxa (DISPLAY_LEVELS/LEVEL_LABELS/zoom_column) — shared with main.py,
+# which reads these same columns.
+_ALL_LEVELS: tuple[str, ...] = DISPLAY_LEVELS
 
 # Coarsest-first (zoom, cell size in meters). The lowest-hash point per
 # (grouping_key, cell) at a band becomes visible at that band's zoom; the
@@ -116,11 +123,11 @@ def _duckdb_connect() -> duckdb.DuckDBPyConnection:
 
 
 def _key_col(level: str) -> str:
-    return f'"{_LEVEL_LABELS[level].lower()}Key"'
+    return f'"{LEVEL_LABELS[level].lower()}Key"'
 
 
 def _zoom_col(level: str) -> str:
-    return f'"minZoom{_LEVEL_LABELS[level]}"'
+    return f'"{zoom_column(level)}"'
 
 
 def build_ancestor_frame() -> pd.DataFrame:
@@ -136,7 +143,7 @@ def build_ancestor_frame() -> pd.DataFrame:
         ranks = ancestors.get(taxon_key, {})
         row: dict[str, str | None] = {"taxon_key": taxon_key}
         for level in ANCESTOR_RANK_LEVELS:
-            row[f"{_LEVEL_LABELS[level].lower()}Key"] = ranks.get(level)
+            row[f"{LEVEL_LABELS[level].lower()}Key"] = ranks.get(level)
         row["infraKey"] = taxon_key if taxon["rank"] in subspecies_equivalents else None
         rows.append(row)
     return pd.DataFrame(rows)
@@ -280,8 +287,47 @@ def main() -> None:
     tmp_dest.replace(OCCURRENCES_FILE)
     print(f"[observation_ranks] wrote {OCCURRENCES_FILE}  ({time.monotonic() - t_write:.1f}s)")
 
+    # Final phase: the hilbertIdx-sorted spatial index, built from the
+    # just-written real OCCURRENCES_FILE so it's always consistent with
+    # what's actually live.
+    t_spatial = time.monotonic()
+    build_spatial_index()
+    print(f"[observation_ranks] spatial index phase done  ({time.monotonic() - t_spatial:.1f}s)")
+
     elapsed = time.monotonic() - t0
     print(f"[observation_ranks] done  levels={len(_ALL_LEVELS)}  rows={n_rows}  total={elapsed:.1f}s")
+
+
+def build_spatial_index() -> None:
+    """Slim, hilbertIdx-sorted secondary index — same established pattern as
+    scripts/populate_tree.py's _build_catalog_number_index (narrow
+    projection, differently sorted, for one specific access pattern), just
+    keyed on hilbertIdx instead of catalogNumber, and including the
+    minZoom* columns this file needs that populate_tree's index doesn't.
+    Standalone (not folded into main()'s single connection) so it can be
+    rebuilt/verified on its own against an already-ranked OCCURRENCES_FILE,
+    without repeating the ranking passes. Plain in-memory connection is
+    enough — a straight scan + sort + write over a narrow projection, no
+    persistent mutated table like the ranking passes need.
+    """
+    print(f"[observation_ranks] building spatial index {OCCURRENCES_BY_HILBERT_FILE}")
+    con = duckdb.connect()
+    con.execute(f"PRAGMA temp_directory='{_DUCKDB_SPILL_DIR.as_posix()}'")
+    zoom_cols_out_sql = ", ".join(f'"{zoom_column(level)}"' for level in _ALL_LEVELS)
+    tmp_dest = OCCURRENCES_BY_HILBERT_FILE.with_suffix(".parquet.tmp")
+    con.execute(f"""
+        COPY (
+            SELECT
+                "catalogNumber", "taxon_key", "decimalLatitude", "decimalLongitude",
+                "mediaUrl", "mediaAttribution", "mediaLicense", "hilbertIdx",
+                {zoom_cols_out_sql}
+            FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')
+            ORDER BY "hilbertIdx"
+        ) TO '{tmp_dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 50000)
+    """)
+    con.close()
+    tmp_dest.replace(OCCURRENCES_BY_HILBERT_FILE)
+    print(f"[observation_ranks] wrote {OCCURRENCES_BY_HILBERT_FILE}")
 
 
 if __name__ == "__main__":  # pragma: no cover

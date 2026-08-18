@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 
+import duckdb
 import httpx
 import pandas as pd
 import psutil
@@ -34,6 +35,7 @@ from starlette.concurrency import run_in_threadpool
 import util.rankings as rankings
 from config.config import load_config
 from scripts.build_tree import _is_usable_license, _normalize_license_url
+from scripts.observation_ranks import OCCURRENCES_BY_HILBERT_FILE
 from util import citations, descriptions, download, gis, taxa, tiles, units, upload
 from util.rankings import POSITION_FILE, RANKINGS_FILE
 from util.stats import (
@@ -234,11 +236,24 @@ def _is_expensive_subtree_taxon(taxon: dict, observation_count: int | None = Non
     return observation_count >= _LARGE_TAXON_THRESHOLD
 
 
-def _reject_if_large_taxon(taxon: dict) -> None:
+def _reject_if_large_taxon(taxon: dict, *, zoom_scoped: bool = False) -> None:
     """Block per-observation aggregation (filtering, slicing, raw sample/value
     listing, downloading) for taxa too large/broad to do it live — matches the
     frontend's large-taxon map/filter/download disable threshold (see
-    get_taxon's large_taxon field, which uses the same helper)."""
+    get_taxon's large_taxon field, which uses the same helper).
+
+    zoom_scoped=True — passed only by the zoom/bbox occurrence viewport path
+    (see _get_species_occurrences_viewport) — skips this guard for GENUS/
+    FAMILY specifically. The guard exists because collect_taxon_df's/
+    _read_occurrences_scoped's subtree traversal (opening every descendant
+    leaf's own parquet file) is slow at that scope; the viewport path queries
+    occurrences_by_hilbert.parquet in one bulk query instead and doesn't have
+    that cost driver. KINGDOM/PHYLUM/CLASS/ORDER stay blocked regardless —
+    not a performance question, just never a sane map scope — and the
+    SPECIES/INFRA observation-count threshold is unaffected either way.
+    """
+    if zoom_scoped and taxon["rank"] in ("GENUS", "FAMILY"):
+        return
     if _is_expensive_subtree_taxon(taxon):
         raise HTTPException(status_code=400, detail="large_taxon")
 
@@ -2275,6 +2290,100 @@ def get_occurrence(request: Request, catalog_number: str):
     )
 
 
+def _occurrence_entries_from_df(df: pd.DataFrame) -> list[dict]:
+    """Shared by both the cached full-taxon path and the zoom/bbox viewport
+    path: dedupe by catalogNumber and shape into the response entry format
+    (catalogNumber/latitude/longitude + optional media fields)."""
+    df = df.dropna(subset=["catalogNumber", "decimalLatitude", "decimalLongitude"])
+    df = df.drop_duplicates(subset="catalogNumber")
+    collected: list[dict] = []
+    for r in df.to_dict("records"):
+        entry = {
+            "catalogNumber": str(r["catalogNumber"]),
+            "latitude": r["decimalLatitude"],
+            "longitude": r["decimalLongitude"],
+        }
+        media_url = r.get("mediaUrl")
+        if isinstance(media_url, str) and media_url:
+            entry["media_url"] = media_url
+            attribution = r.get("mediaAttribution")
+            if isinstance(attribution, str) and attribution:
+                entry["media_attribution"] = attribution
+            license_url = r.get("mediaLicense")
+            if isinstance(license_url, str) and license_url:
+                entry["media_license_url"] = license_url
+                entry["media_license"] = _license_label(license_url)
+        collected.append(entry)
+    return collected
+
+
+def _hilbert_range_for_bbox(min_lat: float, min_lon: float, max_lat: float, max_lon: float) -> tuple[int, int]:
+    """Approximate hilbertIdx range covering a bbox, via its 4 corners — a
+    deliberate simplification (one [min, max] range, not a true quad-tree
+    decomposition of the bbox into several disjoint ranges). Used only to
+    prune parquet row groups; an exact lat/lon bbox check still runs on
+    whatever rows fall in the pruned range in
+    _get_species_occurrences_viewport, so overscan here costs query time,
+    never correctness. Revisit with real decomposition only if profiling
+    shows overscan is actually a problem."""
+    corners = [
+        gis.hilbert_index(min_lat, min_lon),
+        gis.hilbert_index(min_lat, max_lon),
+        gis.hilbert_index(max_lat, min_lon),
+        gis.hilbert_index(max_lat, max_lon),
+    ]
+    return min(corners), max(corners)
+
+
+def _get_species_occurrences_viewport(
+    taxon: dict, zoom: int, min_lat: float, min_lon: float, max_lat: float, max_lon: float,
+) -> dict:
+    """Zoom/bbox-scoped occurrence query against occurrences_by_hilbert.parquet
+    (see scripts/observation_ranks.py, which builds it) instead of the full
+    per-taxon read the unfiltered path uses. Not cached — the existing
+    _cached_get_species_occurrences LRU keying works because its params are
+    discrete; a continuous bbox would defeat it (every pan = a new key,
+    cache never hits). The whole point of the hilbert index is that this
+    query should be fast enough uncached; revisit if profiling says
+    otherwise.
+
+    phenology_counts/min_timestamp/max_timestamp (present in the unfiltered
+    response) are deliberately omitted here — they're whole-taxon aggregates
+    and don't have an honest meaning computed over a partial viewport slice.
+    """
+    level = taxa.display_level_for_rank(taxon["rank"])
+    if level not in taxa.DISPLAY_LEVELS:
+        raise HTTPException(status_code=400, detail="unsupported_rank")
+    zoom_col = taxa.zoom_column(level)
+
+    descendant_keys = _scope_taxon_keys(taxon)
+    if not descendant_keys:
+        return {"occurrences": []}
+
+    hilbert_lo, hilbert_hi = _hilbert_range_for_bbox(min_lat, min_lon, max_lat, max_lon)
+    key_placeholders = ",".join("?" for _ in descendant_keys)
+
+    con = duckdb.connect()
+    try:
+        df = con.execute(
+            f"""
+            SELECT "catalogNumber", "decimalLatitude", "decimalLongitude",
+                   "mediaUrl", "mediaAttribution", "mediaLicense"
+            FROM read_parquet('{OCCURRENCES_BY_HILBERT_FILE.as_posix()}')
+            WHERE "taxon_key" IN ({key_placeholders})
+              AND "hilbertIdx" BETWEEN ? AND ?
+              AND "{zoom_col}" <= ?
+              AND "decimalLatitude" BETWEEN ? AND ?
+              AND "decimalLongitude" BETWEEN ? AND ?
+            """,
+            [*descendant_keys, hilbert_lo, hilbert_hi, zoom, min_lat, max_lat, min_lon, max_lon],
+        ).fetchdf()
+    finally:
+        con.close()
+
+    return {"occurrences": _occurrence_entries_from_df(df)}
+
+
 @lru_cache(maxsize=2048)
 def _cached_get_species_occurrences(
     taxon_id: str,
@@ -2335,26 +2444,7 @@ def _cached_get_species_occurrences(
             pheno_acc.update(compute_phenology_counts(df))
         media_cols = [c for c in ("mediaUrl", "mediaAttribution", "mediaLicense") if c in df.columns]
         df = df[["catalogNumber", "decimalLatitude", "decimalLongitude", *media_cols]]
-        df = df.dropna(subset=["catalogNumber", "decimalLatitude", "decimalLongitude"])
-        df = df.drop_duplicates(subset="catalogNumber")
-        collected = []
-        for r in df.to_dict("records"):
-            entry = {
-                "catalogNumber": str(r["catalogNumber"]),
-                "latitude": r["decimalLatitude"],
-                "longitude": r["decimalLongitude"],
-            }
-            media_url = r.get("mediaUrl")
-            if isinstance(media_url, str) and media_url:
-                entry["media_url"] = media_url
-                attribution = r.get("mediaAttribution")
-                if isinstance(attribution, str) and attribution:
-                    entry["media_attribution"] = attribution
-                license_url = r.get("mediaLicense")
-                if isinstance(license_url, str) and license_url:
-                    entry["media_license_url"] = license_url
-                    entry["media_license"] = _license_label(license_url)
-            collected.append(entry)
+        collected = _occurrence_entries_from_df(df)
 
     if use_precomputed_pheno:
         pheno_counts = read_phenology_counts(TREE_ROOT / taxon["path"]) or dict(
@@ -2380,7 +2470,26 @@ def get_species_occurrences(
     phenology: str | None = None,
     start_ts: int | None = None,
     end_ts: int | None = None,
+    zoom: int | None = None,
+    min_lat: float | None = None,
+    min_lon: float | None = None,
+    max_lat: float | None = None,
+    max_lon: float | None = None,
 ):
+    # zoom present -> the new viewport-scoped path (see
+    # _get_species_occurrences_viewport): backward compatible by
+    # construction, since omitting zoom (today's only caller) hits the
+    # unchanged, unfiltered path below exactly as before.
+    if zoom is not None:
+        if None in (min_lat, min_lon, max_lat, max_lon):
+            raise HTTPException(
+                status_code=400, detail="zoom requires min_lat, min_lon, max_lat, and max_lon",
+            )
+        taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+        if taxon is None:
+            raise HTTPException(status_code=404, detail="Taxon not found")
+        _reject_if_large_taxon(taxon, zoom_scoped=True)
+        return _get_species_occurrences_viewport(taxon, zoom, min_lat, min_lon, max_lat, max_lon)
     return _cached_get_species_occurrences(taxon_id, location, phenology, start_ts, end_ts, _DATA_VERSION)
 
 

@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import scripts.observation_ranks as obs_ranks
+from util.gis import hilbert_index
 
 # Genus G1
 #   Species S1 "Echinocereus triglochidiatus"
@@ -41,14 +42,27 @@ _CLUSTER_LAT, _CLUSTER_LON = 40.5, -111.6
 _ISOLATED_LAT, _ISOLATED_LON = 40.5, -114.6
 
 
+def _row(catalog_number: str, taxon_key: str, lat: float, lon: float) -> dict:
+    """Includes mediaUrl/mediaAttribution/mediaLicense and hilbertIdx —
+    always-present columns in the real occurrences.parquet schema (see
+    scripts/populate_tree.py's SCHEMA) that the spatial-index phase in
+    main() selects unconditionally, so fixtures need them too even though
+    these particular tests don't exercise media/hilbert content directly."""
+    return {
+        "catalogNumber": catalog_number,
+        "decimalLatitude": lat,
+        "decimalLongitude": lon,
+        "taxon_key": taxon_key,
+        "mediaUrl": None,
+        "mediaAttribution": None,
+        "mediaLicense": None,
+        "hilbertIdx": hilbert_index(lat, lon),
+    }
+
+
 def _jitter_rows(prefix: str, taxon_key: str, n: int, lat: float, lon: float) -> list[dict]:
     return [
-        {
-            "catalogNumber": f"{prefix}{i}",
-            "decimalLatitude": lat + (i % 5) * 0.001,
-            "decimalLongitude": lon + (i // 5) * 0.001,
-            "taxon_key": taxon_key,
-        }
+        _row(f"{prefix}{i}", taxon_key, lat + (i % 5) * 0.001, lon + (i // 5) * 0.001)
         for i in range(n)
     ]
 
@@ -69,8 +83,7 @@ def _make_parquet(path: Path, rows: list[dict]) -> None:
 def _rows() -> list[dict]:
     return [
         *_jitter_rows("t1-cluster-", "T1", 10, _CLUSTER_LAT, _CLUSTER_LON),
-        {"catalogNumber": "t1-isolated-0", "decimalLatitude": _ISOLATED_LAT,
-         "decimalLongitude": _ISOLATED_LON, "taxon_key": "T1"},
+        _row("t1-isolated-0", "T1", _ISOLATED_LAT, _ISOLATED_LON),
         *_jitter_rows("t2-cluster-", "T2", 5, _CLUSTER_LAT, _CLUSTER_LON),
         *_jitter_rows("s2-", "S2", 3, _CLUSTER_LAT + 5.0, _CLUSTER_LON + 5.0),
     ]
@@ -80,6 +93,7 @@ def _run_main(tmp_path: Path, rows: list[dict]) -> pd.DataFrame:
     occ_path = tmp_path / "occurrences.parquet"
     _make_parquet(occ_path, rows)
     with patch.object(obs_ranks, "OCCURRENCES_FILE", occ_path), \
+         patch.object(obs_ranks, "OCCURRENCES_BY_HILBERT_FILE", tmp_path / "occurrences_by_hilbert.parquet"), \
          patch.object(obs_ranks, "_DUCKDB_SPILL_DIR", tmp_path / "duckdb_spill"), \
          patch.object(obs_ranks, "_DUCKDB_SCRATCH_DB", tmp_path / "scratch.duckdb"), \
          patch.object(obs_ranks, "load_catalog", return_value=_CATALOG), \
@@ -177,8 +191,8 @@ def test_output_is_taxon_key_sorted_even_from_unsorted_source(tmp_path):
     must pass even when fed deliberately unsorted input."""
     occ_path = tmp_path / "occurrences.parquet"
     unsorted_rows = [
-        {"catalogNumber": "a", "decimalLatitude": 40.5, "decimalLongitude": -111.6, "taxon_key": "T2"},
-        {"catalogNumber": "b", "decimalLatitude": 40.5, "decimalLongitude": -111.6, "taxon_key": "S2"},
+        _row("a", "T2", 40.5, -111.6),
+        _row("b", "S2", 40.5, -111.6),
     ]
     occ_path.parent.mkdir(parents=True, exist_ok=True)
     cols: dict[str, list] = {}
@@ -188,6 +202,7 @@ def test_output_is_taxon_key_sorted_even_from_unsorted_source(tmp_path):
     pq.write_table(pa.table({k: pa.array(v) for k, v in cols.items()}), occ_path)
 
     with patch.object(obs_ranks, "OCCURRENCES_FILE", occ_path), \
+         patch.object(obs_ranks, "OCCURRENCES_BY_HILBERT_FILE", tmp_path / "occurrences_by_hilbert.parquet"), \
          patch.object(obs_ranks, "_DUCKDB_SPILL_DIR", tmp_path / "duckdb_spill"), \
          patch.object(obs_ranks, "_DUCKDB_SCRATCH_DB", tmp_path / "scratch.duckdb"), \
          patch.object(obs_ranks, "load_catalog", return_value=_CATALOG), \
@@ -196,3 +211,30 @@ def test_output_is_taxon_key_sorted_even_from_unsorted_source(tmp_path):
 
     result = pq.read_table(occ_path).to_pandas()
     assert list(result["taxon_key"]) == sorted(result["taxon_key"])
+
+def test_spatial_index_is_slim_and_hilbert_sorted(tmp_path):
+    """occurrences_by_hilbert.parquet should be a narrow projection (not a
+    full-width copy — see main()'s comment on why), physically sorted by
+    hilbertIdx, carrying the minZoom* columns the main file also has."""
+    occ_path = tmp_path / "occurrences.parquet"
+    spatial_path = tmp_path / "occurrences_by_hilbert.parquet"
+    _make_parquet(occ_path, _rows())
+
+    with patch.object(obs_ranks, "OCCURRENCES_FILE", occ_path), \
+         patch.object(obs_ranks, "OCCURRENCES_BY_HILBERT_FILE", spatial_path), \
+         patch.object(obs_ranks, "_DUCKDB_SPILL_DIR", tmp_path / "duckdb_spill"), \
+         patch.object(obs_ranks, "_DUCKDB_SCRATCH_DB", tmp_path / "scratch.duckdb"), \
+         patch.object(obs_ranks, "load_catalog", return_value=_CATALOG), \
+         patch.object(obs_ranks, "ancestor_keys_by_rank", return_value=_ANCESTORS):
+        obs_ranks.main()
+
+    result = pq.read_table(spatial_path).to_pandas()
+    expected_cols = {
+        "catalogNumber", "taxon_key", "decimalLatitude", "decimalLongitude",
+        "mediaUrl", "mediaAttribution", "mediaLicense", "hilbertIdx",
+        "minZoomKingdom", "minZoomPhylum", "minZoomClass", "minZoomOrder",
+        "minZoomFamily", "minZoomGenus", "minZoomSpecies", "minZoomInfra",
+    }
+    assert set(result.columns) == expected_cols
+    assert len(result) == len(_rows())
+    assert list(result["hilbertIdx"]) == sorted(result["hilbertIdx"])

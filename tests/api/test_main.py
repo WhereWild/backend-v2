@@ -1252,6 +1252,127 @@ def test_get_species_occurrences_includes_media():
 
 
 # ---------------------------------------------------------------------------
+# /species/{id}/occurrences — zoom/bbox viewport path
+# ---------------------------------------------------------------------------
+
+from util.gis import hilbert_index as _hilbert_index  # noqa: E402
+
+_VISIBLE_LAT, _VISIBLE_LON = 40.5, -75.0
+_HIDDEN_LAT, _HIDDEN_LON = 41.0, -74.5
+_OUTSIDE_BBOX_LAT, _OUTSIDE_BBOX_LON = 10.0, 10.0
+
+# A generous bbox around _VISIBLE/_HIDDEN but nowhere near _OUTSIDE_BBOX.
+_BBOX = {"min_lat": 39.0, "min_lon": -76.0, "max_lat": 42.0, "max_lon": -73.0}
+
+
+def _viewport_table() -> pa.Table:
+    rows = [
+        ("VIS001", _VISIBLE_LAT, _VISIBLE_LON, 0),   # minZoomSpecies=0: always visible
+        ("HID001", _HIDDEN_LAT, _HIDDEN_LON, 10),    # minZoomSpecies=10: needs zoom>=10
+        ("OUT001", _OUTSIDE_BBOX_LAT, _OUTSIDE_BBOX_LON, 0),  # visible but outside the bbox
+    ]
+    return pa.table({
+        "catalogNumber": [r[0] for r in rows],
+        "taxon_key": ["2923970"] * len(rows),
+        "decimalLatitude": [r[1] for r in rows],
+        "decimalLongitude": [r[2] for r in rows],
+        "mediaUrl": pa.array([None] * len(rows), type=pa.string()),
+        "mediaAttribution": pa.array([None] * len(rows), type=pa.string()),
+        "mediaLicense": pa.array([None] * len(rows), type=pa.string()),
+        "hilbertIdx": [_hilbert_index(r[1], r[2]) for r in rows],
+        "minZoomSpecies": [r[3] for r in rows],
+    })
+
+
+def _write_viewport_fixture(tmp_path: Path) -> Path:
+    path = tmp_path / "occurrences_by_hilbert.parquet"
+    pq.write_table(_viewport_table(), path)
+    return path
+
+
+def test_get_species_occurrences_zoom_bbox_filters_by_zoom(tmp_path):
+    """A point whose minZoomSpecies exceeds the requested zoom must not
+    appear, even though it's within the bbox."""
+    path = _write_viewport_fixture(tmp_path)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
+        r = client.get("/species/2923970/occurrences", params={"zoom": 5, **_BBOX})
+    assert r.status_code == 200
+    catalog_numbers = {o["catalogNumber"] for o in r.json()["occurrences"]}
+    assert catalog_numbers == {"VIS001"}
+
+
+def test_get_species_occurrences_zoom_bbox_filters_by_location(tmp_path):
+    """A point outside the requested bbox must not appear, even at minZoom=0."""
+    path = _write_viewport_fixture(tmp_path)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
+        r = client.get("/species/2923970/occurrences", params={"zoom": 15, **_BBOX})
+    assert r.status_code == 200
+    catalog_numbers = {o["catalogNumber"] for o in r.json()["occurrences"]}
+    assert catalog_numbers == {"VIS001", "HID001"}
+    assert "OUT001" not in catalog_numbers
+
+
+def test_get_species_occurrences_zoom_omits_phenology_and_timestamp(tmp_path):
+    """Whole-taxon aggregates don't have an honest meaning over a partial
+    viewport slice — see _get_species_occurrences_viewport's docstring."""
+    path = _write_viewport_fixture(tmp_path)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
+        r = client.get("/species/2923970/occurrences", params={"zoom": 15, **_BBOX})
+    assert r.status_code == 200
+    body = r.json()
+    assert "phenology_counts" not in body
+    assert "min_timestamp" not in body
+    assert "max_timestamp" not in body
+
+
+def test_get_species_occurrences_zoom_requires_full_bbox():
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/2923970/occurrences", params={"zoom": 5, "min_lat": 39.0})
+    assert r.status_code == 400
+
+
+def test_get_species_occurrences_genus_reachable_with_zoom(tmp_path):
+    """GENUS is rejected outright without zoom (see
+    test_get_species_occurrences_nonleaf_rejected_as_large_taxon) but reachable
+    via the viewport path, which doesn't have the subtree-traversal cost that
+    guard exists for."""
+    table = _viewport_table()
+    # GENUS reads minZoomGenus, not minZoomSpecies — the base fixture only
+    # has the latter, so carry the same per-row values into a Genus column.
+    table = table.append_column("minZoomGenus", table.column("minZoomSpecies"))
+    path = tmp_path / "occurrences_by_hilbert.parquet"
+    pq.write_table(table, path)
+
+    with patch.object(taxa, "get_taxon_by_id", return_value=NONLEAF_TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[DESC_TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
+        r = client.get("/species/2923968/occurrences", params={"zoom": 15, **_BBOX})
+    assert r.status_code == 200
+
+
+def test_get_species_occurrences_order_still_blocked_with_zoom():
+    """KINGDOM/PHYLUM/CLASS/ORDER stay blocked even with zoom+bbox — never a
+    sane map scope regardless of query mechanism, per plan scope."""
+    order_taxon = {**NONLEAF_TAXON, "rank": "ORDER"}
+    with patch.object(taxa, "get_taxon_by_id", return_value=order_taxon), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/2923968/occurrences", params={"zoom": 15, **_BBOX})
+    assert r.status_code == 400
+    assert r.json()["detail"] == "large_taxon"
+
+
+# ---------------------------------------------------------------------------
 # /occurrence/{catalog_number}
 # ---------------------------------------------------------------------------
 

@@ -11,7 +11,10 @@ from typing import Any, TypedDict
 
 from rapidfuzz import fuzz, process
 
+from config.config import load_config
 from util.storage import ParquetStorageProxy
+
+CONFIG = load_config("global")
 
 CATALOG_DIR = Path(os.environ.get("WHEREWILD_DATA_ROOT", "data")) / "taxonomy" / "catalog"
 
@@ -117,6 +120,32 @@ def _children_index() -> dict[str, list[str]]:
 ANCESTOR_RANK_LEVELS: tuple[str, ...] = (
     "KINGDOM", "PHYLUM", "CLASS", "ORDER", "FAMILY", "GENUS", "SPECIES",
 )
+
+# Every level a minZoom* column exists for: the 7 ancestor ranks above, plus
+# INFRA (subspecies/variety/form — see display_level_for_rank). Single
+# source of truth for the "minZoom" + label column-naming convention, shared
+# by scripts/observation_ranks.py (which writes these columns) and main.py
+# (which reads them) so the two don't duplicate the naming scheme.
+DISPLAY_LEVELS: tuple[str, ...] = (*ANCESTOR_RANK_LEVELS, "INFRA")
+
+LEVEL_LABELS: dict[str, str] = {rank: rank.capitalize() for rank in ANCESTOR_RANK_LEVELS}
+LEVEL_LABELS["INFRA"] = "Infra"
+
+
+def zoom_column(level: str) -> str:
+    """minZoom column name for a display level, e.g. "GENUS" -> "minZoomGenus"."""
+    return f"minZoom{LEVEL_LABELS[level]}"
+
+
+def display_level_for_rank(rank: str) -> str:
+    """Which DISPLAY_LEVELS entry (and therefore which minZoom column) a
+    taxon of this rank uses for its own map view. Infraspecific ranks
+    (config.subspecies_equivalents) get the separate INFRA column rather
+    than being treated as SPECIES — see ancestor_keys_by_rank's docstring
+    and scripts/observation_ranks.py for why."""
+    if rank in CONFIG.subspecies_equivalents:
+        return "INFRA"
+    return rank
 
 
 @lru_cache(maxsize=1)

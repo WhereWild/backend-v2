@@ -231,6 +231,7 @@ def test_main_full_pipeline_completes(tmp_path):
          patch("scripts.gis.build_overviews.main", side_effect=lambda: call_order.append("build_overviews")), \
          patch("scripts.enrich_tree.main", side_effect=lambda: call_order.append("enrich_tree")), \
          patch("scripts.enrich_temporal.main", side_effect=lambda: call_order.append("enrich_temporal")), \
+         patch("scripts.observation_ranks.main", side_effect=lambda: call_order.append("observation_ranks")), \
          patch("scripts.process_tree.run_stats", side_effect=lambda: call_order.append("process_tree")), \
          patch("scripts.process_tree.run_rankings", side_effect=lambda: call_order.append("process_tree_rankings")), \
          patch("scripts.process_tree.run_consolidation", side_effect=lambda: call_order.append("process_tree_consolidate")), \
@@ -242,7 +243,7 @@ def test_main_full_pipeline_completes(tmp_path):
     assert call_order == [
         "wipe", "tree", "populate", "carry_forward",
         "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal",
-        "process_tree", "process_tree_rankings", "process_tree_consolidate",
+        "observation_ranks", "process_tree", "process_tree_rankings", "process_tree_consolidate",
     ]
     p = _pipeline(tmp_path)
     assert p["status"] == "completed"
@@ -251,7 +252,7 @@ def test_main_full_pipeline_completes(tmp_path):
         for s in [
             "sync_gbif", "build_tree", "populate_tree", "carry_forward",
             "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal",
-            "process_tree", "process_tree_rankings", "process_tree_consolidate",
+            "observation_ranks", "process_tree", "process_tree_rankings", "process_tree_consolidate",
         ]
     )
     assert p["error"] is None
@@ -277,6 +278,7 @@ def test_main_wipe_happens_before_sync_download(tmp_path):
          patch("scripts.gis.build_overviews.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
+         patch("scripts.observation_ranks.main"), \
          patch("scripts.process_tree.run_stats"), \
          patch("scripts.process_tree.run_rankings"), \
          patch("scripts.process_tree.run_consolidation"), \
@@ -305,6 +307,7 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
          patch("scripts.gis.build_overviews.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
+         patch("scripts.observation_ranks.main"), \
          patch("scripts.process_tree.run_stats"), \
          patch("scripts.process_tree.run_rankings"), \
          patch("scripts.process_tree.run_consolidation"), \
@@ -352,6 +355,7 @@ def test_main_crash_detected_on_next_run(tmp_path, capsys):
          patch("scripts.gis.build_overviews.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
+         patch("scripts.observation_ranks.main"), \
          patch("scripts.process_tree.run_stats"), \
          patch("scripts.process_tree.run_rankings"), \
          patch("scripts.process_tree.run_consolidation"), \
@@ -416,6 +420,7 @@ def test_main_inhibitor_released_on_success():
          patch("scripts.gis.build_overviews.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
+         patch("scripts.observation_ranks.main"), \
          patch("scripts.process_tree.run_stats"), \
          patch("scripts.process_tree.run_rankings"), \
          patch("scripts.process_tree.run_consolidation"), \
@@ -463,6 +468,7 @@ def test_main_force_clears_gbif_crawl_timestamps(tmp_path, monkeypatch):
          patch("scripts.gis.build_overviews.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
+         patch("scripts.observation_ranks.main"), \
          patch("scripts.process_tree.run_stats"), \
          patch("scripts.process_tree.run_rankings"), \
          patch("scripts.process_tree.run_consolidation"), \
@@ -491,6 +497,7 @@ def test_main_stage_flag_skips_prior_stages(tmp_path, monkeypatch):
          patch("scripts.gis.build_overviews.main"), \
          patch("scripts.enrich_tree.main", side_effect=lambda: call_order.append("enrich_tree")), \
          patch("scripts.enrich_temporal.main", side_effect=lambda: call_order.append("enrich_temporal")), \
+         patch("scripts.observation_ranks.main", side_effect=lambda: call_order.append("observation_ranks")), \
          patch("scripts.process_tree.run_stats", side_effect=lambda: call_order.append("process_tree")), \
          patch("scripts.process_tree.run_rankings", side_effect=lambda: call_order.append("process_tree_rankings")), \
          patch("scripts.process_tree.run_consolidation", side_effect=lambda: call_order.append("process_tree_consolidate")), \
@@ -534,6 +541,7 @@ def test_main_resume_skips_completed_stages(tmp_path, monkeypatch):
          patch("scripts.gis.build_overviews.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
+         patch("scripts.observation_ranks.main"), \
          patch("scripts.process_tree.run_stats"), \
          patch("scripts.process_tree.run_rankings"), \
          patch("scripts.process_tree.run_consolidation"), \

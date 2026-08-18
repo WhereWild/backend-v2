@@ -44,6 +44,7 @@ def clear_lru_caches():
     taxa._path_index.cache_clear()
     taxa._children_index.cache_clear()
     taxa._inat_id_index.cache_clear()
+    taxa.ancestor_keys_by_rank.cache_clear()
     yield
     taxa._load_payload.cache_clear()
     taxa.load_catalog.cache_clear()
@@ -52,6 +53,7 @@ def clear_lru_caches():
     taxa._path_index.cache_clear()
     taxa._children_index.cache_clear()
     taxa._inat_id_index.cache_clear()
+    taxa.ancestor_keys_by_rank.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -365,3 +367,66 @@ def test_iter_descendants_subtree(tree_catalog):
     genus = _TREE_CATALOG["2"]
     keys = {t["taxon_key"] for t in taxa.iter_descendants(genus, include_self=True)}
     assert keys == {"2", "3", "4"}
+
+
+# ---------------------------------------------------------------------------
+# ancestor_keys_by_rank
+# ---------------------------------------------------------------------------
+
+_INFRA_CATALOG = {
+    "10": {
+        "taxon_key": "10", "path": "Cactaceae_1/Echinocereus_10",
+        "scientific_name": "Echinocereus", "common_name": "", "rank": "GENUS",
+    },
+    "11": {
+        "taxon_key": "11", "path": "Cactaceae_1/Echinocereus_10/Echinocereus_triglochidiatus_11",
+        "scientific_name": "Echinocereus triglochidiatus", "common_name": "", "rank": "SPECIES",
+    },
+    "12": {
+        "taxon_key": "12",
+        "path": "Cactaceae_1/Echinocereus_10/Echinocereus_triglochidiatus_11/ssp_triglochidiatus_12",
+        "scientific_name": "Echinocereus triglochidiatus subsp. triglochidiatus",
+        "common_name": "", "rank": "SUBSPECIES",
+    },
+    "13": {
+        "taxon_key": "13",
+        "path": "Cactaceae_1/Echinocereus_10/Echinocereus_triglochidiatus_11/ssp_mojavensis_13",
+        "scientific_name": "Echinocereus triglochidiatus subsp. mojavensis",
+        "common_name": "", "rank": "SUBSPECIES",
+    },
+}
+_INFRA_PAYLOAD = {"catalog": _INFRA_CATALOG, "combined_name_index": {}}
+
+
+@pytest.fixture
+def infra_catalog():
+    with patch.object(taxa, "_load_payload", return_value=_INFRA_PAYLOAD):
+        yield
+
+
+def test_ancestor_keys_by_rank_missing_levels_skipped(tree_catalog):
+    """_TREE_CATALOG has no PHYLUM/CLASS/ORDER/FAMILY entries at all — a
+    lineage missing a rank should just omit it, not error or guess."""
+    ancestors = taxa.ancestor_keys_by_rank()
+    assert ancestors["3"]["KINGDOM"] == "1"
+    assert ancestors["3"]["GENUS"] == "2"
+    assert ancestors["3"]["SPECIES"] == "3"
+    assert "PHYLUM" not in ancestors["3"]
+    assert "FAMILY" not in ancestors["3"]
+
+
+def test_ancestor_keys_by_rank_node_is_own_ancestor_at_its_rank(tree_catalog):
+    ancestors = taxa.ancestor_keys_by_rank()
+    assert ancestors["2"]["GENUS"] == "2"
+    assert "SPECIES" not in ancestors["2"]
+
+
+def test_ancestor_keys_by_rank_infraspecific_species_ancestor_is_parent_species(infra_catalog):
+    """Both sibling subspecies must resolve to the same SPECIES ancestor —
+    this is what lets minZoomSpecies pool them for a species-as-a-whole
+    view, distinct from their own (separate) infraspecific grouping."""
+    ancestors = taxa.ancestor_keys_by_rank()
+    assert ancestors["12"]["SPECIES"] == "11"
+    assert ancestors["13"]["SPECIES"] == "11"
+    assert ancestors["12"]["GENUS"] == "10"
+    assert ancestors["13"]["GENUS"] == "10"

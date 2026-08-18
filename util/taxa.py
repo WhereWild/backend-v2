@@ -112,6 +112,53 @@ def _children_index() -> dict[str, list[str]]:
     return index
 
 
+# Ranks that can own their own display/map view — matches build_tree.py's
+# TAXONOMY_LEVELS, uppercased to match TaxonRecord["rank"]'s casing.
+ANCESTOR_RANK_LEVELS: tuple[str, ...] = (
+    "KINGDOM", "PHYLUM", "CLASS", "ORDER", "FAMILY", "GENUS", "SPECIES",
+)
+
+
+@lru_cache(maxsize=1)
+def ancestor_keys_by_rank() -> dict[str, dict[str, str]]:
+    """taxon_key -> {rank: ancestor_taxon_key} for every rank in
+    ANCESTOR_RANK_LEVELS present in that taxon's own lineage.
+
+    Walks each taxon's own `path` (a "/"-joined chain of
+    "{name}_{taxon_key}" segments, one per ancestor level — see
+    scripts/build_tree.py's TAXONOMY_LEVELS loop) from itself upward,
+    looking up each prefix's taxon via _path_index() and recording it under
+    its own `rank`. Driven by each node's actual `rank` field rather than
+    assuming positional correspondence between path segments and
+    TAXONOMY_LEVELS, since some lineages skip a rank (a GBIF record can lack
+    e.g. an "order" designation) — a taxon simply has no entry for a rank
+    missing from its lineage, which callers should treat as legitimately
+    absent, not an error.
+
+    A rank-N node's own entry includes itself as its own rank-N ancestor
+    (e.g. a GENUS node's dict has "GENUS" -> its own key) — the natural
+    result of walking prefixes starting at the full path.
+
+    Catalog-sized (not occurrence-sized), cached: safe to call per-observation.
+    """
+    catalog = load_catalog()
+    path_to_key = _path_index()
+    result: dict[str, dict[str, str]] = {}
+    for key, taxon in catalog.items():
+        segments = taxon["path"].split("/")
+        ancestors: dict[str, str] = {}
+        for i in range(len(segments), 0, -1):
+            prefix = "/".join(segments[:i])
+            anc_key = path_to_key.get(prefix)
+            if anc_key is None:
+                continue
+            anc_rank = catalog[anc_key]["rank"]
+            if anc_rank in ANCESTOR_RANK_LEVELS and anc_rank not in ancestors:
+                ancestors[anc_rank] = anc_key
+        result[key] = ancestors
+    return result
+
+
 def get_children(taxon_key: Any) -> list[TaxonRecord]:
     """Return the direct children of a taxon in catalog order."""
     catalog = load_catalog()

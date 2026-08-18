@@ -1530,6 +1530,61 @@ def test_get_species_occurrences_tile_includes_variable_values(tmp_path, monkeyp
     assert body["variable_max"] == pytest.approx(20.0)
 
 
+def test_occurrence_entries_from_df_resolves_each_rows_own_taxon():
+    """A large-taxon viewport tile (e.g. a Plantae kingdom page) can mix rows
+    from many different descendant species in one response — each entry
+    must carry ITS OWN observed taxon, not the queried taxon, and
+    scientific_name must have underscores converted to spaces like every
+    other place main.py surfaces one (see get_taxon's own scientific_name
+    handling)."""
+    df = pd.DataFrame({
+        "catalogNumber": ["A1", "B1"],
+        "decimalLatitude": [40.0, 41.0],
+        "decimalLongitude": [-74.0, -73.0],
+        "taxon_key": ["AAA1", "BBB2"],
+    })
+    fake_catalog = {
+        "AAA1": {
+            "taxon_key": "AAA1",
+            "scientific_name": "Genus_speciesa",
+            "common_name": "Species A",
+            "rank": "SPECIES",
+        },
+        "BBB2": {
+            "taxon_key": "BBB2",
+            "scientific_name": "Genus_speciesb",
+            "common_name": "Species B",
+            "rank": "SPECIES",
+        },
+    }
+    with patch.object(taxa, "load_catalog", return_value=fake_catalog):
+        entries = main_module._occurrence_entries_from_df(df)
+    by_catalog = {e["catalogNumber"]: e for e in entries}
+    assert by_catalog["A1"]["taxon_id"] == "AAA1"
+    assert by_catalog["A1"]["scientific_name"] == "Genus speciesa"
+    assert by_catalog["A1"]["common_name"] == "Species A"
+    assert by_catalog["B1"]["taxon_id"] == "BBB2"
+    assert by_catalog["B1"]["scientific_name"] == "Genus speciesb"
+
+
+def test_occurrence_entries_from_df_omits_taxon_fields_without_taxon_key_column():
+    """The flat/full-taxon path's df never has a taxon_key column (its guard
+    already restricts it to species/infraspecific taxa, where every row's
+    real taxon trivially IS the queried one) — no catalog lookup should even
+    be attempted, let alone add taxon fields to the entries."""
+    df = pd.DataFrame({
+        "catalogNumber": ["A1"],
+        "decimalLatitude": [40.0],
+        "decimalLongitude": [-74.0],
+    })
+    with patch.object(taxa, "load_catalog") as mock_load_catalog:
+        entries = main_module._occurrence_entries_from_df(df)
+    mock_load_catalog.assert_not_called()
+    assert "taxon_id" not in entries[0]
+    assert "scientific_name" not in entries[0]
+    assert "common_name" not in entries[0]
+
+
 def test_get_species_occurrences_tile_rejects_bad_zoom():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None):

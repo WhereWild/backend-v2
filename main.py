@@ -2349,9 +2349,21 @@ def get_occurrence(request: Request, catalog_number: str):
 def _occurrence_entries_from_df(df: pd.DataFrame) -> list[dict]:
     """Shared by both the cached full-taxon path and the zoom/bbox viewport
     path: dedupe by catalogNumber and shape into the response entry format
-    (catalogNumber/latitude/longitude + optional media fields)."""
+    (catalogNumber/latitude/longitude + optional media fields).
+
+    When df carries a "taxon_key" column, each entry is also annotated with
+    the OBSERVED taxon's own id/scientific_name/common_name — not the
+    queried taxon's. The flat/full-taxon path never includes this column
+    (its guard already restricts it to species/infraspecific taxa, where
+    every row's real taxon trivially IS the queried one, so there was never
+    anything to resolve). The zoom/bbox viewport path can be queried at any
+    rank including genus/family/kingdom, where a single tile's rows span many
+    different descendant species — callers (e.g. the observation gallery)
+    need the row's own taxon to link/label correctly, not the page's."""
     df = df.dropna(subset=["catalogNumber", "decimalLatitude", "decimalLongitude"])
     df = df.drop_duplicates(subset="catalogNumber")
+    resolve_taxon = "taxon_key" in df.columns
+    catalog = taxa.load_catalog() if resolve_taxon else None
     collected: list[dict] = []
     for r in df.to_dict("records"):
         entry = {
@@ -2369,6 +2381,13 @@ def _occurrence_entries_from_df(df: pd.DataFrame) -> list[dict]:
             if isinstance(license_url, str) and license_url:
                 entry["media_license_url"] = license_url
                 entry["media_license"] = _license_label(license_url)
+        if resolve_taxon and catalog is not None:
+            taxon_key = r.get("taxon_key")
+            observed = catalog.get(str(taxon_key)) if taxon_key is not None else None
+            if observed is not None:
+                entry["taxon_id"] = observed["taxon_key"]
+                entry["scientific_name"] = observed["scientific_name"].replace("_", " ")
+                entry["common_name"] = observed["common_name"]
         collected.append(entry)
     return collected
 
@@ -2516,7 +2535,7 @@ def _get_species_occurrences_viewport(
         df = con.execute(
             f"""
             SELECT o."catalogNumber", o."decimalLatitude", o."decimalLongitude",
-                   o."mediaUrl", o."mediaAttribution", o."mediaLicense"{extra_cols_sql}
+                   o."mediaUrl", o."mediaAttribution", o."mediaLicense", o."taxon_key"{extra_cols_sql}
             FROM read_parquet('{OCCURRENCES_BY_HILBERT_FILE.as_posix()}') o
             SEMI JOIN descendants d ON o."taxon_key" = d."taxon_key"
             WHERE o."hilbertIdx" BETWEEN ? AND ?

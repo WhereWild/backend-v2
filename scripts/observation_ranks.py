@@ -85,12 +85,12 @@ _ALL_LEVELS: tuple[str, ...] = DISPLAY_LEVELS
 # "everything remaining becomes visible here, unthinned." Tunable constants,
 # not yet fit against real data.
 _BANDS: tuple[tuple[int, float], ...] = (
-    (0, 200_000.0),
-    (4, 50_000.0),
-    (7, 10_000.0),
-    (10, 2_000.0),
-    (13, 250.0),
-    (15, 1.0),
+    (0, 100_000.0),
+    (2, 25_000.0),
+    (5, 5_000.0),
+    (8, 1_000.0),
+    (11, 125.0),
+    (13, 1.0),
 )
 
 _MERCATOR_HALF_CIRCUMFERENCE_M = math.pi * 6378137.0

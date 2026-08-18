@@ -2355,6 +2355,8 @@ def _hilbert_range_for_bbox(min_lat: float, min_lon: float, max_lat: float, max_
 
 def _get_species_occurrences_viewport(
     taxon: dict, zoom: int, min_lat: float, min_lon: float, max_lat: float, max_lon: float,
+    *, location: str | None = None, phenology: str | None = None,
+    start_ts: int | None = None, end_ts: int | None = None,
 ) -> dict:
     """Zoom/bbox-scoped occurrence query against occurrences_by_hilbert.parquet
     (see scripts/observation_ranks.py, which builds it) instead of the full
@@ -2365,9 +2367,22 @@ def _get_species_occurrences_viewport(
     query should be fast enough uncached; revisit if profiling says
     otherwise.
 
+    location/phenology/start_ts/end_ts reuse the exact same filter
+    semantics as the flat endpoint (_location_filter_col,
+    apply_phenology_filter, apply_timestamp_filter, _filter_occ_df) — one
+    tile's worth of rows is always small, so applying them in pandas after
+    the SQL fetch is simpler than pushing each into SQL, and it keeps this
+    consistent with the flat endpoint's behavior instead of a second,
+    subtly different implementation. This also applies the same
+    obscured/coordinateUncertaintyInMeters quality filtering the flat
+    endpoint always applies via _filter_occ_df — a gap in this endpoint
+    before filter params existed, since occurrences_by_hilbert.parquet
+    didn't carry those columns at all.
+
     phenology_counts/min_timestamp/max_timestamp (present in the unfiltered
-    response) are deliberately omitted here — they're whole-taxon aggregates
-    and don't have an honest meaning computed over a partial viewport slice.
+    response) are still deliberately omitted — they're whole-taxon
+    aggregates and don't have an honest meaning computed over a partial
+    viewport slice, filtered or not.
     """
     level = taxa.display_level_for_rank(taxon["rank"])
     if level not in taxa.DISPLAY_LEVELS:
@@ -2379,6 +2394,16 @@ def _get_species_occurrences_viewport(
         return {"occurrences": []}
 
     hilbert_lo, hilbert_hi = _hilbert_range_for_bbox(min_lat, min_lon, max_lat, max_lon)
+
+    filter_col = _location_filter_col(location) if location is not None else None
+    extra_cols = ["obscured", "coordinateUncertaintyInMeters"]
+    if filter_col:
+        extra_cols.append(filter_col)
+    if phenology is not None:
+        extra_cols.append("rcs")
+    if start_ts is not None or end_ts is not None:
+        extra_cols.append("eventTimestamp")
+    extra_cols_sql = "".join(f', o."{c}"' for c in extra_cols)
 
     con = duckdb.connect()
     try:
@@ -2395,7 +2420,7 @@ def _get_species_occurrences_viewport(
         df = con.execute(
             f"""
             SELECT o."catalogNumber", o."decimalLatitude", o."decimalLongitude",
-                   o."mediaUrl", o."mediaAttribution", o."mediaLicense"
+                   o."mediaUrl", o."mediaAttribution", o."mediaLicense"{extra_cols_sql}
             FROM read_parquet('{OCCURRENCES_BY_HILBERT_FILE.as_posix()}') o
             SEMI JOIN descendants d ON o."taxon_key" = d."taxon_key"
             WHERE o."hilbertIdx" BETWEEN ? AND ?
@@ -2407,6 +2432,14 @@ def _get_species_occurrences_viewport(
         ).fetchdf()
     finally:
         con.close()
+
+    df = _filter_occ_df(df)
+    if filter_col is not None and filter_col in df.columns:
+        df = df[df[filter_col].astype(str) == str(location)]
+    if phenology is not None:
+        df = apply_phenology_filter(df, phenology)
+    if start_ts is not None or end_ts is not None:
+        df = apply_timestamp_filter(df, start_ts, end_ts)
 
     return {"occurrences": _occurrence_entries_from_df(df)}
 
@@ -2506,7 +2539,11 @@ _MAX_TILE_ZOOM = 24  # generous sane bound — well past any zoom this app's map
 
 @app.get("/species/{taxon_id}/occurrences/{z}/{x}/{y}")
 @limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
-def get_species_occurrences_tile(request: Request, taxon_id: str, z: int, x: int, y: int):
+def get_species_occurrences_tile(
+    request: Request, taxon_id: str, z: int, x: int, y: int,
+    location: str | None = None, phenology: str | None = None,
+    start_ts: int | None = None, end_ts: int | None = None,
+):
     """Tile-coordinate-addressed viewport occurrences — same JSON shape as
     /species/{taxon_id}/occurrences (a list of individual, still-interactive
     observations, not a rendered image), just scoped to one map tile instead
@@ -2521,6 +2558,10 @@ def get_species_occurrences_tile(request: Request, taxon_id: str, z: int, x: int
     tile, by construction — so "huge area at high zoom" isn't just bad
     practice under this contract, it's inexpressible: no (z, x, y) means
     that.
+
+    location/phenology/start_ts/end_ts match the flat endpoint's query
+    params exactly (same validation, same semantics) — see
+    _get_species_occurrences_viewport for how they're applied.
     """
     if z < 0 or z > _MAX_TILE_ZOOM:
         raise HTTPException(status_code=400, detail=f"z must be between 0 and {_MAX_TILE_ZOOM}")
@@ -2533,8 +2574,15 @@ def get_species_occurrences_tile(request: Request, taxon_id: str, z: int, x: int
         raise HTTPException(status_code=404, detail="Taxon not found")
     _reject_if_large_taxon(taxon, zoom_scoped=True)
 
+    phenology_norm = phenology.strip().lower() if phenology else None
+    if phenology_norm is not None and phenology_norm not in _PHENOLOGY_VALUES:
+        raise HTTPException(status_code=400, detail=f"Invalid phenology value: {phenology!r}")
+
     min_lon, min_lat, max_lon, max_lat = tiles.tile_bounds_wgs84(z, x, y)
-    return _get_species_occurrences_viewport(taxon, z, min_lat, min_lon, max_lat, max_lon)
+    return _get_species_occurrences_viewport(
+        taxon, z, min_lat, min_lon, max_lat, max_lon,
+        location=location, phenology=phenology_norm, start_ts=start_ts, end_ts=end_ts,
+    )
 
 
 @lru_cache(maxsize=1)

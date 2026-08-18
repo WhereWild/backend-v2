@@ -298,6 +298,21 @@ def main() -> None:
     print(f"[observation_ranks] done  levels={len(_ALL_LEVELS)}  rows={n_rows}  total={elapsed:.1f}s")
 
 
+# Columns beyond the base display fields, carried purely so
+# main.py:_get_species_occurrences_viewport can apply the same
+# location/phenology/timestamp/quality filters the flat occurrence endpoint
+# does, without falling back to a second read of the wide OCCURRENCES_FILE
+# (which would defeat the point of querying this slim, hilbertIdx-sorted
+# file in the first place). Kept in sync with what those filters actually
+# read: _location_filter_col's four possible columns, apply_phenology_filter
+# (rcs), apply_timestamp_filter (eventTimestamp), and _filter_occ_df
+# (obscured, coordinateUncertaintyInMeters).
+_FILTER_COLS: tuple[str, ...] = (
+    "level0Gid", "level1Gid", "level2Gid", "gbifRegion",
+    "rcs", "eventTimestamp", "obscured", "coordinateUncertaintyInMeters",
+)
+
+
 def build_spatial_index() -> None:
     """Slim, hilbertIdx-sorted secondary index — same established pattern as
     scripts/populate_tree.py's _build_catalog_number_index (narrow
@@ -314,13 +329,20 @@ def build_spatial_index() -> None:
     con = duckdb.connect()
     con.execute(f"PRAGMA temp_directory='{_DUCKDB_SPILL_DIR.as_posix()}'")
     zoom_cols_out_sql = ", ".join(f'"{zoom_column(level)}"' for level in _ALL_LEVELS)
+    # Restricted to columns actually present — older fixtures/snapshots may
+    # predate _FILTER_COLS being added; not every one is load-bearing for
+    # the columns build_spatial_index has always required (zoom/media/hilbert).
+    existing_cols = set(con.sql(f"SELECT * FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')").columns)
+    filter_cols_out_sql = ", ".join(f'"{col}"' for col in _FILTER_COLS if col in existing_cols)
+    if filter_cols_out_sql:
+        filter_cols_out_sql = ", " + filter_cols_out_sql
     tmp_dest = OCCURRENCES_BY_HILBERT_FILE.with_suffix(".parquet.tmp")
     con.execute(f"""
         COPY (
             SELECT
                 "catalogNumber", "taxon_key", "decimalLatitude", "decimalLongitude",
                 "mediaUrl", "mediaAttribution", "mediaLicense", "hilbertIdx",
-                {zoom_cols_out_sql}
+                {zoom_cols_out_sql}{filter_cols_out_sql}
             FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')
             ORDER BY "hilbertIdx"
         ) TO '{tmp_dest.as_posix()}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 50000)

@@ -1282,9 +1282,10 @@ _OUTSIDE_LAT, _OUTSIDE_LON = -33.90, 151.20
 
 def _viewport_table() -> pa.Table:
     rows = [
-        ("VIS001", _VISIBLE_LAT, _VISIBLE_LON, 0),   # minZoomSpecies=0: always visible
-        ("HID001", _HIDDEN_LAT, _HIDDEN_LON, 10),    # minZoomSpecies=10: needs zoom>=10
-        ("OUT001", _OUTSIDE_LAT, _OUTSIDE_LON, 0),   # visible but on the other side of the planet
+        # catalogNumber, lat, lon, minZoomSpecies, level0Gid, rcs, eventTimestamp, obscured, coordinateUncertaintyInMeters
+        ("VIS001", _VISIBLE_LAT, _VISIBLE_LON, 0, "USA", "flowers", 1000, "No", 10.0),
+        ("HID001", _HIDDEN_LAT, _HIDDEN_LON, 10, "USA", "fruits or seeds", 2000, "No", 10.0),
+        ("OUT001", _OUTSIDE_LAT, _OUTSIDE_LON, 0, "AUS", "flowers", 3000, "No", 10.0),
     ]
     return pa.table({
         "catalogNumber": [r[0] for r in rows],
@@ -1296,6 +1297,14 @@ def _viewport_table() -> pa.Table:
         "mediaLicense": pa.array([None] * len(rows), type=pa.string()),
         "hilbertIdx": [_hilbert_index(r[1], r[2]) for r in rows],
         "minZoomSpecies": [r[3] for r in rows],
+        "level0Gid": [r[4] for r in rows],
+        "level1Gid": pa.array([None] * len(rows), type=pa.string()),
+        "level2Gid": pa.array([None] * len(rows), type=pa.string()),
+        "gbifRegion": pa.array([None] * len(rows), type=pa.string()),
+        "rcs": [r[5] for r in rows],
+        "eventTimestamp": [r[6] for r in rows],
+        "obscured": [r[7] for r in rows],
+        "coordinateUncertaintyInMeters": [r[8] for r in rows],
     })
 
 
@@ -1355,6 +1364,91 @@ def test_get_species_occurrences_tile_omits_phenology_and_timestamp(tmp_path):
     assert "phenology_counts" not in body
     assert "min_timestamp" not in body
     assert "max_timestamp" not in body
+
+
+def test_get_species_occurrences_tile_filters_by_location_param(tmp_path, monkeypatch):
+    """location= matches the flat endpoint's semantics exactly — VIS/HID are
+    both level0Gid=USA, OUT001 is AUS, but only VIS/HID are even in this
+    tile's bbox to begin with (see the zoom/location test above)."""
+    _patch_hierarchy(monkeypatch, {"USA": _USA})
+    path = _write_viewport_fixture(tmp_path)
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}?location=USA")
+    assert r.status_code == 200
+    catalog_numbers = {o["catalogNumber"] for o in r.json()["occurrences"]}
+    assert catalog_numbers == {"VIS001", "HID001"}
+
+
+def test_get_species_occurrences_tile_filters_by_phenology(tmp_path):
+    """phenology= keeps only rows whose rcs matches (see
+    apply_phenology_filter) — VIS001 is flowers, HID001 is fruits or seeds."""
+    path = _write_viewport_fixture(tmp_path)
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}?phenology=flowers")
+    assert r.status_code == 200
+    catalog_numbers = {o["catalogNumber"] for o in r.json()["occurrences"]}
+    assert catalog_numbers == {"VIS001"}
+
+
+def test_get_species_occurrences_tile_rejects_invalid_phenology(tmp_path):
+    path = _write_viewport_fixture(tmp_path)
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}?phenology=not_a_real_value")
+    assert r.status_code == 400
+
+
+def test_get_species_occurrences_tile_filters_by_timestamp(tmp_path):
+    """start_ts/end_ts keeps only rows whose eventTimestamp falls in range —
+    VIS001=1000, HID001=2000."""
+    path = _write_viewport_fixture(tmp_path)
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}?start_ts=1500&end_ts=2500")
+    assert r.status_code == 200
+    catalog_numbers = {o["catalogNumber"] for o in r.json()["occurrences"]}
+    assert catalog_numbers == {"HID001"}
+
+
+def test_get_species_occurrences_tile_applies_quality_filter(tmp_path):
+    """Obscured rows are dropped the same way the flat endpoint drops them
+    (_filter_occ_df) — a gap in this endpoint before it read these columns
+    at all."""
+    table = _viewport_table()
+    obscured_col = pa.array(["Yes", "No", "No"], type=pa.string())
+    table = table.set_column(table.column_names.index("obscured"), "obscured", obscured_col)
+    path = tmp_path / "occurrences_by_hilbert.parquet"
+    pq.write_table(table, path)
+
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None), \
+         patch("main.iter_descendants", return_value=[TAXON]), \
+         patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}")
+    assert r.status_code == 200
+    catalog_numbers = {o["catalogNumber"] for o in r.json()["occurrences"]}
+    assert "VIS001" not in catalog_numbers
+    assert "HID001" in catalog_numbers
 
 
 def test_get_species_occurrences_tile_rejects_bad_zoom():

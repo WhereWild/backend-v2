@@ -2484,27 +2484,44 @@ def get_species_occurrences(
     phenology: str | None = None,
     start_ts: int | None = None,
     end_ts: int | None = None,
-    zoom: int | None = None,
-    min_lat: float | None = None,
-    min_lon: float | None = None,
-    max_lat: float | None = None,
-    max_lon: float | None = None,
 ):
-    # zoom present -> the new viewport-scoped path (see
-    # _get_species_occurrences_viewport): backward compatible by
-    # construction, since omitting zoom (today's only caller) hits the
-    # unchanged, unfiltered path below exactly as before.
-    if zoom is not None:
-        if None in (min_lat, min_lon, max_lat, max_lon):
-            raise HTTPException(
-                status_code=400, detail="zoom requires min_lat, min_lon, max_lat, and max_lon",
-            )
-        taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
-        if taxon is None:
-            raise HTTPException(status_code=404, detail="Taxon not found")
-        _reject_if_large_taxon(taxon, zoom_scoped=True)
-        return _get_species_occurrences_viewport(taxon, zoom, min_lat, min_lon, max_lat, max_lon)
     return _cached_get_species_occurrences(taxon_id, location, phenology, start_ts, end_ts, _DATA_VERSION)
+
+
+_MAX_TILE_ZOOM = 24  # generous sane bound — well past any zoom this app's map ever reaches
+
+
+@app.get("/species/{taxon_id}/occurrences/{z}/{x}/{y}")
+@limiter.limit(_RATE_LIMIT_SUBTREE_RAW)
+def get_species_occurrences_tile(request: Request, taxon_id: str, z: int, x: int, y: int):
+    """Tile-coordinate-addressed viewport occurrences — same JSON shape as
+    /species/{taxon_id}/occurrences (a list of individual, still-interactive
+    observations, not a rendered image), just scoped to one map tile instead
+    of the whole taxon.
+
+    Deliberately z/x/y (matching every other tile endpoint in this API,
+    e.g. /api/layers/{id}/tiles/{z}/{x}/{y}.png), not a raw client-supplied
+    bbox: an earlier version took zoom + min/max lat/lon directly, and nothing
+    stopped a request pairing a high zoom with a huge bbox — verified live,
+    that combination didn't complete in 120s for a large taxon. A tile's
+    bbox is a deterministic function of (z, x, y) — world_size / 2^z per
+    tile, by construction — so "huge area at high zoom" isn't just bad
+    practice under this contract, it's inexpressible: no (z, x, y) means
+    that.
+    """
+    if z < 0 or z > _MAX_TILE_ZOOM:
+        raise HTTPException(status_code=400, detail=f"z must be between 0 and {_MAX_TILE_ZOOM}")
+    tiles_per_axis = 2 ** z
+    if not (0 <= x < tiles_per_axis) or not (0 <= y < tiles_per_axis):
+        raise HTTPException(status_code=400, detail=f"x and y must be in [0, {tiles_per_axis})")
+
+    taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
+    if taxon is None:
+        raise HTTPException(status_code=404, detail="Taxon not found")
+    _reject_if_large_taxon(taxon, zoom_scoped=True)
+
+    min_lon, min_lat, max_lon, max_lat = tiles.tile_bounds_wgs84(z, x, y)
+    return _get_species_occurrences_viewport(taxon, z, min_lat, min_lon, max_lat, max_lon)
 
 
 @lru_cache(maxsize=1)

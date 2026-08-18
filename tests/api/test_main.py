@@ -1252,24 +1252,39 @@ def test_get_species_occurrences_includes_media():
 
 
 # ---------------------------------------------------------------------------
-# /species/{id}/occurrences — zoom/bbox viewport path
+# /species/{id}/occurrences/{z}/{x}/{y} — tile viewport path
 # ---------------------------------------------------------------------------
+
+import math  # noqa: E402
 
 from util.gis import hilbert_index as _hilbert_index  # noqa: E402
 
-_VISIBLE_LAT, _VISIBLE_LON = 40.5, -75.0
-_HIDDEN_LAT, _HIDDEN_LON = 41.0, -74.5
-_OUTSIDE_BBOX_LAT, _OUTSIDE_BBOX_LON = 10.0, 10.0
 
-# A generous bbox around _VISIBLE/_HIDDEN but nowhere near _OUTSIDE_BBOX.
-_BBOX = {"min_lat": 39.0, "min_lon": -76.0, "max_lat": 42.0, "max_lon": -73.0}
+def _deg2num(lat: float, lon: float, z: int) -> tuple[int, int]:
+    """Standard slippy-map lon/lat -> tile x/y, the inverse of
+    util.tiles.tile_bounds_wgs84 — used to place fixture points inside a
+    specific, known tile rather than guessing real-world coordinates
+    against tile boundaries."""
+    lat_rad = math.radians(lat)
+    n = 2.0 ** z
+    xtile = int((lon + 180.0) / 360.0 * n)
+    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return xtile, ytile
+
+
+# VIS/HID sit a few hundred meters apart in NYC — close enough to always
+# share a tile up to fairly high zoom. OUT sits on the opposite side of the
+# planet (Sydney) — never shares a tile with VIS/HID at any zoom used here.
+_VISIBLE_LAT, _VISIBLE_LON = 40.70, -74.00
+_HIDDEN_LAT, _HIDDEN_LON = 40.7001, -74.00  # ~11m away — well within one z=15 tile (~930m)
+_OUTSIDE_LAT, _OUTSIDE_LON = -33.90, 151.20
 
 
 def _viewport_table() -> pa.Table:
     rows = [
         ("VIS001", _VISIBLE_LAT, _VISIBLE_LON, 0),   # minZoomSpecies=0: always visible
         ("HID001", _HIDDEN_LAT, _HIDDEN_LON, 10),    # minZoomSpecies=10: needs zoom>=10
-        ("OUT001", _OUTSIDE_BBOX_LAT, _OUTSIDE_BBOX_LON, 0),  # visible but outside the bbox
+        ("OUT001", _OUTSIDE_LAT, _OUTSIDE_LON, 0),   # visible but on the other side of the planet
     ]
     return pa.table({
         "catalogNumber": [r[0] for r in rows],
@@ -1290,43 +1305,51 @@ def _write_viewport_fixture(tmp_path: Path) -> Path:
     return path
 
 
-def test_get_species_occurrences_zoom_bbox_filters_by_zoom(tmp_path):
-    """A point whose minZoomSpecies exceeds the requested zoom must not
-    appear, even though it's within the bbox."""
+def test_get_species_occurrences_tile_filters_by_zoom(tmp_path):
+    """A point whose minZoomSpecies exceeds the tile's z must not appear,
+    even though VIS/HID share the same tile at this z."""
     path = _write_viewport_fixture(tmp_path)
+    z = 5  # < HID001's minZoomSpecies=10
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch("main.iter_descendants", return_value=[TAXON]), \
          patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
-        r = client.get("/species/2923970/occurrences", params={"zoom": 5, **_BBOX})
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}")
     assert r.status_code == 200
     catalog_numbers = {o["catalogNumber"] for o in r.json()["occurrences"]}
     assert catalog_numbers == {"VIS001"}
 
 
-def test_get_species_occurrences_zoom_bbox_filters_by_location(tmp_path):
-    """A point outside the requested bbox must not appear, even at minZoom=0."""
+def test_get_species_occurrences_tile_filters_by_location(tmp_path):
+    """A point outside the requested tile must not appear, even though it
+    clears the zoom threshold — OUT001 sits on the opposite side of the
+    planet from the VIS/HID tile."""
     path = _write_viewport_fixture(tmp_path)
+    z = 15  # >= HID001's minZoomSpecies=10, so both VIS/HID qualify by zoom
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch("main.iter_descendants", return_value=[TAXON]), \
          patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
-        r = client.get("/species/2923970/occurrences", params={"zoom": 15, **_BBOX})
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}")
     assert r.status_code == 200
     catalog_numbers = {o["catalogNumber"] for o in r.json()["occurrences"]}
     assert catalog_numbers == {"VIS001", "HID001"}
     assert "OUT001" not in catalog_numbers
 
 
-def test_get_species_occurrences_zoom_omits_phenology_and_timestamp(tmp_path):
+def test_get_species_occurrences_tile_omits_phenology_and_timestamp(tmp_path):
     """Whole-taxon aggregates don't have an honest meaning over a partial
     viewport slice — see _get_species_occurrences_viewport's docstring."""
     path = _write_viewport_fixture(tmp_path)
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch("main.iter_descendants", return_value=[TAXON]), \
          patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
-        r = client.get("/species/2923970/occurrences", params={"zoom": 15, **_BBOX})
+        r = client.get(f"/species/2923970/occurrences/{z}/{x}/{y}")
     assert r.status_code == 200
     body = r.json()
     assert "phenology_counts" not in body
@@ -1334,18 +1357,27 @@ def test_get_species_occurrences_zoom_omits_phenology_and_timestamp(tmp_path):
     assert "max_timestamp" not in body
 
 
-def test_get_species_occurrences_zoom_requires_full_bbox():
+def test_get_species_occurrences_tile_rejects_bad_zoom():
     with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None):
-        r = client.get("/species/2923970/occurrences", params={"zoom": 5, "min_lat": 39.0})
+        r = client.get("/species/2923970/occurrences/-1/0/0")
     assert r.status_code == 400
 
 
-def test_get_species_occurrences_genus_reachable_with_zoom(tmp_path):
+def test_get_species_occurrences_tile_rejects_out_of_range_xy():
+    """x/y must satisfy 0 <= x, y < 2^z — this is what makes a huge area at
+    high zoom inexpressible, not just discouraged."""
+    with patch.object(taxa, "get_taxon_by_id", return_value=TAXON), \
+         patch.object(taxa, "get_taxon_by_slug", return_value=None):
+        r = client.get("/species/2923970/occurrences/5/999/0")
+    assert r.status_code == 400
+
+
+def test_get_species_occurrences_genus_reachable_with_tile(tmp_path):
     """GENUS is rejected outright without zoom (see
     test_get_species_occurrences_nonleaf_rejected_as_large_taxon) but reachable
-    via the viewport path, which doesn't have the subtree-traversal cost that
-    guard exists for."""
+    via the tile viewport path, which doesn't have the subtree-traversal cost
+    that guard exists for."""
     table = _viewport_table()
     # GENUS reads minZoomGenus, not minZoomSpecies — the base fixture only
     # has the latter, so carry the same per-row values into a Genus column.
@@ -1353,32 +1385,37 @@ def test_get_species_occurrences_genus_reachable_with_zoom(tmp_path):
     path = tmp_path / "occurrences_by_hilbert.parquet"
     pq.write_table(table, path)
 
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
     with patch.object(taxa, "get_taxon_by_id", return_value=NONLEAF_TAXON), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch("main.iter_descendants", return_value=[DESC_TAXON]), \
          patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
-        r = client.get("/species/2923968/occurrences", params={"zoom": 15, **_BBOX})
+        r = client.get(f"/species/2923968/occurrences/{z}/{x}/{y}")
     assert r.status_code == 200
 
 
-def test_get_species_occurrences_order_reachable_with_zoom(tmp_path):
-    """ORDER (and every rank up to KINGDOM) is reachable via the viewport
-    path — the SEMI JOIN fix (see _get_species_occurrences_viewport) removed
-    the cost driver that made broad ranks slow, verified directly against
-    real KINGDOM-scope data (Plantae, ~188K descendant species) at ~50ms/query
-    regardless of zoom. _reject_if_large_taxon(zoom_scoped=True) no longer
-    carves out an exception by rank; it skips the guard unconditionally."""
+def test_get_species_occurrences_order_reachable_with_tile(tmp_path):
+    """ORDER (and every rank up to KINGDOM) is reachable via the tile
+    viewport path — the SEMI JOIN fix (see _get_species_occurrences_viewport)
+    removed the cost driver that made broad ranks slow, verified directly
+    against real KINGDOM-scope data (Plantae, ~188K descendant species) at
+    ~50ms/query regardless of zoom. _reject_if_large_taxon(zoom_scoped=True)
+    no longer carves out an exception by rank; it skips the guard
+    unconditionally."""
     table = _viewport_table()
     table = table.append_column("minZoomOrder", table.column("minZoomSpecies"))
     path = tmp_path / "occurrences_by_hilbert.parquet"
     pq.write_table(table, path)
 
+    z = 15
+    x, y = _deg2num(_VISIBLE_LAT, _VISIBLE_LON, z)
     order_taxon = {**NONLEAF_TAXON, "rank": "ORDER"}
     with patch.object(taxa, "get_taxon_by_id", return_value=order_taxon), \
          patch.object(taxa, "get_taxon_by_slug", return_value=None), \
          patch("main.iter_descendants", return_value=[DESC_TAXON]), \
          patch.object(main_module, "OCCURRENCES_BY_HILBERT_FILE", path):
-        r = client.get("/species/2923968/occurrences", params={"zoom": 15, **_BBOX})
+        r = client.get(f"/species/2923968/occurrences/{z}/{x}/{y}")
     assert r.status_code == 200
 
 

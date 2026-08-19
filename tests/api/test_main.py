@@ -983,6 +983,17 @@ def test_check_all_obscured_false_for_empty_scope(monkeypatch):
         assert main_module._check_all_obscured(TAXON, None) is False
 
 
+def test_check_all_obscured_false_when_occurrences_file_missing(tmp_path, monkeypatch):
+    """Degrades to False (not an unhandled duckdb.IOException) when the
+    occurrences file doesn't exist — e.g. a fresh checkout with no data yet,
+    or a concurrent regen mid-write. Matches _read_occurrences_scoped's own
+    try/except-return-empty contract, which the old materialize-then-scan
+    implementation of this check relied on for the same cases."""
+    monkeypatch.setattr(main_module, "OCCURRENCES_FILE", tmp_path / "no-such-file.parquet")
+    with patch("main.iter_descendants", return_value=[TAXON]):
+        assert main_module._check_all_obscured(TAXON, None) is False
+
+
 # ---------------------------------------------------------------------------
 # /api/taxon/{id}/env-stats (lines 128-184)
 # ---------------------------------------------------------------------------

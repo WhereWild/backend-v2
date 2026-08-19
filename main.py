@@ -1523,7 +1523,13 @@ def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
     yes/no question. Short-circuiting on the first non-obscured row found
     (or the first row found at all, for the empty-scope case) means this
     scales with how quickly a counterexample turns up, not with taxon
-    size — safe for any rank, no large-taxon guard needed."""
+    size — safe for any rank, no large-taxon guard needed.
+
+    Degrades to False on any read/query error (missing file, a file mid-
+    write by a concurrent regen, a schema without an "obscured" column) —
+    matches _read_occurrences_scoped's own try/except-return-empty contract,
+    which the old materialize-then-scan implementation relied on for the
+    same cases."""
     keys = _scope_taxon_keys(taxon)
     if not keys:
         return False
@@ -1553,6 +1559,8 @@ def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
             """,
             loc_params,
         ).fetchone()
+    except duckdb.Error:
+        return False
     finally:
         con.close()
     return has_unobscured_row is None

@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from collections import Counter
@@ -19,6 +20,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 
+import duckdb
 import httpx
 import pandas as pd
 import psutil
@@ -288,17 +290,60 @@ def _load_legend_full(layer_id: str) -> dict:
     return json.loads(Path(path).read_text())
 
 
+@lru_cache(maxsize=4096)
+def _cached_scope_taxon_keys(taxon_key: str, rank: str, data_version: str) -> tuple[str, ...]:
+    """The real work behind _scope_taxon_keys, cached by (taxon_key, rank,
+    data_version) — the DFS in iter_descendants is a pure function of the
+    catalog tree, but was being re-walked from scratch on every single
+    call with no memoization at all. For a kingdom-scale taxon (e.g.
+    Plantae, ~188K descendants) this DFS alone measured ~300ms, and every
+    caller (species locations, obscured check, variable values) pays that
+    cost fresh on every request, including repeated requests for the same
+    taxon in quick succession. The descendant set never changes between
+    calls for the same taxon short of a data reload, which is exactly what
+    data_version already exists to invalidate against (matches every other
+    _cached_* function in this file).
+
+    Takes rank directly rather than re-resolving the taxon via
+    taxa.get_taxon_by_id(taxon_key) — the caller already has a resolved
+    taxon dict (_scope_taxon_keys(taxon) below), and re-looking it up here
+    would silently diverge from whatever that dict actually says whenever
+    the two don't agree (e.g. a caller working from a taxon resolved by
+    slug, or in tests, a mocked/synthetic taxon that doesn't round-trip
+    through get_taxon_by_id at all). iter_descendants only ever reads
+    taxon["taxon_key"] off what it's given (see its own implementation), so
+    a minimal single-key dict is a complete, correct stand-in — no need for
+    the rest of the taxon record here."""
+    minimal_taxon = {"taxon_key": taxon_key}
+    if rank == _CONFIG.species_rank:
+        return tuple(str(t["taxon_key"]) for t in iter_descendants(minimal_taxon, include_self=True))
+    if rank in _CONFIG.leaf_rank_set:
+        return (taxon_key,)
+    return tuple(str(t["taxon_key"]) for t in iter_descendants(minimal_taxon, include_self=False))
+
+
+# Route handlers here are plain `def`, not `async def` — FastAPI runs each
+# one on its own real OS thread (its threadpool), not serialized on the
+# event loop. lru_cache's dict isn't corrupted by concurrent access (the
+# GIL protects that), but it does nothing to stop a genuine stampede: if
+# several requests for the same taxon race in before any of them has
+# stored a result, every one of them independently sees a miss and redoes
+# the ~300ms+ DFS. A single lock around the whole lookup is enough:
+# contention only exists during that first, short-lived cold burst per
+# (taxon_key, rank, data_version) — every request after that is a cache
+# hit and the lock is held only as long as a dict lookup takes.
+_scope_taxon_keys_lock = threading.Lock()
+
+
 def _scope_taxon_keys(taxon: dict) -> list[str]:
     """taxon_keys in scope for occurrence-level queries: species rolls up
     subspecies/variety/form; a leaf is itself; other ranks read only their
     descendant leaves (not any stray direct-to-ancestor observations) —
-    mirrors util.stats.collect_taxon_df's own scope dispatch."""
-    rank = taxon["rank"]
-    if rank == _CONFIG.species_rank:
-        return [str(t["taxon_key"]) for t in iter_descendants(taxon, include_self=True)]
-    if rank in _CONFIG.leaf_rank_set:
-        return [str(taxon["taxon_key"])]
-    return [str(t["taxon_key"]) for t in iter_descendants(taxon, include_self=False)]
+    mirrors util.stats.collect_taxon_df's own scope dispatch. See
+    _cached_scope_taxon_keys for why the actual DFS is memoized, and
+    _scope_taxon_keys_lock for why a lock wraps it too."""
+    with _scope_taxon_keys_lock:
+        return list(_cached_scope_taxon_keys(str(taxon["taxon_key"]), taxon["rank"], _DATA_VERSION))
 
 
 def _read_occurrences_scoped(taxon: dict, columns: list[str] | None = None) -> pd.DataFrame:
@@ -1470,17 +1515,55 @@ def get_taxon(request: Request, taxon_id: str, unit_system: str | None = Query(N
 
 
 def _check_all_obscured(taxon: dict, location_gid: str | None) -> bool:
-    """Return True when every observation in scope has obscured coordinates."""
+    """Return True when every observation in scope has obscured coordinates.
+
+    An EXISTS-style bounded check (LIMIT 1), not a full materialize-then-
+    scan over every matching row via _read_occurrences_scoped — that loaded
+    every matching row (up to the taxon's entire size) just to answer a
+    yes/no question. Short-circuiting on the first non-obscured row found
+    (or the first row found at all, for the empty-scope case) means this
+    scales with how quickly a counterexample turns up, not with taxon
+    size — safe for any rank, no large-taxon guard needed.
+
+    Degrades to False on any read/query error (missing file, a file mid-
+    write by a concurrent regen, a schema without an "obscured" column) —
+    matches _read_occurrences_scoped's own try/except-return-empty contract,
+    which the old materialize-then-scan implementation relied on for the
+    same cases."""
+    keys = _scope_taxon_keys(taxon)
+    if not keys:
+        return False
     filter_col = _location_filter_col(location_gid) if location_gid else None
-    needed = ["obscured"] + ([filter_col] if filter_col else [])
-    df = _read_occurrences_scoped(taxon, columns=needed)
-    if "obscured" not in df.columns:
+    loc_clause = f'AND o."{filter_col}" = ?' if filter_col else ""
+    loc_params = [location_gid] if filter_col else []
+    con = duckdb.connect()
+    try:
+        con.register("descendants", pd.DataFrame({"taxon_key": keys}))
+        has_any_row = con.execute(
+            f"""
+            SELECT 1 FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') o
+            SEMI JOIN descendants d ON o."taxon_key" = d."taxon_key"
+            WHERE 1=1 {loc_clause}
+            LIMIT 1
+            """,
+            loc_params,
+        ).fetchone()
+        if has_any_row is None:
+            return False
+        has_unobscured_row = con.execute(
+            f"""
+            SELECT 1 FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') o
+            SEMI JOIN descendants d ON o."taxon_key" = d."taxon_key"
+            WHERE o."obscured" = 'No' {loc_clause}
+            LIMIT 1
+            """,
+            loc_params,
+        ).fetchone()
+    except duckdb.Error:
         return False
-    if filter_col and filter_col in df.columns:
-        df = df[df[filter_col].astype(str) == str(location_gid)]
-    if df.empty:
-        return False
-    return not (df["obscured"] == "No").any()
+    finally:
+        con.close()
+    return has_unobscured_row is None
 
 
 @lru_cache(maxsize=4096)
@@ -1488,7 +1571,9 @@ def _cached_get_species_obscured(taxon_id: str, location: str | None, data_versi
     taxon = taxa.get_taxon_by_id(taxon_id) or taxa.get_taxon_by_slug(taxon_id)
     if taxon is None:
         raise HTTPException(status_code=404, detail="Taxon not found")
-    _reject_if_large_taxon(taxon)
+    # No _reject_if_large_taxon guard here: _check_all_obscured is now a
+    # bounded EXISTS check whose cost is "how fast a counterexample turns
+    # up," not taxon size — safe for any rank, including kingdom.
     location_gid = location.strip() if location else None
     all_obscured = _check_all_obscured(taxon, location_gid)
     return {
@@ -3092,6 +3177,7 @@ def query_taxa(
 # ---------------------------------------------------------------------------
 
 def _clear_data_versioned_caches() -> None:
+    _cached_scope_taxon_keys.cache_clear()
     _cached_get_taxon.cache_clear()
     _cached_get_species_obscured.cache_clear()
     _cached_get_taxon_env_stats.cache_clear()

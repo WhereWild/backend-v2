@@ -21,12 +21,14 @@ clusters stay visibly denser — but has no coverage guarantee. A real,
 isolated population can statistically vanish entirely at low zoom purely by
 bad luck, which is worse than losing density fidelity. The fix: a
 coarse-to-fine sequence of spatial "coverage bands" layered on top of the
-hash. Within each (grouping_key, grid_cell) pair at a band's resolution, the
-lowest-hash point becomes that pair's guaranteed representative at that
-band's zoom; everything else in the cell waits for a finer band. Points
-always render at their real coordinates — the grid decides WHEN a point is
-revealed, never WHERE. This is the point-cloud analogue of a raster
-mipmap/COG-overview pyramid: each band is a coarser or finer level of
+hash. Within each (grouping_key, grid_cell) pair at a band's resolution, up
+to that band's own _MAX_REPRESENTATIVES_BY_BAND lowest-hash points become
+that pair's guaranteed representatives at that band's zoom; everything else
+in the cell waits for a finer band. Points always render at their real
+coordinates —
+the grid decides WHEN a point is revealed, never WHERE. This is the
+point-cloud analogue of a raster mipmap/COG-overview pyramid: each band is
+a coarser or finer level of
 detail, always built from real observations, never a synthetic centroid.
 
 Subspecies/variety/form get their own INFRA column, separate from SPECIES:
@@ -44,6 +46,7 @@ silently drop these columns if this ran any earlier in the pipeline.
 from __future__ import annotations
 
 import math
+import re
 import time
 from pathlib import Path
 
@@ -80,18 +83,58 @@ _DUCKDB_MEMORY_LIMIT = "20GB"
 # which reads these same columns.
 _ALL_LEVELS: tuple[str, ...] = DISPLAY_LEVELS
 
-# Coarsest-first (zoom, cell size in meters). The lowest-hash point per
-# (grouping_key, cell) at a band becomes visible at that band's zoom; the
-# last band's zoom is also the fallback for anything left over — effectively
-# "everything remaining becomes visible here, unthinned." Tunable constants,
-# not yet fit against real data.
+# Coarsest-first (zoom, cell size in meters). The MAX_REPRESENTATIVES_PER_CELL
+# lowest-hash points per (grouping_key, cell) at a band become visible at
+# that band's zoom; the last band's zoom is also the fallback for anything
+# left over — effectively "everything remaining becomes visible here,
+# unthinned." Tunable constants, not yet fit against real data.
+#
+# Cell sizes back to the ORIGINAL values, zoom thresholds kept at this
+# session's compressed range (0,2,4,6,8,10 — full density now reached at
+# z10 instead of the original z15, deliberately kept). The coarse cells
+# (20km/5km) this session tried briefly were the mistake, not the zoom
+# compression: at low zoom a tile covers a huge area, and at 20km/5km cell
+# size that area contains hundreds of thousands of distinct cells — even 1
+# point per cell added up to 1-1.8M rows in a single z=2 tile response,
+# 60-130s just to build it. These original, much coarser cells keep a
+# low-zoom tile's cell count sane regardless of zoom threshold;
+# _MAX_REPRESENTATIVES_BY_BAND below still gives genuinely dense areas
+# better coverage once zoomed in far enough to reach the finer bands,
+# where a tile is small enough for that to be safe. (Also worth noting:
+# none of this session's earlier band changes were ever actually taking
+# effect in production until just now — a duplicate-column collision in
+# the join-back step silently discarded every regen's results — so this is
+# the first time any of these values have been genuinely live-tested.)
 _BANDS: tuple[tuple[int, float], ...] = (
-    (0, 100_000.0),
-    (2, 25_000.0),
-    (5, 5_000.0),
-    (8, 1_000.0),
-    (11, 125.0),
-    (13, 1.0),
+    (0, 200_000.0),
+    (2, 50_000.0),
+    (4, 10_000.0),
+    (6, 2_000.0),
+    (8, 250.0),
+    (10, 1.0),
+)
+
+# How many lowest-hash points get promoted per (grouping_key, cell) at each
+# band, not just the single best one — one value per _BANDS entry (same
+# order, coarsest-first). A single constant across every band was tried
+# first (50) and confirmed live to be badly wrong at the coarse end: at low
+# zoom, one map TILE can span most of the visible world, so it can contain
+# many thousands of the large coarse-band cells — 50 promoted per cell
+# there compounded into 500k+ rows in a single tile response (~500KB+ of
+# JSON, 16-28s just to build the response entries, confirmed live). At the
+# fine end this isn't a problem at all: a high-zoom tile is geographically
+# tiny, so it only ever overlaps a handful of the small fine-band cells,
+# and real observations rarely even collide at the finest bands' near-GPS
+# precision (250m, 1m) to begin with. Ramping linearly from 1 (coarsest
+# band) to 10 (finest band — lowered from an initial 50, which was
+# confirmed live to still be more than needed for typical use) keeps the
+# coarse end safe (matches what was already working — confirmed live that
+# density looked fine there even before this feature existed) while still
+# giving genuinely dense areas better coverage once zoomed in further,
+# which is what this was for in the first place.
+_MAX_REPRESENTATIVES_BY_BAND: tuple[int, ...] = (1, 3, 5, 6, 8, 10)
+assert len(_MAX_REPRESENTATIVES_BY_BAND) == len(_BANDS), (
+    "_MAX_REPRESENTATIVES_BY_BAND must have exactly one entry per _BANDS entry"
 )
 
 _MERCATOR_HALF_CIRCUMFERENCE_M = math.pi * 6378137.0
@@ -201,7 +244,9 @@ def main() -> None:
         remaining = _null_count(con, zoom_col, key_col)
         print(f"[observation_ranks] level {level} ({level_idx}/{len(_ALL_LEVELS)})  pending={remaining}")
 
-        for band_idx, (zoom, cell_m) in enumerate(_BANDS, start=1):
+        for band_idx, ((zoom, cell_m), max_reps) in enumerate(
+            zip(_BANDS, _MAX_REPRESENTATIVES_BY_BAND), start=1
+        ):
             t_band = time.monotonic()
             con.execute(f"""
                 UPDATE occ SET {zoom_col} = {zoom}
@@ -215,15 +260,15 @@ def main() -> None:
                                ) AS rnk
                         FROM occ
                         WHERE {zoom_col} IS NULL AND {key_col} IS NOT NULL
-                    ) ranked WHERE rnk = 1
+                    ) ranked WHERE rnk <= {max_reps}
                 )
             """)
             still_remaining = _null_count(con, zoom_col, key_col)
             updated = remaining - still_remaining
             remaining = still_remaining
             print(
-                f"[observation_ranks]   band {band_idx}/{len(_BANDS)}  zoom={zoom} cell={cell_m:.0f}m  "
-                f"updated={updated}  remaining={remaining}  ({time.monotonic() - t_band:.1f}s)"
+                f"[observation_ranks]   band {band_idx}/{len(_BANDS)}  zoom={zoom} cell={cell_m:.0f}m "
+                f"max_reps={max_reps}  updated={updated}  remaining={remaining}  ({time.monotonic() - t_band:.1f}s)"
             )
 
         # Anything left in this level's groups after the finest band becomes
@@ -253,13 +298,40 @@ def main() -> None:
     #
     # The verification query below stays regardless — cheap insurance that
     # costs nothing to keep.
+    # o.* EXCLUDE (...) the old zoom columns (and any already-accumulated
+    # duplicate-suffixed shadow columns from a past run of this exact bug —
+    # see below) — without this, `SELECT o.*, r.zoom_col` collides with the
+    # SAME-named column o already carries from the previous run, and DuckDB
+    # silently resolves that by renaming the NEW one to zoom_col_1 instead
+    # of erroring. That meant every rerun kept the OLD value under the real
+    # column name and buried the freshly computed one under a suffixed
+    # column nothing ever reads — confirmed live: 5 generations
+    # (minZoomKingdom, _1, _2, _3, _4) had piled up in production, with the
+    # live-served column still holding the value from before this bug was
+    # ever introduced, completely unaffected by any rerun since. EXCLUDE
+    # covers both the canonical names and any already-accumulated `_N`
+    # suffixes so a rerun after this fix also cleans up that backlog
+    # instead of leaving it to bloat the file forever.
+    zoom_col_names = {zoom_column(level) for level in _ALL_LEVELS}
+    existing_cols = set(con.sql(
+        f"SELECT * FROM read_parquet('{OCCURRENCES_FILE.as_posix()}')"
+    ).columns)
+    stale_suffix_re = re.compile(
+        r"^(" + "|".join(re.escape(name) for name in zoom_col_names) + r")_\d+$"
+    )
+    stale_cols = sorted(
+        c for c in existing_cols if c in zoom_col_names or stale_suffix_re.match(c)
+    )
+    exclude_sql = f' EXCLUDE ({", ".join(f'"{c}"' for c in stale_cols)})' if stale_cols else ""
     zoom_cols_sql = ", ".join(f'r.{_zoom_col(level)}' for level in _ALL_LEVELS)
     tmp_dest = OCCURRENCES_FILE.with_suffix(".parquet.tmp")
     t_write = time.monotonic()
     print(f"[observation_ranks] writing {tmp_dest}")
+    if stale_cols:
+        print(f"[observation_ranks] dropping stale/duplicate zoom columns: {stale_cols}")
     con.execute(f"""
         COPY (
-            SELECT o.*, {zoom_cols_sql}
+            SELECT o.*{exclude_sql}, {zoom_cols_sql}
             FROM read_parquet('{OCCURRENCES_FILE.as_posix()}') o
             LEFT JOIN occ r ON o."catalogNumber" = r."catalogNumber"
             ORDER BY o."taxon_key"

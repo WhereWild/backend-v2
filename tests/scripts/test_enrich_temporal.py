@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import builtins
-import signal
 import threading
 from pathlib import Path
 
@@ -189,7 +188,7 @@ class TestRunLayer:
                             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no S3")))
         monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
                             _mock_batches(pa.table({})))
-        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
+        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg())
         assert "[skip]" in capsys.readouterr().out
 
     def test_skips_when_no_worklist_rows(self, monkeypatch, capsys) -> None:
@@ -207,7 +206,7 @@ class TestRunLayer:
                             _mock_batches(pa.table({})))
         monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
                             lambda *a, **kw: empty)
-        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
+        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg())
         assert "[skip]" in capsys.readouterr().out
 
     def test_normal_run(self, monkeypatch, capsys) -> None:
@@ -222,23 +221,9 @@ class TestRunLayer:
                             lambda *a, **kw: ({}, {}))
         monkeypatch.setattr("scripts.enrich_temporal.write_back", lambda *a, **kw: None)
 
-        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
+        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg())
         out = capsys.readouterr().out
         assert "[done]" in out
-
-    def test_stop_event_aborts_before_chunk(self, monkeypatch, capsys) -> None:
-        monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
-                            lambda *a, **kw: _make_chunk_index())
-        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
-                            _mock_batches(pa.table({})))
-        monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
-                            lambda *a, **kw: _occ_table_with_chunk())
-        monkeypatch.setattr("scripts.enrich_temporal._download_layer_chunk", lambda *a, **kw: None)
-
-        stop = threading.Event()
-        stop.set()
-        et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), stop)
-        assert "[stop]" in capsys.readouterr().out
 
     def test_run_layer_mode_calls_process_chunk_mode(self, monkeypatch, capsys) -> None:
         mode_layer = TemporalLayer(
@@ -257,7 +242,7 @@ class TestRunLayer:
         monkeypatch.setattr("scripts.enrich_temporal.process_chunk_mode",
                             lambda *a, **kw: (mode_called.append(1), ({}, {}))[-1])
         monkeypatch.setattr("scripts.enrich_temporal.write_back", lambda *a, **kw: None)
-        et._run_layer(mode_layer, _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
+        et._run_layer(mode_layer, _DUMMY_OCC_PATH, _MockCfg())
         assert mode_called
 
     def test_process_chunk_exception_propagates(self, monkeypatch) -> None:
@@ -274,7 +259,7 @@ class TestRunLayer:
 
         monkeypatch.setattr("scripts.enrich_temporal.process_chunk", _raise)
         with pytest.raises(RuntimeError, match="chunk failed"):
-            et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg(), threading.Event())
+            et._run_layer(_make_layer(), _DUMMY_OCC_PATH, _MockCfg())
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +305,7 @@ class TestMain:
             lambda *a, layers=(), **kw: {lyr.id: occ_table.num_rows for lyr in layers},
         )
         monkeypatch.setattr("scripts.enrich_temporal.VARS_TO_ENRICH", None)
+        monkeypatch.setattr("scripts.enrich_temporal._start_prefetcher", lambda *a, **kw: None)
 
     def test_no_observations_exits_early(self, monkeypatch, tmp_path: Path, capsys) -> None:
         empty = _make_occ_table(0)
@@ -341,20 +327,19 @@ class TestMain:
         assert "weather_code_simple" in run_layer_calls
         assert "vapor_pressure_deficit" in run_layer_calls
 
-    def test_handle_signal_sets_stop(self, monkeypatch, tmp_path: Path, capsys) -> None:
-        captured: dict[int, object] = {}
-        monkeypatch.setattr(signal, "signal", lambda sig, h: captured.__setitem__(sig, h))
-        self._patch_base(monkeypatch, tmp_path, _make_occ_table(0))
-        et.main()
-        assert signal.SIGTERM in captured
-        captured[signal.SIGTERM](signal.SIGTERM, None)  # type: ignore[operator]
-        assert "signal" in capsys.readouterr().out
+    def test_interrupt_skips_cleanup(self, monkeypatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(et, "CLEAR_CACHE", True)
+        self._patch_base(monkeypatch, tmp_path, _make_occ_table())
+        cleaned: list[str] = []
+        monkeypatch.setattr("scripts.enrich_temporal._cleanup_cache", lambda d: cleaned.append(d))
 
-    def test_signal_setup_exception_ignored(self, monkeypatch, tmp_path: Path) -> None:
-        monkeypatch.setattr(signal, "signal",
-                            lambda *a: (_ for _ in ()).throw(ValueError("not main thread")))
-        self._patch_base(monkeypatch, tmp_path, _make_occ_table(0))
-        et.main()  # must not propagate
+        def _interrupt(*a, **kw):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("scripts.enrich_temporal._run_layer", _interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            et.main()
+        assert cleaned == []
 
     def test_clear_cache_true_calls_cleanup(self, monkeypatch, tmp_path: Path) -> None:
         monkeypatch.setattr(et, "CLEAR_CACHE", True)
@@ -372,3 +357,92 @@ class TestMain:
         et.main()
         assert cleaned == []
         assert "preserved" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Background prefetch
+# ---------------------------------------------------------------------------
+
+def _prefetch_chunk_index() -> ChunkIndex:
+    ranges = [
+        ChunkRange(chunk_num=10, start=0.0, end=3599.0, time_len=1, source="chunk"),
+        ChunkRange(chunk_num=11, start=3600.0, end=7199.0, time_len=1, source="chunk"),
+    ]
+    return ChunkIndex(latest_end_time=7199.0, resolution=3600.0, ranges=ranges)
+
+
+class TestPlanLayerDownloads:
+    def test_yields_dense_skips_sparse(self, monkeypatch) -> None:
+        monkeypatch.setattr(et, "_RANGE_REQUEST_THRESHOLD", 2)
+        monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
+                            lambda *a, **kw: _prefetch_chunk_index())
+        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
+                            _mock_batches(pa.table({"x": pa.array([1])})))
+        # chunk 10 -> 3 rows (dense), chunk 11 -> 1 row (sparse)
+        worklist = pa.table({"chunk_num": pa.array([10, 10, 10, 11], type=pa.int32())})
+        monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
+                            lambda *a, **kw: worklist)
+        out = list(et._plan_layer_downloads(_make_layer(), _DUMMY_OCC_PATH, _MockCfg()))
+        assert out == [
+            (_prefetch_chunk_index().ranges[0], "copernicus_era5", ["precipitation"]),
+        ]
+
+    def test_dedups_across_batches(self, monkeypatch) -> None:
+        monkeypatch.setattr(et, "_RANGE_REQUEST_THRESHOLD", 0)
+        monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
+                            lambda *a, **kw: _prefetch_chunk_index())
+        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
+                            lambda *a, **kw: [pa.table({"x": [1]}), pa.table({"x": [2]})])
+        worklist = pa.table({"chunk_num": pa.array([10, 11], type=pa.int32())})
+        monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
+                            lambda *a, **kw: worklist)
+        out = list(et._plan_layer_downloads(_make_layer(), _DUMMY_OCC_PATH, _MockCfg()))
+        assert [e.chunk_num for e, _, _ in out] == [10, 11]
+
+    def test_empty_worklist_yields_nothing(self, monkeypatch) -> None:
+        monkeypatch.setattr("scripts.enrich_temporal.build_chunk_index",
+                            lambda *a, **kw: _prefetch_chunk_index())
+        monkeypatch.setattr("scripts.enrich_temporal.iter_occ_index_batches",
+                            _mock_batches(pa.table({"x": pa.array([1])})))
+        monkeypatch.setattr("scripts.enrich_temporal.map_to_worklist",
+                            lambda *a, **kw: pa.table({"chunk_num": pa.array([], type=pa.int32())}))
+        assert list(et._plan_layer_downloads(_make_layer(), _DUMMY_OCC_PATH, _MockCfg())) == []
+
+
+class TestStartPrefetcher:
+    def test_downloads_planned_chunks(self, monkeypatch, tmp_path: Path) -> None:
+        idx = tmp_path / "occ_index_precipitation.parquet"
+        idx.write_bytes(b"x")
+        layer = _make_layer()
+        entry = ChunkRange(chunk_num=10, start=0.0, end=1.0, time_len=1, source="chunk")
+        monkeypatch.setattr("scripts.enrich_temporal._plan_layer_downloads",
+                            lambda *a, **kw: iter([(entry, "copernicus_era5", ["precipitation"])]))
+        got: list = []
+        monkeypatch.setattr("scripts.enrich_temporal._download_layer_chunk",
+                            lambda e, m, v, d: got.append((e.chunk_num, m, tuple(v))))
+        t = et._start_prefetcher([layer], {"precipitation": idx}, {"precipitation": 5},
+                                 _MockCfg(), threading.Event())
+        t.join(timeout=5)
+        assert got == [(10, "copernicus_era5", ("precipitation",))]
+
+    def test_skips_layer_without_index_file(self, monkeypatch, tmp_path: Path) -> None:
+        called = threading.Event()
+        monkeypatch.setattr("scripts.enrich_temporal._plan_layer_downloads",
+                            lambda *a, **kw: called.set() or iter([]))
+        t = et._start_prefetcher([_make_layer()], {"precipitation": tmp_path / "missing.parquet"},
+                                 {"precipitation": 5}, _MockCfg(), threading.Event())
+        t.join(timeout=5)
+        assert not called.is_set()
+
+    def test_prefetch_stop_halts_planning(self, monkeypatch, tmp_path: Path) -> None:
+        idx = tmp_path / "occ_index_precipitation.parquet"
+        idx.write_bytes(b"x")
+        stop_evt = threading.Event()
+        stop_evt.set()
+        planned = threading.Event()
+        monkeypatch.setattr("scripts.enrich_temporal._plan_layer_downloads",
+                            lambda *a, **kw: planned.set() or iter([]))
+        t = et._start_prefetcher([_make_layer()], {"precipitation": idx},
+                                 {"precipitation": 5}, _MockCfg(), stop_evt)
+        t.join(timeout=5)
+        assert not planned.is_set()

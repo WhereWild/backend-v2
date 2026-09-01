@@ -111,7 +111,18 @@ def _predicate_matches(request: dict, fmt: str, has_coordinate: bool) -> bool:
     return has_hc == has_coordinate
 
 
-def _find_existing_download(fmt: str, has_coordinate: bool) -> str | None:
+def _parse_gbif_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _find_existing_download(
+    fmt: str, has_coordinate: bool, min_created: str | None = None
+) -> str | None:
     """Return the key of an existing GBIF download (not FAILED/KILLED/
     CANCELLED) whose predicate matches what we'd request right now, or None.
     A SUCCEEDED match is always preferred over a still-preparing one (usable
@@ -125,6 +136,16 @@ def _find_existing_download(fmt: str, has_coordinate: bool) -> str | None:
     full prep time independently). Without this check, any crash/retry
     before local state is persisted burns a fresh ~1hr download every time,
     and can exhaust GBIF's small per-account concurrent-download quota.
+
+    min_created (the crawl_finished timestamp of the crawl we're syncing for)
+    rejects any export GBIF built *before* that crawl finished: the predicate
+    alone can't tell a fresh export from a weeks-old one for the same taxa,
+    and reusing a stale one silently rebuilds the whole tree from data that
+    predates the "new crawl" the freshness check just detected (real
+    incident: an Aug-8 export got reused for an Aug-28 crawl, so every
+    downstream stage saw zero new/changed observations). An entry with no
+    parseable `created` is rejected too when min_created is set — better a
+    redundant fresh request than another silent stale rebuild.
     """
     resp = httpx.get(
         f"{BASE_URL}/occurrence/download/user/{GBIF_USER}",
@@ -133,6 +154,7 @@ def _find_existing_download(fmt: str, has_coordinate: bool) -> str | None:
         timeout=30,
     )
     resp.raise_for_status()
+    min_created_dt = _parse_gbif_ts(min_created)
     fallback: str | None = None
     for entry in resp.json().get("results", []):
         status = entry.get("status")
@@ -140,6 +162,10 @@ def _find_existing_download(fmt: str, has_coordinate: bool) -> str | None:
             continue
         if not _predicate_matches(entry.get("request", {}), fmt, has_coordinate):
             continue
+        if min_created_dt is not None:
+            created_dt = _parse_gbif_ts(entry.get("created"))
+            if created_dt is None or created_dt < min_created_dt:
+                continue
         if status == "SUCCEEDED":
             return entry["key"]
         if fallback is None:
@@ -147,8 +173,8 @@ def _find_existing_download(fmt: str, has_coordinate: bool) -> str | None:
     return fallback
 
 
-def request_download() -> str:
-    existing = _find_existing_download("SPECIES_LIST", has_coordinate=False)
+def request_download(crawl_finished: str | None = None) -> str:
+    existing = _find_existing_download("SPECIES_LIST", has_coordinate=False, min_created=crawl_finished)
     if existing:
         print(f"Reusing existing download: {existing}")
         return existing
@@ -277,8 +303,8 @@ def _cleanup_occurrences_dir() -> None:
             item.unlink()
 
 
-def request_occurrence_download() -> str:
-    existing = _find_existing_download("DWCA", has_coordinate=True)
+def request_occurrence_download(crawl_finished: str | None = None) -> str:
+    existing = _find_existing_download("DWCA", has_coordinate=True, min_created=crawl_finished)
     if existing:
         print(f"Reusing existing occurrence download: {existing}")
         return existing
@@ -325,7 +351,7 @@ def sync_occurrences() -> bool:
 
     print(f"New crawl detected: {crawl_finished}")
 
-    download_key = request_occurrence_download()
+    download_key = request_occurrence_download(crawl_finished)
     gbif_meta = poll_until_ready(download_key)
     download_zip(gbif_meta["downloadLink"], OCCURRENCES_DIR)
     extract(OCCURRENCES_DIR)
@@ -352,7 +378,7 @@ def main() -> bool:
 
     print(f"New crawl detected: {crawl_finished}")
 
-    download_key = request_download()
+    download_key = request_download(crawl_finished)
     gbif_meta = poll_until_ready(download_key)
     download_zip(gbif_meta["downloadLink"])
     extract()
@@ -394,8 +420,8 @@ def sync_all() -> bool:
 
     print(f"New crawl detected: {crawl_finished}")
 
-    taxonomy_key = request_download() if need_taxonomy else None
-    occurrences_key = request_occurrence_download() if need_occurrences else None
+    taxonomy_key = request_download(crawl_finished) if need_taxonomy else None
+    occurrences_key = request_occurrence_download(crawl_finished) if need_occurrences else None
 
     if taxonomy_key:
         gbif_meta = poll_until_ready(taxonomy_key)

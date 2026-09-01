@@ -17,12 +17,15 @@ Usage:
     python -m scripts.enrich_temporal
     VARS_TO_ENRICH=precipitation,temperature_2m python -m scripts.enrich_temporal
     CLEAR_CACHE=0 python -m scripts.enrich_temporal   # keep cache for quick re-runs
+
+The .om chunk cache under cfg.temporal_cache_dir is cleared only after a run
+finishes cleanly. If the run is interrupted (Ctrl-C, SIGTERM, crash) the cache
+is left in place as a warm cache for the rerun.
 """
 from __future__ import annotations
 
 import gc
 import os
-import signal
 import threading
 import time
 import traceback
@@ -73,17 +76,6 @@ _BATCH_ROWS = int(os.environ.get("TEMPORAL_BATCH_ROWS", "5000000"))
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _rss_mb() -> float | None:
-    try:
-        with open("/proc/self/status", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    return float(line.split()[1]) / 1024.0
-    except Exception:
-        return None
-    return None
-
-
 def _cleanup_cache(cache_dir: str) -> None:
     cache_root = Path(cache_dir)
     if not cache_root.exists():
@@ -94,6 +86,17 @@ def _cleanup_cache(cache_dir: str) -> None:
                 path.unlink()
         except Exception as exc:
             print(f"[cleanup] failed to remove {path}: {exc}")
+
+
+def _rss_mb() -> float | None:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        return None
+    return None
 
 
 def _filter_layers(all_layers: list[TemporalLayer], vars_to_enrich: list[str] | None) -> list[TemporalLayer]:
@@ -115,7 +118,6 @@ def _run_layer(
     layer: TemporalLayer,
     occ_index_path: Path,
     cfg,
-    stop: threading.Event,
 ) -> None:
     print(
         f"[layer] id={layer.id} model={layer.model} agg={layer.agg} "
@@ -154,13 +156,8 @@ def _run_layer(
     t_start = time.monotonic()
     total_rows_done = 0
     batch_num = 0
-    stopped = False
 
     for occ_batch in iter_occ_index_batches(occ_index_path, _BATCH_ROWS):
-        if stop.is_set():
-            print(f"[stop] {layer.id}: interrupted")
-            stopped = True
-            break
         batch_num += 1
 
         worklist = map_to_worklist(occ_batch, chunk_index, layer.grid_mode, layer.grid_step, accumulated=layer.accumulated)
@@ -229,10 +226,6 @@ def _run_layer(
         batch_updates: dict[str, dict[str, list]] = {}
 
         for chunk_entry in chunks_this_batch:
-            if stop.is_set():
-                print(f"[stop] {layer.id}: interrupted before chunk {chunk_entry.chunk_num}")
-                stopped = True
-                break
             chunk_worklist = batch_chunk_worklists[chunk_entry.chunk_num]
             use_range = chunk_entry.chunk_num in sparse_set
             print(
@@ -290,20 +283,136 @@ def _run_layer(
             f"rows={total_rows_done}{rss_str} elapsed={time.monotonic() - t_start:.0f}s"
         )
 
-        if batch_updates and not stop.is_set():
+        if batch_updates:
             write_back(batch_updates)
 
         gc.collect()
         pa.default_memory_pool().release_unused()
 
-        if stopped:
-            break
+    if total_rows_done == 0:
+        print(f"[skip] {layer.id}: no observations mapped to any chunk")
+    else:
+        print(f"[done] {layer.id} rows={total_rows_done} elapsed={time.monotonic() - t_start:.1f}s")
 
-    if not stopped:
-        if total_rows_done == 0:
-            print(f"[skip] {layer.id}: no observations mapped to any chunk")
-        else:
-            print(f"[done] {layer.id} rows={total_rows_done} elapsed={time.monotonic() - t_start:.1f}s")
+
+# ---------------------------------------------------------------------------
+# Background prefetch
+# ---------------------------------------------------------------------------
+#
+# Each layer is processed as a single pass: every dense chunk is downloaded in
+# full up front, then processing runs. That download phase is pure dead time on
+# the critical path (~20-45% of each layer's wall time in practice).
+#
+# The prefetcher below runs on its own thread from the moment the occurrence
+# indices are built. It walks the layers in processing order, works out which
+# chunks each one will pull in full (mirroring the per-batch logic in
+# _run_layer), and downloads them ahead of time. Downloads land atomically via
+# _download_chunk's .tmp+rename, and per-file locks stop the main thread and the
+# prefetcher racing on the same file, so by the time _run_layer asks for a chunk
+# it is usually already on disk and its own prefetch call returns immediately.
+# Sparse chunks (HTTP range requests) never touch the cache dir and are skipped
+# here.
+
+
+def _plan_layer_downloads(layer: TemporalLayer, occ_index_path: Path, cfg):
+    """Yield (chunk_entry, model, [var]) for every dense chunk `layer` will need.
+
+    Scans the whole occurrence index for the layer up front. Mirrors the dense
+    vs. sparse split and secondary-source chunk resolution in _run_layer.
+    """
+    chunk_var = layer.sources[0] if layer.sources else layer.id
+    chunk_index = build_chunk_index(layer.model, chunk_var, min_date=cfg.temporal_min_date)
+    chunks_eligible = list(chunk_index.ranges)
+
+    secondary_indices: dict[str, object] = {}
+    for src_var in layer.sources[1:]:
+        try:
+            secondary_indices[src_var] = build_chunk_index(
+                layer.model, src_var, min_date=cfg.temporal_min_date
+            )
+        except Exception:
+            pass
+
+    seen: set[tuple[int, str]] = set()
+    for occ_batch in iter_occ_index_batches(occ_index_path, _BATCH_ROWS):
+        worklist = map_to_worklist(
+            occ_batch, chunk_index, layer.grid_mode, layer.grid_step,
+            accumulated=layer.accumulated,
+        )
+        if worklist.num_rows == 0:
+            continue
+        for entry in chunks_eligible:
+            sl = worklist.filter(pc.equal(worklist["chunk_num"], entry.chunk_num))
+            if sl.num_rows <= _RANGE_REQUEST_THRESHOLD:
+                continue  # sparse (or absent) — served by range requests
+            key = (entry.chunk_num, chunk_var)
+            if key not in seen:
+                seen.add(key)
+                yield entry, layer.model, [chunk_var]
+            if secondary_indices:
+                pfs_ts = entry.start - entry.file_offset * chunk_index.resolution
+                for var in layer.sources[1:]:
+                    sec_idx = secondary_indices.get(var)
+                    if sec_idx is None:
+                        continue
+                    sec_entry, _ = _chunk_entry_for_time(sec_idx, pfs_ts)
+                    if sec_entry is None:
+                        continue
+                    sec_key = (sec_entry.chunk_num, var)
+                    if sec_key not in seen:
+                        seen.add(sec_key)
+                        yield sec_entry, layer.model, [var]
+
+
+def _start_prefetcher(
+    active_layers: list[TemporalLayer],
+    layer_index_paths: dict[str, Path],
+    counts: dict[str, int],
+    cfg,
+    prefetch_stop: threading.Event,
+) -> threading.Thread:
+    def _run() -> None:
+        submitted = 0
+        failures = 0
+        try:
+            with ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS) as pool:
+                futs = []
+                for layer in active_layers:
+                    if layer.derived or prefetch_stop.is_set():
+                        continue
+                    if counts.get(layer.id, 0) == 0:
+                        continue
+                    idx_path = layer_index_paths.get(layer.id)
+                    if idx_path is None or not idx_path.exists():
+                        continue
+                    try:
+                        for entry, model, dl_vars in _plan_layer_downloads(layer, idx_path, cfg):
+                            if prefetch_stop.is_set():
+                                break
+                            futs.append(pool.submit(
+                                _download_layer_chunk, entry, model, dl_vars,
+                                cfg.temporal_cache_dir,
+                            ))
+                            submitted += 1
+                    except Exception as exc:
+                        print(f"[prefetch-bg] {layer.id}: planning failed — {exc}")
+                for fut in futs:
+                    if prefetch_stop.is_set():
+                        break
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        failures += 1
+                        print(f"[prefetch-bg] download failed — {exc}")
+                if prefetch_stop.is_set():
+                    pool.shutdown(wait=False, cancel_futures=True)
+            print(f"[prefetch-bg] done: {submitted} chunk files, {failures} failures")
+        except Exception:
+            traceback.print_exc()
+
+    thread = threading.Thread(target=_run, name="temporal-prefetch", daemon=True)
+    thread.start()
+    return thread
 
 
 # ---------------------------------------------------------------------------
@@ -311,18 +420,10 @@ def _run_layer(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # No custom signal handling: Ctrl-C / SIGTERM propagate as usual and the
+    # process exits immediately. Carry-forward means almost every value is
+    # already enriched on a rerun, so there's nothing worth stopping cleanly for.
     cfg = load_config("global")
-    stop = threading.Event()
-
-    def _handle_signal(signum: int, _frame: object) -> None:
-        print(f"[signal] received {signum}, stopping after current chunk...")
-        stop.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(sig, _handle_signal)
-        except Exception as exc:
-            print(f"[warn] could not register handler for signal {sig}: {exc}")
 
     Path(cfg.temporal_cache_dir).mkdir(parents=True, exist_ok=True)
     cache_dir = Path(cfg.temporal_cache_dir)
@@ -337,7 +438,8 @@ def main() -> None:
         for layer in non_derived
     }
 
-    completed = False
+    prefetch_stop = threading.Event()
+    prefetch_thread: threading.Thread | None = None
     try:
         print(f"[occ_index] scanning roots={list(cfg.taxonomy_roots)}")
         counts = build_per_layer_occ_indices(
@@ -351,35 +453,38 @@ def main() -> None:
 
         if all(n == 0 for n in counts.values()):
             print("[done] no observations to enrich")
-            completed = True
-            return
-
-        for layer in active_layers:
-            if layer.derived or stop.is_set():
-                continue
-            n = counts.get(layer.id, 0)
-            if n == 0:
-                print(f"[skip] {layer.id}: no observations to enrich")
-                continue
-            print(f"[occ_index] {layer.id}: {n} observations")
-            _run_layer(layer, layer_index_paths[layer.id], cfg, stop)
-
-        completed = True
-    finally:
-        for idx_path in layer_index_paths.values():
-            try:
-                if idx_path.exists():
-                    idx_path.unlink()
-            except Exception:
-                pass
-        if CLEAR_CACHE:
-            if completed:
-                print(f"[cleanup] clearing cache {cfg.temporal_cache_dir}")
-                _cleanup_cache(cfg.temporal_cache_dir)
-            else:
-                print(f"[cleanup] skipping cache clear — run did not complete cleanly ({cfg.temporal_cache_dir})")
         else:
-            print(f"[cleanup] cache preserved (CLEAR_CACHE=0): {cfg.temporal_cache_dir}")
+            prefetch_thread = _start_prefetcher(
+                active_layers, layer_index_paths, counts, cfg, prefetch_stop,
+            )
+            for layer in active_layers:
+                if layer.derived:
+                    continue
+                n = counts.get(layer.id, 0)
+                if n == 0:
+                    print(f"[skip] {layer.id}: no observations to enrich")
+                    continue
+                print(f"[occ_index] {layer.id}: {n} observations")
+                _run_layer(layer, layer_index_paths[layer.id], cfg)
+    finally:
+        # Always tell the prefetcher to stop; it's a daemon thread so the wait
+        # is short. Nothing else runs here — cache cleanup below is reached only
+        # on a clean, complete run, never on Ctrl-C / SIGTERM / a crash.
+        prefetch_stop.set()
+        if prefetch_thread is not None:
+            prefetch_thread.join(timeout=10)
+
+    for idx_path in layer_index_paths.values():
+        try:
+            if idx_path.exists():
+                idx_path.unlink()
+        except Exception:
+            pass
+    if CLEAR_CACHE:
+        print(f"[cleanup] clearing cache {cfg.temporal_cache_dir}")
+        _cleanup_cache(cfg.temporal_cache_dir)
+    else:
+        print(f"[cleanup] cache preserved (CLEAR_CACHE=0): {cfg.temporal_cache_dir}")
 
 
 if __name__ == "__main__":  # pragma: no cover

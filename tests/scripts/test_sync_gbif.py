@@ -209,6 +209,40 @@ def test_find_existing_download_no_match_returns_none(httpx_mock: HTTPXMock, mon
     assert sync_gbif._find_existing_download("SPECIES_LIST", has_coordinate=False) is None
 
 
+def test_find_existing_download_skips_export_older_than_crawl(httpx_mock: HTTPXMock, monkeypatch):
+    # An export built before the crawl we're syncing for can't contain that
+    # crawl's data — must be ignored so a fresh request goes out.
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    httpx_mock.add_response(json={"results": [
+        {"key": "stale", "status": "SUCCEEDED", "created": "2026-08-08T05:38:55.898+00:00",
+         "request": _species_list_request()},
+    ]})
+    assert sync_gbif._find_existing_download(
+        "SPECIES_LIST", has_coordinate=False, min_created="2026-08-28T18:55:15.733+00:00"
+    ) is None
+
+
+def test_find_existing_download_reuses_export_newer_than_crawl(httpx_mock: HTTPXMock, monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    httpx_mock.add_response(json={"results": [
+        {"key": "fresh", "status": "SUCCEEDED", "created": "2026-08-28T19:10:00.000+00:00",
+         "request": _species_list_request()},
+    ]})
+    assert sync_gbif._find_existing_download(
+        "SPECIES_LIST", has_coordinate=False, min_created="2026-08-28T18:55:15.733+00:00"
+    ) == "fresh"
+
+
+def test_find_existing_download_skips_export_missing_created_when_crawl_given(httpx_mock: HTTPXMock, monkeypatch):
+    monkeypatch.setattr(sync_gbif.CONFIG, "taxonomy_roots", ("7HS", "CXQ"))
+    httpx_mock.add_response(json={"results": [
+        {"key": "no-created", "status": "SUCCEEDED", "request": _species_list_request()},
+    ]})
+    assert sync_gbif._find_existing_download(
+        "SPECIES_LIST", has_coordinate=False, min_created="2026-08-28T18:55:15.733+00:00"
+    ) is None
+
+
 # --- request_download ---
 
 def test_request_download_reuses_existing(httpx_mock: HTTPXMock, capsys):
@@ -472,13 +506,13 @@ def test_sync_all_requests_both_before_polling_either(httpx_mock: HTTPXMock):
     real_request_download = sync_gbif.request_download
     real_request_occurrence_download = sync_gbif.request_occurrence_download
 
-    def tracked_request_download():
+    def tracked_request_download(*args, **kwargs):
         call_order.append("request_taxonomy")
-        return real_request_download()
+        return real_request_download(*args, **kwargs)
 
-    def tracked_request_occurrence_download():
+    def tracked_request_occurrence_download(*args, **kwargs):
         call_order.append("request_occurrences")
-        return real_request_occurrence_download()
+        return real_request_occurrence_download(*args, **kwargs)
 
     def tracked_poll(key, *a, **kw):
         call_order.append(f"poll:{key}")

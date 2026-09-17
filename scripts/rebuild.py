@@ -14,12 +14,13 @@ data directory (preserving sync_state.json) and runs the full pipeline:
   5. process_gadm  — download GADM GeoPackage + build location tables and catalog
   6. download_gis  — download all GIS layers (runs every scripts/gis/download_*.py)
   7. build_overviews — build COG overviews for all GIS layers
-  8. enrich_tree     — sample GIS layer values into per-taxon occurrence parquets
-  9. enrich_temporal — enrich occurrences with time-windowed ERA5 weather statistics
- 10. process_tree             — compute per-taxon summary statistics and KDE density graphs
- 11. process_tree_rankings    — compute relative rankings across all taxa
- 12. process_tree_consolidate — build global stats files
- 13. push            — sync data/ to production server (only with --push)
+  8. prop_metadata   — embed /gis-editor metadata (data type + legend) into GIS layers
+  9. enrich_tree     — sample GIS layer values into per-taxon occurrence parquets
+ 10. enrich_temporal — enrich occurrences with time-windowed ERA5 weather statistics
+ 11. process_tree             — compute per-taxon summary statistics and KDE density graphs
+ 12. process_tree_rankings    — compute relative rankings across all taxa
+ 13. process_tree_consolidate — build global stats files
+ 14. push            — sync data/ to production server (only with --push)
 
 Pipeline state is written to sync_state.json["pipeline"] so an external
 process (e.g. a Discord bot) can poll it without coupling to this script.
@@ -45,6 +46,7 @@ import scripts.enrich_temporal as enrich_temporal
 import scripts.enrich_tree as enrich_tree
 import scripts.gis.build_overviews as build_overviews
 import scripts.gis.process_gadm as process_gadm
+import scripts.gis.prop_metadata as prop_metadata
 import scripts.populate_tree as populate_tree
 import scripts.process_tree as process_tree
 import scripts.sync_gbif as sync_gbif
@@ -314,6 +316,7 @@ STAGES: list[tuple[str, str, object]] = [
     ("process_gadm",    "Processing GADM (download + location tables)",       lambda: process_gadm.main()),
     ("download_gis",    "Downloading GIS layers",                             lambda: _run_download_gis()),
     ("build_overviews", "Building COG overviews",                             lambda: build_overviews.main()),
+    ("prop_metadata",   "Embedding /gis-editor metadata into GIS layers",     lambda: prop_metadata.main()),
     ("enrich_tree",     "Enriching tree (GIS sampling)",                      lambda: enrich_tree.main()),
     ("enrich_temporal", "Enriching tree (temporal ERA5 weather)",              lambda: enrich_temporal.main()),
     ("process_tree",             "Processing tree (summary stats + KDE)",    lambda: process_tree.run_stats()),

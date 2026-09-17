@@ -229,6 +229,7 @@ def test_main_full_pipeline_completes(tmp_path):
          patch("scripts.gis.process_gadm.main", side_effect=lambda: call_order.append("process_gadm")), \
          patch("scripts.rebuild._run_download_gis", side_effect=lambda: call_order.append("download_gis")), \
          patch("scripts.gis.build_overviews.main", side_effect=lambda: call_order.append("build_overviews")), \
+         patch("scripts.gis.prop_metadata.main", side_effect=lambda: call_order.append("prop_metadata")), \
          patch("scripts.enrich_tree.main", side_effect=lambda: call_order.append("enrich_tree")), \
          patch("scripts.enrich_temporal.main", side_effect=lambda: call_order.append("enrich_temporal")), \
          patch("scripts.process_tree.run_stats", side_effect=lambda: call_order.append("process_tree")), \
@@ -241,7 +242,7 @@ def test_main_full_pipeline_completes(tmp_path):
 
     assert call_order == [
         "wipe", "tree", "populate", "carry_forward",
-        "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal",
+        "process_gadm", "download_gis", "build_overviews", "prop_metadata", "enrich_tree", "enrich_temporal",
         "process_tree", "process_tree_rankings", "process_tree_consolidate",
     ]
     p = _pipeline(tmp_path)
@@ -250,7 +251,7 @@ def test_main_full_pipeline_completes(tmp_path):
         p["stages"][s]["status"] == "completed"
         for s in [
             "sync_gbif", "build_tree", "populate_tree", "carry_forward",
-            "process_gadm", "download_gis", "build_overviews", "enrich_tree", "enrich_temporal",
+            "process_gadm", "download_gis", "build_overviews", "prop_metadata", "enrich_tree", "enrich_temporal",
             "process_tree", "process_tree_rankings", "process_tree_consolidate",
         ]
     )
@@ -275,6 +276,7 @@ def test_main_wipe_happens_before_sync_download(tmp_path):
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.gis.prop_metadata.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
          patch("scripts.process_tree.run_stats"), \
@@ -303,6 +305,7 @@ def test_main_stage_in_progress_written_before_run(tmp_path):
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.gis.prop_metadata.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
          patch("scripts.process_tree.run_stats"), \
@@ -350,6 +353,7 @@ def test_main_crash_detected_on_next_run(tmp_path, capsys):
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.gis.prop_metadata.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
          patch("scripts.process_tree.run_stats"), \
@@ -414,6 +418,7 @@ def test_main_inhibitor_released_on_success():
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.gis.prop_metadata.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
          patch("scripts.process_tree.run_stats"), \
@@ -461,6 +466,7 @@ def test_main_force_clears_gbif_crawl_timestamps(tmp_path, monkeypatch):
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.gis.prop_metadata.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
          patch("scripts.process_tree.run_stats"), \
@@ -489,6 +495,7 @@ def test_main_stage_flag_skips_prior_stages(tmp_path, monkeypatch):
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.gis.prop_metadata.main"), \
          patch("scripts.enrich_tree.main", side_effect=lambda: call_order.append("enrich_tree")), \
          patch("scripts.enrich_temporal.main", side_effect=lambda: call_order.append("enrich_temporal")), \
          patch("scripts.process_tree.run_stats", side_effect=lambda: call_order.append("process_tree")), \
@@ -532,6 +539,7 @@ def test_main_resume_skips_completed_stages(tmp_path, monkeypatch):
          patch("scripts.gis.process_gadm.main"), \
          patch("scripts.rebuild._run_download_gis"), \
          patch("scripts.gis.build_overviews.main"), \
+         patch("scripts.gis.prop_metadata.main"), \
          patch("scripts.enrich_tree.main"), \
          patch("scripts.enrich_temporal.main"), \
          patch("scripts.process_tree.run_stats"), \

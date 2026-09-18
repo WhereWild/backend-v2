@@ -1098,6 +1098,98 @@ def _build_temporal_var_meta(df: pd.DataFrame) -> list[dict]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Custom layers ("extra options" opt-in on a raw CSV upload)
+#
+# A custom layer is a raster/vector file authored or edited via /gis-editor,
+# never uploaded to this backend at all -- sampling happens entirely in the
+# browser (see frontend/components/upload/customLayers.ts, which reuses
+# /gis-editor's own raster/vector inspection and point-sampling code), and
+# the frontend sends only: the already-sampled per-observation values, as
+# an ordinary extra column in the raw CSV/TSV/Parquet payload, plus this
+# small JSON description of what that column means. This is merged into
+# layer_meta exactly like _build_temporal_var_meta's synthetic rows above,
+# so process_observations_df computes real stats for it same as any built-
+# in layer -- the only thing that doesn't apply is relative-rank comparison
+# (compute_relative_ranks_for_upload only ever finds a sibling group for a
+# variable a real taxon in the tree actually has, so a custom layer's
+# variable simply never matches one; no separate skip logic is needed).
+# ---------------------------------------------------------------------------
+
+CUSTOM_LAYER_VALUE_TYPES = frozenset({"ratio", "interval", "nominal", "ordinal"})
+
+
+def parse_custom_layer_metadata(raw_json: str | None) -> list[dict]:
+    """Parses the frontend's JSON description of each custom layer it
+    already sampled client-side into layer_meta-compatible rows. Raises
+    HTTPException(422) on any malformed/invalid entry -- this drives
+    request-time validation in main.py, not a background job failure.
+    """
+    if not raw_json:
+        return []
+    try:
+        entries = json.loads(raw_json)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid custom_layer_metadata JSON: {exc}") from exc
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=422, detail="custom_layer_metadata must be a JSON array.")
+
+    rows: list[dict] = []
+    seen_ids: set[str] = set()
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=422, detail=f"custom_layer_metadata[{i}] must be an object.")
+        layer_id = str(entry.get("id") or "").strip()
+        if not layer_id:
+            raise HTTPException(status_code=422, detail=f"custom_layer_metadata[{i}] is missing 'id'.")
+        if layer_id in seen_ids:
+            raise HTTPException(status_code=422, detail=f"Duplicate custom layer id: {layer_id!r}.")
+        seen_ids.add(layer_id)
+
+        value_type = str(entry.get("valueType") or entry.get("value_type") or "").strip()
+        if value_type not in CUSTOM_LAYER_VALUE_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"custom_layer_metadata[{i}] has an unsupported valueType: {value_type!r}.",
+            )
+
+        legend_classes_raw = entry.get("legendClasses") or entry.get("legend_classes")
+        legend_json: str | None = None
+        if value_type in ("nominal", "ordinal") and legend_classes_raw:
+            try:
+                legend_json = json.dumps([
+                    {
+                        "id": int(cls["id"]),
+                        "name": str(cls.get("name", cls["id"])),
+                        "color": cls.get("color"),
+                    }
+                    for cls in legend_classes_raw
+                ])
+            except (TypeError, ValueError, KeyError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"custom_layer_metadata[{i}] has invalid legendClasses: {exc}",
+                ) from exc
+
+        rows.append({
+            "id":            layer_id,
+            "name":          str(entry.get("name") or layer_id).strip(),
+            "units":         entry.get("units") or None,
+            "imperial_unit": None,
+            "value_type":    value_type,
+            "domain":        "discrete" if value_type in ("nominal", "ordinal") else "continuous",
+            "category":      "Custom Layers",
+            "group":         None,
+            "group_label":   None,
+            "sort_order":    20000 + i,  # after static + temporal layer entries
+            "render_min":    None,
+            "render_max":    None,
+            "legend_classes": legend_json,
+            "_legend_key":   layer_id,
+        })
+    return rows
+
+
 def _add_ternary_classification_overlay(work_dir: Path, layer_meta: dict[str, dict]) -> None:
     """Augment density_grid.parquet with each compositional group's classification
     overlay (class ids + boundary lines), when a classifier is registered for it.
@@ -1167,8 +1259,16 @@ def _package_archive(
         layer = layer_meta.get(col)
         if not layer or layer.get("value_type") not in ("nominal", "ordinal"):
             continue
-        legend_id = layer.get("_legend_key", col)
-        classes = _load_legend(legend_id)
+        # A purely synthetic layer (temporal, or a custom layer sampled
+        # client-side -- see parse_custom_layer_metadata) has no on-disk
+        # legend file for _load_legend() to find; its classes travel as an
+        # inline JSON string on the layer dict instead, same convention
+        # variable_metadata.parquet's own writer below already uses.
+        if layer.get("legend_classes"):
+            classes = json.loads(layer["legend_classes"])
+        else:
+            legend_id = layer.get("_legend_key", col)
+            classes = _load_legend(legend_id)
         for cls in classes:
             lookup_rows.append({
                 "variable": col,
@@ -1338,6 +1438,7 @@ def build_archive(
     image_filename: str | None = None,
     image_url: str | None = None,
     parent_taxon_id: str | None = None,
+    custom_layer_metadata: list[dict] | None = None,
 ) -> tuple[Path, str, Path]:
     """Compute stats and package all outputs into a ZIP archive.
 
@@ -1346,6 +1447,8 @@ def build_archive(
     """
     layer_meta = _build_layer_meta()
     for row in _build_temporal_var_meta(df):
+        layer_meta[row["id"]] = row
+    for row in (custom_layer_metadata or []):
         layer_meta[row["id"]] = row
 
     work_dir = Path(tempfile.mkdtemp(prefix="wherewild-upload-"))

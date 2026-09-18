@@ -2961,6 +2961,76 @@ def test_upload_without_parent_taxon_id_stays_none():
     assert job.parent_taxon_id is None
 
 
+def test_upload_custom_layer_metadata_stored_on_job():
+    csv = b"latitude,longitude,my_layer\n45.0,-120.0,3.0\n"
+    metadata = json.dumps([{"id": "my_layer", "name": "My Layer", "valueType": "ratio"}])
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"custom_layer_metadata": metadata},
+        )
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.custom_layer_metadata == [{
+        "id": "my_layer", "name": "My Layer", "units": None, "imperial_unit": None,
+        "value_type": "ratio", "domain": "continuous", "category": "Custom Layers",
+        "group": None, "group_label": None, "sort_order": 20000,
+        "render_min": None, "render_max": None, "legend_classes": None,
+        "_legend_key": "my_layer",
+    }]
+
+
+def test_upload_without_custom_layer_metadata_stays_empty():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.custom_layer_metadata == []
+
+
+def test_upload_custom_layer_metadata_invalid_json_rejected():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"custom_layer_metadata": "not json"},
+        )
+    assert r.status_code == 422
+
+
+def test_upload_custom_layer_metadata_column_missing_from_file_rejected():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    metadata = json.dumps([{"id": "my_layer", "valueType": "ratio"}])
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"custom_layer_metadata": metadata},
+        )
+    assert r.status_code == 422
+    assert "my_layer" in r.json()["detail"]
+
+
+def test_upload_custom_layer_metadata_id_collision_with_built_in_layer_rejected():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    metadata = json.dumps([{"id": "bio1", "valueType": "ratio"}])
+    with patch(
+        "util.tiles.load_layers",
+        return_value=[{"id": "bio1", "filename": "bio1.tif", "window_hours": None}],
+    ):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"custom_layer_metadata": metadata},
+        )
+    assert r.status_code == 422
+    assert "bio1" in r.json()["detail"]
+
+
 def test_upload_tsv_parsed_correctly():
     tsv = b"latitude\tlongitude\n45.0\t-120.0\n"
     with patch("util.tiles.load_layers", return_value=[]):

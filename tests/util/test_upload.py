@@ -472,6 +472,127 @@ def test_build_archive_generates_categorical_value_lookup():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def test_build_archive_categorical_value_lookup_uses_inline_legend_for_custom_layer():
+    """A custom layer has no on-disk legend file for _load_legend() to find
+    -- its classes travel as an inline JSON string on the layer_meta entry
+    instead (see parse_custom_layer_metadata), same as a temporal layer's
+    own synthetic legend_classes."""
+    import zipfile
+    df = pd.DataFrame({
+        "catalogNumber": ["OBS1"],
+        "decimalLatitude": [45.0],
+        "decimalLongitude": [-120.0],
+        "my_layer": [3.0],
+    })
+    fake_meta = {
+        "my_layer": {
+            "id": "my_layer", "value_type": "nominal",
+            "legend_classes": '[{"id": 3, "name": "Wetland", "color": "#00f"}]',
+            "_legend_key": "my_layer",
+        },
+    }
+    import io
+    # _load_legend forced to return [] for everything -- if the code fell
+    # back to it instead of using the inline legend_classes JSON, the
+    # lookup row below would come back empty and the assertion would fail.
+    with patch("util.upload._build_layer_meta", return_value=fake_meta), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch("util.upload._load_legend", return_value=[]):
+        archive_path, _, work_dir = up.build_archive(df)
+    try:
+        with zipfile.ZipFile(archive_path) as zf:
+            table = pq.read_table(io.BytesIO(zf.read("categorical_value_lookup.parquet")))
+        rows = table.to_pylist()
+        assert rows == [{
+            "variable": "my_layer", "code": "3", "metric": "class_3",
+            "label": "Wetland", "group": "", "groupLabel": "",
+        }]
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# parse_custom_layer_metadata
+# ---------------------------------------------------------------------------
+
+def test_parse_custom_layer_metadata_none_returns_empty():
+    assert up.parse_custom_layer_metadata(None) == []
+
+
+def test_parse_custom_layer_metadata_empty_string_returns_empty():
+    assert up.parse_custom_layer_metadata("") == []
+
+
+def test_parse_custom_layer_metadata_valid_continuous_layer():
+    raw = json.dumps([{"id": "my_layer", "name": "My Layer", "valueType": "ratio", "units": "mm"}])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows == [{
+        "id": "my_layer", "name": "My Layer", "units": "mm", "imperial_unit": None,
+        "value_type": "ratio", "domain": "continuous", "category": "Custom Layers",
+        "group": None, "group_label": None, "sort_order": 20000,
+        "render_min": None, "render_max": None, "legend_classes": None,
+        "_legend_key": "my_layer",
+    }]
+
+
+def test_parse_custom_layer_metadata_valid_categorical_layer_with_legend():
+    raw = json.dumps([{
+        "id": "my_layer", "name": "My Layer", "valueType": "nominal",
+        "legendClasses": [{"id": 1, "name": "Forest", "color": "#0f0"}],
+    }])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows[0]["domain"] == "discrete"
+    assert json.loads(rows[0]["legend_classes"]) == [
+        {"id": 1, "name": "Forest", "color": "#0f0"},
+    ]
+
+
+def test_parse_custom_layer_metadata_invalid_json_raises_422():
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata("not json")
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_non_array_raises_422():
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(json.dumps({"id": "x"}))
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_missing_id_raises_422():
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(json.dumps([{"valueType": "ratio"}]))
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_duplicate_id_raises_422():
+    raw = json.dumps([
+        {"id": "my_layer", "valueType": "ratio"},
+        {"id": "my_layer", "valueType": "ratio"},
+    ])
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(raw)
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_unsupported_value_type_raises_422():
+    raw = json.dumps([{"id": "my_layer", "valueType": "circular"}])
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(raw)
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_invalid_legend_classes_raises_422():
+    raw = json.dumps([{
+        "id": "my_layer", "valueType": "nominal",
+        "legendClasses": [{"name": "missing id"}],
+    }])
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(raw)
+    assert exc.value.status_code == 422
+
+
 def test_build_archive_includes_variable_metadata():
     import io
     import zipfile
@@ -950,6 +1071,28 @@ def test_build_archive_keeps_plain_name_for_unresolvable_parent_taxon_id():
         )
     try:
         assert archive_name == "processed_observations.zip"
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def test_build_archive_merges_custom_layer_metadata_into_layer_meta():
+    df = _make_minimal_df()
+    custom_rows = [{
+        "id": "my_layer", "name": "My Layer", "units": None,
+        "imperial_unit": None, "value_type": "ratio", "domain": "continuous",
+        "category": "Custom Layers", "group": None, "group_label": None,
+        "sort_order": 20000, "render_min": None, "render_max": None,
+        "legend_classes": None, "_legend_key": "my_layer",
+    }]
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df") as mock_process:
+        archive_path, _, work_dir = up.build_archive(
+            df, custom_layer_metadata=custom_rows,
+        )
+    try:
+        layer_meta_arg = mock_process.call_args[0][2]
+        assert layer_meta_arg["my_layer"] == custom_rows[0]
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -33,7 +34,7 @@ import pyarrow.parquet as pq
 import rasterio
 from fastapi import HTTPException
 
-from config.config import ZERO_NODATA_LAYERS, load_config
+from config.config import METRICS_BY_TYPE, ZERO_NODATA_LAYERS, ValueType, load_config
 from util import descriptions
 from util.gis import (
     COMPOSITION_CLASSIFIERS,
@@ -46,7 +47,15 @@ from util.gis import (
     sample_soil_texture_batch,
     sample_vector_batch,
 )
-from util.rankings import POSITION_FILE
+from util.rankings import (
+    MIN_RANKING_SAMPLES,
+    NOMINAL_SKIP_RANK_METRICS,
+    ORDINAL_SKIP_RANK_METRICS,
+    POSITION_FILE,
+    rank_value_against_group,
+    read_rank_context_groups,
+    resolve_context_label,
+)
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -57,6 +66,7 @@ from util.stats import (
     _filter_df,
     process_observations_df,
 )
+from util.taxa import get_ancestors, get_taxon_by_id
 from util.temporal import (
     TailBuffer,
     build_chunk_index,
@@ -287,6 +297,208 @@ def build_description_profile_for_df(work_dir: Path, df: pd.DataFrame) -> dict:
         numerical_stats=numerical_stats or None,
         circular_stats=circular_stats or None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Parent-taxon relative ranking ("extra options" opt-in on a raw CSV upload)
+#
+# A raw upload has no taxon_key and isn't in the tree, so it can't use the
+# real per-taxon precomputed relative_ranks_positions.parquet the download
+# path re-exports (see build_species_archive). Instead, when the user picks
+# a parent taxon in the upload UI, this treats the upload's own computed
+# stats as if they belonged to a new SPECIES-level child of that taxon, and
+# ranks them against that parent's real, already-precomputed sibling index
+# (util.rankings.read_rank_context_groups) via a cheap binary search per
+# metric -- no full tree rebuild, and nothing is written back to the real
+# index, so this is purely additive/read-only from the tree's perspective.
+# ---------------------------------------------------------------------------
+
+_CATEGORICAL_SAMPLE_COUNT_METRIC_PRIORITY: dict[ValueType, tuple[str, ...]] = {
+    # Mirrors _write_rank_positions' own count_idx lookup: {variable}::count
+    # if the value type has one (ordinal does, as a tall metric row, unlike
+    # numeric/circular's wide "count" column), else {variable}::total_samples.
+    ValueType.NOMINAL: ("total_samples",),
+    ValueType.ORDINAL: ("count", "total_samples"),
+}
+
+
+def _resolve_own_categorical_rankable_values(
+    work_dir: Path, layer_meta: dict[str, dict], filename: str, vtype: ValueType,
+) -> dict[tuple[str, str], tuple[float, int]]:
+    """(variable, metric) -> (own_value, own_sample_count) for a nominal or
+    ordinal variable's rankable metrics -- the exact same METRICS_BY_TYPE
+    minus skip-set vocabulary util.rankings._write_rank_positions uses (see
+    NOMINAL_SKIP_RANK_METRICS/ORDINAL_SKIP_RANK_METRICS), plus its class_
+    fraction handling: a taxon (here, this upload) with zero presence in a
+    class gets no row at all for it, matching the real pipeline never
+    writing one for a zero-valued taxon.
+    """
+    path = work_dir / filename
+    if not path.exists():
+        return {}
+
+    skip_metrics = (
+        NOMINAL_SKIP_RANK_METRICS if vtype is ValueType.NOMINAL else ORDINAL_SKIP_RANK_METRICS
+    )
+    rankable_metrics = set(METRICS_BY_TYPE[vtype]) - skip_metrics
+    sample_count_metrics = _CATEGORICAL_SAMPLE_COUNT_METRIC_PRIORITY[vtype]
+
+    by_variable: dict[str, dict[str, float]] = {}
+    for row in pq.read_table(path).to_pylist():
+        variable = row.get("variable")
+        metric = row.get("metric")
+        if not variable or not metric:
+            continue
+        by_variable.setdefault(variable, {})[metric] = row.get("value")
+
+    result: dict[tuple[str, str], tuple[float, int]] = {}
+    for variable, by_metric in by_variable.items():
+        layer = layer_meta.get(variable)
+        if not layer:
+            continue
+        try:
+            if ValueType(layer.get("value_type") or "") != vtype:
+                continue
+        except ValueError:
+            continue
+
+        sample_count = next(
+            (by_metric[m] for m in sample_count_metrics if by_metric.get(m) is not None),
+            None,
+        )
+        if sample_count is None or sample_count < MIN_RANKING_SAMPLES:
+            continue
+        sample_count = int(sample_count)
+
+        for metric, value in by_metric.items():
+            if value is None or not math.isfinite(value):
+                continue
+            is_class_metric = metric.startswith("class_")
+            if not is_class_metric and metric not in rankable_metrics:
+                continue
+            if is_class_metric and value == 0.0:
+                continue  # no presence in this class -- matches the real writer's own row omission
+            result[(variable, metric)] = (float(value), sample_count)
+
+    return result
+
+
+def _resolve_own_rankable_values(
+    work_dir: Path, layer_meta: dict[str, dict],
+) -> dict[tuple[str, str], tuple[float, int]]:
+    """(variable, metric) -> (own_value, own_sample_count) for every
+    metric this upload has >= MIN_RANKING_SAMPLES samples for -- the exact
+    same metric vocabulary + per-variable sample-count gate
+    util.rankings._write_rank_positions applies when building the real
+    tree's ranking index, so every value here is directly comparable to
+    that index. Covers numerical, circular, nominal, and ordinal variables.
+    """
+    def _read_rows(filename: str) -> list[dict]:
+        path = work_dir / filename
+        if not path.exists():
+            return []
+        return pq.read_table(path).to_pylist()
+
+    result: dict[tuple[str, str], tuple[float, int]] = {}
+
+    for row in _read_rows(NUMERICAL_STATS_FILE):
+        variable = row.get("variable")
+        layer = layer_meta.get(variable)
+        if not variable or not layer:
+            continue
+        try:
+            vtype = ValueType(layer.get("value_type") or "")
+        except ValueError:
+            continue
+        if vtype not in (ValueType.RATIO, ValueType.INTERVAL):
+            continue
+        count = row.get("count")
+        if count is None or count < MIN_RANKING_SAMPLES:
+            continue
+        for metric in METRICS_BY_TYPE[vtype]:
+            value = row.get(metric)
+            if value is None or not math.isfinite(value):
+                continue
+            result[(variable, metric)] = (float(value), int(count))
+
+    for row in _read_rows(CIRCULAR_STATS_FILE):
+        variable = row.get("variable")
+        layer = layer_meta.get(variable)
+        if not variable or not layer or layer.get("value_type") != ValueType.CIRCULAR:
+            continue
+        count = row.get("count")
+        if count is None or count < MIN_RANKING_SAMPLES:
+            continue
+        for metric in METRICS_BY_TYPE[ValueType.CIRCULAR]:
+            value = row.get(metric)
+            if value is None or not math.isfinite(value):
+                continue
+            result[(variable, metric)] = (float(value), int(count))
+
+    result.update(_resolve_own_categorical_rankable_values(
+        work_dir, layer_meta, NOMINAL_STATS_FILE, ValueType.NOMINAL,
+    ))
+    result.update(_resolve_own_categorical_rankable_values(
+        work_dir, layer_meta, ORDINAL_STATS_FILE, ValueType.ORDINAL,
+    ))
+
+    return result
+
+
+def compute_relative_ranks_for_upload(
+    work_dir: Path, layer_meta: dict[str, dict], parent_taxon_id: str,
+) -> list[dict] | None:
+    """Rank this upload's own computed stats against ``parent_taxon_id``'s
+    real precomputed SPECIES-level sibling index, AND every one of that
+    taxon's own ancestors' sibling indexes up to the root -- one context row
+    per ancestor level, same as a real taxon in the tree gets ranked against
+    its whole lineage (main.py's _load_relative_ranks returns one row per
+    ancestor context for a given taxon_key/variable). Writes the result into
+    ``work_dir / POSITION_FILE`` so _package_archive picks it up exactly
+    like a species download's own (real) relative ranks. Returns the rows
+    written, or None (writing nothing) if the taxon doesn't resolve or
+    nothing in this upload clears the ranking sample-size threshold.
+
+    Always ranks as a SPECIES-level entrant regardless of each context
+    taxon's own rank (a genus, family, order, ... ancestor's SPECIES-rank
+    descendants are all well-defined comparison cohorts) -- this mirrors
+    the common case of comparing one species against its congeners, family,
+    order, and so on up the tree.
+    """
+    selected = get_taxon_by_id(parent_taxon_id)
+    if selected is None:
+        return None
+
+    own_values = _resolve_own_rankable_values(work_dir, layer_meta)
+    if not own_values:
+        return None
+
+    rows: list[dict] = []
+    for context_taxon in (selected, *get_ancestors(selected)):
+        context_id = str(context_taxon["taxon_key"])
+        context_label = resolve_context_label(context_taxon)
+        groups = read_rank_context_groups(context_id, _CONFIG.species_rank)
+        if not groups:
+            continue
+        for (variable, metric), (value, sample_count) in own_values.items():
+            group = groups.get((variable, metric))
+            if group is None or group.empty:
+                continue
+            ranked = rank_value_against_group(value, group)
+            rows.append({
+                "variable": variable,
+                "metric": metric,
+                "position": ranked["position"],
+                "count": ranked["count"],
+                "sampleCount": sample_count,
+                "contextLabel": context_label,
+            })
+
+    if not rows:
+        return None
+
+    pq.write_table(pa.Table.from_pylist(rows), work_dir / POSITION_FILE)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1103,6 +1315,21 @@ def _add_metadata_to_archive(
             zf.writestr(metadata["imageFile"], image_bytes)
 
 
+def _parent_taxon_filename_suffix(parent_taxon_id: str) -> str | None:
+    """Same slug-taxon_key naming convention util.download._archive_filename
+    uses for a species download's own filename, applied here to the user-
+    selected parent taxon so a processed ZIP ranked against one is
+    identifiable from its filename alone. None if the id doesn't resolve
+    (build_archive already tolerates an unresolvable parent_taxon_id
+    elsewhere -- see compute_relative_ranks_for_upload)."""
+    taxon = get_taxon_by_id(parent_taxon_id)
+    if taxon is None:
+        return None
+    name = taxon.get("scientific_name") or taxon.get("common_name") or str(taxon["taxon_key"])
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "taxon"
+    return f"{slug}-{taxon['taxon_key']}"
+
+
 def build_archive(
     df: pd.DataFrame,
     *,
@@ -1110,6 +1337,7 @@ def build_archive(
     image_bytes: bytes | None = None,
     image_filename: str | None = None,
     image_url: str | None = None,
+    parent_taxon_id: str | None = None,
 ) -> tuple[Path, str, Path]:
     """Compute stats and package all outputs into a ZIP archive.
 
@@ -1122,10 +1350,18 @@ def build_archive(
 
     work_dir = Path(tempfile.mkdtemp(prefix="wherewild-upload-"))
     archive_name = "processed_observations.zip"
+    if parent_taxon_id:
+        suffix = _parent_taxon_filename_suffix(parent_taxon_id)
+        if suffix:
+            archive_name = f"processed_observations-{suffix}.zip"
     try:
         filtered = _filter_df(df.copy())
         process_observations_df(work_dir, filtered, layer_meta)
         _add_ternary_classification_overlay(work_dir, layer_meta)
+        # Must run before _package_archive -- it checks work_dir / POSITION_FILE
+        # for existence at zip time, same as every other stats file.
+        if parent_taxon_id:
+            compute_relative_ranks_for_upload(work_dir, layer_meta, parent_taxon_id)
         archive_path = _package_archive(work_dir, df, layer_meta, archive_name)
         description_profile = (
             build_description_profile_for_df(work_dir, df) if generate_description else None

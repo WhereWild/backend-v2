@@ -411,6 +411,7 @@ class _UploadJob:
     image_bytes: bytes | None = None
     image_filename: str | None = None
     image_url: str | None = None
+    parent_taxon_id: str | None = None
 
 
 _upload_queue: list[str] = []        # ordered job IDs waiting to run
@@ -438,6 +439,7 @@ async def _upload_consumer() -> None:
                 image_bytes=job.image_bytes,
                 image_filename=job.image_filename,
                 image_url=job.image_url,
+                parent_taxon_id=job.parent_taxon_id,
             )
             job.archive_path = archive_path
             job.archive_name = archive_name
@@ -3214,6 +3216,7 @@ async def upload_raw_observations(
     generate_description: bool = Form(False),
     image: UploadFile | None = File(None),
     image_url: str | None = Form(None),
+    parent_taxon_id: str | None = Form(None),
 ) -> JSONResponse:
     """Accept a CSV, TSV, or Parquet file and queue it for processing.
 
@@ -3227,7 +3230,11 @@ async def upload_raw_observations(
     usable but serve different offline guarantees -- an uploaded image's
     bytes are embedded straight into the archive (fully offline once
     downloaded), while image_url is stored as a plain string (no re-upload
-    needed, but requires network access to actually display).
+    needed, but requires network access to actually display). parent_taxon_id
+    ranks this upload's own computed stats against that taxon's real
+    precomputed sibling index, as if this dataset were a new SPECIES-level
+    child of it (see upload.compute_relative_ranks_for_upload) -- validated
+    here so a bad id fails fast instead of silently producing no ranks.
     """
     filename = file.filename or ""
     suffix = Path(filename).suffix.lower()
@@ -3305,6 +3312,15 @@ async def upload_raw_observations(
             )
         image_filename = image.filename
 
+    resolved_parent_taxon_id: str | None = None
+    if parent_taxon_id:
+        if taxa.get_taxon_by_id(parent_taxon_id) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown parent taxon id: {parent_taxon_id!r}",
+            )
+        resolved_parent_taxon_id = parent_taxon_id
+
     job_id = str(uuid.uuid4())
     _upload_jobs[job_id] = _UploadJob(
         job_id=job_id,
@@ -3313,6 +3329,7 @@ async def upload_raw_observations(
         image_bytes=image_bytes,
         image_filename=image_filename,
         image_url=image_url or None,
+        parent_taxon_id=resolved_parent_taxon_id,
     )
     _upload_queue.append(job_id)
 

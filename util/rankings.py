@@ -141,6 +141,12 @@ _ORDINAL_SKIP_RANK_METRICS: frozenset[str] = frozenset({
     "10th_percentile", "25th_percentile", "median", "75th_percentile", "90th_percentile",
 })
 
+# Public re-exports -- util.upload's custom-upload parent-taxon ranking needs
+# the exact same nominal/ordinal rankable-metric vocabulary this module uses
+# when building the real tree's ranking index.
+NOMINAL_SKIP_RANK_METRICS = _NOMINAL_SKIP_RANK_METRICS
+ORDINAL_SKIP_RANK_METRICS = _ORDINAL_SKIP_RANK_METRICS
+
 
 def _metrics_for_vtype(layer: dict, vtype: ValueType) -> tuple[str, ...]:
     """Return rankable metric names for a value type.
@@ -933,6 +939,77 @@ def _read_rank_positions(context_id: str, rank: str, variable: str, metric: str)
         return tbl.to_pylist()
     except Exception:
         return []
+
+
+def resolve_context_label(taxon: TaxonRecord) -> str:
+    """Public re-export of _resolve_context_label — util.upload's custom-
+    upload parent-taxon ranking needs the exact same ancestor display-label
+    convention the real tree pipeline uses (scientific name, falling back to
+    common name, falling back to taxon_key), so a synthetic upload's ranking
+    row reads identically to a real taxon's."""
+    return _resolve_context_label(taxon)
+
+
+def read_rank_context_groups(
+    context_id: str, rank: str,
+) -> dict[tuple[str, str], pd.DataFrame]:
+    """One filtered read of EVERY (variable, metric) group ranked under this
+    (context_id, rank) pair at once, keyed by (variable, metric) -> that
+    group's existing member rows sorted ascending by value.
+
+    Pruned to the matching row group(s) via the same physical
+    (contextTaxonId, rank, variable, metric, position) sort _read_rank_positions
+    relies on, but withOUT a variable/metric filter -- a single ancestor
+    context can have dozens of rankable variables, and reading them all in
+    one predicate-pushed pass is far cheaper than one filtered read per
+    metric (see util.upload's parent-taxon ranking option, which needs
+    every metric a custom upload has data for, not just one)."""
+    path = GLOBAL_STATS_DIR / RANKINGS_FILE
+    if not path.exists():
+        return {}
+    try:
+        tbl = _storage.read_table(
+            path,
+            columns=["variable", "metric", "value", "count"],
+            filters=[("contextTaxonId", "=", context_id), ("rank", "=", rank)],
+        )
+    except Exception:
+        return {}
+    if tbl.num_rows == 0:
+        return {}
+    df = tbl.to_pandas()
+    groups: dict[tuple[str, str], pd.DataFrame] = {}
+    for key, group in df.groupby(["variable", "metric"], sort=False):
+        groups[key] = group.sort_values("value", kind="stable").reset_index(drop=True)
+    return groups
+
+
+def rank_value_against_group(value: float, group: pd.DataFrame) -> dict:
+    """Where would `value` slot into this already-sorted sibling group?
+
+    Mirrors _write_rank_positions' min-rank convention exactly: position is
+    0-indexed and tied values share the lower position, which is exactly
+    what np.searchsorted(..., side="left") gives for a value tied with an
+    existing member. count is the group's own size + 1 -- treating `value`
+    as genuinely joining the cohort, which keeps the (position+1)/count
+    percentile main.py._load_relative_ranks computes in the valid [0, 1]
+    range (using the group's un-incremented size would let a value ranked
+    above every existing member compute to a percentile over 100%).
+
+    `group`'s own `count` column is the group's full population size, which
+    for most metrics equals len(group) -- but for a nominal/ordinal class_
+    fraction metric, _write_rank_positions never writes a row for a taxon
+    with zero presence in that class, so `group` only holds the nonzero
+    members while `count` still reflects the TRUE population including
+    those implicit zeros. `offset` (0 for every non-class_ metric) shifts a
+    real nonzero `value`'s position up by however many implicit-zero
+    members exist below it, exactly like _write_rank_positions' own
+    class_-metric offset."""
+    sorted_values = group["value"].to_numpy(dtype=np.float64)
+    existing_count = int(group["count"].iloc[0]) if len(group) else len(sorted_values)
+    offset = existing_count - len(sorted_values)
+    local_position = int(np.searchsorted(sorted_values, value, side="left"))
+    return {"position": offset + local_position, "count": existing_count + 1}
 
 
 def _accepted_ranks(descendant_rank: str, include_species_like: bool) -> frozenset[str] | None:

@@ -15,7 +15,7 @@ import time
 import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -412,6 +412,12 @@ class _UploadJob:
     image_filename: str | None = None
     image_url: str | None = None
     parent_taxon_id: str | None = None
+    # Never the raw custom-layer file itself -- see main.py's
+    # upload_raw_observations and util.upload.parse_custom_layer_metadata.
+    # The frontend samples each attached layer client-side and sends only
+    # this small description plus the already-sampled values as ordinary
+    # extra column(s) in df.
+    custom_layer_metadata: list[dict] = field(default_factory=list)
 
 
 _upload_queue: list[str] = []        # ordered job IDs waiting to run
@@ -440,6 +446,7 @@ async def _upload_consumer() -> None:
                 image_filename=job.image_filename,
                 image_url=job.image_url,
                 parent_taxon_id=job.parent_taxon_id,
+                custom_layer_metadata=job.custom_layer_metadata,
             )
             job.archive_path = archive_path
             job.archive_name = archive_name
@@ -3217,6 +3224,7 @@ async def upload_raw_observations(
     image: UploadFile | None = File(None),
     image_url: str | None = Form(None),
     parent_taxon_id: str | None = Form(None),
+    custom_layer_metadata: str | None = Form(None),
 ) -> JSONResponse:
     """Accept a CSV, TSV, or Parquet file and queue it for processing.
 
@@ -3235,6 +3243,11 @@ async def upload_raw_observations(
     precomputed sibling index, as if this dataset were a new SPECIES-level
     child of it (see upload.compute_relative_ranks_for_upload) -- validated
     here so a bad id fails fast instead of silently producing no ranks.
+    custom_layer_metadata is a JSON-encoded description of any custom (GIS-
+    editor-authored) layer(s) the frontend already sampled client-side --
+    this backend never receives the raw raster/vector file, only this small
+    metadata blob plus the already-sampled values as ordinary extra
+    column(s) in `file` (see util.upload.parse_custom_layer_metadata).
     """
     filename = file.filename or ""
     suffix = Path(filename).suffix.lower()
@@ -3301,6 +3314,26 @@ async def upload_raw_observations(
     df = upload.validate_coordinates(df)
     upload.check_reserved_columns(df, static_layer_ids)
 
+    custom_layer_rows = upload.parse_custom_layer_metadata(custom_layer_metadata)
+    if custom_layer_rows:
+        collisions = sorted({row["id"] for row in custom_layer_rows} & static_layer_ids)
+        if collisions:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Custom layer id(s) collide with built-in layers: {', '.join(collisions)}.",
+            )
+        missing_cols = sorted(
+            row["id"] for row in custom_layer_rows if row["id"] not in df.columns
+        )
+        if missing_cols:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Custom layer metadata given for column(s) not present in the "
+                    f"uploaded file: {', '.join(missing_cols)}."
+                ),
+            )
+
     image_bytes: bytes | None = None
     image_filename: str | None = None
     if image is not None and image.filename:
@@ -3330,6 +3363,7 @@ async def upload_raw_observations(
         image_filename=image_filename,
         image_url=image_url or None,
         parent_taxon_id=resolved_parent_taxon_id,
+        custom_layer_metadata=custom_layer_rows,
     )
     _upload_queue.append(job_id)
 

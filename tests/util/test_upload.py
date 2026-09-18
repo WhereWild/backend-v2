@@ -544,6 +544,48 @@ def test_build_archive_no_lookup_when_no_nominal_layers():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def test_package_archive_includes_relative_ranks_when_present(tmp_path):
+    """Relative-rank positions are download-only: _copy_taxon_stats (in
+    util/download.py) writes relative_ranks_positions.parquet into work_dir
+    before _package_archive runs, exactly like the other stats files, so
+    this only asserts _package_archive's own files_to_zip wiring picks it up
+    when present -- a plain upload never writes this file, so it's absent
+    there (see the next test)."""
+    df = _make_minimal_df()
+    pq.write_table(
+        pa.Table.from_pylist([
+            {"variable": "bio1", "metric": "mean", "position": 4, "count": 10,
+             "sampleCount": 25, "contextLabel": "Testaceae"},
+        ]),
+        tmp_path / up.POSITION_FILE,
+    )
+    import io
+    archive_path = up._package_archive(tmp_path, df, {}, "a.zip")
+    with zipfile.ZipFile(archive_path) as zf:
+        names = zf.namelist()
+        assert up.POSITION_FILE in names
+        table = pq.read_table(io.BytesIO(zf.read(up.POSITION_FILE)))
+    assert table.to_pylist()[0]["contextLabel"] == "Testaceae"
+
+
+def test_build_archive_omits_relative_ranks_for_plain_upload():
+    """A custom CSV upload has no tree ancestors to rank against, so nothing
+    ever writes relative_ranks_positions.parquet into its work_dir -- the
+    archive simply doesn't have the entry, same as every other file here
+    that _package_archive skips when missing."""
+    df = _make_minimal_df()
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"):
+        archive_path, _, work_dir = up.build_archive(df)
+    try:
+        with zipfile.ZipFile(archive_path) as zf:
+            names = zf.namelist()
+        assert up.POSITION_FILE not in names
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def test_build_archive_http_exception_reraises_and_cleans_up():
     df = _make_minimal_df()
     with patch("util.upload._build_layer_meta", return_value={}), \

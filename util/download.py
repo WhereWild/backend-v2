@@ -30,6 +30,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from util.rankings import POSITION_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -88,6 +89,7 @@ _STATS_FILES = (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
     DENSITY_GRID_FILE,
+    POSITION_FILE,
 )
 
 

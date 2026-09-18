@@ -110,6 +110,14 @@ def _taxon(**overrides):
     return base
 
 
+def test_stats_files_includes_relative_rank_positions():
+    """Relative-rank positions must be copied into a species download's
+    work_dir by _copy_taxon_stats the same way every other precomputed
+    stats file is -- otherwise a re-imported download would show no ranks
+    at all, same shape as if the metric had never been ranked."""
+    assert dl.POSITION_FILE in dl._STATS_FILES
+
+
 def test_build_species_archive_returns_none_when_no_occurrences():
     with patch("util.download.collect_taxon_df", return_value=None):
         result = dl.build_species_archive(_taxon(), storage=MagicMock())

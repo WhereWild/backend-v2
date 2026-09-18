@@ -139,6 +139,27 @@ def _add_location_gid(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _add_media_license_label(df: pd.DataFrame) -> pd.DataFrame:
+    """Each occurrence row stores a raw mediaLicense URL, not a display label
+    (see scripts/populate_tree.py) -- split it into mediaLicenseUrl (the raw
+    URL) + mediaLicense (a human-readable label, e.g. "CC BY 4.0"), matching
+    SpeciesOccurrence.mediaLicense/mediaLicenseUrl's own convention (see
+    main.py's identical derivation for the live /gis/... occurrence routes:
+    media_license_url = the raw column, media_license = _license_label(it)).
+    Without this, occurrence.parquet carried a bare URL under the name the
+    frontend expects to already be a short label, so every per-occurrence
+    photo's license silently failed to render.
+    """
+    if "mediaLicense" not in df.columns:
+        return df
+    result = df.copy()
+    result["mediaLicenseUrl"] = result["mediaLicense"]
+    # .map(..., na_action="ignore") leaves NaN rows as NaN instead of passing
+    # them to _license_label, which expects str | None, not a bare float NaN.
+    result["mediaLicense"] = result["mediaLicense"].map(_license_label, na_action="ignore")
+    return result
+
+
 def build_species_archive(
     taxon: TaxonRecord, storage: ParquetStorage,
 ) -> tuple[Path, str, Path] | None:
@@ -151,6 +172,7 @@ def build_species_archive(
     if df is None or df.empty:
         return None
     df = _add_location_gid(df)
+    df = _add_media_license_label(df)
 
     layer_meta = _build_layer_meta()
     for row in _build_temporal_var_meta(df):

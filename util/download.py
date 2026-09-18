@@ -43,11 +43,43 @@ from util.stats import (
 from util.storage import ParquetStorage
 from util.taxa import TaxonRecord
 from util.upload import (
+    _add_metadata_to_archive,
     _add_ternary_classification_overlay,
     _build_layer_meta,
     _build_temporal_var_meta,
     _package_archive,
+    build_description_profile_for_df,
 )
+
+# Duplicated (not imported) from main.py's identically-named helper to avoid
+# a circular import (main.py -> util.download; the reverse would cycle).
+# Keep in sync if the taxon dict's image_* field naming ever changes.
+
+
+def _license_label(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = re.search(r"/publicdomain/zero/([^/]+)/", url)
+    if m:
+        return f"CC0 {m.group(1)}"
+    m = re.search(r"/licenses/([^/]+)/([^/]+)/", url)
+    if m:
+        parts = m.group(1).split("-")
+        return "CC " + "-".join(p.upper() for p in parts) + " " + m.group(2)
+    return url
+
+
+def _image_fields(taxon: TaxonRecord) -> dict:
+    """Return unified image_* fields, preferring iNat over GBIF backup."""
+    prefix = "inat_preferred" if taxon.get("inat_preferred_image") else "gbif_backup"
+    license_url = taxon.get(f"{prefix}_image_license") or None
+    return {
+        "image_url": taxon.get(f"{prefix}_image") or None,
+        "image_license": _license_label(license_url),
+        "image_license_url": license_url,
+        "image_creator": taxon.get(f"{prefix}_image_creator") or None,
+        "image_rights_holder": taxon.get(f"{prefix}_image_attribution") or None,
+    }
 
 _STATS_FILES = (
     NUMERICAL_STATS_FILE,
@@ -130,6 +162,22 @@ def build_species_archive(
         _copy_taxon_stats(work_dir, str(taxon["taxon_key"]), storage)
         _add_ternary_classification_overlay(work_dir, layer_meta)
         archive_path = _package_archive(work_dir, df, layer_meta, archive_name, include_csv=False)
+        # Always included (not gated behind an option, unlike the custom
+        # upload's own checkbox/image field) -- a species already HAS a real
+        # description and image, so there's no "opt in" question here, and a
+        # re-imported species download needs to exercise the exact same
+        # description/image display path a custom upload does.
+        description_profile = build_description_profile_for_df(work_dir, df)
+        image_fields = _image_fields(taxon)
+        _add_metadata_to_archive(
+            archive_path,
+            description_profile=description_profile,
+            image_url=image_fields["image_url"],
+            image_license=image_fields["image_license"],
+            image_license_url=image_fields["image_license_url"],
+            image_creator=image_fields["image_creator"],
+            image_rights_holder=image_fields["image_rights_holder"],
+        )
     except Exception:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise

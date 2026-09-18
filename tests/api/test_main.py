@@ -2879,6 +2879,52 @@ def test_upload_csv_success():
     assert body["status"] == "queued"
 
 
+def test_upload_extra_options_stored_on_job():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[
+                ("file", ("obs.csv", csv, "text/csv")),
+                ("image", ("photo.jpg", b"\xff\xd8\xff\xe0fakejpeg", "image/jpeg")),
+            ],
+            data={"generate_description": "true", "image_url": "https://example.com/x.jpg"},
+        )
+    assert r.status_code == 202
+    job_id = r.json()["job_id"]
+    job = main_module._upload_jobs[job_id]
+    assert job.generate_description is True
+    assert job.image_bytes == b"\xff\xd8\xff\xe0fakejpeg"
+    assert job.image_filename == "photo.jpg"
+    assert job.image_url == "https://example.com/x.jpg"
+
+
+def test_upload_without_extra_options_defaults_stay_empty():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.generate_description is False
+    assert job.image_bytes is None
+    assert job.image_url is None
+
+
+def test_upload_image_too_large_rejected():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    big_image = b"\x00" * (main_module._MAX_IMAGE_BYTES + 1)
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[
+                ("file", ("obs.csv", csv, "text/csv")),
+                ("image", ("photo.jpg", big_image, "image/jpeg")),
+            ],
+        )
+    assert r.status_code == 413
+
+
 def test_upload_tsv_parsed_correctly():
     tsv = b"latitude\tlongitude\n45.0\t-120.0\n"
     with patch("util.tiles.load_layers", return_value=[]):

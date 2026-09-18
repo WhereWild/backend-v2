@@ -33,7 +33,8 @@ import pyarrow.parquet as pq
 import rasterio
 from fastapi import HTTPException
 
-from config.config import ZERO_NODATA_LAYERS
+from config.config import ZERO_NODATA_LAYERS, load_config
+from util import descriptions
 from util.gis import (
     COMPOSITION_CLASSIFIERS,
     DERIVED_FROM_ELEVATION,
@@ -72,6 +73,8 @@ _LEGEND_DIR = Path("config/gis/legends")
 _GADM_PATH = Path("data/gis/gadm.gpkg")
 _HIERARCHY_PATH = Path("data/gis/locations/hierarchy.csv")
 _CATALOG_PATH = Path("config/gis/catalog.json")
+
+_CONFIG = load_config("global")
 
 _gadm_gdf = None
 _hierarchy: dict[str, dict] | None = None
@@ -163,6 +166,128 @@ def build_locations_table(df: pd.DataFrame) -> pa.Table | None:
         "hierarchy": pa.array(rows_hierarchy, type=pa.string()),
     })
 
+
+# ---------------------------------------------------------------------------
+# Natural-language description (util.descriptions), for an arbitrary
+# self-contained dataset -- shared by the upload path (build_archive) and the
+# taxon-download path (util.download.build_species_archive), same as
+# _package_archive above: both leave a set of standard-named stats files in
+# work_dir first, this just reads them back.
+# ---------------------------------------------------------------------------
+
+def _load_legend_full(layer_id: str) -> dict:
+    path = _LEGEND_DIR / f"{layer_id}_legend.json"
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        return json.load(f)
+
+
+class _InMemoryLocTaxaStorage:
+    """Duck-types util.storage.ParquetStorage's read_table() just enough for
+    descriptions.build_location_text() -- there's only ever one dataset here
+    (this one upload/download job), so the path/filters it's called with are
+    irrelevant; the in-memory table already IS the filtered result."""
+
+    def __init__(self, table: pa.Table):
+        self._table = table
+
+    def read_table(self, path, columns=None, filters=None):  # noqa: ARG002
+        return self._table
+
+
+def _build_location_counts_table(df: pd.DataFrame) -> pa.Table | None:
+    """(scope, gid, count) rows from df's own level0Gid/level1Gid/level2Gid
+    columns -- the exact shape descriptions.build_location_text() expects
+    from a real taxon's precomputed location_taxa.parquet, just derived
+    directly from this one dataset's own rows instead of a stored,
+    taxon-keyed aggregate."""
+    scopes: list[str] = []
+    gids: list[str] = []
+    counts: list[int] = []
+    for col, scope in _CONFIG.location_columns:
+        if col not in df.columns:
+            continue
+        for gid, count in df[col].dropna().value_counts().items():
+            if not gid:
+                continue
+            scopes.append(scope)
+            gids.append(str(gid))
+            counts.append(int(count))
+    if not gids:
+        return None
+    return pa.table({
+        "scope": pa.array(scopes, type=pa.string()),
+        "gid": pa.array(gids, type=pa.string()),
+        "count": pa.array(counts, type=pa.int64()),
+    })
+
+
+def build_description_profile_for_df(work_dir: Path, df: pd.DataFrame) -> dict:
+    """Same descriptions.build_description_profile() the species page uses,
+    fed from this one dataset's own just-computed stats (already written into
+    work_dir under their standard names -- see process_observations_df/
+    _copy_taxon_stats) and its own location counts, instead of a real taxon's
+    precomputed global aggregates. taxon_key/loc_taxa_path below are inert
+    placeholders -- _InMemoryLocTaxaStorage.read_table() ignores both, since
+    there's only ever this one dataset's worth of location counts to return.
+    """
+    def _read_rows(filename: str) -> list[dict]:
+        path = work_dir / filename
+        if not path.exists():
+            return []
+        return pq.read_table(path).to_pylist()
+
+    numerical_stats = {r["variable"]: r for r in _read_rows(NUMERICAL_STATS_FILE)}
+    circular_stats = {r["variable"]: r for r in _read_rows(CIRCULAR_STATS_FILE)}
+    nominal_rows = _read_rows(NOMINAL_STATS_FILE)
+    ordinal_rows = _read_rows(ORDINAL_STATS_FILE)
+
+    def _class_fractions(variable: str) -> dict[int, float]:
+        return {
+            int(r["metric"][6:]): float(r["value"])
+            for r in nominal_rows
+            if r["variable"] == variable
+            and r["metric"].startswith("class_")
+            and r["metric"][6:].isdigit()
+            and float(r["value"] or 0) > 0
+        }
+
+    salinity_median = next(
+        (float(r["value"]) for r in ordinal_rows if r["variable"] == "salinity" and r["metric"] == "median"),
+        None,
+    )
+
+    locations_table = _build_location_counts_table(df)
+    storage = _InMemoryLocTaxaStorage(locations_table if locations_table is not None else pa.table({
+        "scope": pa.array([], type=pa.string()),
+        "gid": pa.array([], type=pa.string()),
+        "count": pa.array([], type=pa.int64()),
+    }))
+
+    return descriptions.build_description_profile(
+        "upload",
+        hierarchy=_load_hierarchy(),
+        storage=storage,
+        loc_taxa_path=Path("unused"),
+        scope_by_level=_CONFIG.location_scope_by_level,
+        kg2_class_fractions=_class_fractions("kg2") or None,
+        kg2_legend_classes=_load_legend("kg2") or None,
+        lc_class_fractions=_class_fractions("landcover") or None,
+        lc_legend=_load_legend_full("landcover") or None,
+        soil_texture_class_fractions=_class_fractions("soil_texture") or None,
+        soil_texture_legend=_load_legend_full("soil_texture") or None,
+        eco_class_fractions=_class_fractions("ecoregions") or None,
+        eco_legend_classes=_load_legend("ecoregions") or None,
+        biome_class_fractions=_class_fractions("biome") or None,
+        biome_legend=_load_legend_full("biome") or None,
+        salinity_median=salinity_median,
+        salinity_legend_classes=_load_legend("salinity") or None,
+        numerical_stats=numerical_stats or None,
+        circular_stats=circular_stats or None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Column alias resolution
 # ---------------------------------------------------------------------------
@@ -183,6 +308,12 @@ _CATALOG_ALIASES = (
     "gbifID",        "gbif_id",
 )
 _NAME_ALIASES = ("observationName", "observation_name", "name", "title", "label")
+_IMAGE_ALIASES = (
+    "imageUrl", "image_url", "imageURL",
+    "photoUrl", "photo_url", "photoURL",
+    "mediaUrl", "media_url", "mediaURL",
+    "image", "photo",
+)
 _DATE_ALIASES = (
     "eventDate", "event_date", "dateTime", "date_time",
     "date", "datetime", "timestamp",
@@ -255,6 +386,26 @@ def ensure_observation_names(df: pd.DataFrame) -> pd.DataFrame:
     if missing.any():
         fallback = pd.Series([f"Observation #{i}" for i in range(1, len(df) + 1)], index=df.index)
         df.loc[missing, "observationName"] = fallback[missing]
+    return df
+
+
+def normalize_image_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Recognizes an optional per-occurrence photo URL column under any of
+    _IMAGE_ALIASES and renames it to the canonical `imageUrl` -- unlike
+    catalogNumber/observationName above, this is genuinely optional (no
+    synthesized fallback) and rides through to occurrence.parquet untouched,
+    same as any other unrecognized column would; this just widens which
+    column names are picked up as the intended one. See
+    frontend/data/uploadLocalSpeciesDataSource.normalize.ts, which reads
+    this exact column name back out as SpeciesOccurrence.mediaUrl."""
+    if "imageUrl" not in df.columns:
+        col = _find_column(list(df.columns), _IMAGE_ALIASES)
+        if not col:
+            return df
+        df = df.rename(columns={col: "imageUrl"})
+    df = df.copy()
+    blank = df["imageUrl"].isna() | (df["imageUrl"].astype(str).str.strip() == "")
+    df.loc[blank, "imageUrl"] = None
     return df
 
 
@@ -895,7 +1046,66 @@ def _package_archive(
     return archive_path
 
 
-def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
+def _add_metadata_to_archive(
+    archive_path: Path,
+    *,
+    description_profile: dict | None = None,
+    image_bytes: bytes | None = None,
+    image_filename: str | None = None,
+    image_url: str | None = None,
+    image_license: str | None = None,
+    image_license_url: str | None = None,
+    image_creator: str | None = None,
+    image_rights_holder: str | None = None,
+) -> None:
+    """Appends upload_metadata.json (plus an embedded image, if any bytes
+    were given) to an already-built archive -- a separate pass from
+    _package_archive above rather than a parameter on it, since this is the
+    one part of the archive that's optional and per-caller (a plain re-upload
+    has none of it; a species download always has description_profile +
+    image_url; a custom upload has whichever of these the user opted into).
+    A no-op if the caller has nothing to add, so plain re-uploads' archives
+    are byte-for-byte what they always were.
+
+    imageFile (when present) names the zip member the actual image bytes are
+    stored under, for an uploaded image -- works fully offline once
+    downloaded. imageUrl alone (no imageFile) is a plain remote URL --
+    convenient (no re-upload needed for e.g. a species' existing photo, or a
+    custom upload pointing at one already hosted somewhere) but requires
+    network access to actually display.
+    """
+    metadata: dict = {}
+    if description_profile is not None:
+        metadata["descriptionProfile"] = description_profile
+    if image_bytes:
+        ext = Path(image_filename or "").suffix or ".jpg"
+        metadata["imageFile"] = f"taxon_image{ext}"
+    if image_url:
+        metadata["imageUrl"] = image_url
+    if image_license:
+        metadata["imageLicense"] = image_license
+    if image_license_url:
+        metadata["imageLicenseUrl"] = image_license_url
+    if image_creator:
+        metadata["imageCreator"] = image_creator
+    if image_rights_holder:
+        metadata["imageRightsHolder"] = image_rights_holder
+    if not metadata:
+        return
+    with zipfile.ZipFile(archive_path, "a", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("upload_metadata.json", json.dumps(metadata))
+        if image_bytes:
+            zf.writestr(metadata["imageFile"], image_bytes)
+
+
+def build_archive(
+    df: pd.DataFrame,
+    *,
+    generate_description: bool = False,
+    image_bytes: bytes | None = None,
+    image_filename: str | None = None,
+    image_url: str | None = None,
+) -> tuple[Path, str, Path]:
     """Compute stats and package all outputs into a ZIP archive.
 
     Returns ``(archive_path, archive_filename, work_dir)``. The caller is
@@ -912,6 +1122,16 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
         process_observations_df(work_dir, filtered, layer_meta)
         _add_ternary_classification_overlay(work_dir, layer_meta)
         archive_path = _package_archive(work_dir, df, layer_meta, archive_name)
+        description_profile = (
+            build_description_profile_for_df(work_dir, df) if generate_description else None
+        )
+        _add_metadata_to_archive(
+            archive_path,
+            description_profile=description_profile,
+            image_bytes=image_bytes,
+            image_filename=image_filename,
+            image_url=image_url,
+        )
     except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise

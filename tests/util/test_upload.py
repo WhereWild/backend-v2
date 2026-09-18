@@ -4,11 +4,14 @@
 
 import json
 import shutil
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from fastapi import HTTPException
 
@@ -144,6 +147,42 @@ def test_ensure_observation_names_fills_missing_and_blank():
     assert result["observationName"].iloc[0] == "Observation #1"
     assert result["observationName"].iloc[1] == "Cedar"
     assert result["observationName"].iloc[2] == "Observation #3"
+
+
+# ---------------------------------------------------------------------------
+# normalize_image_column
+# ---------------------------------------------------------------------------
+
+def test_normalize_image_column_already_present():
+    df = pd.DataFrame({"imageUrl": ["https://example.com/a.jpg"]})
+    result = up.normalize_image_column(df)
+    assert list(result["imageUrl"]) == ["https://example.com/a.jpg"]
+
+
+def test_normalize_image_column_alias():
+    df = pd.DataFrame({"photo_url": ["https://example.com/b.jpg"], "x": [1]})
+    result = up.normalize_image_column(df)
+    assert "imageUrl" in result.columns
+    assert "photo_url" not in result.columns
+    assert list(result["imageUrl"]) == ["https://example.com/b.jpg"]
+
+
+def test_normalize_image_column_absent_when_no_alias_matches():
+    df = pd.DataFrame({"x": [1, 2]})
+    result = up.normalize_image_column(df)
+    assert "imageUrl" not in result.columns
+
+
+def test_normalize_image_column_blanks_become_none():
+    # pandas normalizes an assigned None to NaN on an object column -- both
+    # serialize identically to a parquet/JSON null downstream, so check
+    # missing-ness (pd.isna) rather than exact identity to None.
+    df = pd.DataFrame({"imageUrl": ["https://example.com/c.jpg", "", "  ", None]})
+    result = up.normalize_image_column(df)
+    assert result["imageUrl"].iloc[0] == "https://example.com/c.jpg"
+    assert pd.isna(result["imageUrl"].iloc[1])
+    assert pd.isna(result["imageUrl"].iloc[2])
+    assert pd.isna(result["imageUrl"].iloc[3])
 
 
 # ---------------------------------------------------------------------------
@@ -522,3 +561,148 @@ def test_build_archive_generic_exception_wraps_as_500():
             up.build_archive(df)
     assert exc.value.status_code == 500
     assert "crash" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# _load_legend_full
+# ---------------------------------------------------------------------------
+
+def test_load_legend_full_missing_file_returns_empty_dict(tmp_path):
+    with patch("util.upload._LEGEND_DIR", tmp_path):
+        assert up._load_legend_full("nonexistent") == {}
+
+
+def test_load_legend_full_returns_whole_document(tmp_path):
+    legend = {
+        "classes": [{"id": 1, "name": "Forest"}],
+        "attribute_axes": {"forest": [{"values": ["temperate"]}]},
+    }
+    (tmp_path / "landcover_legend.json").write_text(json.dumps(legend))
+    with patch("util.upload._LEGEND_DIR", tmp_path):
+        result = up._load_legend_full("landcover")
+    assert result == legend
+
+
+# ---------------------------------------------------------------------------
+# _build_location_counts_table
+# ---------------------------------------------------------------------------
+
+def test_build_location_counts_table_tallies_each_level():
+    df = pd.DataFrame({
+        "level0Gid": ["USA", "USA", "USA"],
+        "level1Gid": ["USA.CA", "USA.CA", "USA.OR"],
+        "level2Gid": [None, None, None],
+    })
+    table = up._build_location_counts_table(df)
+    rows = {(r["scope"], r["gid"]): r["count"] for r in table.to_pylist()}
+    assert rows[("gadm_level0", "USA")] == 3
+    assert rows[("gadm_level1", "USA.CA")] == 2
+    assert rows[("gadm_level1", "USA.OR")] == 1
+    assert ("gadm_level2", None) not in rows
+
+
+def test_build_location_counts_table_none_when_no_gid_columns():
+    df = pd.DataFrame({"catalogNumber": ["A", "B"]})
+    assert up._build_location_counts_table(df) is None
+
+
+# ---------------------------------------------------------------------------
+# build_description_profile_for_df
+# ---------------------------------------------------------------------------
+
+def test_build_description_profile_for_df_uses_local_stats_and_locations(tmp_path):
+    numerical = pa.Table.from_pylist([
+        {"variable": "elevation", "min": 100.0, "max": 2000.0, "mean": 900.0},
+    ])
+    pq.write_table(numerical, tmp_path / up.NUMERICAL_STATS_FILE)
+    nominal = pa.Table.from_pylist([
+        {"variable": "kg2", "metric": "class_1", "value": 0.9},
+    ])
+    pq.write_table(nominal, tmp_path / up.NOMINAL_STATS_FILE)
+
+    df = pd.DataFrame({
+        "level0Gid": ["USA", "USA"],
+        "level1Gid": ["USA.CA", "USA.CA"],
+    })
+
+    fake_hierarchy = {
+        "USA": {"name": "United States", "level": 0, "parent_gid": None},
+        "USA.CA": {"name": "California", "level": 1, "parent_gid": "USA"},
+    }
+    fake_kg2_legend = [{"id": 1, "name": "Tropical", "group": "tropical", "group_label": "tropical"}]
+
+    with patch("util.upload._load_hierarchy", return_value=fake_hierarchy), \
+         patch("util.upload._load_legend", side_effect=lambda lid: fake_kg2_legend if lid == "kg2" else []), \
+         patch("util.upload._load_legend_full", return_value={}):
+        profile = up.build_description_profile_for_df(tmp_path, df)
+
+    assert "sections" in profile
+    section_ids = {s["id"] for s in profile["sections"]}
+    assert "locations" in section_ids
+    assert "climate" in section_ids
+    assert "terrain" in section_ids
+
+
+def test_build_description_profile_for_df_empty_work_dir_still_returns_profile(tmp_path):
+    df = pd.DataFrame({"catalogNumber": ["A"]})
+    with patch("util.upload._load_hierarchy", return_value={}):
+        profile = up.build_description_profile_for_df(tmp_path, df)
+    assert profile == {"sections": []}
+
+
+# ---------------------------------------------------------------------------
+# _add_metadata_to_archive
+# ---------------------------------------------------------------------------
+
+def _make_empty_zip(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("occurrence.parquet", b"placeholder")
+
+
+def test_add_metadata_to_archive_noop_when_nothing_given(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    up._add_metadata_to_archive(archive_path)
+    with zipfile.ZipFile(archive_path) as zf:
+        assert "upload_metadata.json" not in zf.namelist()
+
+
+def test_add_metadata_to_archive_writes_description_profile(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    profile = {"sections": [{"id": "climate", "title": "Climates", "lines": []}]}
+    up._add_metadata_to_archive(archive_path, description_profile=profile)
+    with zipfile.ZipFile(archive_path) as zf:
+        metadata = json.loads(zf.read("upload_metadata.json"))
+    assert metadata == {"descriptionProfile": profile}
+
+
+def test_add_metadata_to_archive_embeds_uploaded_image_bytes(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    up._add_metadata_to_archive(
+        archive_path,
+        image_bytes=b"\xff\xd8\xff\xe0fakejpegbytes",
+        image_filename="my photo.JPG",
+    )
+    with zipfile.ZipFile(archive_path) as zf:
+        metadata = json.loads(zf.read("upload_metadata.json"))
+        assert metadata["imageFile"] == "taxon_image.JPG"
+        assert zf.read("taxon_image.JPG") == b"\xff\xd8\xff\xe0fakejpegbytes"
+
+
+def test_add_metadata_to_archive_stores_image_url_without_embedding(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    up._add_metadata_to_archive(
+        archive_path,
+        image_url="https://example.com/photo.jpg",
+        image_license="CC BY 4.0",
+        image_creator="Someone",
+    )
+    with zipfile.ZipFile(archive_path) as zf:
+        metadata = json.loads(zf.read("upload_metadata.json"))
+        assert "imageFile" not in metadata
+        assert metadata["imageUrl"] == "https://example.com/photo.jpg"
+        assert metadata["imageLicense"] == "CC BY 4.0"
+        assert metadata["imageCreator"] == "Someone"

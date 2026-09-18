@@ -24,7 +24,7 @@ import duckdb
 import httpx
 import pandas as pd
 import psutil
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from shapely.geometry.base import BaseGeometry
@@ -391,6 +391,7 @@ def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
 
 _MAX_UPLOAD_ROWS = 50_000
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # well above what 50k CSV/TSV/Parquet rows needs
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024  # plenty for a single photo
 _MAX_CONCURRENT_UPLOAD_JOBS = 20  # bounds worst-case memory (up to 50k-row DataFrame each) between TTL sweeps
 _DONE_TTL_SECONDS = 3600  # archive stays available for 1 hour after completion
 
@@ -405,6 +406,11 @@ class _UploadJob:
     work_dir: Path | None = None
     error: str | None = None
     done_at: float | None = None
+    # "Extra options" from the upload form -- see upload_raw_observations.
+    generate_description: bool = False
+    image_bytes: bytes | None = None
+    image_filename: str | None = None
+    image_url: str | None = None
 
 
 _upload_queue: list[str] = []        # ordered job IDs waiting to run
@@ -425,7 +431,14 @@ async def _upload_consumer() -> None:
             df = await run_in_threadpool(upload.enrich_with_gadm, job.df)
             df = await run_in_threadpool(upload.enrich_with_gis, df)
             df = await run_in_threadpool(upload.enrich_with_temporal, df)
-            archive_path, archive_name, work_dir = await run_in_threadpool(upload.build_archive, df)
+            archive_path, archive_name, work_dir = await run_in_threadpool(
+                upload.build_archive,
+                df,
+                generate_description=job.generate_description,
+                image_bytes=job.image_bytes,
+                image_filename=job.image_filename,
+                image_url=job.image_url,
+            )
             job.archive_path = archive_path
             job.archive_name = archive_name
             job.work_dir = work_dir
@@ -3198,11 +3211,23 @@ def _clear_temporal_versioned_caches() -> None:
 async def upload_raw_observations(
     request: Request,
     file: UploadFile = File(...),
+    generate_description: bool = Form(False),
+    image: UploadFile | None = File(None),
+    image_url: str | None = Form(None),
 ) -> JSONResponse:
     """Accept a CSV, TSV, or Parquet file and queue it for processing.
 
     Returns a job ID immediately. Poll /upload/status/{job_id} for progress,
     then fetch the result from /upload/download/{job_id} when status is 'done'.
+
+    "Extra options", all optional: generate_description asks the job to run
+    util.descriptions' same rule-based writeup the species page uses, fed
+    from this upload's own computed stats (see
+    upload.build_description_profile_for_df). image/image_url are mutually
+    usable but serve different offline guarantees -- an uploaded image's
+    bytes are embedded straight into the archive (fully offline once
+    downloaded), while image_url is stored as a plain string (no re-upload
+    needed, but requires network access to actually display).
     """
     filename = file.filename or ""
     suffix = Path(filename).suffix.lower()
@@ -3265,11 +3290,30 @@ async def upload_raw_observations(
     df = upload.normalize_timestamp_column(df)
     df = upload.ensure_catalog_numbers(df)
     df = upload.ensure_observation_names(df)
+    df = upload.normalize_image_column(df)
     df = upload.validate_coordinates(df)
     upload.check_reserved_columns(df, static_layer_ids)
 
+    image_bytes: bytes | None = None
+    image_filename: str | None = None
+    if image is not None and image.filename:
+        image_bytes = await image.read()
+        if len(image_bytes) > _MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Image exceeds the {_MAX_IMAGE_BYTES // (1024 * 1024)}MB size limit.",
+            )
+        image_filename = image.filename
+
     job_id = str(uuid.uuid4())
-    _upload_jobs[job_id] = _UploadJob(job_id=job_id, df=df)
+    _upload_jobs[job_id] = _UploadJob(
+        job_id=job_id,
+        df=df,
+        generate_description=generate_description,
+        image_bytes=image_bytes,
+        image_filename=image_filename,
+        image_url=image_url or None,
+    )
     _upload_queue.append(job_id)
 
     return JSONResponse(

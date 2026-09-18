@@ -46,6 +46,7 @@ from util.gis import (
     sample_soil_texture_batch,
     sample_vector_batch,
 )
+from util.rankings import POSITION_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -930,13 +931,16 @@ def _package_archive(
     """Write occurrence.parquet + categorical_value_lookup/variable_metadata/
     locations, then zip them alongside whatever stats files the caller has
     already written into ``work_dir`` (numerical/nominal/ordinal/circular
-    stats, density, density_grid) into one archive.
+    stats, density, density_grid, relative-rank positions) into one archive.
 
     Shared by the upload path (stats computed fresh via
     process_observations_df) and the taxon-download path (stats copied from
     the tree's precomputed GLOBAL_STATS_DIR) — this function only cares that
     the stats files already exist in work_dir under their standard names,
-    not how they got there.
+    not how they got there. Relative-rank positions are download-only (a
+    custom upload has no tree ancestors to rank against), so
+    ``work_dir / POSITION_FILE`` simply won't exist on that path and this
+    entry is skipped, same as every other optional file here.
 
     ``include_csv`` also zips a .csv alongside every .parquet member — cheap
     for upload-sized data, but pandas' to_csv() on a real taxon's full
@@ -1021,6 +1025,7 @@ def _package_archive(
         (work_dir / CIRCULAR_STATS_FILE,        CIRCULAR_STATS_FILE),
         (work_dir / DENSITY_FILE,               DENSITY_FILE),
         (work_dir / DENSITY_GRID_FILE,          DENSITY_GRID_FILE),
+        (work_dir / POSITION_FILE,              POSITION_FILE),
         (lookup_path,                           "categorical_value_lookup.parquet"),
         (meta_path,                             "variable_metadata.parquet"),
         (locations_path,                        "locations.parquet"),

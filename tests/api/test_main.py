@@ -2925,6 +2925,42 @@ def test_upload_image_too_large_rejected():
     assert r.status_code == 413
 
 
+def test_upload_parent_taxon_id_rejected_when_unknown():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]), \
+         patch("main.taxa.get_taxon_by_id", return_value=None):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"parent_taxon_id": "does-not-exist"},
+        )
+    assert r.status_code == 422
+
+
+def test_upload_parent_taxon_id_stored_on_job_when_valid():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]), \
+         patch("main.taxa.get_taxon_by_id", return_value={"taxon_key": "42"}):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"parent_taxon_id": "42"},
+        )
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.parent_taxon_id == "42"
+
+
+def test_upload_without_parent_taxon_id_stays_none():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.parent_taxon_id is None
+
+
 def test_upload_tsv_parsed_correctly():
     tsv = b"latitude\tlongitude\n45.0\t-120.0\n"
     with patch("util.tiles.load_layers", return_value=[]):

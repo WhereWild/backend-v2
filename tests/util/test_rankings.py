@@ -311,6 +311,111 @@ def test_batch_metric_values_no_files(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# resolve_context_label (public re-export of _resolve_context_label)
+# ---------------------------------------------------------------------------
+
+def test_resolve_context_label_public_matches_private():
+    taxon = {"taxon_key": "1", "scientific_name": "Plantae", "common_name": ""}
+    assert rk.resolve_context_label(taxon) == rk._resolve_context_label(taxon)
+
+
+# ---------------------------------------------------------------------------
+# read_rank_context_groups / rank_value_against_group
+# (custom-upload parent-taxon ranking -- see util.upload.
+#  compute_relative_ranks_for_upload)
+# ---------------------------------------------------------------------------
+
+def _write_rankings_file(tmp_path, rows: list[dict]):
+    pq.write_table(pa.table({
+        "taxon_key": [r.get("taxon_key", "t") for r in rows],
+        "variable": [r["variable"] for r in rows],
+        "metric": [r["metric"] for r in rows],
+        "value": [r["value"] for r in rows],
+        "position": [r.get("position", 0) for r in rows],
+        "count": [r["count"] for r in rows],
+        "sampleCount": [r.get("sampleCount", 0) for r in rows],
+        "contextTaxonId": [r["contextTaxonId"] for r in rows],
+        "rank": [r["rank"] for r in rows],
+        "contextLabel": [r.get("contextLabel", "") for r in rows],
+    }), tmp_path / rk.RANKINGS_FILE)
+
+
+def test_read_rank_context_groups_groups_by_variable_and_metric(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    _write_rankings_file(tmp_path, [
+        {"variable": "bio1", "metric": "mean", "value": 5.0, "count": 3,
+         "contextTaxonId": "42", "rank": "SPECIES"},
+        {"variable": "bio1", "metric": "mean", "value": 1.0, "count": 3,
+         "contextTaxonId": "42", "rank": "SPECIES"},
+        {"variable": "bio1", "metric": "mean", "value": 3.0, "count": 3,
+         "contextTaxonId": "42", "rank": "SPECIES"},
+        {"variable": "bio1", "metric": "std", "value": 0.5, "count": 3,
+         "contextTaxonId": "42", "rank": "SPECIES"},
+        # Different context / rank -- must not leak into the "42"/"SPECIES" groups.
+        {"variable": "bio1", "metric": "mean", "value": 99.0, "count": 1,
+         "contextTaxonId": "999", "rank": "SPECIES"},
+        {"variable": "bio1", "metric": "mean", "value": 99.0, "count": 1,
+         "contextTaxonId": "42", "rank": "GENUS"},
+    ])
+
+    groups = rk.read_rank_context_groups("42", "SPECIES")
+
+    assert set(groups.keys()) == {("bio1", "mean"), ("bio1", "std")}
+    assert list(groups[("bio1", "mean")]["value"]) == [1.0, 3.0, 5.0]
+
+
+def test_read_rank_context_groups_no_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(rk, "GLOBAL_STATS_DIR", tmp_path)
+    assert rk.read_rank_context_groups("42", "SPECIES") == {}
+
+
+def test_rank_value_against_group_inserts_in_the_middle():
+    group = pd.DataFrame({"value": [1.0, 3.0, 5.0], "count": [3, 3, 3]})
+    result = rk.rank_value_against_group(4.0, group)
+    assert result == {"position": 2, "count": 4}
+
+
+def test_rank_value_against_group_ties_share_the_lower_position():
+    """Matches _write_rank_positions' min-rank convention: a value tied with
+    an existing member gets that member's (lower) position, not a position
+    after it."""
+    group = pd.DataFrame({"value": [1.0, 3.0, 3.0, 5.0], "count": [4, 4, 4, 4]})
+    result = rk.rank_value_against_group(3.0, group)
+    assert result["position"] == 1
+
+
+def test_rank_value_against_group_above_everyone_gets_a_valid_percentile():
+    """A value ranked above every existing member must still compute to a
+    percentile <= 1.0 downstream (main.py's (position+1)/count) -- count is
+    incremented, not left at the group's original size."""
+    group = pd.DataFrame({"value": [1.0, 2.0], "count": [2, 2]})
+    result = rk.rank_value_against_group(99.0, group)
+    assert result == {"position": 2, "count": 3}
+    assert (result["position"] + 1) / result["count"] <= 1.0
+
+
+def test_rank_value_against_group_below_everyone():
+    group = pd.DataFrame({"value": [1.0, 2.0], "count": [2, 2]})
+    result = rk.rank_value_against_group(-5.0, group)
+    assert result == {"position": 0, "count": 3}
+
+
+def test_rank_value_against_group_class_metric_offsets_by_implicit_zeros():
+    """A nominal/ordinal class_ fraction group only holds taxa with nonzero
+    presence in that class (see _write_rank_positions) -- its `count`
+    column still reflects the TRUE population including the taxa who are
+    implicitly absent (0.0) and thus omitted from `group` entirely. A real
+    nonzero value must be offset up by however many implicit zeros exist
+    below it, not just searched against the 2 members actually present."""
+    # 5 total taxa in this context/rank/variable/metric population, but only
+    # 2 of them have nonzero presence (the other 3 are implicit zeros).
+    group = pd.DataFrame({"value": [0.2, 0.6], "count": [5, 5]})
+    result = rk.rank_value_against_group(0.4, group)
+    # 3 implicit zeros + 1 real value (0.2) below 0.4 = position 4.
+    assert result == {"position": 4, "count": 6}
+
+
+# ---------------------------------------------------------------------------
 # RankingsSink
 # ---------------------------------------------------------------------------
 

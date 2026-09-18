@@ -606,6 +606,368 @@ def test_build_archive_generic_exception_wraps_as_500():
 
 
 # ---------------------------------------------------------------------------
+# _resolve_own_rankable_values / compute_relative_ranks_for_upload
+# (custom-upload "extra options" parent-taxon ranking)
+# ---------------------------------------------------------------------------
+
+_RATIO_LAYER_META = {
+    "bio1": {"id": "bio1", "value_type": "ratio"},
+    "aspect_deg": {"id": "aspect_deg", "value_type": "circular"},
+}
+
+
+def test_resolve_own_rankable_values_numeric_variable(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+        "min": [1.0],
+        "max": [9.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    result = up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META)
+
+    assert result[("bio1", "mean")] == (5.0, 42)
+    assert result[("bio1", "min")] == (1.0, 42)
+    assert result[("bio1", "max")] == (9.0, 42)
+
+
+def test_resolve_own_rankable_values_skips_variable_below_sample_threshold(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [5],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    result = up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META)
+
+    assert result == {}
+
+
+def test_resolve_own_rankable_values_skips_unknown_variable(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["not_in_layer_meta"],
+        "count": [42],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    result = up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META)
+
+    assert result == {}
+
+
+def test_resolve_own_rankable_values_includes_circular_metrics(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["aspect_deg"],
+        "count": [42],
+        "circular_mean": [180.0],
+        "rbar": [0.8],
+    }), tmp_path / up.CIRCULAR_STATS_FILE)
+
+    result = up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META)
+
+    assert result[("aspect_deg", "circular_mean")] == (180.0, 42)
+    assert result[("aspect_deg", "rbar")] == (0.8, 42)
+
+
+def test_resolve_own_rankable_values_no_files(tmp_path):
+    assert up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META) == {}
+
+
+_NOMINAL_LAYER_META = {"kg2": {"id": "kg2", "value_type": "nominal"}}
+_ORDINAL_LAYER_META = {"salinity": {"id": "salinity", "value_type": "ordinal"}}
+
+
+def _write_tall_stats(path, rows):
+    pq.write_table(pa.table({
+        "variable": [r[0] for r in rows],
+        "metric": [r[1] for r in rows],
+        "value": [r[2] for r in rows],
+    }), path)
+
+
+def test_resolve_own_rankable_values_includes_nominal_metrics(tmp_path):
+    _write_tall_stats(tmp_path / up.NOMINAL_STATS_FILE, [
+        ("kg2", "total_samples", 50.0),
+        ("kg2", "unique_classes", 3.0),
+        ("kg2", "entropy", 0.9),
+        ("kg2", "mode", 5.0),  # excluded -- a class id, not comparable across taxa
+        ("kg2", "class_5", 0.6),
+        ("kg2", "class_2", 0.0),  # excluded -- zero presence, no row at all
+    ])
+
+    result = up._resolve_own_rankable_values(tmp_path, _NOMINAL_LAYER_META)
+
+    assert result == {
+        ("kg2", "total_samples"): (50.0, 50),
+        ("kg2", "unique_classes"): (3.0, 50),
+        ("kg2", "entropy"): (0.9, 50),
+        ("kg2", "class_5"): (0.6, 50),
+    }
+
+
+def test_resolve_own_rankable_values_nominal_below_sample_threshold(tmp_path):
+    _write_tall_stats(tmp_path / up.NOMINAL_STATS_FILE, [
+        ("kg2", "total_samples", 5.0),
+        ("kg2", "class_5", 0.6),
+    ])
+
+    assert up._resolve_own_rankable_values(tmp_path, _NOMINAL_LAYER_META) == {}
+
+
+def test_resolve_own_rankable_values_ordinal_prefers_count_over_total_samples(tmp_path):
+    _write_tall_stats(tmp_path / up.ORDINAL_STATS_FILE, [
+        ("salinity", "count", 42.0),
+        ("salinity", "total_samples", 999.0),
+        ("salinity", "median", 3.0),  # excluded -- an ordinal class id
+        ("salinity", "unique_classes", 4.0),
+        ("salinity", "class_1", 0.3),
+    ])
+
+    result = up._resolve_own_rankable_values(tmp_path, _ORDINAL_LAYER_META)
+
+    # sample_count comes from "count" (42), not "total_samples" (999) --
+    # matches _write_rank_positions' own count-then-total_samples priority.
+    assert result == {
+        ("salinity", "count"): (42.0, 42),
+        ("salinity", "total_samples"): (999.0, 42),
+        ("salinity", "unique_classes"): (4.0, 42),
+        ("salinity", "class_1"): (0.3, 42),
+    }
+
+
+def test_resolve_own_rankable_values_categorical_skips_wrong_value_type(tmp_path):
+    _write_tall_stats(tmp_path / up.NOMINAL_STATS_FILE, [
+        ("salinity", "total_samples", 50.0),
+        ("salinity", "class_1", 0.6),
+    ])
+    # salinity is declared ordinal in the layer meta, not nominal.
+    assert up._resolve_own_rankable_values(tmp_path, _ORDINAL_LAYER_META) == {}
+
+
+def test_compute_relative_ranks_for_upload_returns_none_for_unknown_taxon(tmp_path):
+    with patch("util.upload.get_taxon_by_id", return_value=None):
+        result = up.compute_relative_ranks_for_upload(tmp_path, {}, "999")
+    assert result is None
+    assert not (tmp_path / up.POSITION_FILE).exists()
+
+
+def test_compute_relative_ranks_for_upload_returns_none_with_no_rankable_stats(tmp_path):
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor):
+        result = up.compute_relative_ranks_for_upload(tmp_path, {}, "42")
+    assert result is None
+    assert not (tmp_path / up.POSITION_FILE).exists()
+
+
+def test_compute_relative_ranks_for_upload_writes_position_file(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    group = pd.DataFrame({"value": [1.0, 3.0, 9.0], "count": [3, 3, 3]})
+
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor), \
+         patch("util.upload.get_ancestors", return_value=[]), \
+         patch("util.upload.read_rank_context_groups", return_value={("bio1", "mean"): group}):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _RATIO_LAYER_META, "42")
+
+    assert result == [{
+        "variable": "bio1",
+        "metric": "mean",
+        "position": 2,  # 5.0 slots after 1.0 and 3.0, before 9.0
+        "count": 4,
+        "sampleCount": 42,
+        "contextLabel": "Testaceae",
+    }]
+
+    written = pq.read_table(tmp_path / up.POSITION_FILE).to_pylist()
+    assert written == result
+
+
+def test_compute_relative_ranks_for_upload_ranks_against_every_ancestor_up_the_tree(tmp_path):
+    """A selected genus parent must also produce context rows for its own
+    ancestors (family, order, ...), same as a real taxon's own lineage."""
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    genus = {"taxon_key": "42", "scientific_name": "Testus"}
+    family = {"taxon_key": "43", "scientific_name": "Testaceae"}
+    order = {"taxon_key": "44", "scientific_name": "Testales"}
+    groups_by_context = {
+        "42": {("bio1", "mean"): pd.DataFrame({"value": [1.0, 3.0], "count": [2, 2]})},
+        "43": {("bio1", "mean"): pd.DataFrame({"value": [1.0, 3.0, 9.0], "count": [3, 3, 3]})},
+        "44": {},  # no siblings ranked at this level -- contributes nothing
+    }
+
+    with patch("util.upload.get_taxon_by_id", return_value=genus), \
+         patch("util.upload.get_ancestors", return_value=[family, order]), \
+         patch(
+             "util.upload.read_rank_context_groups",
+             side_effect=lambda context_id, _rank: groups_by_context[context_id],
+         ):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _RATIO_LAYER_META, "42")
+
+    assert result == [
+        {
+            "variable": "bio1", "metric": "mean", "position": 2, "count": 3,
+            "sampleCount": 42, "contextLabel": "Testus",
+        },
+        {
+            "variable": "bio1", "metric": "mean", "position": 2, "count": 4,
+            "sampleCount": 42, "contextLabel": "Testaceae",
+        },
+    ]
+
+
+def test_compute_relative_ranks_for_upload_ranks_nominal_class_metric(tmp_path):
+    """End-to-end: a nominal class_ fraction gets ranked with the implicit-
+    zero offset applied, not just searched against the group's own (nonzero-
+    only) members."""
+    _write_tall_stats(tmp_path / up.NOMINAL_STATS_FILE, [
+        ("kg2", "total_samples", 50.0),
+        ("kg2", "class_5", 0.4),
+    ])
+
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    # 5 total in the population, only 2 have nonzero class_5 presence.
+    group = pd.DataFrame({"value": [0.1, 0.6], "count": [5, 5]})
+
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor), \
+         patch("util.upload.get_ancestors", return_value=[]), \
+         patch("util.upload.read_rank_context_groups", return_value={("kg2", "class_5"): group}):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _NOMINAL_LAYER_META, "42")
+
+    assert result == [{
+        "variable": "kg2",
+        "metric": "class_5",
+        "position": 4,  # 3 implicit zeros + 0.1 below 0.4
+        "count": 6,
+        "sampleCount": 50,
+        "contextLabel": "Testaceae",
+    }]
+
+
+def test_compute_relative_ranks_for_upload_skips_metrics_with_no_sibling_group(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+        "min": [1.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    # Only "mean" has a sibling group under this ancestor -- "min" has none.
+    group = pd.DataFrame({"value": [1.0, 9.0], "count": [2, 2]})
+
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor), \
+         patch("util.upload.get_ancestors", return_value=[]), \
+         patch("util.upload.read_rank_context_groups", return_value={("bio1", "mean"): group}):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _RATIO_LAYER_META, "42")
+
+    assert len(result) == 1
+    assert result[0]["metric"] == "mean"
+
+
+def test_compute_relative_ranks_for_upload_returns_none_when_ancestor_has_no_groups(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor), \
+         patch("util.upload.get_ancestors", return_value=[]), \
+         patch("util.upload.read_rank_context_groups", return_value={}):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _RATIO_LAYER_META, "42")
+
+    assert result is None
+    assert not (tmp_path / up.POSITION_FILE).exists()
+
+
+def test_build_archive_writes_relative_ranks_when_parent_taxon_id_given():
+    df = _make_minimal_df()
+    fake_rows = [{"variable": "bio1", "metric": "mean", "position": 1,
+                  "count": 2, "sampleCount": 42, "contextLabel": "Testaceae"}]
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch(
+             "util.upload.compute_relative_ranks_for_upload",
+             return_value=fake_rows,
+         ) as mock_compute:
+        archive_path, _, work_dir = up.build_archive(df, parent_taxon_id="42")
+    try:
+        mock_compute.assert_called_once_with(work_dir, {}, "42")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def test_parent_taxon_filename_suffix_uses_same_slug_convention_as_download():
+    taxon = {"taxon_key": "42", "scientific_name": "Testus taxus"}
+    with patch("util.upload.get_taxon_by_id", return_value=taxon):
+        assert up._parent_taxon_filename_suffix("42") == "testus-taxus-42"
+
+
+def test_parent_taxon_filename_suffix_none_for_unknown_taxon():
+    with patch("util.upload.get_taxon_by_id", return_value=None):
+        assert up._parent_taxon_filename_suffix("999") is None
+
+
+def test_build_archive_names_zip_with_parent_taxon_suffix():
+    df = _make_minimal_df()
+    taxon = {"taxon_key": "42", "scientific_name": "Testus taxus"}
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch("util.upload.get_taxon_by_id", return_value=taxon), \
+         patch("util.upload.compute_relative_ranks_for_upload", return_value=None):
+        archive_path, archive_name, work_dir = up.build_archive(
+            df, parent_taxon_id="42",
+        )
+    try:
+        assert archive_name == "processed_observations-testus-taxus-42.zip"
+        assert archive_path.name == archive_name
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def test_build_archive_keeps_plain_name_for_unresolvable_parent_taxon_id():
+    df = _make_minimal_df()
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch("util.upload.get_taxon_by_id", return_value=None):
+        archive_path, archive_name, work_dir = up.build_archive(
+            df, parent_taxon_id="does-not-exist",
+        )
+    try:
+        assert archive_name == "processed_observations.zip"
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def test_build_archive_skips_ranking_without_parent_taxon_id():
+    df = _make_minimal_df()
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch("util.upload.compute_relative_ranks_for_upload") as mock_compute:
+        archive_path, _, work_dir = up.build_archive(df)
+    try:
+        mock_compute.assert_not_called()
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # _load_legend_full
 # ---------------------------------------------------------------------------
 

@@ -548,6 +548,48 @@ def test_parse_custom_layer_metadata_valid_categorical_layer_with_legend():
     ]
 
 
+def test_parse_custom_layer_metadata_ordinal_render_min_max_spans_class_ids():
+    """Ordinal coloring is a gradient keyed to (classId - render_min) /
+    (render_max - render_min) -- render_min/max must span the class id
+    range (matching every built-in ordinal layer's own catalog.json
+    convention, e.g. salinity: render_min=0/render_max=4 for classes 0..4),
+    not stay None, or the gradient collapses to a single color."""
+    raw = json.dumps([{
+        "id": "my_layer", "name": "My Layer", "valueType": "ordinal",
+        "legendClasses": [
+            {"id": 2, "name": "Medium", "color": "#ff0"},
+            {"id": 0, "name": "Low", "color": "#0f0"},
+            {"id": 4, "name": "High", "color": "#f00"},
+        ],
+    }])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows[0]["render_min"] == 0.0
+    assert rows[0]["render_max"] == 4.0
+
+
+def test_parse_custom_layer_metadata_nominal_also_gets_render_min_max():
+    """Nominal doesn't need render_min/max for its own pixel coloring (it
+    uses legendClasses.color directly), but setting it anyway is harmless
+    and keeps the two categorical value types consistent."""
+    raw = json.dumps([{
+        "id": "my_layer", "name": "My Layer", "valueType": "nominal",
+        "legendClasses": [
+            {"id": 5, "name": "Forest", "color": "#0f0"},
+            {"id": 9, "name": "Water", "color": "#00f"},
+        ],
+    }])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows[0]["render_min"] == 5.0
+    assert rows[0]["render_max"] == 9.0
+
+
+def test_parse_custom_layer_metadata_no_legend_leaves_render_min_max_none():
+    raw = json.dumps([{"id": "my_layer", "valueType": "ratio"}])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows[0]["render_min"] is None
+    assert rows[0]["render_max"] is None
+
+
 def test_parse_custom_layer_metadata_invalid_json_raises_422():
     with pytest.raises(HTTPException) as exc:
         up.parse_custom_layer_metadata("not json")

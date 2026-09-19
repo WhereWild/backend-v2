@@ -1155,8 +1155,11 @@ def parse_custom_layer_metadata(raw_json: str | None) -> list[dict]:
 
         legend_classes_raw = entry.get("legendClasses") or entry.get("legend_classes")
         legend_json: str | None = None
+        render_min: float | None = None
+        render_max: float | None = None
         if value_type in ("nominal", "ordinal") and legend_classes_raw:
             try:
+                class_ids = [int(cls["id"]) for cls in legend_classes_raw]
                 legend_json = json.dumps([
                     {
                         "id": int(cls["id"]),
@@ -1170,6 +1173,19 @@ def parse_custom_layer_metadata(raw_json: str | None) -> list[dict]:
                     status_code=422,
                     detail=f"custom_layer_metadata[{i}] has invalid legendClasses: {exc}",
                 ) from exc
+            if class_ids:
+                # Ordinal coloring is a gradient keyed to (classId - render_min)
+                # / (render_max - render_min) -- it never uses a class's own
+                # color at the pixel/marker level (that's nominal's job; see
+                # cogTileRenderer.ts's colorsById, only populated when
+                # isNominal). Every built-in ordinal layer in catalog.json
+                # sets render_min/render_max to its class-id range (e.g.
+                # salinity: 0/4 for classes 0..4), not a data statistic --
+                # mirror that exactly so a custom ordinal layer's gradient
+                # spans its own classes instead of collapsing to a single
+                # color with the range left at None.
+                render_min = float(min(class_ids))
+                render_max = float(max(class_ids))
 
         rows.append({
             "id":            layer_id,
@@ -1182,8 +1198,8 @@ def parse_custom_layer_metadata(raw_json: str | None) -> list[dict]:
             "group":         None,
             "group_label":   None,
             "sort_order":    20000 + i,  # after static + temporal layer entries
-            "render_min":    None,
-            "render_max":    None,
+            "render_min":    render_min,
+            "render_max":    render_max,
             "legend_classes": legend_json,
             "_legend_key":   layer_id,
         })

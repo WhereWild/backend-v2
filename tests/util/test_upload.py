@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import io
 import json
 import shutil
 import zipfile
@@ -1246,6 +1247,15 @@ def test_build_description_profile_for_df_empty_work_dir_still_returns_profile(t
 def _make_empty_zip(path: Path) -> None:
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("occurrence.parquet", b"placeholder")
+
+
+def test_ensure_observation_names_fills_a_column_that_is_empty_for_every_row():
+    # An all-empty CSV column is read back as float64 -- assigning the
+    # "Observation #N" fallback into it used to raise a TypeError.
+    df = pd.read_csv(io.StringIO("observationName,decimalLatitude\n,1\n,2\n"))
+    assert df["observationName"].dtype == "float64"
+    out = up.ensure_observation_names(df)
+    assert list(out["observationName"]) == ["Observation #1", "Observation #2"]
 
 
 def test_add_metadata_to_archive_noop_when_nothing_given(tmp_path):

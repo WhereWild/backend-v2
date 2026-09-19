@@ -401,6 +401,10 @@ class _UploadJob:
     job_id: str
     df: pd.DataFrame
     status: str = "queued"       # queued | processing | done | error
+    # Human-readable sub-stage within "processing", surfaced to the upload
+    # page's progress message -- see _upload_consumer, which sets this
+    # right before each major pipeline step. None while queued/done/error.
+    stage: str | None = None
     archive_path: Path | None = None
     archive_name: str | None = None
     work_dir: Path | None = None
@@ -435,9 +439,13 @@ async def _upload_consumer() -> None:
             continue
         job.status = "processing"
         try:
+            job.stage = "Matching observations to countries and regions"
             df = await run_in_threadpool(upload.enrich_with_gadm, job.df)
+            job.stage = "Sampling environmental layers"
             df = await run_in_threadpool(upload.enrich_with_gis, df)
+            job.stage = "Sampling recent weather"
             df = await run_in_threadpool(upload.enrich_with_temporal, df)
+            job.stage = "Computing statistics"
             archive_path, archive_name, work_dir = await run_in_threadpool(
                 upload.build_archive,
                 df,
@@ -456,6 +464,7 @@ async def _upload_consumer() -> None:
             job.status = "error"
             job.error = str(exc)
         finally:
+            job.stage = None
             job.done_at = time.monotonic()
 
 
@@ -3380,7 +3389,13 @@ async def upload_job_status(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found or expired.")
     position = _upload_queue.index(job_id) + 1 if job_id in _upload_queue else 0
-    return {"job_id": job_id, "status": job.status, "position": position, "error": job.error}
+    return {
+        "job_id": job_id,
+        "status": job.status,
+        "position": position,
+        "stage": job.stage,
+        "error": job.error,
+    }
 
 
 @app.get("/upload/download/{job_id}")

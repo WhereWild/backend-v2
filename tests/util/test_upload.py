@@ -1266,6 +1266,15 @@ def test_add_metadata_to_archive_writes_description_profile(tmp_path):
     assert metadata == {"descriptionProfile": profile}
 
 
+def test_add_metadata_to_archive_records_parent_taxon_id(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    up._add_metadata_to_archive(archive_path, parent_taxon_id="6SRLS")
+    with zipfile.ZipFile(archive_path) as zf:
+        metadata = json.loads(zf.read("upload_metadata.json"))
+    assert metadata == {"parentTaxonId": "6SRLS"}
+
+
 def test_add_metadata_to_archive_embeds_uploaded_image_bytes(tmp_path):
     archive_path = tmp_path / "a.zip"
     _make_empty_zip(archive_path)

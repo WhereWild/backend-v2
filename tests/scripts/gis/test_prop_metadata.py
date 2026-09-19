@@ -15,7 +15,12 @@ CATALOG = {
             "id": "test",
             "display_name": "Test",
             "layers": [
-                {"id": "bio1", "filename": "bio1.tif", "value_type": "interval"},
+                {
+                    "id": "bio1",
+                    "filename": "bio1.tif",
+                    "value_type": "interval",
+                    "display_name": "Annual Mean Temperature",
+                },
                 {"id": "koppen", "filename": "koppen.tif", "value_type": "nominal"},
                 {"id": "salinity", "filename": "salinity.tif", "value_type": "ordinal"},
                 {"id": "no_legend", "filename": "no_legend.tif", "value_type": "nominal"},
@@ -160,6 +165,41 @@ def test_embed_metadata_continuous_layer_writes_no_legend_tag(tmp_path):
     mock_ds.update_tags.assert_called_once_with(WHEREWILD_VALUE_TYPE="interval")
 
 
+def test_embed_metadata_writes_the_display_name_when_given(tmp_path):
+    mock_ds = _mock_dataset({})
+    with patch("scripts.gis.prop_metadata.rasterio.open", return_value=mock_ds):
+        changed = pm._embed_metadata(
+            tmp_path / "bio1.tif", "interval", [], "Annual Mean Temperature"
+        )
+    assert changed is True
+    mock_ds.update_tags.assert_called_once_with(
+        WHEREWILD_VALUE_TYPE="interval",
+        WHEREWILD_NAME="Annual Mean Temperature",
+    )
+
+
+def test_embed_metadata_rewrites_when_only_the_display_name_changed(tmp_path):
+    mock_ds = _mock_dataset(
+        {"WHEREWILD_VALUE_TYPE": "interval", "WHEREWILD_NAME": "Old name"}
+    )
+    with patch("scripts.gis.prop_metadata.rasterio.open", return_value=mock_ds):
+        changed = pm._embed_metadata(tmp_path / "bio1.tif", "interval", [], "New name")
+    assert changed is True
+    mock_ds.update_tags.assert_called_once()
+
+
+def test_embed_metadata_no_op_when_the_display_name_is_already_current(tmp_path):
+    mock_ds = _mock_dataset(
+        {"WHEREWILD_VALUE_TYPE": "interval", "WHEREWILD_NAME": "Annual Mean Temperature"}
+    )
+    with patch("scripts.gis.prop_metadata.rasterio.open", return_value=mock_ds):
+        changed = pm._embed_metadata(
+            tmp_path / "bio1.tif", "interval", [], "Annual Mean Temperature"
+        )
+    assert changed is False
+    mock_ds.update_tags.assert_not_called()
+
+
 # --- main --------------------------------------------------------------------
 
 
@@ -186,7 +226,12 @@ def test_main_embeds_metadata_for_each_recognized_layer(tmp_path, monkeypatch, c
     with patch("scripts.gis.prop_metadata.rasterio.open", side_effect=fake_open):
         pm.main()
 
-    assert calls["bio1.tif"] == {"WHEREWILD_VALUE_TYPE": "interval"}
+    assert calls["bio1.tif"] == {
+        "WHEREWILD_VALUE_TYPE": "interval",
+        "WHEREWILD_NAME": "Annual Mean Temperature",
+    }
+    # A catalog entry with no display_name gets no name tag at all.
+    assert "WHEREWILD_NAME" not in calls["koppen.tif"]
     assert calls["koppen.tif"]["WHEREWILD_VALUE_TYPE"] == "nominal"
     assert json.loads(calls["koppen.tif"]["WHEREWILD_LEGEND"]) == [
         {"id": 1, "name": "Tropical", "color": "#ff0000"},

@@ -598,6 +598,10 @@ def ensure_observation_names(df: pd.DataFrame) -> pd.DataFrame:
     missing = df["observationName"].isna() | (df["observationName"].astype(str).str.strip() == "")
     if missing.any():
         fallback = pd.Series([f"Observation #{i}" for i in range(1, len(df) + 1)], index=df.index)
+        # A column that's empty for every row (e.g. an empty CSV column) is
+        # read as float64, which can't hold these strings -- pandas raises
+        # rather than upcasting.
+        df["observationName"] = df["observationName"].astype(object)
         df.loc[missing, "observationName"] = fallback[missing]
     return df
 

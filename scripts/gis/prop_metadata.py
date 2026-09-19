@@ -3,16 +3,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
-Embeds this project's own WHEREWILD_VALUE_TYPE/WHEREWILD_LEGEND GDAL
-metadata into every GeoTIFF in data/gis/layers/, from the exact same
+Embeds this project's own WHEREWILD_VALUE_TYPE/WHEREWILD_LEGEND/
+WHEREWILD_NAME GDAL metadata into every GeoTIFF in data/gis/layers/, from the exact same
 catalog/legend data the map/API already serve from -- so any of these
 production layers, dropped straight into frontend's /gis-editor for local
 inspection, opens already configured with the correct data type and full
 legend instead of falling back to /gis-editor's own (deliberately
 conservative, sample-based) auto-detection.
 
-WHAT GETS WRITTEN, AND WHY THOSE TWO ITEMS SPECIFICALLY
-    Two dataset-level (no `sample` attribute -- these apply to the whole
+WHAT GETS WRITTEN, AND WHY THOSE ITEMS SPECIFICALLY
+    Three dataset-level (no `sample` attribute -- these apply to the whole
     file, not one band) GDAL_METADATA items, exactly matching what
     frontend/components/gisEditor/tiffMetadataWriter.ts writes when a user
     manually saves a file from /gis-editor, and what
@@ -37,6 +37,11 @@ WHAT GETS WRITTEN, AND WHY THOSE TWO ITEMS SPECIFICALLY
                              just a sane starting legend swatch, same as
                              it is in the frontend's own auto-detected
                              default).
+      WHEREWILD_NAME        The layer's catalog display_name (e.g. "Annual
+                             Mean Temperature"), which /gis-editor shows as
+                             the layer's Display Name instead of the bare
+                             file name (bio1.tif). Skipped for a layer with
+                             no display_name.
 
 WHY EMBEDDING THIS MATTERS BEYOND JUST SAVING A DETECTION PASS
     Some of this can't be recovered from pixel values at all, no matter
@@ -152,10 +157,15 @@ def _classes_for_layer(layer_id: str, value_type: str, cb_colors: dict) -> list[
     return classes
 
 
-def _embed_metadata(path: Path, value_type: str, classes: list[dict]) -> bool:
-    """Writes WHEREWILD_VALUE_TYPE/WHEREWILD_LEGEND, returning True if
-    anything actually changed (so main() can report real work done vs. an
-    already-up-to-date no-op)."""
+def _embed_metadata(
+    path: Path,
+    value_type: str,
+    classes: list[dict],
+    display_name: str | None = None,
+) -> bool:
+    """Writes WHEREWILD_VALUE_TYPE/WHEREWILD_LEGEND/WHEREWILD_NAME,
+    returning True if anything actually changed (so main() can report real
+    work done vs. an already-up-to-date no-op)."""
     legend_json = json.dumps(classes, separators=(",", ":")) if classes else None
     # IGNORE_COG_LAYOUT_BREAK: same reasoning as build_overviews.py's own
     # _fill_nodata_with_zero -- a tag-only edit via r+ against an
@@ -167,16 +177,21 @@ def _embed_metadata(path: Path, value_type: str, classes: list[dict]) -> bool:
         up_to_date = (
             tags.get("WHEREWILD_VALUE_TYPE") == value_type
             and tags.get("WHEREWILD_LEGEND") == legend_json
+            and tags.get("WHEREWILD_NAME") == display_name
         )
         if up_to_date:
             return False
         new_tags = {"WHEREWILD_VALUE_TYPE": value_type}
         if legend_json is not None:
             new_tags["WHEREWILD_LEGEND"] = legend_json
+        if display_name is not None:
+            new_tags["WHEREWILD_NAME"] = display_name
         # update_tags() merges into the existing domain rather than
         # replacing it -- if a layer's catalog value_type ever changes
         # away from nominal/ordinal (legend_json now None), this won't
-        # clear a stale WHEREWILD_LEGEND left over from when it wasn't.
+        # clear a stale WHEREWILD_LEGEND left over from when it wasn't
+        # (and likewise a display_name later removed from the catalog
+        # leaves the old WHEREWILD_NAME in place).
         # Not worth a full SetMetadata reset for a case that shouldn't
         # come up in practice (a layer's measurement level changing at
         # all is rare); worth knowing if it ever does.
@@ -208,8 +223,9 @@ def main() -> None:
             if value_type in ("nominal", "ordinal") and layer_id
             else []
         )
+        display_name = str(layer.get("display_name") or "").strip() or None
         try:
-            if _embed_metadata(path, value_type, classes):
+            if _embed_metadata(path, value_type, classes, display_name):
                 print(
                     f"[prop-metadata] embedded {value_type} "
                     f"({len(classes)} classes) -> {path.name}"

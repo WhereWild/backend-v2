@@ -118,6 +118,31 @@ def get_children(taxon_key: Any) -> list[TaxonRecord]:
     return [catalog[k] for k in _children_index().get(str(taxon_key), []) if k in catalog]
 
 
+def get_ancestors(taxon: TaxonRecord) -> list[TaxonRecord]:
+    """Ancestors of `taxon`, immediate parent first, up through the root.
+
+    Walks `path` (a "/"-joined lineage string, e.g. "Root/Plantae/.../Genus")
+    one segment at a time rather than following any stored parent-key field
+    -- each prefix of `path` IS an ancestor's own `path`, resolvable back to
+    that ancestor's taxon_key via `_path_index()`. A root-level taxon's path
+    has no "/", so the walk naturally stops there.
+    """
+    catalog = load_catalog()
+    path_to_key = _path_index()
+    path = taxon["path"]
+    ancestors: list[TaxonRecord] = []
+    while "/" in path:
+        path = path.rsplit("/", 1)[0]
+        key = path_to_key.get(path)
+        if key is None:
+            break
+        parent = catalog.get(key)
+        if parent is None:
+            break
+        ancestors.append(parent)
+    return ancestors
+
+
 def iter_descendants(taxon: TaxonRecord, *, include_self: bool = True) -> Iterable[TaxonRecord]:
     """DFS over a taxon and all its descendants."""
     if include_self:

@@ -30,6 +30,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from util.rankings import POSITION_FILE
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -43,11 +44,43 @@ from util.stats import (
 from util.storage import ParquetStorage
 from util.taxa import TaxonRecord
 from util.upload import (
+    _add_metadata_to_archive,
     _add_ternary_classification_overlay,
     _build_layer_meta,
     _build_temporal_var_meta,
     _package_archive,
+    build_description_profile_for_df,
 )
+
+# Duplicated (not imported) from main.py's identically-named helper to avoid
+# a circular import (main.py -> util.download; the reverse would cycle).
+# Keep in sync if the taxon dict's image_* field naming ever changes.
+
+
+def _license_label(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = re.search(r"/publicdomain/zero/([^/]+)/", url)
+    if m:
+        return f"CC0 {m.group(1)}"
+    m = re.search(r"/licenses/([^/]+)/([^/]+)/", url)
+    if m:
+        parts = m.group(1).split("-")
+        return "CC " + "-".join(p.upper() for p in parts) + " " + m.group(2)
+    return url
+
+
+def _image_fields(taxon: TaxonRecord) -> dict:
+    """Return unified image_* fields, preferring iNat over GBIF backup."""
+    prefix = "inat_preferred" if taxon.get("inat_preferred_image") else "gbif_backup"
+    license_url = taxon.get(f"{prefix}_image_license") or None
+    return {
+        "image_url": taxon.get(f"{prefix}_image") or None,
+        "image_license": _license_label(license_url),
+        "image_license_url": license_url,
+        "image_creator": taxon.get(f"{prefix}_image_creator") or None,
+        "image_rights_holder": taxon.get(f"{prefix}_image_attribution") or None,
+    }
 
 _STATS_FILES = (
     NUMERICAL_STATS_FILE,
@@ -56,6 +89,7 @@ _STATS_FILES = (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
     DENSITY_GRID_FILE,
+    POSITION_FILE,
 )
 
 
@@ -107,6 +141,27 @@ def _add_location_gid(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _add_media_license_label(df: pd.DataFrame) -> pd.DataFrame:
+    """Each occurrence row stores a raw mediaLicense URL, not a display label
+    (see scripts/populate_tree.py) -- split it into mediaLicenseUrl (the raw
+    URL) + mediaLicense (a human-readable label, e.g. "CC BY 4.0"), matching
+    SpeciesOccurrence.mediaLicense/mediaLicenseUrl's own convention (see
+    main.py's identical derivation for the live /gis/... occurrence routes:
+    media_license_url = the raw column, media_license = _license_label(it)).
+    Without this, occurrence.parquet carried a bare URL under the name the
+    frontend expects to already be a short label, so every per-occurrence
+    photo's license silently failed to render.
+    """
+    if "mediaLicense" not in df.columns:
+        return df
+    result = df.copy()
+    result["mediaLicenseUrl"] = result["mediaLicense"]
+    # .map(..., na_action="ignore") leaves NaN rows as NaN instead of passing
+    # them to _license_label, which expects str | None, not a bare float NaN.
+    result["mediaLicense"] = result["mediaLicense"].map(_license_label, na_action="ignore")
+    return result
+
+
 def build_species_archive(
     taxon: TaxonRecord, storage: ParquetStorage,
 ) -> tuple[Path, str, Path] | None:
@@ -119,6 +174,7 @@ def build_species_archive(
     if df is None or df.empty:
         return None
     df = _add_location_gid(df)
+    df = _add_media_license_label(df)
 
     layer_meta = _build_layer_meta()
     for row in _build_temporal_var_meta(df):
@@ -130,6 +186,22 @@ def build_species_archive(
         _copy_taxon_stats(work_dir, str(taxon["taxon_key"]), storage)
         _add_ternary_classification_overlay(work_dir, layer_meta)
         archive_path = _package_archive(work_dir, df, layer_meta, archive_name, include_csv=False)
+        # Always included (not gated behind an option, unlike the custom
+        # upload's own checkbox/image field) -- a species already HAS a real
+        # description and image, so there's no "opt in" question here, and a
+        # re-imported species download needs to exercise the exact same
+        # description/image display path a custom upload does.
+        description_profile = build_description_profile_for_df(work_dir, df)
+        image_fields = _image_fields(taxon)
+        _add_metadata_to_archive(
+            archive_path,
+            description_profile=description_profile,
+            image_url=image_fields["image_url"],
+            image_license=image_fields["image_license"],
+            image_license_url=image_fields["image_license_url"],
+            image_creator=image_fields["image_creator"],
+            image_rights_holder=image_fields["image_rights_holder"],
+        )
     except Exception:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise

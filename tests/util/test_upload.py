@@ -2,13 +2,17 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+import io
 import json
 import shutil
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from fastapi import HTTPException
 
@@ -144,6 +148,42 @@ def test_ensure_observation_names_fills_missing_and_blank():
     assert result["observationName"].iloc[0] == "Observation #1"
     assert result["observationName"].iloc[1] == "Cedar"
     assert result["observationName"].iloc[2] == "Observation #3"
+
+
+# ---------------------------------------------------------------------------
+# normalize_image_column
+# ---------------------------------------------------------------------------
+
+def test_normalize_image_column_already_present():
+    df = pd.DataFrame({"imageUrl": ["https://example.com/a.jpg"]})
+    result = up.normalize_image_column(df)
+    assert list(result["imageUrl"]) == ["https://example.com/a.jpg"]
+
+
+def test_normalize_image_column_alias():
+    df = pd.DataFrame({"photo_url": ["https://example.com/b.jpg"], "x": [1]})
+    result = up.normalize_image_column(df)
+    assert "imageUrl" in result.columns
+    assert "photo_url" not in result.columns
+    assert list(result["imageUrl"]) == ["https://example.com/b.jpg"]
+
+
+def test_normalize_image_column_absent_when_no_alias_matches():
+    df = pd.DataFrame({"x": [1, 2]})
+    result = up.normalize_image_column(df)
+    assert "imageUrl" not in result.columns
+
+
+def test_normalize_image_column_blanks_become_none():
+    # pandas normalizes an assigned None to NaN on an object column -- both
+    # serialize identically to a parquet/JSON null downstream, so check
+    # missing-ness (pd.isna) rather than exact identity to None.
+    df = pd.DataFrame({"imageUrl": ["https://example.com/c.jpg", "", "  ", None]})
+    result = up.normalize_image_column(df)
+    assert result["imageUrl"].iloc[0] == "https://example.com/c.jpg"
+    assert pd.isna(result["imageUrl"].iloc[1])
+    assert pd.isna(result["imageUrl"].iloc[2])
+    assert pd.isna(result["imageUrl"].iloc[3])
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +473,169 @@ def test_build_archive_generates_categorical_value_lookup():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def test_build_archive_categorical_value_lookup_uses_inline_legend_for_custom_layer():
+    """A custom layer has no on-disk legend file for _load_legend() to find
+    -- its classes travel as an inline JSON string on the layer_meta entry
+    instead (see parse_custom_layer_metadata), same as a temporal layer's
+    own synthetic legend_classes."""
+    import zipfile
+    df = pd.DataFrame({
+        "catalogNumber": ["OBS1"],
+        "decimalLatitude": [45.0],
+        "decimalLongitude": [-120.0],
+        "my_layer": [3.0],
+    })
+    fake_meta = {
+        "my_layer": {
+            "id": "my_layer", "value_type": "nominal",
+            "legend_classes": '[{"id": 3, "name": "Wetland", "color": "#00f"}]',
+            "_legend_key": "my_layer",
+        },
+    }
+    import io
+    # _load_legend forced to return [] for everything -- if the code fell
+    # back to it instead of using the inline legend_classes JSON, the
+    # lookup row below would come back empty and the assertion would fail.
+    with patch("util.upload._build_layer_meta", return_value=fake_meta), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch("util.upload._load_legend", return_value=[]):
+        archive_path, _, work_dir = up.build_archive(df)
+    try:
+        with zipfile.ZipFile(archive_path) as zf:
+            table = pq.read_table(io.BytesIO(zf.read("categorical_value_lookup.parquet")))
+        rows = table.to_pylist()
+        assert rows == [{
+            "variable": "my_layer", "code": "3", "metric": "class_3",
+            "label": "Wetland", "group": "", "groupLabel": "",
+        }]
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# parse_custom_layer_metadata
+# ---------------------------------------------------------------------------
+
+def test_parse_custom_layer_metadata_none_returns_empty():
+    assert up.parse_custom_layer_metadata(None) == []
+
+
+def test_parse_custom_layer_metadata_empty_string_returns_empty():
+    assert up.parse_custom_layer_metadata("") == []
+
+
+def test_parse_custom_layer_metadata_valid_continuous_layer():
+    raw = json.dumps([{"id": "my_layer", "name": "My Layer", "valueType": "ratio", "units": "mm"}])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows == [{
+        "id": "my_layer", "name": "My Layer", "units": "mm", "imperial_unit": None,
+        "value_type": "ratio", "domain": "continuous", "category": "Custom Layers",
+        "group": None, "group_label": None, "sort_order": 20000,
+        "render_min": None, "render_max": None, "legend_classes": None,
+        "_legend_key": "my_layer",
+    }]
+
+
+def test_parse_custom_layer_metadata_valid_categorical_layer_with_legend():
+    raw = json.dumps([{
+        "id": "my_layer", "name": "My Layer", "valueType": "nominal",
+        "legendClasses": [{"id": 1, "name": "Forest", "color": "#0f0"}],
+    }])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows[0]["domain"] == "discrete"
+    assert json.loads(rows[0]["legend_classes"]) == [
+        {"id": 1, "name": "Forest", "color": "#0f0"},
+    ]
+
+
+def test_parse_custom_layer_metadata_ordinal_render_min_max_spans_class_ids():
+    """Ordinal coloring is a gradient keyed to (classId - render_min) /
+    (render_max - render_min) -- render_min/max must span the class id
+    range (matching every built-in ordinal layer's own catalog.json
+    convention, e.g. salinity: render_min=0/render_max=4 for classes 0..4),
+    not stay None, or the gradient collapses to a single color."""
+    raw = json.dumps([{
+        "id": "my_layer", "name": "My Layer", "valueType": "ordinal",
+        "legendClasses": [
+            {"id": 2, "name": "Medium", "color": "#ff0"},
+            {"id": 0, "name": "Low", "color": "#0f0"},
+            {"id": 4, "name": "High", "color": "#f00"},
+        ],
+    }])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows[0]["render_min"] == 0.0
+    assert rows[0]["render_max"] == 4.0
+
+
+def test_parse_custom_layer_metadata_nominal_also_gets_render_min_max():
+    """Nominal doesn't need render_min/max for its own pixel coloring (it
+    uses legendClasses.color directly), but setting it anyway is harmless
+    and keeps the two categorical value types consistent."""
+    raw = json.dumps([{
+        "id": "my_layer", "name": "My Layer", "valueType": "nominal",
+        "legendClasses": [
+            {"id": 5, "name": "Forest", "color": "#0f0"},
+            {"id": 9, "name": "Water", "color": "#00f"},
+        ],
+    }])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows[0]["render_min"] == 5.0
+    assert rows[0]["render_max"] == 9.0
+
+
+def test_parse_custom_layer_metadata_no_legend_leaves_render_min_max_none():
+    raw = json.dumps([{"id": "my_layer", "valueType": "ratio"}])
+    rows = up.parse_custom_layer_metadata(raw)
+    assert rows[0]["render_min"] is None
+    assert rows[0]["render_max"] is None
+
+
+def test_parse_custom_layer_metadata_invalid_json_raises_422():
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata("not json")
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_non_array_raises_422():
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(json.dumps({"id": "x"}))
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_missing_id_raises_422():
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(json.dumps([{"valueType": "ratio"}]))
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_duplicate_id_raises_422():
+    raw = json.dumps([
+        {"id": "my_layer", "valueType": "ratio"},
+        {"id": "my_layer", "valueType": "ratio"},
+    ])
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(raw)
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_unsupported_value_type_raises_422():
+    raw = json.dumps([{"id": "my_layer", "valueType": "circular"}])
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(raw)
+    assert exc.value.status_code == 422
+
+
+def test_parse_custom_layer_metadata_invalid_legend_classes_raises_422():
+    raw = json.dumps([{
+        "id": "my_layer", "valueType": "nominal",
+        "legendClasses": [{"name": "missing id"}],
+    }])
+    with pytest.raises(HTTPException) as exc:
+        up.parse_custom_layer_metadata(raw)
+    assert exc.value.status_code == 422
+
+
 def test_build_archive_includes_variable_metadata():
     import io
     import zipfile
@@ -505,6 +708,48 @@ def test_build_archive_no_lookup_when_no_nominal_layers():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def test_package_archive_includes_relative_ranks_when_present(tmp_path):
+    """Relative-rank positions are download-only: _copy_taxon_stats (in
+    util/download.py) writes relative_ranks_positions.parquet into work_dir
+    before _package_archive runs, exactly like the other stats files, so
+    this only asserts _package_archive's own files_to_zip wiring picks it up
+    when present -- a plain upload never writes this file, so it's absent
+    there (see the next test)."""
+    df = _make_minimal_df()
+    pq.write_table(
+        pa.Table.from_pylist([
+            {"variable": "bio1", "metric": "mean", "position": 4, "count": 10,
+             "sampleCount": 25, "contextLabel": "Testaceae"},
+        ]),
+        tmp_path / up.POSITION_FILE,
+    )
+    import io
+    archive_path = up._package_archive(tmp_path, df, {}, "a.zip")
+    with zipfile.ZipFile(archive_path) as zf:
+        names = zf.namelist()
+        assert up.POSITION_FILE in names
+        table = pq.read_table(io.BytesIO(zf.read(up.POSITION_FILE)))
+    assert table.to_pylist()[0]["contextLabel"] == "Testaceae"
+
+
+def test_build_archive_omits_relative_ranks_for_plain_upload():
+    """A custom CSV upload has no tree ancestors to rank against, so nothing
+    ever writes relative_ranks_positions.parquet into its work_dir -- the
+    archive simply doesn't have the entry, same as every other file here
+    that _package_archive skips when missing."""
+    df = _make_minimal_df()
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"):
+        archive_path, _, work_dir = up.build_archive(df)
+    try:
+        with zipfile.ZipFile(archive_path) as zf:
+            names = zf.namelist()
+        assert up.POSITION_FILE not in names
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def test_build_archive_http_exception_reraises_and_cleans_up():
     df = _make_minimal_df()
     with patch("util.upload._build_layer_meta", return_value={}), \
@@ -522,3 +767,551 @@ def test_build_archive_generic_exception_wraps_as_500():
             up.build_archive(df)
     assert exc.value.status_code == 500
     assert "crash" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# _resolve_own_rankable_values / compute_relative_ranks_for_upload
+# (custom-upload "extra options" parent-taxon ranking)
+# ---------------------------------------------------------------------------
+
+_RATIO_LAYER_META = {
+    "bio1": {"id": "bio1", "value_type": "ratio"},
+    "aspect_deg": {"id": "aspect_deg", "value_type": "circular"},
+}
+
+
+def test_resolve_own_rankable_values_numeric_variable(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+        "min": [1.0],
+        "max": [9.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    result = up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META)
+
+    assert result[("bio1", "mean")] == (5.0, 42)
+    assert result[("bio1", "min")] == (1.0, 42)
+    assert result[("bio1", "max")] == (9.0, 42)
+
+
+def test_resolve_own_rankable_values_skips_variable_below_sample_threshold(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [5],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    result = up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META)
+
+    assert result == {}
+
+
+def test_resolve_own_rankable_values_skips_unknown_variable(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["not_in_layer_meta"],
+        "count": [42],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    result = up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META)
+
+    assert result == {}
+
+
+def test_resolve_own_rankable_values_includes_circular_metrics(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["aspect_deg"],
+        "count": [42],
+        "circular_mean": [180.0],
+        "rbar": [0.8],
+    }), tmp_path / up.CIRCULAR_STATS_FILE)
+
+    result = up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META)
+
+    assert result[("aspect_deg", "circular_mean")] == (180.0, 42)
+    assert result[("aspect_deg", "rbar")] == (0.8, 42)
+
+
+def test_resolve_own_rankable_values_no_files(tmp_path):
+    assert up._resolve_own_rankable_values(tmp_path, _RATIO_LAYER_META) == {}
+
+
+_NOMINAL_LAYER_META = {"kg2": {"id": "kg2", "value_type": "nominal"}}
+_ORDINAL_LAYER_META = {"salinity": {"id": "salinity", "value_type": "ordinal"}}
+
+
+def _write_tall_stats(path, rows):
+    pq.write_table(pa.table({
+        "variable": [r[0] for r in rows],
+        "metric": [r[1] for r in rows],
+        "value": [r[2] for r in rows],
+    }), path)
+
+
+def test_resolve_own_rankable_values_includes_nominal_metrics(tmp_path):
+    _write_tall_stats(tmp_path / up.NOMINAL_STATS_FILE, [
+        ("kg2", "total_samples", 50.0),
+        ("kg2", "unique_classes", 3.0),
+        ("kg2", "entropy", 0.9),
+        ("kg2", "mode", 5.0),  # excluded -- a class id, not comparable across taxa
+        ("kg2", "class_5", 0.6),
+        ("kg2", "class_2", 0.0),  # excluded -- zero presence, no row at all
+    ])
+
+    result = up._resolve_own_rankable_values(tmp_path, _NOMINAL_LAYER_META)
+
+    assert result == {
+        ("kg2", "total_samples"): (50.0, 50),
+        ("kg2", "unique_classes"): (3.0, 50),
+        ("kg2", "entropy"): (0.9, 50),
+        ("kg2", "class_5"): (0.6, 50),
+    }
+
+
+def test_resolve_own_rankable_values_nominal_below_sample_threshold(tmp_path):
+    _write_tall_stats(tmp_path / up.NOMINAL_STATS_FILE, [
+        ("kg2", "total_samples", 5.0),
+        ("kg2", "class_5", 0.6),
+    ])
+
+    assert up._resolve_own_rankable_values(tmp_path, _NOMINAL_LAYER_META) == {}
+
+
+def test_resolve_own_rankable_values_ordinal_prefers_count_over_total_samples(tmp_path):
+    _write_tall_stats(tmp_path / up.ORDINAL_STATS_FILE, [
+        ("salinity", "count", 42.0),
+        ("salinity", "total_samples", 999.0),
+        ("salinity", "median", 3.0),  # excluded -- an ordinal class id
+        ("salinity", "unique_classes", 4.0),
+        ("salinity", "class_1", 0.3),
+    ])
+
+    result = up._resolve_own_rankable_values(tmp_path, _ORDINAL_LAYER_META)
+
+    # sample_count comes from "count" (42), not "total_samples" (999) --
+    # matches _write_rank_positions' own count-then-total_samples priority.
+    assert result == {
+        ("salinity", "count"): (42.0, 42),
+        ("salinity", "total_samples"): (999.0, 42),
+        ("salinity", "unique_classes"): (4.0, 42),
+        ("salinity", "class_1"): (0.3, 42),
+    }
+
+
+def test_resolve_own_rankable_values_categorical_skips_wrong_value_type(tmp_path):
+    _write_tall_stats(tmp_path / up.NOMINAL_STATS_FILE, [
+        ("salinity", "total_samples", 50.0),
+        ("salinity", "class_1", 0.6),
+    ])
+    # salinity is declared ordinal in the layer meta, not nominal.
+    assert up._resolve_own_rankable_values(tmp_path, _ORDINAL_LAYER_META) == {}
+
+
+def test_compute_relative_ranks_for_upload_returns_none_for_unknown_taxon(tmp_path):
+    with patch("util.upload.get_taxon_by_id", return_value=None):
+        result = up.compute_relative_ranks_for_upload(tmp_path, {}, "999")
+    assert result is None
+    assert not (tmp_path / up.POSITION_FILE).exists()
+
+
+def test_compute_relative_ranks_for_upload_returns_none_with_no_rankable_stats(tmp_path):
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor):
+        result = up.compute_relative_ranks_for_upload(tmp_path, {}, "42")
+    assert result is None
+    assert not (tmp_path / up.POSITION_FILE).exists()
+
+
+def test_compute_relative_ranks_for_upload_writes_position_file(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    group = pd.DataFrame({"value": [1.0, 3.0, 9.0], "count": [3, 3, 3]})
+
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor), \
+         patch("util.upload.get_ancestors", return_value=[]), \
+         patch("util.upload.read_rank_context_groups", return_value={("bio1", "mean"): group}):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _RATIO_LAYER_META, "42")
+
+    assert result == [{
+        "variable": "bio1",
+        "metric": "mean",
+        "position": 2,  # 5.0 slots after 1.0 and 3.0, before 9.0
+        "count": 4,
+        "sampleCount": 42,
+        "contextLabel": "Testaceae",
+    }]
+
+    written = pq.read_table(tmp_path / up.POSITION_FILE).to_pylist()
+    assert written == result
+
+
+def test_compute_relative_ranks_for_upload_ranks_against_every_ancestor_up_the_tree(tmp_path):
+    """A selected genus parent must also produce context rows for its own
+    ancestors (family, order, ...), same as a real taxon's own lineage."""
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    genus = {"taxon_key": "42", "scientific_name": "Testus"}
+    family = {"taxon_key": "43", "scientific_name": "Testaceae"}
+    order = {"taxon_key": "44", "scientific_name": "Testales"}
+    groups_by_context = {
+        "42": {("bio1", "mean"): pd.DataFrame({"value": [1.0, 3.0], "count": [2, 2]})},
+        "43": {("bio1", "mean"): pd.DataFrame({"value": [1.0, 3.0, 9.0], "count": [3, 3, 3]})},
+        "44": {},  # no siblings ranked at this level -- contributes nothing
+    }
+
+    with patch("util.upload.get_taxon_by_id", return_value=genus), \
+         patch("util.upload.get_ancestors", return_value=[family, order]), \
+         patch(
+             "util.upload.read_rank_context_groups",
+             side_effect=lambda context_id, _rank: groups_by_context[context_id],
+         ):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _RATIO_LAYER_META, "42")
+
+    assert result == [
+        {
+            "variable": "bio1", "metric": "mean", "position": 2, "count": 3,
+            "sampleCount": 42, "contextLabel": "Testus",
+        },
+        {
+            "variable": "bio1", "metric": "mean", "position": 2, "count": 4,
+            "sampleCount": 42, "contextLabel": "Testaceae",
+        },
+    ]
+
+
+def test_compute_relative_ranks_for_upload_ranks_nominal_class_metric(tmp_path):
+    """End-to-end: a nominal class_ fraction gets ranked with the implicit-
+    zero offset applied, not just searched against the group's own (nonzero-
+    only) members."""
+    _write_tall_stats(tmp_path / up.NOMINAL_STATS_FILE, [
+        ("kg2", "total_samples", 50.0),
+        ("kg2", "class_5", 0.4),
+    ])
+
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    # 5 total in the population, only 2 have nonzero class_5 presence.
+    group = pd.DataFrame({"value": [0.1, 0.6], "count": [5, 5]})
+
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor), \
+         patch("util.upload.get_ancestors", return_value=[]), \
+         patch("util.upload.read_rank_context_groups", return_value={("kg2", "class_5"): group}):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _NOMINAL_LAYER_META, "42")
+
+    assert result == [{
+        "variable": "kg2",
+        "metric": "class_5",
+        "position": 4,  # 3 implicit zeros + 0.1 below 0.4
+        "count": 6,
+        "sampleCount": 50,
+        "contextLabel": "Testaceae",
+    }]
+
+
+def test_compute_relative_ranks_for_upload_skips_metrics_with_no_sibling_group(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+        "min": [1.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    # Only "mean" has a sibling group under this ancestor -- "min" has none.
+    group = pd.DataFrame({"value": [1.0, 9.0], "count": [2, 2]})
+
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor), \
+         patch("util.upload.get_ancestors", return_value=[]), \
+         patch("util.upload.read_rank_context_groups", return_value={("bio1", "mean"): group}):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _RATIO_LAYER_META, "42")
+
+    assert len(result) == 1
+    assert result[0]["metric"] == "mean"
+
+
+def test_compute_relative_ranks_for_upload_returns_none_when_ancestor_has_no_groups(tmp_path):
+    pq.write_table(pa.table({
+        "variable": ["bio1"],
+        "count": [42],
+        "mean": [5.0],
+    }), tmp_path / up.NUMERICAL_STATS_FILE)
+
+    ancestor = {"taxon_key": "42", "scientific_name": "Testaceae"}
+    with patch("util.upload.get_taxon_by_id", return_value=ancestor), \
+         patch("util.upload.get_ancestors", return_value=[]), \
+         patch("util.upload.read_rank_context_groups", return_value={}):
+        result = up.compute_relative_ranks_for_upload(tmp_path, _RATIO_LAYER_META, "42")
+
+    assert result is None
+    assert not (tmp_path / up.POSITION_FILE).exists()
+
+
+def test_build_archive_writes_relative_ranks_when_parent_taxon_id_given():
+    df = _make_minimal_df()
+    fake_rows = [{"variable": "bio1", "metric": "mean", "position": 1,
+                  "count": 2, "sampleCount": 42, "contextLabel": "Testaceae"}]
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch("util.upload.get_taxon_by_id", return_value=None), \
+         patch(
+             "util.upload.compute_relative_ranks_for_upload",
+             return_value=fake_rows,
+         ) as mock_compute:
+        archive_path, _, work_dir = up.build_archive(df, parent_taxon_id="42")
+    try:
+        mock_compute.assert_called_once_with(work_dir, {}, "42")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def test_parent_taxon_filename_suffix_uses_same_slug_convention_as_download():
+    taxon = {"taxon_key": "42", "scientific_name": "Testus taxus"}
+    with patch("util.upload.get_taxon_by_id", return_value=taxon):
+        assert up._parent_taxon_filename_suffix("42") == "testus-taxus-42"
+
+
+def test_parent_taxon_filename_suffix_none_for_unknown_taxon():
+    with patch("util.upload.get_taxon_by_id", return_value=None):
+        assert up._parent_taxon_filename_suffix("999") is None
+
+
+def test_build_archive_names_zip_with_parent_taxon_suffix():
+    df = _make_minimal_df()
+    taxon = {"taxon_key": "42", "scientific_name": "Testus taxus"}
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch("util.upload.get_taxon_by_id", return_value=taxon), \
+         patch("util.upload.compute_relative_ranks_for_upload", return_value=None):
+        archive_path, archive_name, work_dir = up.build_archive(
+            df, parent_taxon_id="42",
+        )
+    try:
+        assert archive_name == "processed_observations-testus-taxus-42.zip"
+        assert archive_path.name == archive_name
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def test_build_archive_keeps_plain_name_for_unresolvable_parent_taxon_id():
+    df = _make_minimal_df()
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch("util.upload.get_taxon_by_id", return_value=None):
+        archive_path, archive_name, work_dir = up.build_archive(
+            df, parent_taxon_id="does-not-exist",
+        )
+    try:
+        assert archive_name == "processed_observations.zip"
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def test_build_archive_merges_custom_layer_metadata_into_layer_meta():
+    df = _make_minimal_df()
+    custom_rows = [{
+        "id": "my_layer", "name": "My Layer", "units": None,
+        "imperial_unit": None, "value_type": "ratio", "domain": "continuous",
+        "category": "Custom Layers", "group": None, "group_label": None,
+        "sort_order": 20000, "render_min": None, "render_max": None,
+        "legend_classes": None, "_legend_key": "my_layer",
+    }]
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df") as mock_process:
+        archive_path, _, work_dir = up.build_archive(
+            df, custom_layer_metadata=custom_rows,
+        )
+    try:
+        layer_meta_arg = mock_process.call_args[0][2]
+        assert layer_meta_arg["my_layer"] == custom_rows[0]
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def test_build_archive_skips_ranking_without_parent_taxon_id():
+    df = _make_minimal_df()
+    with patch("util.upload._build_layer_meta", return_value={}), \
+         patch("util.upload._filter_df", side_effect=lambda d: d), \
+         patch("util.upload.process_observations_df"), \
+         patch("util.upload.compute_relative_ranks_for_upload") as mock_compute:
+        archive_path, _, work_dir = up.build_archive(df)
+    try:
+        mock_compute.assert_not_called()
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# _load_legend_full
+# ---------------------------------------------------------------------------
+
+def test_load_legend_full_missing_file_returns_empty_dict(tmp_path):
+    with patch("util.upload._LEGEND_DIR", tmp_path):
+        assert up._load_legend_full("nonexistent") == {}
+
+
+def test_load_legend_full_returns_whole_document(tmp_path):
+    legend = {
+        "classes": [{"id": 1, "name": "Forest"}],
+        "attribute_axes": {"forest": [{"values": ["temperate"]}]},
+    }
+    (tmp_path / "landcover_legend.json").write_text(json.dumps(legend))
+    with patch("util.upload._LEGEND_DIR", tmp_path):
+        result = up._load_legend_full("landcover")
+    assert result == legend
+
+
+# ---------------------------------------------------------------------------
+# _build_location_counts_table
+# ---------------------------------------------------------------------------
+
+def test_build_location_counts_table_tallies_each_level():
+    df = pd.DataFrame({
+        "level0Gid": ["USA", "USA", "USA"],
+        "level1Gid": ["USA.CA", "USA.CA", "USA.OR"],
+        "level2Gid": [None, None, None],
+    })
+    table = up._build_location_counts_table(df)
+    rows = {(r["scope"], r["gid"]): r["count"] for r in table.to_pylist()}
+    assert rows[("gadm_level0", "USA")] == 3
+    assert rows[("gadm_level1", "USA.CA")] == 2
+    assert rows[("gadm_level1", "USA.OR")] == 1
+    assert ("gadm_level2", None) not in rows
+
+
+def test_build_location_counts_table_none_when_no_gid_columns():
+    df = pd.DataFrame({"catalogNumber": ["A", "B"]})
+    assert up._build_location_counts_table(df) is None
+
+
+# ---------------------------------------------------------------------------
+# build_description_profile_for_df
+# ---------------------------------------------------------------------------
+
+def test_build_description_profile_for_df_uses_local_stats_and_locations(tmp_path):
+    numerical = pa.Table.from_pylist([
+        {"variable": "elevation", "min": 100.0, "max": 2000.0, "mean": 900.0},
+    ])
+    pq.write_table(numerical, tmp_path / up.NUMERICAL_STATS_FILE)
+    nominal = pa.Table.from_pylist([
+        {"variable": "kg2", "metric": "class_1", "value": 0.9},
+    ])
+    pq.write_table(nominal, tmp_path / up.NOMINAL_STATS_FILE)
+
+    df = pd.DataFrame({
+        "level0Gid": ["USA", "USA"],
+        "level1Gid": ["USA.CA", "USA.CA"],
+    })
+
+    fake_hierarchy = {
+        "USA": {"name": "United States", "level": 0, "parent_gid": None},
+        "USA.CA": {"name": "California", "level": 1, "parent_gid": "USA"},
+    }
+    fake_kg2_legend = [{"id": 1, "name": "Tropical", "group": "tropical", "group_label": "tropical"}]
+
+    with patch("util.upload._load_hierarchy", return_value=fake_hierarchy), \
+         patch("util.upload._load_legend", side_effect=lambda lid: fake_kg2_legend if lid == "kg2" else []), \
+         patch("util.upload._load_legend_full", return_value={}):
+        profile = up.build_description_profile_for_df(tmp_path, df)
+
+    assert "sections" in profile
+    section_ids = {s["id"] for s in profile["sections"]}
+    assert "locations" in section_ids
+    assert "climate" in section_ids
+    assert "terrain" in section_ids
+
+
+def test_build_description_profile_for_df_empty_work_dir_still_returns_profile(tmp_path):
+    df = pd.DataFrame({"catalogNumber": ["A"]})
+    with patch("util.upload._load_hierarchy", return_value={}):
+        profile = up.build_description_profile_for_df(tmp_path, df)
+    assert profile == {"sections": []}
+
+
+# ---------------------------------------------------------------------------
+# _add_metadata_to_archive
+# ---------------------------------------------------------------------------
+
+def _make_empty_zip(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("occurrence.parquet", b"placeholder")
+
+
+def test_ensure_observation_names_fills_a_column_that_is_empty_for_every_row():
+    # An all-empty CSV column is read back as float64 -- assigning the
+    # "Observation #N" fallback into it used to raise a TypeError.
+    df = pd.read_csv(io.StringIO("observationName,decimalLatitude\n,1\n,2\n"))
+    assert df["observationName"].dtype == "float64"
+    out = up.ensure_observation_names(df)
+    assert list(out["observationName"]) == ["Observation #1", "Observation #2"]
+
+
+def test_add_metadata_to_archive_noop_when_nothing_given(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    up._add_metadata_to_archive(archive_path)
+    with zipfile.ZipFile(archive_path) as zf:
+        assert "upload_metadata.json" not in zf.namelist()
+
+
+def test_add_metadata_to_archive_writes_description_profile(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    profile = {"sections": [{"id": "climate", "title": "Climates", "lines": []}]}
+    up._add_metadata_to_archive(archive_path, description_profile=profile)
+    with zipfile.ZipFile(archive_path) as zf:
+        metadata = json.loads(zf.read("upload_metadata.json"))
+    assert metadata == {"descriptionProfile": profile}
+
+
+def test_add_metadata_to_archive_records_parent_taxon_id(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    up._add_metadata_to_archive(archive_path, parent_taxon_id="6SRLS")
+    with zipfile.ZipFile(archive_path) as zf:
+        metadata = json.loads(zf.read("upload_metadata.json"))
+    assert metadata == {"parentTaxonId": "6SRLS"}
+
+
+def test_add_metadata_to_archive_embeds_uploaded_image_bytes(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    up._add_metadata_to_archive(
+        archive_path,
+        image_bytes=b"\xff\xd8\xff\xe0fakejpegbytes",
+        image_filename="my photo.JPG",
+    )
+    with zipfile.ZipFile(archive_path) as zf:
+        metadata = json.loads(zf.read("upload_metadata.json"))
+        assert metadata["imageFile"] == "taxon_image.JPG"
+        assert zf.read("taxon_image.JPG") == b"\xff\xd8\xff\xe0fakejpegbytes"
+
+
+def test_add_metadata_to_archive_stores_image_url_without_embedding(tmp_path):
+    archive_path = tmp_path / "a.zip"
+    _make_empty_zip(archive_path)
+    up._add_metadata_to_archive(
+        archive_path,
+        image_url="https://example.com/photo.jpg",
+        image_license="CC BY 4.0",
+        image_creator="Someone",
+    )
+    with zipfile.ZipFile(archive_path) as zf:
+        metadata = json.loads(zf.read("upload_metadata.json"))
+        assert "imageFile" not in metadata
+        assert metadata["imageUrl"] == "https://example.com/photo.jpg"
+        assert metadata["imageLicense"] == "CC BY 4.0"
+        assert metadata["imageCreator"] == "Someone"

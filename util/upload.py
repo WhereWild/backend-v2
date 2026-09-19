@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -33,7 +34,8 @@ import pyarrow.parquet as pq
 import rasterio
 from fastapi import HTTPException
 
-from config.config import ZERO_NODATA_LAYERS
+from config.config import METRICS_BY_TYPE, ZERO_NODATA_LAYERS, ValueType, load_config
+from util import descriptions
 from util.gis import (
     COMPOSITION_CLASSIFIERS,
     DERIVED_FROM_ELEVATION,
@@ -45,6 +47,15 @@ from util.gis import (
     sample_soil_texture_batch,
     sample_vector_batch,
 )
+from util.rankings import (
+    MIN_RANKING_SAMPLES,
+    NOMINAL_SKIP_RANK_METRICS,
+    ORDINAL_SKIP_RANK_METRICS,
+    POSITION_FILE,
+    rank_value_against_group,
+    read_rank_context_groups,
+    resolve_context_label,
+)
 from util.stats import (
     CIRCULAR_STATS_FILE,
     DENSITY_FILE,
@@ -55,6 +66,7 @@ from util.stats import (
     _filter_df,
     process_observations_df,
 )
+from util.taxa import get_ancestors, get_taxon_by_id
 from util.temporal import (
     TailBuffer,
     build_chunk_index,
@@ -72,6 +84,8 @@ _LEGEND_DIR = Path("config/gis/legends")
 _GADM_PATH = Path("data/gis/gadm.gpkg")
 _HIERARCHY_PATH = Path("data/gis/locations/hierarchy.csv")
 _CATALOG_PATH = Path("config/gis/catalog.json")
+
+_CONFIG = load_config("global")
 
 _gadm_gdf = None
 _hierarchy: dict[str, dict] | None = None
@@ -163,6 +177,330 @@ def build_locations_table(df: pd.DataFrame) -> pa.Table | None:
         "hierarchy": pa.array(rows_hierarchy, type=pa.string()),
     })
 
+
+# ---------------------------------------------------------------------------
+# Natural-language description (util.descriptions), for an arbitrary
+# self-contained dataset -- shared by the upload path (build_archive) and the
+# taxon-download path (util.download.build_species_archive), same as
+# _package_archive above: both leave a set of standard-named stats files in
+# work_dir first, this just reads them back.
+# ---------------------------------------------------------------------------
+
+def _load_legend_full(layer_id: str) -> dict:
+    path = _LEGEND_DIR / f"{layer_id}_legend.json"
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        return json.load(f)
+
+
+class _InMemoryLocTaxaStorage:
+    """Duck-types util.storage.ParquetStorage's read_table() just enough for
+    descriptions.build_location_text() -- there's only ever one dataset here
+    (this one upload/download job), so the path/filters it's called with are
+    irrelevant; the in-memory table already IS the filtered result."""
+
+    def __init__(self, table: pa.Table):
+        self._table = table
+
+    def read_table(self, path, columns=None, filters=None):  # noqa: ARG002
+        return self._table
+
+
+def _build_location_counts_table(df: pd.DataFrame) -> pa.Table | None:
+    """(scope, gid, count) rows from df's own level0Gid/level1Gid/level2Gid
+    columns -- the exact shape descriptions.build_location_text() expects
+    from a real taxon's precomputed location_taxa.parquet, just derived
+    directly from this one dataset's own rows instead of a stored,
+    taxon-keyed aggregate."""
+    scopes: list[str] = []
+    gids: list[str] = []
+    counts: list[int] = []
+    for col, scope in _CONFIG.location_columns:
+        if col not in df.columns:
+            continue
+        for gid, count in df[col].dropna().value_counts().items():
+            if not gid:
+                continue
+            scopes.append(scope)
+            gids.append(str(gid))
+            counts.append(int(count))
+    if not gids:
+        return None
+    return pa.table({
+        "scope": pa.array(scopes, type=pa.string()),
+        "gid": pa.array(gids, type=pa.string()),
+        "count": pa.array(counts, type=pa.int64()),
+    })
+
+
+def build_description_profile_for_df(work_dir: Path, df: pd.DataFrame) -> dict:
+    """Same descriptions.build_description_profile() the species page uses,
+    fed from this one dataset's own just-computed stats (already written into
+    work_dir under their standard names -- see process_observations_df/
+    _copy_taxon_stats) and its own location counts, instead of a real taxon's
+    precomputed global aggregates. taxon_key/loc_taxa_path below are inert
+    placeholders -- _InMemoryLocTaxaStorage.read_table() ignores both, since
+    there's only ever this one dataset's worth of location counts to return.
+    """
+    def _read_rows(filename: str) -> list[dict]:
+        path = work_dir / filename
+        if not path.exists():
+            return []
+        return pq.read_table(path).to_pylist()
+
+    numerical_stats = {r["variable"]: r for r in _read_rows(NUMERICAL_STATS_FILE)}
+    circular_stats = {r["variable"]: r for r in _read_rows(CIRCULAR_STATS_FILE)}
+    nominal_rows = _read_rows(NOMINAL_STATS_FILE)
+    ordinal_rows = _read_rows(ORDINAL_STATS_FILE)
+
+    def _class_fractions(variable: str) -> dict[int, float]:
+        return {
+            int(r["metric"][6:]): float(r["value"])
+            for r in nominal_rows
+            if r["variable"] == variable
+            and r["metric"].startswith("class_")
+            and r["metric"][6:].isdigit()
+            and float(r["value"] or 0) > 0
+        }
+
+    salinity_median = next(
+        (float(r["value"]) for r in ordinal_rows if r["variable"] == "salinity" and r["metric"] == "median"),
+        None,
+    )
+
+    locations_table = _build_location_counts_table(df)
+    storage = _InMemoryLocTaxaStorage(locations_table if locations_table is not None else pa.table({
+        "scope": pa.array([], type=pa.string()),
+        "gid": pa.array([], type=pa.string()),
+        "count": pa.array([], type=pa.int64()),
+    }))
+
+    return descriptions.build_description_profile(
+        "upload",
+        hierarchy=_load_hierarchy(),
+        storage=storage,
+        loc_taxa_path=Path("unused"),
+        scope_by_level=_CONFIG.location_scope_by_level,
+        kg2_class_fractions=_class_fractions("kg2") or None,
+        kg2_legend_classes=_load_legend("kg2") or None,
+        lc_class_fractions=_class_fractions("landcover") or None,
+        lc_legend=_load_legend_full("landcover") or None,
+        soil_texture_class_fractions=_class_fractions("soil_texture") or None,
+        soil_texture_legend=_load_legend_full("soil_texture") or None,
+        eco_class_fractions=_class_fractions("ecoregions") or None,
+        eco_legend_classes=_load_legend("ecoregions") or None,
+        biome_class_fractions=_class_fractions("biome") or None,
+        biome_legend=_load_legend_full("biome") or None,
+        salinity_median=salinity_median,
+        salinity_legend_classes=_load_legend("salinity") or None,
+        numerical_stats=numerical_stats or None,
+        circular_stats=circular_stats or None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parent-taxon relative ranking ("extra options" opt-in on a raw CSV upload)
+#
+# A raw upload has no taxon_key and isn't in the tree, so it can't use the
+# real per-taxon precomputed relative_ranks_positions.parquet the download
+# path re-exports (see build_species_archive). Instead, when the user picks
+# a parent taxon in the upload UI, this treats the upload's own computed
+# stats as if they belonged to a new SPECIES-level child of that taxon, and
+# ranks them against that parent's real, already-precomputed sibling index
+# (util.rankings.read_rank_context_groups) via a cheap binary search per
+# metric -- no full tree rebuild, and nothing is written back to the real
+# index, so this is purely additive/read-only from the tree's perspective.
+# ---------------------------------------------------------------------------
+
+_CATEGORICAL_SAMPLE_COUNT_METRIC_PRIORITY: dict[ValueType, tuple[str, ...]] = {
+    # Mirrors _write_rank_positions' own count_idx lookup: {variable}::count
+    # if the value type has one (ordinal does, as a tall metric row, unlike
+    # numeric/circular's wide "count" column), else {variable}::total_samples.
+    ValueType.NOMINAL: ("total_samples",),
+    ValueType.ORDINAL: ("count", "total_samples"),
+}
+
+
+def _resolve_own_categorical_rankable_values(
+    work_dir: Path, layer_meta: dict[str, dict], filename: str, vtype: ValueType,
+) -> dict[tuple[str, str], tuple[float, int]]:
+    """(variable, metric) -> (own_value, own_sample_count) for a nominal or
+    ordinal variable's rankable metrics -- the exact same METRICS_BY_TYPE
+    minus skip-set vocabulary util.rankings._write_rank_positions uses (see
+    NOMINAL_SKIP_RANK_METRICS/ORDINAL_SKIP_RANK_METRICS), plus its class_
+    fraction handling: a taxon (here, this upload) with zero presence in a
+    class gets no row at all for it, matching the real pipeline never
+    writing one for a zero-valued taxon.
+    """
+    path = work_dir / filename
+    if not path.exists():
+        return {}
+
+    skip_metrics = (
+        NOMINAL_SKIP_RANK_METRICS if vtype is ValueType.NOMINAL else ORDINAL_SKIP_RANK_METRICS
+    )
+    rankable_metrics = set(METRICS_BY_TYPE[vtype]) - skip_metrics
+    sample_count_metrics = _CATEGORICAL_SAMPLE_COUNT_METRIC_PRIORITY[vtype]
+
+    by_variable: dict[str, dict[str, float]] = {}
+    for row in pq.read_table(path).to_pylist():
+        variable = row.get("variable")
+        metric = row.get("metric")
+        if not variable or not metric:
+            continue
+        by_variable.setdefault(variable, {})[metric] = row.get("value")
+
+    result: dict[tuple[str, str], tuple[float, int]] = {}
+    for variable, by_metric in by_variable.items():
+        layer = layer_meta.get(variable)
+        if not layer:
+            continue
+        try:
+            if ValueType(layer.get("value_type") or "") != vtype:
+                continue
+        except ValueError:
+            continue
+
+        sample_count = next(
+            (by_metric[m] for m in sample_count_metrics if by_metric.get(m) is not None),
+            None,
+        )
+        if sample_count is None or sample_count < MIN_RANKING_SAMPLES:
+            continue
+        sample_count = int(sample_count)
+
+        for metric, value in by_metric.items():
+            if value is None or not math.isfinite(value):
+                continue
+            is_class_metric = metric.startswith("class_")
+            if not is_class_metric and metric not in rankable_metrics:
+                continue
+            if is_class_metric and value == 0.0:
+                continue  # no presence in this class -- matches the real writer's own row omission
+            result[(variable, metric)] = (float(value), sample_count)
+
+    return result
+
+
+def _resolve_own_rankable_values(
+    work_dir: Path, layer_meta: dict[str, dict],
+) -> dict[tuple[str, str], tuple[float, int]]:
+    """(variable, metric) -> (own_value, own_sample_count) for every
+    metric this upload has >= MIN_RANKING_SAMPLES samples for -- the exact
+    same metric vocabulary + per-variable sample-count gate
+    util.rankings._write_rank_positions applies when building the real
+    tree's ranking index, so every value here is directly comparable to
+    that index. Covers numerical, circular, nominal, and ordinal variables.
+    """
+    def _read_rows(filename: str) -> list[dict]:
+        path = work_dir / filename
+        if not path.exists():
+            return []
+        return pq.read_table(path).to_pylist()
+
+    result: dict[tuple[str, str], tuple[float, int]] = {}
+
+    for row in _read_rows(NUMERICAL_STATS_FILE):
+        variable = row.get("variable")
+        layer = layer_meta.get(variable)
+        if not variable or not layer:
+            continue
+        try:
+            vtype = ValueType(layer.get("value_type") or "")
+        except ValueError:
+            continue
+        if vtype not in (ValueType.RATIO, ValueType.INTERVAL):
+            continue
+        count = row.get("count")
+        if count is None or count < MIN_RANKING_SAMPLES:
+            continue
+        for metric in METRICS_BY_TYPE[vtype]:
+            value = row.get(metric)
+            if value is None or not math.isfinite(value):
+                continue
+            result[(variable, metric)] = (float(value), int(count))
+
+    for row in _read_rows(CIRCULAR_STATS_FILE):
+        variable = row.get("variable")
+        layer = layer_meta.get(variable)
+        if not variable or not layer or layer.get("value_type") != ValueType.CIRCULAR:
+            continue
+        count = row.get("count")
+        if count is None or count < MIN_RANKING_SAMPLES:
+            continue
+        for metric in METRICS_BY_TYPE[ValueType.CIRCULAR]:
+            value = row.get(metric)
+            if value is None or not math.isfinite(value):
+                continue
+            result[(variable, metric)] = (float(value), int(count))
+
+    result.update(_resolve_own_categorical_rankable_values(
+        work_dir, layer_meta, NOMINAL_STATS_FILE, ValueType.NOMINAL,
+    ))
+    result.update(_resolve_own_categorical_rankable_values(
+        work_dir, layer_meta, ORDINAL_STATS_FILE, ValueType.ORDINAL,
+    ))
+
+    return result
+
+
+def compute_relative_ranks_for_upload(
+    work_dir: Path, layer_meta: dict[str, dict], parent_taxon_id: str,
+) -> list[dict] | None:
+    """Rank this upload's own computed stats against ``parent_taxon_id``'s
+    real precomputed SPECIES-level sibling index, AND every one of that
+    taxon's own ancestors' sibling indexes up to the root -- one context row
+    per ancestor level, same as a real taxon in the tree gets ranked against
+    its whole lineage (main.py's _load_relative_ranks returns one row per
+    ancestor context for a given taxon_key/variable). Writes the result into
+    ``work_dir / POSITION_FILE`` so _package_archive picks it up exactly
+    like a species download's own (real) relative ranks. Returns the rows
+    written, or None (writing nothing) if the taxon doesn't resolve or
+    nothing in this upload clears the ranking sample-size threshold.
+
+    Always ranks as a SPECIES-level entrant regardless of each context
+    taxon's own rank (a genus, family, order, ... ancestor's SPECIES-rank
+    descendants are all well-defined comparison cohorts) -- this mirrors
+    the common case of comparing one species against its congeners, family,
+    order, and so on up the tree.
+    """
+    selected = get_taxon_by_id(parent_taxon_id)
+    if selected is None:
+        return None
+
+    own_values = _resolve_own_rankable_values(work_dir, layer_meta)
+    if not own_values:
+        return None
+
+    rows: list[dict] = []
+    for context_taxon in (selected, *get_ancestors(selected)):
+        context_id = str(context_taxon["taxon_key"])
+        context_label = resolve_context_label(context_taxon)
+        groups = read_rank_context_groups(context_id, _CONFIG.species_rank)
+        if not groups:
+            continue
+        for (variable, metric), (value, sample_count) in own_values.items():
+            group = groups.get((variable, metric))
+            if group is None or group.empty:
+                continue
+            ranked = rank_value_against_group(value, group)
+            rows.append({
+                "variable": variable,
+                "metric": metric,
+                "position": ranked["position"],
+                "count": ranked["count"],
+                "sampleCount": sample_count,
+                "contextLabel": context_label,
+            })
+
+    if not rows:
+        return None
+
+    pq.write_table(pa.Table.from_pylist(rows), work_dir / POSITION_FILE)
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Column alias resolution
 # ---------------------------------------------------------------------------
@@ -183,6 +521,12 @@ _CATALOG_ALIASES = (
     "gbifID",        "gbif_id",
 )
 _NAME_ALIASES = ("observationName", "observation_name", "name", "title", "label")
+_IMAGE_ALIASES = (
+    "imageUrl", "image_url", "imageURL",
+    "photoUrl", "photo_url", "photoURL",
+    "mediaUrl", "media_url", "mediaURL",
+    "image", "photo",
+)
 _DATE_ALIASES = (
     "eventDate", "event_date", "dateTime", "date_time",
     "date", "datetime", "timestamp",
@@ -254,7 +598,31 @@ def ensure_observation_names(df: pd.DataFrame) -> pd.DataFrame:
     missing = df["observationName"].isna() | (df["observationName"].astype(str).str.strip() == "")
     if missing.any():
         fallback = pd.Series([f"Observation #{i}" for i in range(1, len(df) + 1)], index=df.index)
+        # A column that's empty for every row (e.g. an empty CSV column) is
+        # read as float64, which can't hold these strings -- pandas raises
+        # rather than upcasting.
+        df["observationName"] = df["observationName"].astype(object)
         df.loc[missing, "observationName"] = fallback[missing]
+    return df
+
+
+def normalize_image_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Recognizes an optional per-occurrence photo URL column under any of
+    _IMAGE_ALIASES and renames it to the canonical `imageUrl` -- unlike
+    catalogNumber/observationName above, this is genuinely optional (no
+    synthesized fallback) and rides through to occurrence.parquet untouched,
+    same as any other unrecognized column would; this just widens which
+    column names are picked up as the intended one. See
+    frontend/data/uploadLocalSpeciesDataSource.normalize.ts, which reads
+    this exact column name back out as SpeciesOccurrence.mediaUrl."""
+    if "imageUrl" not in df.columns:
+        col = _find_column(list(df.columns), _IMAGE_ALIASES)
+        if not col:
+            return df
+        df = df.rename(columns={col: "imageUrl"})
+    df = df.copy()
+    blank = df["imageUrl"].isna() | (df["imageUrl"].astype(str).str.strip() == "")
+    df.loc[blank, "imageUrl"] = None
     return df
 
 
@@ -734,6 +1102,114 @@ def _build_temporal_var_meta(df: pd.DataFrame) -> list[dict]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Custom layers ("extra options" opt-in on a raw CSV upload)
+#
+# A custom layer is a raster/vector file authored or edited via /gis-editor,
+# never uploaded to this backend at all -- sampling happens entirely in the
+# browser (see frontend/components/upload/customLayers.ts, which reuses
+# /gis-editor's own raster/vector inspection and point-sampling code), and
+# the frontend sends only: the already-sampled per-observation values, as
+# an ordinary extra column in the raw CSV/TSV/Parquet payload, plus this
+# small JSON description of what that column means. This is merged into
+# layer_meta exactly like _build_temporal_var_meta's synthetic rows above,
+# so process_observations_df computes real stats for it same as any built-
+# in layer -- the only thing that doesn't apply is relative-rank comparison
+# (compute_relative_ranks_for_upload only ever finds a sibling group for a
+# variable a real taxon in the tree actually has, so a custom layer's
+# variable simply never matches one; no separate skip logic is needed).
+# ---------------------------------------------------------------------------
+
+CUSTOM_LAYER_VALUE_TYPES = frozenset({"ratio", "interval", "nominal", "ordinal"})
+
+
+def parse_custom_layer_metadata(raw_json: str | None) -> list[dict]:
+    """Parses the frontend's JSON description of each custom layer it
+    already sampled client-side into layer_meta-compatible rows. Raises
+    HTTPException(422) on any malformed/invalid entry -- this drives
+    request-time validation in main.py, not a background job failure.
+    """
+    if not raw_json:
+        return []
+    try:
+        entries = json.loads(raw_json)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid custom_layer_metadata JSON: {exc}") from exc
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=422, detail="custom_layer_metadata must be a JSON array.")
+
+    rows: list[dict] = []
+    seen_ids: set[str] = set()
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=422, detail=f"custom_layer_metadata[{i}] must be an object.")
+        layer_id = str(entry.get("id") or "").strip()
+        if not layer_id:
+            raise HTTPException(status_code=422, detail=f"custom_layer_metadata[{i}] is missing 'id'.")
+        if layer_id in seen_ids:
+            raise HTTPException(status_code=422, detail=f"Duplicate custom layer id: {layer_id!r}.")
+        seen_ids.add(layer_id)
+
+        value_type = str(entry.get("valueType") or entry.get("value_type") or "").strip()
+        if value_type not in CUSTOM_LAYER_VALUE_TYPES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"custom_layer_metadata[{i}] has an unsupported valueType: {value_type!r}.",
+            )
+
+        legend_classes_raw = entry.get("legendClasses") or entry.get("legend_classes")
+        legend_json: str | None = None
+        render_min: float | None = None
+        render_max: float | None = None
+        if value_type in ("nominal", "ordinal") and legend_classes_raw:
+            try:
+                class_ids = [int(cls["id"]) for cls in legend_classes_raw]
+                legend_json = json.dumps([
+                    {
+                        "id": int(cls["id"]),
+                        "name": str(cls.get("name", cls["id"])),
+                        "color": cls.get("color"),
+                    }
+                    for cls in legend_classes_raw
+                ])
+            except (TypeError, ValueError, KeyError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"custom_layer_metadata[{i}] has invalid legendClasses: {exc}",
+                ) from exc
+            if class_ids:
+                # Ordinal coloring is a gradient keyed to (classId - render_min)
+                # / (render_max - render_min) -- it never uses a class's own
+                # color at the pixel/marker level (that's nominal's job; see
+                # cogTileRenderer.ts's colorsById, only populated when
+                # isNominal). Every built-in ordinal layer in catalog.json
+                # sets render_min/render_max to its class-id range (e.g.
+                # salinity: 0/4 for classes 0..4), not a data statistic --
+                # mirror that exactly so a custom ordinal layer's gradient
+                # spans its own classes instead of collapsing to a single
+                # color with the range left at None.
+                render_min = float(min(class_ids))
+                render_max = float(max(class_ids))
+
+        rows.append({
+            "id":            layer_id,
+            "name":          str(entry.get("name") or layer_id).strip(),
+            "units":         entry.get("units") or None,
+            "imperial_unit": None,
+            "value_type":    value_type,
+            "domain":        "discrete" if value_type in ("nominal", "ordinal") else "continuous",
+            "category":      "Custom Layers",
+            "group":         None,
+            "group_label":   None,
+            "sort_order":    20000 + i,  # after static + temporal layer entries
+            "render_min":    render_min,
+            "render_max":    render_max,
+            "legend_classes": legend_json,
+            "_legend_key":   layer_id,
+        })
+    return rows
+
+
 def _add_ternary_classification_overlay(work_dir: Path, layer_meta: dict[str, dict]) -> None:
     """Augment density_grid.parquet with each compositional group's classification
     overlay (class ids + boundary lines), when a classifier is registered for it.
@@ -779,13 +1255,16 @@ def _package_archive(
     """Write occurrence.parquet + categorical_value_lookup/variable_metadata/
     locations, then zip them alongside whatever stats files the caller has
     already written into ``work_dir`` (numerical/nominal/ordinal/circular
-    stats, density, density_grid) into one archive.
+    stats, density, density_grid, relative-rank positions) into one archive.
 
     Shared by the upload path (stats computed fresh via
     process_observations_df) and the taxon-download path (stats copied from
     the tree's precomputed GLOBAL_STATS_DIR) — this function only cares that
     the stats files already exist in work_dir under their standard names,
-    not how they got there.
+    not how they got there. Relative-rank positions are download-only (a
+    custom upload has no tree ancestors to rank against), so
+    ``work_dir / POSITION_FILE`` simply won't exist on that path and this
+    entry is skipped, same as every other optional file here.
 
     ``include_csv`` also zips a .csv alongside every .parquet member — cheap
     for upload-sized data, but pandas' to_csv() on a real taxon's full
@@ -800,8 +1279,16 @@ def _package_archive(
         layer = layer_meta.get(col)
         if not layer or layer.get("value_type") not in ("nominal", "ordinal"):
             continue
-        legend_id = layer.get("_legend_key", col)
-        classes = _load_legend(legend_id)
+        # A purely synthetic layer (temporal, or a custom layer sampled
+        # client-side -- see parse_custom_layer_metadata) has no on-disk
+        # legend file for _load_legend() to find; its classes travel as an
+        # inline JSON string on the layer dict instead, same convention
+        # variable_metadata.parquet's own writer below already uses.
+        if layer.get("legend_classes"):
+            classes = json.loads(layer["legend_classes"])
+        else:
+            legend_id = layer.get("_legend_key", col)
+            classes = _load_legend(legend_id)
         for cls in classes:
             lookup_rows.append({
                 "variable": col,
@@ -870,6 +1357,7 @@ def _package_archive(
         (work_dir / CIRCULAR_STATS_FILE,        CIRCULAR_STATS_FILE),
         (work_dir / DENSITY_FILE,               DENSITY_FILE),
         (work_dir / DENSITY_GRID_FILE,          DENSITY_GRID_FILE),
+        (work_dir / POSITION_FILE,              POSITION_FILE),
         (lookup_path,                           "categorical_value_lookup.parquet"),
         (meta_path,                             "variable_metadata.parquet"),
         (locations_path,                        "locations.parquet"),
@@ -895,7 +1383,89 @@ def _package_archive(
     return archive_path
 
 
-def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
+def _add_metadata_to_archive(
+    archive_path: Path,
+    *,
+    description_profile: dict | None = None,
+    image_bytes: bytes | None = None,
+    image_filename: str | None = None,
+    image_url: str | None = None,
+    image_license: str | None = None,
+    image_license_url: str | None = None,
+    image_creator: str | None = None,
+    image_rights_holder: str | None = None,
+    parent_taxon_id: str | None = None,
+) -> None:
+    """Appends upload_metadata.json (plus an embedded image, if any bytes
+    were given) to an already-built archive -- a separate pass from
+    _package_archive above rather than a parameter on it, since this is the
+    one part of the archive that's optional and per-caller (a plain re-upload
+    has none of it; a species download always has description_profile +
+    image_url; a custom upload has whichever of these the user opted into).
+    A no-op if the caller has nothing to add, so plain re-uploads' archives
+    are byte-for-byte what they always were.
+
+    imageFile (when present) names the zip member the actual image bytes are
+    stored under, for an uploaded image -- works fully offline once
+    downloaded. imageUrl alone (no imageFile) is a plain remote URL --
+    convenient (no re-upload needed for e.g. a species' existing photo, or a
+    custom upload pointing at one already hosted somewhere) but requires
+    network access to actually display.
+    """
+    metadata: dict = {}
+    if description_profile is not None:
+        metadata["descriptionProfile"] = description_profile
+    if image_bytes:
+        ext = Path(image_filename or "").suffix or ".jpg"
+        metadata["imageFile"] = f"taxon_image{ext}"
+    if image_url:
+        metadata["imageUrl"] = image_url
+    if image_license:
+        metadata["imageLicense"] = image_license
+    if image_license_url:
+        metadata["imageLicenseUrl"] = image_license_url
+    if image_creator:
+        metadata["imageCreator"] = image_creator
+    if image_rights_holder:
+        metadata["imageRightsHolder"] = image_rights_holder
+    # Recorded so re-importing this ZIP and enriching it further can rank
+    # against the same parent again -- the ranking itself only survives as
+    # positions, never as the taxon that produced them.
+    if parent_taxon_id:
+        metadata["parentTaxonId"] = parent_taxon_id
+    if not metadata:
+        return
+    with zipfile.ZipFile(archive_path, "a", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("upload_metadata.json", json.dumps(metadata))
+        if image_bytes:
+            zf.writestr(metadata["imageFile"], image_bytes)
+
+
+def _parent_taxon_filename_suffix(parent_taxon_id: str) -> str | None:
+    """Same slug-taxon_key naming convention util.download._archive_filename
+    uses for a species download's own filename, applied here to the user-
+    selected parent taxon so a processed ZIP ranked against one is
+    identifiable from its filename alone. None if the id doesn't resolve
+    (build_archive already tolerates an unresolvable parent_taxon_id
+    elsewhere -- see compute_relative_ranks_for_upload)."""
+    taxon = get_taxon_by_id(parent_taxon_id)
+    if taxon is None:
+        return None
+    name = taxon.get("scientific_name") or taxon.get("common_name") or str(taxon["taxon_key"])
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "taxon"
+    return f"{slug}-{taxon['taxon_key']}"
+
+
+def build_archive(
+    df: pd.DataFrame,
+    *,
+    generate_description: bool = False,
+    image_bytes: bytes | None = None,
+    image_filename: str | None = None,
+    image_url: str | None = None,
+    parent_taxon_id: str | None = None,
+    custom_layer_metadata: list[dict] | None = None,
+) -> tuple[Path, str, Path]:
     """Compute stats and package all outputs into a ZIP archive.
 
     Returns ``(archive_path, archive_filename, work_dir)``. The caller is
@@ -904,14 +1474,35 @@ def build_archive(df: pd.DataFrame) -> tuple[Path, str, Path]:
     layer_meta = _build_layer_meta()
     for row in _build_temporal_var_meta(df):
         layer_meta[row["id"]] = row
+    for row in (custom_layer_metadata or []):
+        layer_meta[row["id"]] = row
 
     work_dir = Path(tempfile.mkdtemp(prefix="wherewild-upload-"))
     archive_name = "processed_observations.zip"
+    if parent_taxon_id:
+        suffix = _parent_taxon_filename_suffix(parent_taxon_id)
+        if suffix:
+            archive_name = f"processed_observations-{suffix}.zip"
     try:
         filtered = _filter_df(df.copy())
         process_observations_df(work_dir, filtered, layer_meta)
         _add_ternary_classification_overlay(work_dir, layer_meta)
+        # Must run before _package_archive -- it checks work_dir / POSITION_FILE
+        # for existence at zip time, same as every other stats file.
+        if parent_taxon_id:
+            compute_relative_ranks_for_upload(work_dir, layer_meta, parent_taxon_id)
         archive_path = _package_archive(work_dir, df, layer_meta, archive_name)
+        description_profile = (
+            build_description_profile_for_df(work_dir, df) if generate_description else None
+        )
+        _add_metadata_to_archive(
+            archive_path,
+            description_profile=description_profile,
+            image_bytes=image_bytes,
+            image_filename=image_filename,
+            image_url=image_url,
+            parent_taxon_id=parent_taxon_id,
+        )
     except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise

@@ -365,3 +365,20 @@ def test_iter_descendants_subtree(tree_catalog):
     genus = _TREE_CATALOG["2"]
     keys = {t["taxon_key"] for t in taxa.iter_descendants(genus, include_self=True)}
     assert keys == {"2", "3", "4"}
+
+
+def test_get_ancestors_species_returns_genus_then_root(tree_catalog):
+    species = _TREE_CATALOG["3"]
+    ancestors = taxa.get_ancestors(species)
+    assert [a["taxon_key"] for a in ancestors] == ["2", "1"]
+
+
+def test_get_ancestors_genus_returns_root_only(tree_catalog):
+    genus = _TREE_CATALOG["2"]
+    ancestors = taxa.get_ancestors(genus)
+    assert [a["taxon_key"] for a in ancestors] == ["1"]
+
+
+def test_get_ancestors_root_returns_empty(tree_catalog):
+    root = _TREE_CATALOG["1"]
+    assert taxa.get_ancestors(root) == []

@@ -2879,6 +2879,184 @@ def test_upload_csv_success():
     assert body["status"] == "queued"
 
 
+def test_upload_extra_options_stored_on_job():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[
+                ("file", ("obs.csv", csv, "text/csv")),
+                ("image", ("photo.jpg", b"\xff\xd8\xff\xe0fakejpeg", "image/jpeg")),
+            ],
+            data={"generate_description": "true", "image_url": "https://example.com/x.jpg"},
+        )
+    assert r.status_code == 202
+    job_id = r.json()["job_id"]
+    job = main_module._upload_jobs[job_id]
+    assert job.generate_description is True
+    assert job.image_bytes == b"\xff\xd8\xff\xe0fakejpeg"
+    assert job.image_filename == "photo.jpg"
+    assert job.image_url == "https://example.com/x.jpg"
+
+
+def test_upload_without_extra_options_defaults_stay_empty():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.generate_description is False
+    assert job.image_bytes is None
+    assert job.image_url is None
+
+
+def test_upload_image_too_large_rejected():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    big_image = b"\x00" * (main_module._MAX_IMAGE_BYTES + 1)
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[
+                ("file", ("obs.csv", csv, "text/csv")),
+                ("image", ("photo.jpg", big_image, "image/jpeg")),
+            ],
+        )
+    assert r.status_code == 413
+
+
+def test_upload_parent_taxon_id_rejected_when_unknown():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]), \
+         patch("main.taxa.get_taxon_by_id", return_value=None):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"parent_taxon_id": "does-not-exist"},
+        )
+    assert r.status_code == 422
+
+
+def test_upload_parent_taxon_id_stored_on_job_when_valid():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]), \
+         patch("main.taxa.get_taxon_by_id", return_value={"taxon_key": "42"}):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"parent_taxon_id": "42"},
+        )
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.parent_taxon_id == "42"
+
+
+def test_upload_without_parent_taxon_id_stays_none():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.parent_taxon_id is None
+
+
+def test_upload_custom_layer_metadata_stored_on_job():
+    csv = b"latitude,longitude,my_layer\n45.0,-120.0,3.0\n"
+    metadata = json.dumps([{"id": "my_layer", "name": "My Layer", "valueType": "ratio"}])
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"custom_layer_metadata": metadata},
+        )
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.custom_layer_metadata == [{
+        "id": "my_layer", "name": "My Layer", "units": None, "imperial_unit": None,
+        "value_type": "ratio", "domain": "continuous", "category": "Custom Layers",
+        "group": None, "group_label": None, "sort_order": 20000,
+        "render_min": None, "render_max": None, "legend_classes": None,
+        "_legend_key": "my_layer",
+    }]
+
+
+def test_upload_without_custom_layer_metadata_stays_empty():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    assert r.status_code == 202
+    job = main_module._upload_jobs[r.json()["job_id"]]
+    assert job.custom_layer_metadata == []
+
+
+def test_upload_custom_layer_metadata_invalid_json_rejected():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"custom_layer_metadata": "not json"},
+        )
+    assert r.status_code == 422
+
+
+def test_upload_custom_layer_metadata_column_missing_from_file_rejected():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    metadata = json.dumps([{"id": "my_layer", "valueType": "ratio"}])
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"custom_layer_metadata": metadata},
+        )
+    assert r.status_code == 422
+    assert "my_layer" in r.json()["detail"]
+
+
+def test_upload_custom_layer_metadata_id_collision_with_built_in_layer_rejected():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    metadata = json.dumps([{"id": "bio1", "valueType": "ratio"}])
+    with patch(
+        "util.tiles.load_layers",
+        return_value=[{"id": "bio1", "filename": "bio1.tif", "window_hours": None}],
+    ):
+        r = client.post(
+            "/upload/raw-observations",
+            files=[("file", ("obs.csv", csv, "text/csv"))],
+            data={"custom_layer_metadata": metadata},
+        )
+    assert r.status_code == 422
+    assert "bio1" in r.json()["detail"]
+
+
+def test_upload_status_reports_current_stage():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    job_id = r.json()["job_id"]
+    main_module._upload_jobs[job_id].stage = "Sampling environmental layers"
+
+    status = client.get(f"/upload/status/{job_id}")
+
+    assert status.status_code == 200
+    assert status.json()["stage"] == "Sampling environmental layers"
+
+
+def test_upload_status_stage_none_while_queued():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    job_id = r.json()["job_id"]
+
+    status = client.get(f"/upload/status/{job_id}")
+
+    assert status.json()["stage"] is None
+
+
 def test_upload_tsv_parsed_correctly():
     tsv = b"latitude\tlongitude\n45.0\t-120.0\n"
     with patch("util.tiles.load_layers", return_value=[]):

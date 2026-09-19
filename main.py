@@ -15,7 +15,7 @@ import time
 import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -24,7 +24,7 @@ import duckdb
 import httpx
 import pandas as pd
 import psutil
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from shapely.geometry.base import BaseGeometry
@@ -391,6 +391,7 @@ def _filter_occ_df(df: pd.DataFrame) -> pd.DataFrame:
 
 _MAX_UPLOAD_ROWS = 50_000
 _MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # well above what 50k CSV/TSV/Parquet rows needs
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024  # plenty for a single photo
 _MAX_CONCURRENT_UPLOAD_JOBS = 20  # bounds worst-case memory (up to 50k-row DataFrame each) between TTL sweeps
 _DONE_TTL_SECONDS = 3600  # archive stays available for 1 hour after completion
 
@@ -400,11 +401,27 @@ class _UploadJob:
     job_id: str
     df: pd.DataFrame
     status: str = "queued"       # queued | processing | done | error
+    # Human-readable sub-stage within "processing", surfaced to the upload
+    # page's progress message -- see _upload_consumer, which sets this
+    # right before each major pipeline step. None while queued/done/error.
+    stage: str | None = None
     archive_path: Path | None = None
     archive_name: str | None = None
     work_dir: Path | None = None
     error: str | None = None
     done_at: float | None = None
+    # "Extra options" from the upload form -- see upload_raw_observations.
+    generate_description: bool = False
+    image_bytes: bytes | None = None
+    image_filename: str | None = None
+    image_url: str | None = None
+    parent_taxon_id: str | None = None
+    # Never the raw custom-layer file itself -- see main.py's
+    # upload_raw_observations and util.upload.parse_custom_layer_metadata.
+    # The frontend samples each attached layer client-side and sends only
+    # this small description plus the already-sampled values as ordinary
+    # extra column(s) in df.
+    custom_layer_metadata: list[dict] = field(default_factory=list)
 
 
 _upload_queue: list[str] = []        # ordered job IDs waiting to run
@@ -422,10 +439,23 @@ async def _upload_consumer() -> None:
             continue
         job.status = "processing"
         try:
+            job.stage = "Matching observations to countries and regions"
             df = await run_in_threadpool(upload.enrich_with_gadm, job.df)
+            job.stage = "Sampling environmental layers"
             df = await run_in_threadpool(upload.enrich_with_gis, df)
+            job.stage = "Sampling recent weather"
             df = await run_in_threadpool(upload.enrich_with_temporal, df)
-            archive_path, archive_name, work_dir = await run_in_threadpool(upload.build_archive, df)
+            job.stage = "Computing statistics"
+            archive_path, archive_name, work_dir = await run_in_threadpool(
+                upload.build_archive,
+                df,
+                generate_description=job.generate_description,
+                image_bytes=job.image_bytes,
+                image_filename=job.image_filename,
+                image_url=job.image_url,
+                parent_taxon_id=job.parent_taxon_id,
+                custom_layer_metadata=job.custom_layer_metadata,
+            )
             job.archive_path = archive_path
             job.archive_name = archive_name
             job.work_dir = work_dir
@@ -434,6 +464,7 @@ async def _upload_consumer() -> None:
             job.status = "error"
             job.error = str(exc)
         finally:
+            job.stage = None
             job.done_at = time.monotonic()
 
 
@@ -3198,11 +3229,34 @@ def _clear_temporal_versioned_caches() -> None:
 async def upload_raw_observations(
     request: Request,
     file: UploadFile = File(...),
+    generate_description: bool = Form(False),
+    image: UploadFile | None = File(None),
+    image_url: str | None = Form(None),
+    parent_taxon_id: str | None = Form(None),
+    custom_layer_metadata: str | None = Form(None),
 ) -> JSONResponse:
     """Accept a CSV, TSV, or Parquet file and queue it for processing.
 
     Returns a job ID immediately. Poll /upload/status/{job_id} for progress,
     then fetch the result from /upload/download/{job_id} when status is 'done'.
+
+    "Extra options", all optional: generate_description asks the job to run
+    util.descriptions' same rule-based writeup the species page uses, fed
+    from this upload's own computed stats (see
+    upload.build_description_profile_for_df). image/image_url are mutually
+    usable but serve different offline guarantees -- an uploaded image's
+    bytes are embedded straight into the archive (fully offline once
+    downloaded), while image_url is stored as a plain string (no re-upload
+    needed, but requires network access to actually display). parent_taxon_id
+    ranks this upload's own computed stats against that taxon's real
+    precomputed sibling index, as if this dataset were a new SPECIES-level
+    child of it (see upload.compute_relative_ranks_for_upload) -- validated
+    here so a bad id fails fast instead of silently producing no ranks.
+    custom_layer_metadata is a JSON-encoded description of any custom (GIS-
+    editor-authored) layer(s) the frontend already sampled client-side --
+    this backend never receives the raw raster/vector file, only this small
+    metadata blob plus the already-sampled values as ordinary extra
+    column(s) in `file` (see util.upload.parse_custom_layer_metadata).
     """
     filename = file.filename or ""
     suffix = Path(filename).suffix.lower()
@@ -3265,11 +3319,61 @@ async def upload_raw_observations(
     df = upload.normalize_timestamp_column(df)
     df = upload.ensure_catalog_numbers(df)
     df = upload.ensure_observation_names(df)
+    df = upload.normalize_image_column(df)
     df = upload.validate_coordinates(df)
     upload.check_reserved_columns(df, static_layer_ids)
 
+    custom_layer_rows = upload.parse_custom_layer_metadata(custom_layer_metadata)
+    if custom_layer_rows:
+        collisions = sorted({row["id"] for row in custom_layer_rows} & static_layer_ids)
+        if collisions:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Custom layer id(s) collide with built-in layers: {', '.join(collisions)}.",
+            )
+        missing_cols = sorted(
+            row["id"] for row in custom_layer_rows if row["id"] not in df.columns
+        )
+        if missing_cols:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Custom layer metadata given for column(s) not present in the "
+                    f"uploaded file: {', '.join(missing_cols)}."
+                ),
+            )
+
+    image_bytes: bytes | None = None
+    image_filename: str | None = None
+    if image is not None and image.filename:
+        image_bytes = await image.read()
+        if len(image_bytes) > _MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Image exceeds the {_MAX_IMAGE_BYTES // (1024 * 1024)}MB size limit.",
+            )
+        image_filename = image.filename
+
+    resolved_parent_taxon_id: str | None = None
+    if parent_taxon_id:
+        if taxa.get_taxon_by_id(parent_taxon_id) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown parent taxon id: {parent_taxon_id!r}",
+            )
+        resolved_parent_taxon_id = parent_taxon_id
+
     job_id = str(uuid.uuid4())
-    _upload_jobs[job_id] = _UploadJob(job_id=job_id, df=df)
+    _upload_jobs[job_id] = _UploadJob(
+        job_id=job_id,
+        df=df,
+        generate_description=generate_description,
+        image_bytes=image_bytes,
+        image_filename=image_filename,
+        image_url=image_url or None,
+        parent_taxon_id=resolved_parent_taxon_id,
+        custom_layer_metadata=custom_layer_rows,
+    )
     _upload_queue.append(job_id)
 
     return JSONResponse(
@@ -3285,7 +3389,13 @@ async def upload_job_status(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found or expired.")
     position = _upload_queue.index(job_id) + 1 if job_id in _upload_queue else 0
-    return {"job_id": job_id, "status": job.status, "position": position, "error": job.error}
+    return {
+        "job_id": job_id,
+        "status": job.status,
+        "position": position,
+        "stage": job.stage,
+        "error": job.error,
+    }
 
 
 @app.get("/upload/download/{job_id}")

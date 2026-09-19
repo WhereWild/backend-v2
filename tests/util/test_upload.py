@@ -1063,6 +1063,7 @@ def test_build_archive_writes_relative_ranks_when_parent_taxon_id_given():
     with patch("util.upload._build_layer_meta", return_value={}), \
          patch("util.upload._filter_df", side_effect=lambda d: d), \
          patch("util.upload.process_observations_df"), \
+         patch("util.upload.get_taxon_by_id", return_value=None), \
          patch(
              "util.upload.compute_relative_ranks_for_upload",
              return_value=fake_rows,

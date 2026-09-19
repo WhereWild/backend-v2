@@ -3031,6 +3031,32 @@ def test_upload_custom_layer_metadata_id_collision_with_built_in_layer_rejected(
     assert "bio1" in r.json()["detail"]
 
 
+def test_upload_status_reports_current_stage():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    job_id = r.json()["job_id"]
+    main_module._upload_jobs[job_id].stage = "Sampling environmental layers"
+
+    status = client.get(f"/upload/status/{job_id}")
+
+    assert status.status_code == 200
+    assert status.json()["stage"] == "Sampling environmental layers"
+
+
+def test_upload_status_stage_none_while_queued():
+    csv = b"latitude,longitude\n45.0,-120.0\n"
+    with patch("util.tiles.load_layers", return_value=[]):
+        r = client.post("/upload/raw-observations",
+                        files=[("file", ("obs.csv", csv, "text/csv"))])
+    job_id = r.json()["job_id"]
+
+    status = client.get(f"/upload/status/{job_id}")
+
+    assert status.json()["stage"] is None
+
+
 def test_upload_tsv_parsed_correctly():
     tsv = b"latitude\tlongitude\n45.0\t-120.0\n"
     with patch("util.tiles.load_layers", return_value=[]):

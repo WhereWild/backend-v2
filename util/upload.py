@@ -1390,6 +1390,7 @@ def _add_metadata_to_archive(
     image_license_url: str | None = None,
     image_creator: str | None = None,
     image_rights_holder: str | None = None,
+    parent_taxon_id: str | None = None,
 ) -> None:
     """Appends upload_metadata.json (plus an embedded image, if any bytes
     were given) to an already-built archive -- a separate pass from
@@ -1423,6 +1424,11 @@ def _add_metadata_to_archive(
         metadata["imageCreator"] = image_creator
     if image_rights_holder:
         metadata["imageRightsHolder"] = image_rights_holder
+    # Recorded so re-importing this ZIP and enriching it further can rank
+    # against the same parent again -- the ranking itself only survives as
+    # positions, never as the taxon that produced them.
+    if parent_taxon_id:
+        metadata["parentTaxonId"] = parent_taxon_id
     if not metadata:
         return
     with zipfile.ZipFile(archive_path, "a", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1491,6 +1497,7 @@ def build_archive(
             image_bytes=image_bytes,
             image_filename=image_filename,
             image_url=image_url,
+            parent_taxon_id=parent_taxon_id,
         )
     except HTTPException:
         shutil.rmtree(work_dir, ignore_errors=True)

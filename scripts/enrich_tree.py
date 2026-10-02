@@ -29,7 +29,6 @@ from __future__ import annotations
 import functools
 import gc
 import json
-import multiprocessing
 import os
 import re
 import shutil
@@ -56,6 +55,7 @@ from util.gis import (
     sample_soil_texture_batch,
     sample_vector_batch,
 )
+from util.isolation import run_isolated
 from util.taxa import load_catalog
 from util.tiles import resolve_layer_path
 
@@ -600,11 +600,13 @@ def _sample_cog(
     return [None if np.isnan(v) else float(v) for v in arr]
 
 
-def _write_staging_batch(batch_idx: int, table: pa.Table | None) -> None:
+def _write_staging_batch(batch_idx: int, table: pa.Table | None, staging_dir: Path | None = None) -> None:
     if table is None or table.num_rows == 0:
         return
-    STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, STAGING_DIR / f"batch_{batch_idx:05d}.parquet")
+    if staging_dir is None:
+        staging_dir = STAGING_DIR
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, staging_dir / f"batch_{batch_idx:05d}.parquet")
 
 
 def _finalize_enrichment(
@@ -701,13 +703,9 @@ def _finalize_enrichment(
         print(f"[finalize] dropped stale columns: {stale}")
 
 
-def main() -> None:
-    layers = _load_layers()
-    if VARS_TO_ENRICH is not None:
-        layers = [layer for layer in layers if layer["id"] in VARS_TO_ENRICH]
+def _sample_batches(layers: list[dict], staging_dir: Path) -> None:
+    """Stream the worklist and stage every batch's sampled values to staging_dir."""
     layer_ids = [layer["id"] for layer in layers]
-
-    shutil.rmtree(STAGING_DIR, ignore_errors=True)
     batch_count = 0
     for batch in _iter_worklist_batches(layer_ids, CONFIG.taxonomy_roots, row_limit=ROW_LIMIT):
         if batch.num_rows == 0:
@@ -715,32 +713,26 @@ def main() -> None:
         batch_count += 1
         print(f"[worklist] processing batch {batch_count}")
         staging = _process_batch(batch, layers)
-        _write_staging_batch(batch_count, staging)
+        _write_staging_batch(batch_count, staging, staging_dir)
+
+
+def main() -> None:
+    layers = _load_layers()
+    if VARS_TO_ENRICH is not None:
+        layers = [layer for layer in layers if layer["id"] in VARS_TO_ENRICH]
+    layer_ids = [layer["id"] for layer in layers]
+
+    # Both phases run isolated (see util.isolation). Sampling
+    # ends holding ~35GB RSS (worklist DuckDB scan, rasterio/GDAL buffers,
+    # in-RAM raster arrays). Finalize used to be the only spawned phase, but
+    # the parent then sat in join() still holding all of that, stacked on top
+    # of finalize's own 28GB DuckDB limit — OOM-killed (parent at 38.5GB
+    # RSS+swap, child at 26.5GB) once occurrences.parquet grew past ~67M rows.
+    shutil.rmtree(STAGING_DIR, ignore_errors=True)
+    run_isolated(_sample_batches, layers, STAGING_DIR)
 
     print("[finalize] merging staged updates into occurrences.parquet...")
-    # Run in a fresh subprocess rather than in-process: the sampling loop
-    # above was confirmed (via rebuild.log + kernel OOM logs) to still be
-    # holding ~35GB RSS by the time it finishes — rasterio/GDAL buffers and
-    # numpy sample arrays that either aren't fully released or, more likely,
-    # freed by Python but not returned to the OS by glibc's allocator. That
-    # baseline stacks on top of whatever _finalize_enrichment's own DuckDB
-    # query needs, so tuning DuckDB's memory_limit down didn't help — the
-    # process was already most of the way to the ceiling before the query
-    # even started. spawn (not fork) gives the child a genuinely fresh
-    # interpreter and heap, independent of whatever the parent accumulated.
-    ctx = multiprocessing.get_context("spawn")
-    # Pass the paths explicitly rather than letting the child read its own
-    # freshly-imported module globals — spawn does not carry over any
-    # runtime override of OCCURRENCES_FILE/STAGING_DIR (tests patch them;
-    # see _finalize_enrichment's docstring for the failure this caused).
-    proc = ctx.Process(
-        target=_finalize_enrichment,
-        args=(layer_ids, OCCURRENCES_FILE, STAGING_DIR),
-    )
-    proc.start()
-    proc.join()
-    if proc.exitcode != 0:
-        raise RuntimeError(f"_finalize_enrichment subprocess failed (exit code {proc.exitcode})")
+    run_isolated(_finalize_enrichment, layer_ids, OCCURRENCES_FILE, STAGING_DIR)
     shutil.rmtree(STAGING_DIR, ignore_errors=True)
     print("Completed GIS enrichment.")
 

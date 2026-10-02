@@ -111,3 +111,18 @@ def test_setup_raises_if_any_configured_root_missing(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="MISSING"):
         pt._setup()
+
+def test_run_stats_isolates_pass_then_finalize(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pt, "run_isolated", lambda target, *args: calls.append((target, args)))
+    pt.run_stats(resume=True)
+    staging = pt._stats_staging_dir()
+    assert calls == [(pt._compute_stats, (staging, True)), (pt._finalize_stats, (staging,))]
+
+
+def test_run_rankings_isolates_pass_then_finalize(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pt, "run_isolated", lambda target, *args: calls.append((target, args)))
+    pt.run_rankings()
+    staging = pt._rankings_staging_dir()
+    assert calls == [(pt._compute_rankings, (staging,)), (pt._finalize_rankings, (staging,))]

@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import scripts.enrich_tree as et
+from util.isolation import run_isolated
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -495,11 +496,56 @@ def test_finalize_enrichment_drops_stale_columns(tmp_path):
     assert "old_layer" not in out.schema.names
 
 
+def test_write_staging_batch_explicit_dir_overrides_global(tmp_path):
+    staging_dir = tmp_path / "explicit"
+    table = pa.table({"catalogNumber": ["obs1"], "bio1": [1.0]})
+    with patch.object(et, "STAGING_DIR", tmp_path / "global"):
+        et._write_staging_batch(1, table, staging_dir)
+    assert len(list(staging_dir.glob("*.parquet"))) == 1
+    assert not (tmp_path / "global").exists()
+
+
+def test_finalize_enrichment_in_spawned_child_uses_explicit_paths(tmp_path):
+    occ_path = tmp_path / "occurrences.parquet"
+    _make_occurrences_parquet(occ_path)
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    pq.write_table(
+        pa.table({"catalogNumber": ["obs1", "obs2"], "bio1": [1.1, 2.2]}),
+        staging_dir / "batch_00001.parquet",
+    )
+    run_isolated(et._finalize_enrichment, ["bio1"], occ_path, staging_dir)
+    out = pq.read_table(occ_path).to_pandas().set_index("catalogNumber")
+    assert pytest.approx(out.loc["obs1", "bio1"]) == 1.1
+
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
-def test_main_nothing_to_do(tmp_path, capsys):
+@pytest.fixture
+def in_process_phases():
+    """Run main()'s phases in-process — a spawned child wouldn't see the mocks."""
+    with patch.object(et, "run_isolated", side_effect=lambda target, *args: target(*args)) as m:
+        yield m
+
+
+def test_main_runs_sampling_then_finalize_isolated(tmp_path, in_process_phases):
+    cat_path = tmp_path / "catalog.json"
+    cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
+    staging_dir = tmp_path / "staging"
+    with patch.object(et, "CATALOG_PATH", cat_path), \
+         patch.object(et, "OCCURRENCES_FILE", tmp_path / "occurrences.parquet"), \
+         patch.object(et, "STAGING_DIR", staging_dir), \
+         patch.object(et, "_iter_worklist_batches", return_value=iter([])):
+        et.main()
+    targets = [c.args[0] for c in in_process_phases.call_args_list]
+    assert targets == [et._sample_batches, et._finalize_enrichment]
+    assert in_process_phases.call_args_list[0].args[2] == staging_dir
+
+
+def test_main_nothing_to_do(tmp_path, capsys, in_process_phases):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
     with patch.object(et, "CATALOG_PATH", cat_path), \
@@ -511,7 +557,7 @@ def test_main_nothing_to_do(tmp_path, capsys):
     assert "Completed" in out
 
 
-def test_main_processes_batch_and_finalizes(tmp_path, capsys):
+def test_main_processes_batch_and_finalizes(tmp_path, capsys, in_process_phases):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
     layers_dir = tmp_path / "layers"
@@ -537,7 +583,7 @@ def test_main_processes_batch_and_finalizes(tmp_path, capsys):
     assert pytest.approx(result.loc["obs1", "bio1"], abs=0.01) == 2731.0 * 0.1 - 273.15
 
 
-def test_main_skips_empty_batch(tmp_path, capsys):
+def test_main_skips_empty_batch(tmp_path, capsys, in_process_phases):
     empty_batch = pa.table({
         "catalogNumber":    pa.array([], type=pa.string()),
         "hilbertIdx":       pa.array([], type=pa.int32()),
@@ -556,7 +602,7 @@ def test_main_skips_empty_batch(tmp_path, capsys):
     assert "Completed" in out
 
 
-def test_main_vars_to_enrich_filters_layers(tmp_path):
+def test_main_vars_to_enrich_filters_layers(tmp_path, in_process_phases):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
     captured_layer_ids = []
@@ -575,7 +621,7 @@ def test_main_vars_to_enrich_filters_layers(tmp_path):
     assert captured_layer_ids == ["bio1"]
 
 
-def test_main_vars_to_enrich_none_uses_all_layers(tmp_path):
+def test_main_vars_to_enrich_none_uses_all_layers(tmp_path, in_process_phases):
     cat_path = tmp_path / "catalog.json"
     cat_path.write_text(json.dumps(FAKE_CATALOG_JSON))
     captured_layer_ids = []

@@ -47,6 +47,7 @@ from pathlib import Path
 import duckdb
 
 from config.config import load_config
+from util.isolation import run_isolated
 from util.rankings import (
     POSITION_FILE,
     RANKINGS_FILE,
@@ -347,11 +348,21 @@ def run_stats(resume: bool = False) -> None:
     if it already has a completion marker from a prior run, otherwise the
     whole level is (re)computed — cheap, since per-taxon accumulator merging
     is already fast and only leaf levels are large.
+
+    The level pass and the final sort each run isolated (see
+    util.isolation), so the pass's occurrence cache and leftover heap are
+    gone before the sort's 28GB DuckDB limit starts counting.
     """
+    staging_dir = _stats_staging_dir()
+    run_isolated(_compute_stats, staging_dir, resume)
+    print("[stats] finalizing global stats files...")
+    run_isolated(_finalize_stats, staging_dir)
+
+
+def _compute_stats(staging_dir: Path, resume: bool) -> None:
     layers, layer_meta, by_depth, stats_levels, _, total = _setup()
     print(f"[process_tree] {total} taxa — stats:{STATS_WORKERS} workers" + (" — RESUME" if resume else ""))
 
-    staging_dir = _stats_staging_dir()
     if not resume and staging_dir.exists():
         shutil.rmtree(staging_dir)
     marker_dir = staging_dir / ".done"
@@ -391,9 +402,6 @@ def run_stats(resume: bool = False) -> None:
         if cached:
             clear_stats_occurrence_cache()
 
-    print("[stats] finalizing global stats files...")
-    _finalize_stats(staging_dir)
-
 
 def run_rankings() -> None:
     """Compute relative rankings, streaming each tree-depth level's computed
@@ -402,12 +410,24 @@ def run_rankings() -> None:
     per ancestor directory, then sort those chunks into the two final global
     rankings files. Same pattern as run_stats()/StatsSink — nothing gets
     written under the tree directories at all.
+
+    The level pass and the final sort each run isolated (see
+    util.isolation). Run in one process, the pass's preloaded stats cache
+    and leftover heap (~36GB RSS by its end) stacked on top of the sort's
+    28GB DuckDB limit, and the whole rebuild was OOM-killed 14s into the
+    first sort (53.5GB RSS + 5.5GB swap), after a 3h44m pass.
     """
+    staging_dir = _rankings_staging_dir()
+    run_isolated(_compute_rankings, staging_dir)
+    print("[rankings] finalizing global rankings files...")
+    run_isolated(_finalize_rankings, staging_dir)
+
+
+def _compute_rankings(staging_dir: Path) -> None:
     layers, _, by_depth, _, rank_levels, total = _setup()
     print(f"[process_tree] {total} taxa — rankings:{RANK_WORKERS} workers")
     preload_stats_cache(layers)
 
-    staging_dir = _rankings_staging_dir()
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -427,9 +447,6 @@ def run_rankings() -> None:
         by_depth, rank_levels, _task, max_workers=RANK_WORKERS, label="rankings", total=total,
         on_level_start=_on_start, on_level_end=_on_end,
     )
-
-    print("[rankings] finalizing global rankings files...")
-    _finalize_rankings(staging_dir)
 
 
 def main() -> None:

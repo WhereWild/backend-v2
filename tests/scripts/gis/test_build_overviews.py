@@ -189,19 +189,32 @@ def test_build_cog_nominal_uses_mode(tmp_path):
     assert "nearest" not in calls_str.lower()
 
 
-def test_build_cog_cleans_up_base_tif_on_error(tmp_path):
+def test_build_cog_is_one_cog_pass_that_rebuilds_overviews(tmp_path):
     src = tmp_path / "src.tif"
     dst = tmp_path / "dst.tif"
     src.touch()
 
-    with patch("scripts.gis.build_overviews.subprocess.run", side_effect=RuntimeError("gdal fail")):
-        with pytest.raises(RuntimeError):
-            bo._build_cog(src, dst, nominal=False, overview_factors=[2])
+    with patch("scripts.gis.build_overviews.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0)
+        bo._build_cog(src, dst, nominal=True, overview_factors=[2, 4, 8])
 
+    assert mock_run.call_count == 1
+    cmd = mock_run.call_args.args[0]
+    assert cmd[0] == "gdal_translate"
+    assert "COG" in cmd
+    assert "OVERVIEWS=IGNORE_EXISTING" in cmd       # never reuse a source's old overviews
+    assert "OVERVIEW_COUNT=3" in cmd
+    assert f"NUM_THREADS={bo.COG_THREADS}" in cmd
+    assert cmd[-2:] == [str(src), str(dst)]
     assert not dst.with_suffix(".base.tif").exists()
 
 
-def test_build_cog_skips_gdaladdo_when_no_factors(tmp_path):
+def test_build_cog_rejects_non_consecutive_factors(tmp_path):
+    with pytest.raises(ValueError, match="consecutive power-of-two"):
+        bo._build_cog(tmp_path / "s.tif", tmp_path / "d.tif", nominal=False, overview_factors=[2, 8])
+
+
+def test_build_cog_no_factors_writes_no_overviews(tmp_path):
     src = tmp_path / "src.tif"
     dst = tmp_path / "dst.tif"
     src.touch()
@@ -210,8 +223,9 @@ def test_build_cog_skips_gdaladdo_when_no_factors(tmp_path):
         mock_run.return_value = MagicMock(returncode=0)
         bo._build_cog(src, dst, nominal=False, overview_factors=[])
 
-    commands = [c.args[0][0] for c in mock_run.call_args_list]
-    assert "gdaladdo" not in commands
+    cmd = mock_run.call_args.args[0]
+    assert "OVERVIEWS=NONE" in cmd
+    assert not any(c.startswith("OVERVIEW_COUNT") for c in cmd)
 
 
 # --- main ---

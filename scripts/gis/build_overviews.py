@@ -8,7 +8,7 @@ each to a Cloud Optimized GeoTIFF (COG) with appropriate overview levels.
 
 Overview resampling is chosen by value_type:
   interval / ratio → average
-  nominal          → nearest  (preserves discrete class values)
+  nominal/ordinal  → mode     (preserves discrete class values)
 
 Also the one place two config.py-driven corrections actually get applied,
 for the same reason in both cases: acting on every layer in data/gis/layers/
@@ -58,6 +58,11 @@ LAYERS_DIR          = Path("data/gis/layers")
 TARGET_MIN_ZOOM     = 3
 TARGET_TILE_SIZE    = 256
 MAX_OVERVIEW_FACTOR = 2048
+
+# Compression / overview threads for the COG pass. 4, not all cores: all-core
+# vector-heavy GDAL work has panicked this box with a Machine Check (see
+# download_geomorphons.WARP_THREADS).
+COG_THREADS = 4
 
 OVERVIEW_FACTOR_TOLERANCE_RATIO = 0.03
 OVERVIEW_FACTOR_TOLERANCE_MIN   = 2
@@ -201,39 +206,35 @@ def _compute_minmax_bounds(path: Path, layer: dict) -> tuple[float, float]:
 
 
 def _build_cog(src_path: Path, dst_path: Path, *, nominal: bool, overview_factors: list[int]) -> None:
-    resampling = "mode" if nominal else "average"
-    base_tif = dst_path.with_suffix(".base.tif")
-    try:
-        subprocess.run(
-            [
-                "gdal_translate",
-                "-of", "GTiff",
-                "-co", "TILED=YES",
-                "-co", "COMPRESS=DEFLATE",
-                "-co", "BIGTIFF=IF_SAFER",
-                str(src_path), str(base_tif),
-            ],
-            check=True,
-        )
-        if overview_factors:
-            subprocess.run(
-                ["gdaladdo", "-r", resampling, str(base_tif), *[str(f) for f in overview_factors]],
-                check=True,
-            )
-        subprocess.run(
-            [
-                "gdal_translate",
-                "-of", "COG",
-                "-co", "COMPRESS=DEFLATE",
-                "-co", "BIGTIFF=IF_SAFER",
-                "-co", "OVERVIEWS=FORCE_USE_EXISTING",
-                "-co", f"OVERVIEW_RESAMPLING={resampling.upper()}",
-                str(base_tif), str(dst_path),
-            ],
-            check=True,
-        )
-    finally:
-        base_tif.unlink(missing_ok=True)
+    """Write src_path as a COG with fresh overviews in one gdal_translate pass.
+
+    The COG driver builds the overviews itself (OVERVIEWS=IGNORE_EXISTING, so
+    any old internal overviews on src are dropped rather than reused) — this
+    used to be gdal_translate to a plain base GeoTIFF, gdaladdo on that, then a
+    second gdal_translate to COG: two extra full-file passes, all on one core
+    (geomorphons.tif's base copy alone took 71 min). overview_factors are
+    always 2, 4, 8, … (see _overview_factors_for_dataset), which is exactly
+    what OVERVIEW_COUNT levels produce.
+    """
+    if overview_factors != [2 ** i for i in range(1, len(overview_factors) + 1)]:
+        raise ValueError(f"expected consecutive power-of-two factors from 2, got {overview_factors}")
+    cmd = [
+        "gdal_translate",
+        "--config", "GDAL_NUM_THREADS", str(COG_THREADS),
+        "-of", "COG",
+        "-co", "COMPRESS=DEFLATE",
+        "-co", "BIGTIFF=IF_SAFER",
+        "-co", f"NUM_THREADS={COG_THREADS}",
+    ]
+    if overview_factors:
+        cmd += [
+            "-co", "OVERVIEWS=IGNORE_EXISTING",
+            "-co", f"OVERVIEW_RESAMPLING={'MODE' if nominal else 'AVERAGE'}",
+            "-co", f"OVERVIEW_COUNT={len(overview_factors)}",
+        ]
+    else:
+        cmd += ["-co", "OVERVIEWS=NONE"]
+    subprocess.run([*cmd, str(src_path), str(dst_path)], check=True)
 
 
 def _vector_layer_filenames(layer_meta: dict[str, dict]) -> set[str]:

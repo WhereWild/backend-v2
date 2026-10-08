@@ -12,8 +12,10 @@
 #
 # Runs quarterly, not on the taxonomy rebuild's monthly/GBIF-crawl cadence —
 # OSM data doesn't need that freshness, and a full planet build is a multi-hour
-# job (~94GB download, 4-7hrs on this box's specs) that shouldn't ride along
-# with run_rebuild.sh's stages. build_basemap_tiles.py pushes its own result
+# job (4-7hrs on this box's specs) that shouldn't ride along with
+# run_rebuild.sh's stages. After the first ~94GB planet download, each run just
+# catches the cached PBF up via OSM replication diffs, then rebuilds the
+# PMTiles from it. build_basemap_tiles.py pushes its own result
 # to gambaby as its final step (_push_basemap_files) — deliberately NOT
 # `rebuild.py --stage push`, which is the taxonomy pipeline's own stage
 # runner (alert channel included) and has nothing to do with this pipeline.

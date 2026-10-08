@@ -42,7 +42,11 @@ from util.gis import (
     DERIVED_FROM_SOIL,
     hilbert_index,
     sample_aspect_batch,
+    sample_convergence_batch,
     sample_elevation_terrain_batch,
+    sample_heat_load_batch,
+    sample_plan_curvature_batch,
+    sample_profile_curvature_batch,
     sample_slope_batch,
     sample_soil_texture_batch,
     sample_vector_batch,
@@ -768,6 +772,14 @@ def enrich_with_gis(df: pd.DataFrame) -> pd.DataFrame:
                     continue
                 if layer_id == "aspect":
                     sorted_vals = sample_aspect_batch(s_lats, s_lons)
+                elif layer_id == "heat_load":
+                    sorted_vals = sample_heat_load_batch(s_lats, s_lons)
+                elif layer_id == "convergence":
+                    sorted_vals = sample_convergence_batch(s_lats, s_lons)
+                elif layer_id == "plan_curvature":
+                    sorted_vals = sample_plan_curvature_batch(s_lats, s_lons)
+                elif layer_id == "profile_curvature":
+                    sorted_vals = sample_profile_curvature_batch(s_lats, s_lons)
                 else:
                     sorted_vals = sample_slope_batch(s_lats, s_lons)
                 result[layer_id] = [sorted_vals[i] for i in restore]

@@ -106,6 +106,14 @@ def sample_point(layer: dict, lat: float, lon: float, forecast_suffix: str = "")
         return compute_slope_at_point(lat, lon)
     if layer["id"] == "aspect":
         return compute_aspect_at_point(lat, lon)
+    if layer["id"] == "heat_load":
+        return compute_heat_load_at_point(lat, lon)
+    if layer["id"] == "convergence":
+        return compute_convergence_at_point(lat, lon)
+    if layer["id"] == "plan_curvature":
+        return compute_plan_curvature_at_point(lat, lon)
+    if layer["id"] == "profile_curvature":
+        return compute_profile_curvature_at_point(lat, lon)
     if layer["id"] == "soil_texture":
         return compute_soil_texture_at_point(lat, lon)
     if layer.get("vector_field"):
@@ -302,12 +310,19 @@ _EARTH_A = 6378137.0        # WGS84 semi-major axis (m)
 _EARTH_B = 6356752.3142     # WGS84 semi-minor axis (m)
 
 # Layers derived on-the-fly from elevation.tif (no separate COG stored).
-DERIVED_FROM_ELEVATION: frozenset[str] = frozenset({"slope", "aspect"})
+DERIVED_FROM_ELEVATION: frozenset[str] = frozenset(
+    {"slope", "aspect", "heat_load", "convergence", "plan_curvature", "profile_curvature"},
+)
+
+# Slope/aspect match gdaldem's (Horn 1981 3×3 kernel, aspect undefined where
+# the gradient is exactly zero, nodata neighbours replaced by the centre cell
+# as with -compute_edges) — the tool Geomorpho90m used for its slope/aspect
+# layers — so the point sampler and the tile renderer agree with each other
+# and with gdaldem over the same pixels.
 
 
-
-def _meters_per_degree(lat: float) -> tuple[float, float]:
-    """Return (m_per_deg_lat, m_per_deg_lon) at the given latitude."""
+def _meters_per_degree_np(lat):
+    """Vectorised (m_per_deg_lat, m_per_deg_lon) on the WGS84 ellipsoid."""
     lat_rad = np.radians(lat)
     m_per_deg_lat = (
         111132.954
@@ -320,25 +335,167 @@ def _meters_per_degree(lat: float) -> tuple[float, float]:
         - 93.5 * np.cos(3 * lat_rad)
         + 0.118 * np.cos(5 * lat_rad)
     )
+    return m_per_deg_lat, m_per_deg_lon
+
+
+def _meters_per_degree(lat: float) -> tuple[float, float]:
+    """Return (m_per_deg_lat, m_per_deg_lon) at the given latitude."""
+    m_per_deg_lat, m_per_deg_lon = _meters_per_degree_np(lat)
     return float(m_per_deg_lat), float(m_per_deg_lon)
 
 
+def _horn_gradient(dem: np.ndarray, dx_m, dy_m) -> tuple[np.ndarray, np.ndarray]:
+    """Horn (1981) partial derivatives of a DEM with NaN as nodata.
+
+    Returns (dz/dx toward east, dz/dy toward north), NaN wherever the centre
+    cell is NaN. A NaN neighbour takes the centre cell's value, as gdaldem
+    -compute_edges does — never a fill value from elsewhere in the array,
+    which would put fake cliffs along coastlines and data edges. Off-array
+    neighbours are treated the same way (gdaldem extrapolates there instead;
+    callers pad their reads, so the outermost ring is never displayed).
+    `dx_m`/`dy_m` may be scalars or per-row (rows, 1) arrays so geographic
+    grids get each row's own cell width instead of one latitude for all.
+    """
+    dem = np.asarray(dem, dtype=np.float64)
+    z1, z2, z3, z4, _, z6, z7, z8, z9 = _neighbours(dem)
+    dzdx = ((z3 + 2 * z6 + z9) - (z1 + 2 * z4 + z7)) / (8.0 * dx_m)
+    # Row 0 is north, so top-row minus bottom-row is the northward rise.
+    dzdy = ((z1 + 2 * z2 + z3) - (z7 + 2 * z8 + z9)) / (8.0 * dy_m)
+    centre_nan = np.isnan(dem)
+    return np.where(centre_nan, np.nan, dzdx), np.where(centre_nan, np.nan, dzdy)
+
+
+def _neighbours(dem: np.ndarray) -> tuple[np.ndarray, ...]:
+    """The 3×3 window around every cell as nine arrays z1..z9 (row-major,
+    z1 = NW, z5 = centre, z9 = SE). A NaN or off-array neighbour takes the
+    centre cell's value, as gdaldem -compute_edges does."""
+    h, w = dem.shape
+    padded = np.pad(dem, 1, mode="constant", constant_values=np.nan)
+
+    def nb(dr: int, dc: int) -> np.ndarray:
+        a = padded[1 + dr:1 + dr + h, 1 + dc:1 + dc + w]
+        return np.where(np.isnan(a), dem, a)
+
+    return tuple(nb(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1))
+
+
+def _curvatures(dem: np.ndarray, dx_m, dy_m, dzdx, dzdy) -> tuple[np.ndarray, np.ndarray]:
+    """Plan (tangential) and profile curvature, m⁻¹, from a DEM and its Horn
+    first derivatives.
+
+    Second derivatives are Evans-Young's (Evans 1979) least-squares fit over
+    the 3×3 window, with each cell's own east-west and north-south size in
+    metres, so a geographic grid's non-square cells are handled like
+    slope/aspect handle them. Profile curvature is along the slope line.
+    Plan curvature is the tangential form (the normal section through the
+    contour direction, as GRASS r.slope.aspect's tcurvature), not the pure
+    contour curvature: contour curvature divides by the gradient cubed and
+    blows up on near-flat ground (valley floors measured wider than the
+    Wasatch on FABDEM), while tangential is contour curvature × sin(slope)
+    and fades to zero there (Florinsky 2016). Sign: negative is
+    concave — flow decelerating (profile) or converging (plan), where water
+    collects — and positive is convex. Undefined (NaN) where the gradient is
+    exactly zero, like aspect.
+    """
+    dem = np.asarray(dem, dtype=np.float64)
+    z1, z2, z3, z4, z5, z6, z7, z8, z9 = _neighbours(dem)
+    r = (z1 + z3 + z4 + z6 + z7 + z9 - 2 * (z2 + z5 + z8)) / (3.0 * dx_m * dx_m)
+    t = (z1 + z2 + z3 + z7 + z8 + z9 - 2 * (z4 + z5 + z6)) / (3.0 * dy_m * dy_m)
+    # y increases northward (row 0 is north), matching dzdy.
+    s = (z3 - z1 - z9 + z7) / (4.0 * dx_m * dy_m)
+    p, q = dzdx, dzdy
+    g2 = p * p + q * q
+    with np.errstate(divide="ignore", invalid="ignore"):
+        profile = -(p * p * r + 2 * p * q * s + q * q * t) / (g2 * (1 + g2) ** 1.5)
+        plan = -(q * q * r - 2 * p * q * s + p * p * t) / (g2 * np.sqrt(1 + g2))
+    undefined = (g2 == 0) | np.isnan(dem)
+    return np.where(undefined, np.nan, plan), np.where(undefined, np.nan, profile)
+
+
+def _convergence_index(dem: np.ndarray, dx_m, dy_m) -> np.ndarray:
+    """Convergence index (Köthe & Lehmeier 1996, as SAGA's), scaled to ±100.
+
+    For each of the 8 neighbours, the angle between its downslope aspect and
+    the bearing from it back to the centre cell; the index is the mean angle
+    minus 90°, scaled by 100/90. Bearings use ground-metre offsets (each
+    cell's own dx/dy), so diagonals point where they really do on a
+    geographic grid. Sign follows SAGA and our curvatures: negative where
+    the neighbours drain toward the cell (converging, -100 in a pit),
+    positive where they drain away (diverging, +100 on a peak) — the
+    opposite of Geomorpho90m's r.convergence. Flat neighbours (aspect
+    undefined) are left out; NaN if the centre is nodata or no neighbour has
+    an aspect. Needs a 5×5 window around a cell (its neighbours' aspects).
+    """
+    dem = np.asarray(dem, dtype=np.float64)
+    dzdx, dzdy = _horn_gradient(dem, dx_m, dy_m)
+    aspect = _aspect_deg(dzdx, dzdy)
+    h, w = dem.shape
+    padded = np.pad(aspect, 1, mode="constant", constant_values=np.nan)
+    angles = []
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nb_aspect = padded[1 + dr:1 + dr + h, 1 + dc:1 + dc + w]
+            # Neighbour (dr, dc) -> centre: east by -dc cells, north by +dr cells.
+            bearing = np.degrees(np.arctan2(-dc * dx_m, dr * dy_m)) % 360.0
+            angles.append(np.abs((nb_aspect - bearing + 180.0) % 360.0 - 180.0))
+    stack = np.stack(np.broadcast_arrays(*angles))
+    valid = np.isfinite(stack)
+    count = valid.sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(valid, stack, 0.0).sum(axis=0) / count
+    ci = (mean - 90.0) * (100.0 / 90.0)
+    return np.where((count == 0) | np.isnan(dem), np.nan, ci)
+
+
+def _slope_deg(dzdx, dzdy):
+    return np.degrees(np.arctan(np.hypot(dzdx, dzdy)))
+
+
+def _aspect_deg(dzdx, dzdy):
+    """Compass bearing (N=0, clockwise) of the downslope direction; NaN if flat."""
+    aspect = np.degrees(np.arctan2(-dzdx, -dzdy)) % 360.0
+    return np.where((dzdx == 0) & (dzdy == 0), np.nan, aspect)
+
+
 def _horn_slope(patch: np.ndarray, dx_m: float, dy_m: float) -> float:
-    z1, z2, z3 = patch[0, 0], patch[0, 1], patch[0, 2]
-    z4, z6 = patch[1, 0], patch[1, 2]
-    z7, z8, z9 = patch[2, 0], patch[2, 1], patch[2, 2]
-    dzdx = ((z3 + 2*z6 + z9) - (z1 + 2*z4 + z7)) / (8.0 * dx_m)
-    dzdy = ((z7 + 2*z8 + z9) - (z1 + 2*z2 + z3)) / (8.0 * dy_m)
-    return float(np.degrees(np.arctan(np.sqrt(dzdx**2 + dzdy**2))))
+    dzdx, dzdy = _horn_gradient(patch, dx_m, dy_m)
+    return float(_slope_deg(dzdx[1, 1], dzdy[1, 1]))
 
 
-def _horn_aspect(patch: np.ndarray, dx_m: float, dy_m: float) -> float:
-    z1, z2, z3 = patch[0, 0], patch[0, 1], patch[0, 2]
-    z4, z6 = patch[1, 0], patch[1, 2]
-    z7, z8, z9 = patch[2, 0], patch[2, 1], patch[2, 2]
-    dzdx = ((z3 + 2*z6 + z9) - (z1 + 2*z4 + z7)) / (8.0 * dx_m)
-    dzdy = ((z7 + 2*z8 + z9) - (z1 + 2*z2 + z3)) / (8.0 * dy_m)
-    return float((90.0 - np.degrees(np.arctan2(dzdy, -dzdx))) % 360.0)
+def _horn_aspect(patch: np.ndarray, dx_m: float, dy_m: float) -> float | None:
+    dzdx, dzdy = _horn_gradient(patch, dx_m, dy_m)
+    aspect = float(_aspect_deg(dzdx[1, 1], dzdy[1, 1]))
+    return None if np.isnan(aspect) else aspect
+
+
+def _heat_load(slope_deg, aspect_deg, lat_deg):
+    """McCune & Keon (2002) heat load index: potential annual direct incident
+    radiation (MJ cm⁻² yr⁻¹) from slope, aspect and latitude.
+
+    Aspect is folded about the hemisphere's warmest direction (SW = 225° in
+    the north, NW = 315° in the south) so 0 is the coolest face and 180° the
+    warmest, and latitude enters as its absolute value, mirroring the
+    northern-hemisphere fit. Flat ground (aspect NaN) is still defined: every
+    aspect term is multiplied by sin(slope) = 0 there. The equation was fitted
+    on northern mid-latitudes; FABDEM's 60°S–80°N coverage is extrapolation
+    at its poleward ends.
+    """
+    slope = np.radians(slope_deg)
+    lat = np.asarray(lat_deg, dtype=np.float64)
+    warmest = np.where(lat < 0, 315.0, 225.0)
+    aspect = np.where(np.isnan(aspect_deg), 0.0, aspect_deg)
+    folded = np.radians(np.abs(180.0 - np.abs(aspect - warmest)))
+    lat_r = np.radians(np.abs(lat))
+    ln_rad = (
+        -1.467
+        + 1.582 * np.cos(lat_r) * np.cos(slope)
+        - 1.5 * np.cos(folded) * np.sin(slope) * np.sin(lat_r)
+        - 0.262 * np.sin(lat_r) * np.sin(slope)
+        + 0.607 * np.sin(folded) * np.sin(slope)
+    )
+    return np.exp(ln_rad)
 
 
 def sample_elevation_terrain_batch(
@@ -348,14 +505,20 @@ def sample_elevation_terrain_batch(
     want_elevation: bool = False,
     want_slope: bool = False,
     want_aspect: bool = False,
+    want_heat_load: bool = False,
+    want_convergence: bool = False,
+    want_plan_curvature: bool = False,
+    want_profile_curvature: bool = False,
 ) -> dict[str, list[float | None]]:
-    """Sample elevation, slope, and/or aspect in a single pass over elevation.tif.
+    """Sample elevation and/or any elevation-derived terrain value in a single
+    pass over elevation.tif.
 
     Opens the file once and reads one 3×3 window per point, computing all
     requested outputs from the same read.  Points should be hilbert-sorted
     for GDAL block-cache locality.
 
-    Returns a dict with keys matching the requested outputs.
+    Returns a dict with keys matching the requested outputs. Aspect is None
+    on perfectly flat ground, where it is undefined.
     """
     n = len(lats)
     elev_path = resolve_layer_path(LAYERS_DIR, "elevation.tif")
@@ -366,6 +529,14 @@ def sample_elevation_terrain_batch(
         results["slope"] = [None] * n
     if want_aspect:
         results["aspect"] = [None] * n
+    if want_heat_load:
+        results["heat_load"] = [None] * n
+    if want_convergence:
+        results["convergence"] = [None] * n
+    if want_plan_curvature:
+        results["plan_curvature"] = [None] * n
+    if want_profile_curvature:
+        results["profile_curvature"] = [None] * n
     if not results or not elev_path.exists() or n == 0:
         return results
     try:
@@ -373,32 +544,54 @@ def sample_elevation_terrain_batch(
             nodata = ds.nodata
             pixel_deg = abs(ds.transform.a)
             h, w = ds.height, ds.width
-            need_terrain = want_slope or want_aspect
+            need_curvature = want_plan_curvature or want_profile_curvature
+            need_terrain = want_slope or want_aspect or want_heat_load or need_curvature or want_convergence
+            # Convergence needs the neighbours' aspects, so a 5×5 window;
+            # everything else only uses the centre's 3×3.
+            half = 2 if want_convergence else 1
             for i, (lat, lon) in enumerate(zip(lats.tolist(), lons.tolist())):
                 try:
                     row, col = ds.index(lon, lat)
                     if need_terrain:
-                        if row < 1 or col < 1 or row >= h - 1 or col >= w - 1:
+                        if row < half or col < half or row >= h - half or col >= w - half:
                             continue
-                        win = rasterio.windows.Window(col - 1, row - 1, 3, 3)
+                        size = 2 * half + 1
+                        win = rasterio.windows.Window(col - half, row - half, size, size)
                         patch = ds.read(1, window=win).astype(np.float64)
-                        if patch.shape != (3, 3):
+                        if patch.shape != (size, size):
                             continue
-                        if nodata is not None and np.any(patch == nodata):
-                            continue
-                        if np.any(~np.isfinite(patch)):
+                        if nodata is not None:
+                            patch[patch == nodata] = np.nan
+                        patch[~np.isfinite(patch)] = np.nan
+                        c = half
+                        if np.isnan(patch[c, c]):
                             continue
                         if want_elevation:
-                            results["elevation"][i] = float(patch[1, 1])
+                            results["elevation"][i] = float(patch[c, c])
                         m_lat, m_lon = _meters_per_degree(lat)
                         dx_m = pixel_deg * m_lon
                         dy_m = pixel_deg * m_lat
                         if dx_m == 0 or dy_m == 0:
                             continue
+                        dzdx, dzdy = _horn_gradient(patch, dx_m, dy_m)
+                        slope = float(_slope_deg(dzdx[c, c], dzdy[c, c]))
+                        aspect = float(_aspect_deg(dzdx[c, c], dzdy[c, c]))
                         if want_slope:
-                            results["slope"][i] = _horn_slope(patch, dx_m, dy_m)
+                            results["slope"][i] = slope
                         if want_aspect:
-                            results["aspect"][i] = _horn_aspect(patch, dx_m, dy_m)
+                            results["aspect"][i] = None if np.isnan(aspect) else aspect
+                        if want_heat_load:
+                            results["heat_load"][i] = float(_heat_load(slope, aspect, lat))
+                        if want_convergence:
+                            ci = _convergence_index(patch, dx_m, dy_m)[c, c]
+                            if np.isfinite(ci):
+                                results["convergence"][i] = float(ci)
+                        if need_curvature:
+                            plan, profile = _curvatures(patch, dx_m, dy_m, dzdx, dzdy)
+                            if want_plan_curvature and np.isfinite(plan[c, c]):
+                                results["plan_curvature"][i] = float(plan[c, c])
+                            if want_profile_curvature and np.isfinite(profile[c, c]):
+                                results["profile_curvature"][i] = float(profile[c, c])
                     else:
                         # elevation only — single-pixel read is enough
                         if row < 0 or col < 0 or row >= h or col >= w:
@@ -437,66 +630,146 @@ def compute_aspect_at_point(lat: float, lon: float) -> float | None:
     return sample_aspect_batch(np.array([lat]), np.array([lon]))[0]
 
 
-def derive_slope_array(dem: np.ndarray, transform) -> np.ndarray:
-    """Derive slope (degrees) from a 2-D DEM array using np.gradient.
+def sample_heat_load_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]:
+    """Compute heat load (MJ cm⁻² yr⁻¹) for many points with a single file open."""
+    return sample_elevation_terrain_batch(lats, lons, want_heat_load=True).get("heat_load", [None] * len(lats))
 
-    Uses the pixel resolution from `transform` and a latitude-aware unit
-    conversion.  NaN cells in `dem` propagate to NaN in the output.
+
+def compute_heat_load_at_point(lat: float, lon: float) -> float | None:
+    """Compute heat load (MJ cm⁻² yr⁻¹) at a single lat/lon."""
+    return sample_heat_load_batch(np.array([lat]), np.array([lon]))[0]
+
+
+def sample_convergence_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]:
+    """Compute the convergence index (±100) for many points with a single file open."""
+    return sample_elevation_terrain_batch(lats, lons, want_convergence=True).get(
+        "convergence", [None] * len(lats),
+    )
+
+
+def compute_convergence_at_point(lat: float, lon: float) -> float | None:
+    """Compute the convergence index (±100) at a single lat/lon."""
+    return sample_convergence_batch(np.array([lat]), np.array([lon]))[0]
+
+
+def sample_plan_curvature_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]:
+    """Compute plan curvature (m⁻¹) for many points with a single file open."""
+    return sample_elevation_terrain_batch(lats, lons, want_plan_curvature=True).get(
+        "plan_curvature", [None] * len(lats),
+    )
+
+
+def compute_plan_curvature_at_point(lat: float, lon: float) -> float | None:
+    """Compute plan curvature (m⁻¹) at a single lat/lon."""
+    return sample_plan_curvature_batch(np.array([lat]), np.array([lon]))[0]
+
+
+def sample_profile_curvature_batch(lats: np.ndarray, lons: np.ndarray) -> list[float | None]:
+    """Compute profile curvature (m⁻¹) for many points with a single file open."""
+    return sample_elevation_terrain_batch(lats, lons, want_profile_curvature=True).get(
+        "profile_curvature", [None] * len(lats),
+    )
+
+
+def compute_profile_curvature_at_point(lat: float, lon: float) -> float | None:
+    """Compute profile curvature (m⁻¹) at a single lat/lon."""
+    return sample_profile_curvature_batch(np.array([lat]), np.array([lon]))[0]
+
+
+def _row_latitudes(dem: np.ndarray, transform) -> np.ndarray:
+    rows = np.arange(dem.shape[0], dtype=np.float64)
+    return transform.f + (rows + 0.5) * transform.e
+
+
+def _array_cell_sizes(dem: np.ndarray, transform) -> tuple[np.ndarray, np.ndarray]:
+    """Per-row (dx_m, dy_m) as (rows, 1) arrays for a north-up EPSG:4326 grid."""
+    row_lat = _row_latitudes(dem, transform)
+    m_per_deg_lat, m_per_deg_lon = _meters_per_degree_np(row_lat)
+    return (abs(transform.a) * m_per_deg_lon)[:, None], (abs(transform.e) * m_per_deg_lat)[:, None]
+
+
+def _array_gradient(dem: np.ndarray, transform) -> tuple[np.ndarray, np.ndarray]:
+    """Horn gradient of a north-up EPSG:4326 DEM array, per-row cell sizes."""
+    return _horn_gradient(dem, *_array_cell_sizes(dem, transform))
+
+
+def derive_slope_array(dem: np.ndarray, transform) -> np.ndarray:
+    """Derive slope (degrees) from a 2-D EPSG:4326 DEM array (Horn kernel).
+
+    NaN cells in `dem` propagate to NaN in the output.
     Returns a float32 array of the same shape as `dem`.
     """
-    from rasterio.transform import xy as tf_xy
-    finite = np.isfinite(dem)
-    if not np.any(finite):
+    if not np.any(np.isfinite(dem)):
         return np.full(dem.shape, np.nan, dtype=np.float32)
-
-    fill = float(np.nanmedian(dem[finite]))
-    filled = np.where(finite, dem, fill).astype(np.float64)
-
-    pixel_deg_x = abs(transform.a)
-    pixel_deg_y = abs(transform.e)
-    # Use centre-row latitude for the whole tile (good enough for a 256-px tile)
-    centre_row = dem.shape[0] // 2
-    centre_col = dem.shape[1] // 2
-    lon_c, lat_c = tf_xy(transform, centre_row, centre_col)
-    m_per_deg_lat, m_per_deg_lon = _meters_per_degree(float(lat_c))
-    dx_m = pixel_deg_x * m_per_deg_lon
-    dy_m = pixel_deg_y * m_per_deg_lat
-
-    dz_dy, dz_dx = np.gradient(filled, dy_m, dx_m)
-    slope = np.degrees(np.arctan(np.hypot(dz_dx, dz_dy))).astype(np.float32)
-    slope[~finite] = np.nan
-    return slope
+    dzdx, dzdy = _array_gradient(dem, transform)
+    return _slope_deg(dzdx, dzdy).astype(np.float32)
 
 
 def derive_aspect_array(dem: np.ndarray, transform) -> np.ndarray:
-    """Derive aspect (°, N=0 clockwise) from a 2-D DEM array using np.gradient.
+    """Derive aspect (°, N=0 clockwise) from a 2-D EPSG:4326 DEM array (Horn kernel).
 
-    Uses the same pixel/latitude-aware unit conversion as derive_slope_array.
-    NaN cells and flat pixels (slope < _FLAT_SLOPE_THRESHOLD) are set to NaN.
+    NaN cells and perfectly flat cells (aspect undefined) are NaN.
     Returns a float32 array of the same shape as `dem`.
     """
-    from rasterio.transform import xy as tf_xy
-    finite = np.isfinite(dem)
-    if not np.any(finite):
+    if not np.any(np.isfinite(dem)):
         return np.full(dem.shape, np.nan, dtype=np.float32)
+    dzdx, dzdy = _array_gradient(dem, transform)
+    return _aspect_deg(dzdx, dzdy).astype(np.float32)
 
-    fill = float(np.nanmedian(dem[finite]))
-    filled = np.where(finite, dem, fill).astype(np.float64)
 
-    pixel_deg_x = abs(transform.a)
-    pixel_deg_y = abs(transform.e)
-    centre_row = dem.shape[0] // 2
-    centre_col = dem.shape[1] // 2
-    lon_c, lat_c = tf_xy(transform, centre_row, centre_col)
-    m_per_deg_lat, m_per_deg_lon = _meters_per_degree(float(lat_c))
-    dx_m = pixel_deg_x * m_per_deg_lon
-    dy_m = pixel_deg_y * m_per_deg_lat
+def derive_heat_load_array(dem: np.ndarray, transform) -> np.ndarray:
+    """Derive heat load (MJ cm⁻² yr⁻¹) from a 2-D EPSG:4326 DEM array, using
+    each row's own latitude. NaN cells propagate to NaN in the output.
+    Returns a float32 array of the same shape as `dem`.
+    """
+    if not np.any(np.isfinite(dem)):
+        return np.full(dem.shape, np.nan, dtype=np.float32)
+    dzdx, dzdy = _array_gradient(dem, transform)
+    lat = _row_latitudes(dem, transform)[:, None]
+    return _heat_load(_slope_deg(dzdx, dzdy), _aspect_deg(dzdx, dzdy), lat).astype(np.float32)
 
-    dz_dy, dz_dx = np.gradient(filled, dy_m, dx_m)
-    raw = np.degrees(np.arctan2(dz_dy, -dz_dx))
-    aspect = ((90.0 - raw) % 360.0).astype(np.float32)
-    aspect[~finite] = np.nan
-    return aspect
+
+def _array_curvatures(dem: np.ndarray, transform) -> tuple[np.ndarray, np.ndarray]:
+    dx_m, dy_m = _array_cell_sizes(dem, transform)
+    dzdx, dzdy = _horn_gradient(dem, dx_m, dy_m)
+    return _curvatures(dem, dx_m, dy_m, dzdx, dzdy)
+
+
+def derive_convergence_array(dem: np.ndarray, transform) -> np.ndarray:
+    """Derive the convergence index (±100, negative = converging) from a 2-D
+    EPSG:4326 DEM array, with per-row ground-metre neighbour offsets.
+    Returns float32."""
+    if not np.any(np.isfinite(dem)):
+        return np.full(dem.shape, np.nan, dtype=np.float32)
+    return _convergence_index(dem, *_array_cell_sizes(dem, transform)).astype(np.float32)
+
+
+def derive_plan_curvature_array(dem: np.ndarray, transform) -> np.ndarray:
+    """Derive plan curvature (m⁻¹, negative = converging) from a 2-D EPSG:4326
+    DEM array. NaN where nodata or the gradient is zero. Returns float32."""
+    if not np.any(np.isfinite(dem)):
+        return np.full(dem.shape, np.nan, dtype=np.float32)
+    return _array_curvatures(dem, transform)[0].astype(np.float32)
+
+
+def derive_profile_curvature_array(dem: np.ndarray, transform) -> np.ndarray:
+    """Derive profile curvature (m⁻¹, negative = concave/decelerating) from a
+    2-D EPSG:4326 DEM array. NaN where nodata or the gradient is zero.
+    Returns float32."""
+    if not np.any(np.isfinite(dem)):
+        return np.full(dem.shape, np.nan, dtype=np.float32)
+    return _array_curvatures(dem, transform)[1].astype(np.float32)
+
+
+# Array deriver for each DERIVED_FROM_ELEVATION layer (map tiles, chaining).
+ELEVATION_DERIVERS = {
+    "slope": derive_slope_array,
+    "aspect": derive_aspect_array,
+    "heat_load": derive_heat_load_array,
+    "convergence": derive_convergence_array,
+    "plan_curvature": derive_plan_curvature_array,
+    "profile_curvature": derive_profile_curvature_array,
+}
 
 
 # ---------------------------------------------------------------------------

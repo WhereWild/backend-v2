@@ -420,6 +420,42 @@ def test_process_batch_derived_slope_success(tmp_path):
     assert pytest.approx(vals["obs2"]) == 12.0
 
 
+def test_process_batch_derived_heat_load_success(tmp_path):
+    worklist = _make_worklist(["heat_load"])
+    layers = [{"id": "heat_load", "filename": None, "scale_factor": None, "add_offset": None}]
+    layers_dir = tmp_path / "layers"
+    layers_dir.mkdir()
+    (layers_dir / "elevation.tif").touch()
+
+    with patch.object(et, "LAYERS_DIR", layers_dir), \
+         patch.object(et, "sample_heat_load_batch", return_value=[0.25, 0.95]):
+        staging = et._process_batch(worklist, layers)
+    vals = dict(zip(staging.column("catalogNumber").to_pylist(), staging.column("heat_load").to_pylist()))
+    assert pytest.approx(vals["obs1"]) == 0.25
+    assert pytest.approx(vals["obs2"]) == 0.95
+
+
+def test_process_batch_combined_terrain_pass_includes_derived_terrain(tmp_path):
+    ids = ["slope", "aspect", "heat_load", "convergence", "plan_curvature", "profile_curvature"]
+    worklist = _make_worklist(ids)
+    layers = [{"id": lid, "filename": None, "scale_factor": None, "add_offset": None} for lid in ids]
+    layers_dir = tmp_path / "layers"
+    layers_dir.mkdir()
+    (layers_dir / "elevation.tif").touch()
+
+    fake = {
+        "slope": [10.0, 20.0], "aspect": [90.0, 180.0], "heat_load": [0.5, 0.6],
+        "convergence": [-40.0, 25.0],
+        "plan_curvature": [-0.003, 0.002], "profile_curvature": [0.001, -0.004],
+    }
+    with patch.object(et, "LAYERS_DIR", layers_dir), \
+         patch.object(et, "sample_elevation_terrain_batch", return_value=fake) as mock:
+        staging = et._process_batch(worklist, layers)
+    for lid in ("heat_load", "convergence", "plan_curvature", "profile_curvature"):
+        assert mock.call_args.kwargs[f"want_{lid}"] is True
+        assert staging.column(lid).to_pylist() == pytest.approx(fake[lid])
+
+
 # ---------------------------------------------------------------------------
 # _write_staging_batch / _finalize_enrichment
 # ---------------------------------------------------------------------------

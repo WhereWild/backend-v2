@@ -3,44 +3,53 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 """
-Download FABDEM V1-2 tiles from the University of Bristol data repository,
-extract 1°×1° GeoTIFFs, and stitch them into a single global COG.
+Download GEDTM30 (Ho et al. 2025, CC-BY-4.0) from OpenGeoHub: the terrain
+model itself, plus the published land surface parameters that can't be
+derived on the fly from it (slope, aspect, curvature, heat load etc. are
+computed per request from elevation.tif — see util/gis.py).
 
-Steps:
-  1. Download the single FABDEM ZIP from the Bristol dataset page
-  2. Extract 1°×1° FABDEM TIFs to data/gis/dem_raw_tiles/  (atomic: tmp→rename)
-  3. Build a VRT spanning all tiles
-  4. gdal_translate -of COG → data/gis/layers/elevation.tif
+Layers (VARS_TO_DOWNLOAD key → data/gis/layers/<file>):
+  elevation → elevation.tif  GEDTM30 v1.2 DTM, Float32 metres, 1" (85°N–65°S)
+  twi       → twi.tif        GEDTM30 Topographic Wetness Index v1.2.0, Int16
+                             ×0.01 (catalog scale_factor), 1" (84°N–57°S)
 
-Re-running is safe: already-extracted tiles and the final COG are skipped
-unless --force is passed.
+Both are already COGs with overviews, so they're stored as published —
+lossless, no re-encode. The DTM's own scale tag says 0.1, but its values are
+metres (1300.0 at Salt Lake City, where FABDEM has 1298.3), so the tag is
+cleared: anything honouring it would read heights 10× too low.
+
+The TWI layer stops at 57°S while the DTM reaches 65°S; the land in between
+(South Shetlands/Orkneys/Sandwich, the tip of the Antarctic Peninsula) has
+no published TWI.
+
+Full run: aria2c each file into data/gis/dem_raw/, fix it up there, then
+rename it into place. --bbox W S E N clips every layer from the remote COGs
+into --out-dir instead (for testing on a region without the ~770 GB).
+
+Re-running is safe: finished layers are skipped unless --force is passed,
+and aria2c resumes a partial download.
 """
 
 from __future__ import annotations
 
-import io
 import os
-import re
 import subprocess
-import tempfile
-import zipfile
 from pathlib import Path
 
 _raw_vars = os.environ.get("VARS_TO_DOWNLOAD", "")
 VARS_TO_DOWNLOAD: list[str] | None = [v.strip() for v in _raw_vars.split(",") if v.strip()] or None
 
-DATASET_URL = "https://data.bris.ac.uk/datasets/tar/s5hqmjcdj8yo2ibzi9b4ew3sn.zip"
-ZIP_FILENAME = "FABDEM_V1-2.zip"
+S3_BASE = "https://s3.opengeohub.org/global/dtm"
+LAYERS: dict[str, tuple[str, str]] = {
+    # key: (published file under S3_BASE, file in data/gis/layers)
+    "elevation": ("v1.2/gedtm_rf_m_30m_s_20060101_20151231_go_epsg.4326.3855_v1.2.tif", "elevation.tif"),
+    "twi": ("v1.2.0/twi_gedtm_m_30m_s_20060101_20151231_go_epsg.4326_v1.2.0.tif", "twi.tif"),
+}
+# Layers whose scale tag is wrong and has to be cleared (see docstring).
+CLEAR_SCALE = {"elevation"}
 
-RAW_ZIPS_DIR  = Path("data/gis/dem_raw_zips")
-RAW_TILES_DIR = Path("data/gis/dem_raw_tiles")
-LAYERS_DIR    = Path("data/gis/layers")
-OUT_PATH      = LAYERS_DIR / "elevation.tif"
-
-TILE_PATTERN = re.compile(
-    r"^([NS])(\d{1,2})([EW])(\d{1,3})_FABDEM_V1-2\.tif$",
-    re.IGNORECASE,
-)
+RAW_DIR    = Path("data/gis/dem_raw")
+LAYERS_DIR = Path("data/gis/layers")
 
 
 def _run(cmd: list[str]) -> None:
@@ -51,19 +60,20 @@ def _run(cmd: list[str]) -> None:
         )
 
 
-def _download_zip(url: str, dest: Path) -> None:
+def _download(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
             "aria2c",
             "--split=16",
             "--max-connection-per-server=16",
-            "--min-split-size=1M",
+            "--min-split-size=64M",
             "--file-allocation=none",
             "--continue=true",
             "--max-tries=12",
             "--retry-wait=15",
             "--connect-timeout=60",
+            "--summary-interval=300",
             f"--dir={dest.parent}",
             f"--out={dest.name}",
             url,
@@ -72,123 +82,63 @@ def _download_zip(url: str, dest: Path) -> None:
     )
 
 
-def _extract_tiles(zip_path: Path, out_dir: Path) -> list[Path]:
-    """Extract 1°×1° TIF tiles from the outer zip-of-zips.
-
-    Checks disk first — if tiles already exist in out_dir, skips opening the
-    outer zip entirely. Writes atomically (tmp → rename) so a killed process
-    never leaves a partial tile that would be silently skipped on re-run.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    existing = [p for p in out_dir.iterdir() if TILE_PATTERN.match(p.name)]
-    if existing:
-        print(f"  Found {len(existing)} tiles already on disk, skipping extraction.")
-        return existing
-
-    extracted: list[Path] = []
-    with zipfile.ZipFile(zip_path) as outer:
-        inner_zips = [m for m in outer.namelist() if m.endswith(".zip")]
-        total = len(inner_zips)
-        for i, member in enumerate(inner_zips, 1):
-            print(f"  [{i}/{total}] {Path(member).name}", flush=True)
-            inner_data = outer.read(member)
-            with zipfile.ZipFile(io.BytesIO(inner_data)) as inner:
-                for tile_member in inner.namelist():
-                    name = Path(tile_member).name
-                    if not TILE_PATTERN.match(name):
-                        continue
-                    dest = out_dir / name
-                    if dest.exists():
-                        extracted.append(dest)
-                        continue
-                    tmp = dest.with_suffix(".tif.tmp")
-                    tmp.write_bytes(inner.read(tile_member))
-                    tmp.replace(dest)
-                    extracted.append(dest)
-    return extracted
+def _clip(url: str, dest: Path, bbox: tuple[float, float, float, float], clear_scale: bool) -> None:
+    """Clip a remote COG to bbox (W, S, E, N) as a lossless local COG."""
+    w, s, e, n = bbox
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".tif.tmp")
+    _run([
+        "gdal_translate", "-q",
+        "-projwin", str(w), str(n), str(e), str(s),
+        *(["-a_scale", "1", "-a_offset", "0"] if clear_scale else []),
+        "-of", "COG", "-co", "COMPRESS=DEFLATE", "-co", "BIGTIFF=IF_SAFER",
+        "-co", "OVERVIEW_RESAMPLING=AVERAGE", "-co", "NUM_THREADS=4",
+        f"/vsicurl/{url}", str(tmp),
+    ])
+    tmp.replace(dest)
 
 
-def _detect_nodata(path: Path) -> float | None:
-    try:
-        import rasterio  # type: ignore
-        with rasterio.open(path) as ds:
-            return ds.nodata
-    except Exception:
-        return None
+def _clear_scale(path: Path) -> None:
+    """Rewrites only the metadata tag; GDAL calls that a COG layout break,
+    but the IFDs, tiles and overviews stay where they are."""
+    _run(["gdal_edit", "-oo", "IGNORE_COG_LAYOUT_BREAK=YES", "-scale", "1", "-offset", "0", str(path)])
 
 
-def _build_global_cog(tile_paths: list[Path], out_path: Path, nodata: float | None) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_out = out_path.with_suffix(".tif.tmp")
+def main(force: bool = False, bbox: tuple[float, float, float, float] | None = None,
+         out_dir: Path = LAYERS_DIR) -> None:
+    for key, (remote, filename) in LAYERS.items():
+        if not force and VARS_TO_DOWNLOAD is not None and key not in VARS_TO_DOWNLOAD:
+            print(f"[download_dem] {key} skipped (not in VARS_TO_DOWNLOAD)")
+            continue
+        out_path = out_dir / filename
+        if out_path.exists() and not force:
+            print(f"[download_dem] {key}: already exists: {out_path} (use --force to replace)")
+            continue
+        url = f"{S3_BASE}/{remote}"
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        vrt_path = Path(tmp_dir) / "global.vrt"
+        if bbox is not None:
+            print(f"[download_dem] {key}: clipping {bbox} → {out_path}", flush=True)
+            _clip(url, out_path, bbox, clear_scale=key in CLEAR_SCALE)
+            continue
 
-        print(f"Building VRT from {len(tile_paths)} tiles...", flush=True)
-        _run([
-            "gdalbuildvrt", "-overwrite", "-resolution", "highest",
-            str(vrt_path), *[str(p) for p in sorted(tile_paths)],
-        ])
-
-        print("Translating to GeoTIFF...", flush=True)
-        translate_cmd = [
-            "gdal_translate",
-            "-of", "GTiff",
-            "-co", "COMPRESS=DEFLATE",
-            "-co", "TILED=YES",
-            "-co", "BLOCKXSIZE=256",
-            "-co", "BLOCKYSIZE=256",
-            "-co", "BIGTIFF=YES",
-            "-co", "NUM_THREADS=4",
-        ]
-        if nodata is not None:
-            translate_cmd += ["-a_nodata", str(nodata)]
-        translate_cmd += [str(vrt_path), str(tmp_out)]
-        _run(translate_cmd)
-
-    if out_path.exists():
-        out_path.unlink()
-    tmp_out.replace(out_path)
-
-
-def main(force: bool = False) -> None:
-    if not force and VARS_TO_DOWNLOAD is not None and "elevation" not in VARS_TO_DOWNLOAD:
-        print("[download_dem] skipped (elevation not in VARS_TO_DOWNLOAD)")
-        return
-
-    zip_dest = RAW_ZIPS_DIR / ZIP_FILENAME
-    aria2_control = zip_dest.with_suffix(zip_dest.suffix + ".aria2")
-    if not zip_dest.exists() or aria2_control.exists():
-        print(f"Downloading {DATASET_URL} ...")
-        _download_zip(DATASET_URL, zip_dest)
-    else:
-        print(f"ZIP already downloaded: {zip_dest}")
-
-    if OUT_PATH.exists() and not force:
-        print(f"COG already exists: {OUT_PATH} (use --force to rebuild)")
-        return
-
-    print("Extracting tiles...")
-    tile_paths = _extract_tiles(zip_dest, RAW_TILES_DIR)
-    print(f"Collected {len(tile_paths)} 1°×1° tiles")
-
-    if not tile_paths:
-        print("No tiles found — aborting.")
-        return
-
-    nodata = _detect_nodata(tile_paths[0])
-    if nodata is not None:
-        print(f"Detected nodata value: {nodata}")
-
-    print(f"\nBuilding global COG → {OUT_PATH}")
-    _build_global_cog(tile_paths, OUT_PATH, nodata)
-    print(f"\nDone. Wrote {OUT_PATH}")
+        raw = RAW_DIR / Path(remote).name
+        aria2_control = raw.with_suffix(raw.suffix + ".aria2")
+        if not raw.exists() or aria2_control.exists():
+            print(f"[download_dem] {key}: downloading {url}", flush=True)
+            _download(url, raw)
+        if key in CLEAR_SCALE:
+            _clear_scale(raw)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        raw.replace(out_path)
+        print(f"[download_dem] {key}: wrote {out_path}", flush=True)
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Download FABDEM elevation tiles")
-    parser.add_argument("--force", action="store_true", help="Rebuild even if output already exists")
+    parser = argparse.ArgumentParser(description="Download GEDTM30 elevation and terrain layers")
+    parser.add_argument("--force", action="store_true", help="Replace layers that already exist")
+    parser.add_argument("--bbox", type=float, nargs=4, metavar=("W", "S", "E", "N"),
+                        help="Clip to this lon/lat box from the remote COGs instead of downloading")
+    parser.add_argument("--out-dir", type=Path, default=LAYERS_DIR, help="Where to write (default data/gis/layers)")
     args = parser.parse_args()
-    main(force=args.force)
+    main(force=args.force, bbox=tuple(args.bbox) if args.bbox else None, out_dir=args.out_dir)

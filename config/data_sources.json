@@ -162,22 +162,59 @@
       }
     ]
   },
-  "fabdem": {
-    "name": "FABDEM V1-2",
-    "url": "https://data.bris.ac.uk/data/dataset/s5hqmjcdj8yo2ibzi9b4ew3sn",
-    "license": "CC BY-NC-SA 4.0",
-    "license_url": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
-    "citation": "Hawker, L., Uhe, P., Paulo, L., Sosa, J., Savage, J., Sampson, C., and Neal, J. (2022). A 30 m global map of elevation with forests and buildings removed. Environmental Research Letters, 17(2), 024016.",
-    "doi": "https://doi.org/10.1088/1748-9326/ac4d4f",
+  "gedtm30": {
+    "name": "GEDTM30 v1.2",
+    "url": "https://codeberg.org/openlandmap/GEDTM30",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Ho, Y.-F., Grohmann, C. H., Lindsay, J., Reuter, H. I., Parente, L., Witjes, M., and Hengl, T. (2025). GEDTM30: global ensemble digital terrain model at 30 m and derived multiscale terrain variables. PeerJ, 13, e19673.",
+    "doi": "https://doi.org/10.7717/peerj.19673",
     "references": [
       {
-        "authors": "Hawker, L., Uhe, P., Paulo, L., Sosa, J., Savage, J., Sampson, C., and Neal, J.",
-        "year": 2022,
-        "title": "A 30 m global map of elevation with forests and buildings removed",
-        "journal": "Environmental Research Letters",
-        "volume_issue": "17(2)",
-        "pages": "024016",
-        "doi": "https://doi.org/10.1088/1748-9326/ac4d4f"
+        "authors": "Ho, Y.-F., Grohmann, C. H., Lindsay, J., Reuter, H. I., Parente, L., Witjes, M., and Hengl, T.",
+        "year": 2025,
+        "title": "GEDTM30: global ensemble digital terrain model at 30 m and derived multiscale terrain variables",
+        "journal": "PeerJ",
+        "volume_issue": "13",
+        "pages": "e19673",
+        "doi": "https://doi.org/10.7717/peerj.19673"
+      }
+    ]
+  },
+  "gedtm30_geomorphons": {
+    "name": "Geomorphons from GEDTM30 v1.2 (Geomorpho90m method at 30 m)",
+    "url": "https://codeberg.org/openlandmap/GEDTM30",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Derived from GEDTM30 v1.2 (Ho et al. 2025) with GRASS GIS r.geomorphon (Jasiewicz and Stepinski 2013), following the Geomorpho90m workflow (Amatulli et al. 2020).",
+    "doi": "https://doi.org/10.1016/j.geomorph.2012.11.005",
+    "references": [
+      {
+        "authors": "Jasiewicz, J. and Stepinski, T.F.",
+        "year": 2013,
+        "title": "Geomorphons — a pattern recognition approach to classification and mapping of landforms",
+        "journal": "Geomorphology",
+        "volume_issue": "182",
+        "pages": "147–156",
+        "doi": "https://doi.org/10.1016/j.geomorph.2012.11.005"
+      },
+      {
+        "authors": "Amatulli, G., McInerney, D., Sethi, T., Strobl, P., and Domisch, S.",
+        "year": 2020,
+        "title": "Geomorpho90m, empirical evaluation and accuracy assessment of global high-resolution geomorphometric layers",
+        "journal": "Scientific Data",
+        "volume_issue": "7",
+        "pages": "162",
+        "doi": "https://doi.org/10.1038/s41597-020-0479-6"
+      },
+      {
+        "authors": "Ho, Y.-F., Grohmann, C. H., Lindsay, J., Reuter, H. I., Parente, L., Witjes, M., and Hengl, T.",
+        "year": 2025,
+        "title": "GEDTM30: global ensemble digital terrain model at 30 m and derived multiscale terrain variables",
+        "journal": "PeerJ",
+        "volume_issue": "13",
+        "pages": "e19673",
+        "doi": "https://doi.org/10.7717/peerj.19673"
       }
     ]
   },

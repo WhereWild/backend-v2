@@ -36,6 +36,7 @@ from util.stats import (
     NOMINAL_STATS_FILE,
     NUMERICAL_STATS_FILE,
     ORDINAL_STATS_FILE,
+    build_density_curve,
 )
 from util.storage import ParquetStorageProxy
 from util.taxa import TaxonRecord, get_taxon_by_id, iter_descendants, search_taxa_by_name
@@ -1012,6 +1013,85 @@ def rank_value_against_group(value: float, group: pd.DataFrame) -> dict:
     return {"position": offset + local_position, "count": existing_count + 1}
 
 
+# ---------------------------------------------------------------------------
+# Rank distribution density (computed on the fly from a ranking group)
+# ---------------------------------------------------------------------------
+
+# Below this many values a KDE says nothing useful about the cohort — the raw
+# values are returned instead, for the frontend to draw as a strip of points.
+RANK_DENSITY_MIN_VALUES = 20
+
+# Metrics whose values live on the source variable's own scale (a location
+# within its distribution); every other rankable metric is a spread, count,
+# concentration, fraction, or entropy with its own scale regardless of the
+# variable's value type.
+_LOCATION_METRICS: frozenset[str] = frozenset({
+    "min", "10th_percentile", "25th_percentile", "median",
+    "75th_percentile", "90th_percentile", "max", "mean", "mode",
+})
+
+
+def rank_metric_value_type(variable_vtype: ValueType, metric: str) -> ValueType:
+    """Value type of a ranked metric's *values* (not of the variable itself) —
+    picks which KDE build_density_curve uses for a ranking group's distribution.
+
+    Location metrics inherit the variable's scale (a circular variable's
+    circular_mean/mode are bearings); differential entropy of a continuous
+    variable can be negative (interval); everything else — std, variance,
+    ranges, counts, rbar, circular_var/std, class_ fractions, Shannon entropy
+    of a nominal/ordinal variable — is non-negative (ratio)."""
+    if variable_vtype == ValueType.CIRCULAR:
+        if metric in _CIRCULAR_ANGULAR_METRICS:
+            return ValueType.CIRCULAR
+        if metric == "entropy":
+            return ValueType.INTERVAL
+        return ValueType.RATIO
+    if variable_vtype in (ValueType.RATIO, ValueType.INTERVAL):
+        if metric in _LOCATION_METRICS:
+            return variable_vtype
+        if metric == "entropy":
+            return ValueType.INTERVAL
+    return ValueType.RATIO
+
+
+def build_rank_density(values, variable_vtype: ValueType | None, metric: str) -> dict | None:
+    """Density of one ranking group's metric values across its taxa.
+
+    Returns {"count", "points", "density", "min", "max", "bandwidth", "mode"}
+    for a KDE-sized group, {"count", "values"} (sorted) for a group smaller
+    than RANK_DENSITY_MIN_VALUES, or None when there's nothing to show."""
+    if variable_vtype is None:
+        return None
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    n = int(arr.size)
+    if n == 0:
+        return None
+    if n < RANK_DENSITY_MIN_VALUES:
+        return {"count": n, "values": np.sort(arr).tolist()}
+    curve = build_density_curve(arr, rank_metric_value_type(variable_vtype, metric))
+    if curve is None:
+        return None
+    return {"count": n, **curve}
+
+
+def read_rank_density(
+    context_id: str, rank: str, variable: str, metric: str, layers: list[dict],
+) -> dict | None:
+    """Density of a (context, rank, variable, metric) ranking group's values —
+    the same population a relative-rank percentile is computed against,
+    including a class_ metric's implicit-zero taxa."""
+    rank_key = "SUBSPECIES" if rank in CONFIG.subspecies_equivalents else rank
+    entries = _read_rank_positions(context_id, rank_key, variable, metric)
+    if not entries:
+        return None
+    values = [float(e.get("value") or 0.0) for e in entries]
+    if metric.startswith("class_"):
+        full_population = int(entries[0].get("count") or len(values))
+        values.extend([0.0] * max(full_population - len(values), 0))
+    return build_rank_density(values, _filter_value_type(variable, layers), metric)
+
+
 def _accepted_ranks(descendant_rank: str, include_species_like: bool) -> frozenset[str] | None:
     """Return accepted taxon rank set for filtering, or None if no rank filter needed."""
     if descendant_rank == CONFIG.species_rank:
@@ -1320,6 +1400,15 @@ def _query_ranked_scoped(
     total = len(filtered)
     page = filtered[offset:offset + limit]
 
+    # Density of the whole filtered result set (not just this page), with the
+    # page's slice of it marked by its first/last sort values — in sort
+    # order, so a circular page's highlight runs clockwise (or counter-
+    # clockwise for desc) from start to end and may wrap past 0°.
+    density = build_rank_density(
+        [e[2] for e in filtered], _filter_value_type(sort_variable, layers or []), sort_metric,
+    )
+    highlight = {"start": page[0][2], "end": page[-1][2]} if page else None
+
     results = []
     for local_rank, (raw_pos, tk, val, sc) in enumerate(page, start=offset + 1):
         taxon = get_taxon_by_id(tk)
@@ -1343,6 +1432,8 @@ def _query_ranked_scoped(
         "eligible_total": full_population,
         "empty_reason": None if results else "no_results",
         "results": results,
+        "density": density,
+        "highlight": highlight,
     }
 
 

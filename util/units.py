@@ -145,12 +145,43 @@ def convert_summary(
     return result
 
 
+def scale_density_curve(curve: dict[str, Any], scale: float, shift: float = 0.0) -> dict[str, Any]:
+    """Map a density curve through x -> x * scale + shift.
+
+    Positions (points, min, max, mode, raw values) move with the map; the
+    density is divided by |scale| so the curve still integrates to 1, and the
+    bandwidth (a width) only scales."""
+    result = dict(curve)
+    for key in ("points", "values"):
+        if isinstance(result.get(key), list):
+            result[key] = [v * scale + shift for v in result[key]]
+    if isinstance(result.get("density"), list) and scale:
+        result["density"] = [v / abs(scale) for v in result["density"]]
+    if isinstance(result.get("bandwidth"), (int, float)):
+        result["bandwidth"] = result["bandwidth"] * abs(scale)
+    for key in ("min", "max", "mode"):
+        if isinstance(result.get(key), (int, float)):
+            result[key] = result[key] * scale + shift
+    return result
+
+
 def convert_density_curve(
     curve: dict[str, Any] | None,
     layer: dict,
     unit_system: str | None,
+    *,
+    metric: str | None = None,
 ) -> dict[str, Any] | None:
+    """Convert a density curve's x-axis to the target unit system.
+
+    With no metric, the curve is over the variable's raw values. With a
+    metric, it's over that summary metric's values across taxa (a relative-
+    rank distribution) and follows the same per-metric rules as
+    convert_value: no offset for spreads, squared factor for variance,
+    a log|factor| shift for entropy, untouched for dimensionless metrics."""
     if not curve or unit_system != "imperial":
+        return curve
+    if metric is not None and metric in _DIMENSIONLESS_METRICS:
         return curve
     from_unit = layer.get("units") or ""
     to_unit = layer.get("imperial_unit") or ""
@@ -160,16 +191,8 @@ def convert_density_curve(
     if params is None:
         return curve
     factor, off = params
-    use_offset = _apply_offset(layer, None)
-
-    result = dict(curve)
-    if "points" in result:
-        result["points"] = [v * factor + (off if use_offset else 0.0) for v in result["points"]]
-    if "density" in result and factor:
-        result["density"] = [v / abs(factor) for v in result["density"]]
-    if isinstance(result.get("bandwidth"), (int, float)):
-        result["bandwidth"] = result["bandwidth"] * abs(factor)
-    for key in ("min", "max"):
-        if isinstance(result.get(key), (int, float)):
-            result[key] = result[key] * factor + (off if use_offset else 0.0)
-    return result
+    if metric is not None and metric in _ENTROPY_METRICS:
+        return scale_density_curve(curve, 1.0, math.log(abs(factor)))
+    if metric is not None and metric in _SQUARED_FACTOR_METRICS:
+        factor = factor ** 2
+    return scale_density_curve(curve, factor, off if _apply_offset(layer, metric) else 0.0)

@@ -2576,6 +2576,35 @@ def test_load_relative_ranks_reads_consolidated_positions_file(tmp_path):
     assert by_label["Family Y"]["percentile"] == pytest.approx(0.5)
 
 
+def test_load_relative_ranks_carries_context_and_display_value(tmp_path):
+    """Each row carries what the frontend needs to request that context's
+    rank-density curve, plus this taxon's own value in display units for the
+    marker — spread metrics skip the °C→°F offset, class_ shows as %."""
+    from main import _load_relative_ranks
+    pq.write_table(pa.table({
+        "taxon_key": pa.array([TAXON["taxon_key"]] * 3),
+        "variable": pa.array(["bio1"] * 3),
+        "metric": pa.array(["mean", "std", "class_2"]),
+        "value": pa.array([10.0, 10.0, 0.25]),
+        "position": pa.array([0, 0, 0], type=pa.int32()),
+        "count": pa.array([5, 5, 5], type=pa.int32()),
+        "sampleCount": pa.array([30, 30, 30], type=pa.int32()),
+        "contextTaxonId": pa.array(["genusX"] * 3),
+        "rank": pa.array(["SPECIES"] * 3),
+        "contextLabel": pa.array(["Genus X"] * 3),
+    }), tmp_path / main_module.POSITION_FILE)
+    layer = {"id": "bio1", "value_type": "interval", "units": "°C", "imperial_unit": "°F"}
+    with patch.object(main_module, "GLOBAL_STATS_DIR", tmp_path):
+        result = _load_relative_ranks(TAXON["taxon_key"], "bio1", layer, "imperial")
+    by_metric = {r["metric"]: r for r in result}
+    assert by_metric["mean"]["context_taxon_id"] == "genusX"
+    assert by_metric["mean"]["context_rank"] == "SPECIES"
+    assert by_metric["mean"]["variable"] == "bio1"
+    assert by_metric["mean"]["value"] == pytest.approx(50.0)
+    assert by_metric["std"]["value"] == pytest.approx(18.0)
+    assert by_metric["class_2"]["value"] == pytest.approx(25.0)
+
+
 def test_load_relative_ranks_missing_file_returns_empty(tmp_path):
     from main import _load_relative_ranks
     with patch.object(main_module, "GLOBAL_STATS_DIR", tmp_path):
@@ -3407,3 +3436,34 @@ def test_query_taxa_cache_keyed_by_filter_params():
         client.get("/api/taxa/query?q=opuntia&filter=bio1:mean:lt:25")
         client.get("/api/taxa/query?q=opuntia&filter=bio1:mean:lt:30")
     assert mock_search.call_count == 2
+
+
+def test_get_rank_density_class_metric_as_percent():
+    main_module._cached_rank_density.cache_clear()
+    with patch.object(tiles, "load_layers", return_value=[{"id": "kg2", "value_type": "nominal"}]), \
+         patch.object(rankings_module, "read_rank_density", return_value={"count": 2, "values": [0.25, 0.5]}) as read:
+        r = client.get("/api/taxa/rank-density?context_taxon=10&rank=species&variable=kg2&metric=class_1")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["rank"] == "SPECIES"
+    assert body["density"] == {"count": 2, "values": [25.0, 50.0]}
+    assert read.call_args.args[:4] == ("10", "SPECIES", "kg2", "class_1")
+
+
+def test_get_rank_density_imperial_spread_metric():
+    main_module._cached_rank_density.cache_clear()
+    layer = {"id": "bio1", "value_type": "interval", "units": "°C", "imperial_unit": "°F"}
+    with patch.object(tiles, "load_layers", return_value=[layer]), \
+         patch.object(rankings_module, "read_rank_density", return_value={"count": 2, "values": [0.0, 10.0]}):
+        r = client.get(
+            "/api/taxa/rank-density?context_taxon=10&rank=SPECIES&variable=bio1&metric=std&unit_system=imperial"
+        )
+    assert r.json()["density"]["values"] == pytest.approx([0.0, 18.0])
+
+
+def test_get_rank_density_missing_group():
+    main_module._cached_rank_density.cache_clear()
+    with patch.object(rankings_module, "read_rank_density", return_value=None):
+        r = client.get("/api/taxa/rank-density?context_taxon=10&rank=SPECIES&variable=bio1&metric=mean")
+    assert r.status_code == 200
+    assert r.json()["density"] is None

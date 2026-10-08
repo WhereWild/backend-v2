@@ -42,6 +42,6 @@ def test_convert_density_curve_dimensionless_metric_untouched():
     assert units.convert_density_curve(_CURVE, _TEMP, "imperial", metric="count") is _CURVE
 
 
-def test_convert_density_curve_converts_small_group_values():
-    result = units.convert_density_curve({"count": 2, "values": [0.0, 10.0]}, _TEMP, "imperial", metric="mean")
-    assert result["values"] == pytest.approx([32.0, 50.0])
+def test_convert_density_curve_converts_cohort_mean():
+    result = units.convert_density_curve({**_CURVE, "mean": 10.0}, _TEMP, "imperial", metric="mean")
+    assert result["mean"] == pytest.approx(50.0)

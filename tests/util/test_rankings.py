@@ -1327,29 +1327,32 @@ def test_rank_metric_value_type(vtype, metric, expected):
     assert rk.rank_metric_value_type(vtype, metric) == expected
 
 
-def test_build_rank_density_small_group_returns_sorted_values():
-    result = rk.build_rank_density([3.0, 1.0, float("nan"), 2.0], ValueType.RATIO, "mean")
-    assert result == {"count": 3, "mean": 2.0, "values": [1.0, 2.0, 3.0]}
+def test_build_rank_density_curves_any_group_of_two_or_more():
+    """Same gate as a taxon's own density curve: 2+ finite values."""
+    result = rk.build_rank_density([3.0, 1.0, float("nan")], ValueType.RATIO, "mean")
+    assert result["count"] == 2
+    assert result["mean"] == pytest.approx(2.0)
+    assert len(result["points"]) == len(result["density"])
+    assert rk.build_rank_density([5.0], ValueType.RATIO, "mean") is None
 
 
-def test_build_rank_density_large_group_returns_curve():
-    values = np.linspace(1.0, 10.0, rk.RANK_DENSITY_MIN_VALUES * 5)
+def test_build_rank_density_returns_curve_over_value_range():
+    values = np.linspace(1.0, 10.0, 100)
     result = rk.build_rank_density(values, ValueType.RATIO, "mean")
     assert result["count"] == len(values)
-    assert "values" not in result
     assert len(result["points"]) == len(result["density"])
     assert result["min"] == pytest.approx(1.0)
     assert result["max"] == pytest.approx(10.0)
 
 
 def test_build_rank_density_circular_bearing_uses_circular_kde():
-    values = np.linspace(0.0, 350.0, rk.RANK_DENSITY_MIN_VALUES * 2)
+    values = np.linspace(0.0, 350.0, 40)
     result = rk.build_rank_density(values, ValueType.CIRCULAR, "circular_mean")
     assert (result["min"], result["max"]) == (0.0, 360.0)
 
 
 def test_build_rank_density_circular_mean_wraps_through_north():
-    values = [350.0, 10.0] * rk.RANK_DENSITY_MIN_VALUES
+    values = [350.0, 10.0] * 20
     result = rk.build_rank_density(values, ValueType.CIRCULAR, "circular_mean")
     assert result["mean"] == pytest.approx(0.0, abs=1e-6) or result["mean"] == pytest.approx(360.0)
 
@@ -1368,7 +1371,8 @@ def test_read_rank_density_class_metric_includes_implicit_zeros():
     })
     with patch("util.rankings._read_rank_positions", side_effect=fake):
         result = rk.read_rank_density("100", "SPECIES", "kg2", "class_1", _ALL_LAYERS)
-    assert result == {"count": 5, "mean": pytest.approx(0.28), "values": [0.0, 0.0, 0.0, 0.6, 0.8]}
+    assert result["count"] == 5
+    assert result["mean"] == pytest.approx(0.28)
 
 
 def test_read_rank_density_missing_group():
@@ -1393,5 +1397,6 @@ def test_query_ranked_scoped_density_follows_filters_and_highlights_page():
             stat_filters=[rk.StatFilter(variable="bio1", metric="mean", op="gte", value=1.0)],
             layers=[_RATIO_LAYER],
         )
-    assert result["density"] == {"count": 3, "mean": 2.0, "values": [1.0, 2.0, 3.0]}
+    assert result["density"]["count"] == 3
+    assert result["density"]["mean"] == pytest.approx(2.0)
     assert result["highlight"] == {"start": 3.0, "end": 2.0}

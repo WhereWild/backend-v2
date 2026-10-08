@@ -3441,12 +3441,13 @@ def test_query_taxa_cache_keyed_by_filter_params():
 def test_get_rank_density_class_metric_as_percent():
     main_module._cached_rank_density.cache_clear()
     with patch.object(tiles, "load_layers", return_value=[{"id": "kg2", "value_type": "nominal"}]), \
-         patch.object(rankings_module, "read_rank_density", return_value={"count": 2, "values": [0.25, 0.5]}) as read:
+         patch.object(rankings_module, "read_rank_density", return_value={"count": 2, "points": [0.25, 0.5], "density": [2.0, 2.0]}) as read:
         r = client.get("/api/taxa/rank-density?context_taxon=10&rank=species&variable=kg2&metric=class_1")
     assert r.status_code == 200
     body = r.json()
     assert body["rank"] == "SPECIES"
-    assert body["density"] == {"count": 2, "values": [25.0, 50.0]}
+    assert body["density"]["points"] == pytest.approx([25.0, 50.0])
+    assert body["density"]["density"] == pytest.approx([0.02, 0.02])
     assert read.call_args.args[:4] == ("10", "SPECIES", "kg2", "class_1")
 
 
@@ -3454,11 +3455,11 @@ def test_get_rank_density_imperial_spread_metric():
     main_module._cached_rank_density.cache_clear()
     layer = {"id": "bio1", "value_type": "interval", "units": "°C", "imperial_unit": "°F"}
     with patch.object(tiles, "load_layers", return_value=[layer]), \
-         patch.object(rankings_module, "read_rank_density", return_value={"count": 2, "values": [0.0, 10.0]}):
+         patch.object(rankings_module, "read_rank_density", return_value={"count": 2, "points": [0.0, 10.0], "density": [0.1, 0.1]}):
         r = client.get(
             "/api/taxa/rank-density?context_taxon=10&rank=SPECIES&variable=bio1&metric=std&unit_system=imperial"
         )
-    assert r.json()["density"]["values"] == pytest.approx([0.0, 18.0])
+    assert r.json()["density"]["points"] == pytest.approx([0.0, 18.0])
 
 
 def test_get_rank_density_missing_group():

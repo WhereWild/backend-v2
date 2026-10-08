@@ -1017,10 +1017,6 @@ def rank_value_against_group(value: float, group: pd.DataFrame) -> dict:
 # Rank distribution density (computed on the fly from a ranking group)
 # ---------------------------------------------------------------------------
 
-# Below this many values a KDE says nothing useful about the cohort — the raw
-# values are returned instead, for the frontend to draw as a strip of points.
-RANK_DENSITY_MIN_VALUES = 20
-
 # Metrics whose values live on the source variable's own scale (a location
 # within its distribution); every other rankable metric is a spread, count,
 # concentration, fraction, or entropy with its own scale regardless of the
@@ -1058,9 +1054,9 @@ def build_rank_density(values, variable_vtype: ValueType | None, metric: str) ->
     """Density of one ranking group's metric values across its taxa.
 
     Returns {"count", "mean", "points", "density", "min", "max", "bandwidth",
-    "mode"} for a KDE-sized group, {"count", "mean", "values"} (sorted) for a
-    group smaller than RANK_DENSITY_MIN_VALUES, or None when there's nothing
-    to show. "mean" is the circular mean for a bearing metric."""
+    "mode"}, or None when build_density_curve can't build one (fewer than 2
+    values) — the same gate as a taxon's own density curve. "mean" is the
+    circular mean for a bearing metric."""
     if variable_vtype is None:
         return None
     arr = np.asarray(values, dtype=float)
@@ -1074,8 +1070,6 @@ def build_rank_density(values, variable_vtype: ValueType | None, metric: str) ->
         mean = float(np.rad2deg(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())) % 360.0)
     else:
         mean = float(arr.mean())
-    if n < RANK_DENSITY_MIN_VALUES:
-        return {"count": n, "mean": mean, "values": np.sort(arr).tolist()}
     curve = build_density_curve(arr, value_type)
     if curve is None:
         return None

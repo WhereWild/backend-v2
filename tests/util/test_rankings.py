@@ -1304,3 +1304,99 @@ def test_query_ranked_scoped_stat_filter_narrows_results():
         )
     ids = {r["taxon"]["taxon_key"] for r in result["results"]}
     assert ids == {"201"}
+
+
+# ---------------------------------------------------------------------------
+# Rank distribution density
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(("vtype", "metric", "expected"), [
+    (ValueType.RATIO, "mean", ValueType.RATIO),
+    (ValueType.INTERVAL, "median", ValueType.INTERVAL),
+    (ValueType.INTERVAL, "std", ValueType.RATIO),
+    (ValueType.INTERVAL, "count", ValueType.RATIO),
+    (ValueType.RATIO, "entropy", ValueType.INTERVAL),
+    (ValueType.CIRCULAR, "circular_mean", ValueType.CIRCULAR),
+    (ValueType.CIRCULAR, "mode", ValueType.CIRCULAR),
+    (ValueType.CIRCULAR, "rbar", ValueType.RATIO),
+    (ValueType.CIRCULAR, "entropy", ValueType.INTERVAL),
+    (ValueType.NOMINAL, "entropy", ValueType.RATIO),
+    (ValueType.NOMINAL, "class_3", ValueType.RATIO),
+])
+def test_rank_metric_value_type(vtype, metric, expected):
+    assert rk.rank_metric_value_type(vtype, metric) == expected
+
+
+def test_build_rank_density_curves_any_group_of_two_or_more():
+    """Same gate as a taxon's own density curve: 2+ finite values."""
+    result = rk.build_rank_density([3.0, 1.0, float("nan")], ValueType.RATIO, "mean")
+    assert result["count"] == 2
+    assert result["mean"] == pytest.approx(2.0)
+    assert len(result["points"]) == len(result["density"])
+    assert rk.build_rank_density([5.0], ValueType.RATIO, "mean") is None
+
+
+def test_build_rank_density_returns_curve_over_value_range():
+    values = np.linspace(1.0, 10.0, 100)
+    result = rk.build_rank_density(values, ValueType.RATIO, "mean")
+    assert result["count"] == len(values)
+    assert len(result["points"]) == len(result["density"])
+    assert result["min"] == pytest.approx(1.0)
+    assert result["max"] == pytest.approx(10.0)
+
+
+def test_build_rank_density_circular_bearing_uses_circular_kde():
+    values = np.linspace(0.0, 350.0, 40)
+    result = rk.build_rank_density(values, ValueType.CIRCULAR, "circular_mean")
+    assert (result["min"], result["max"]) == (0.0, 360.0)
+
+
+def test_build_rank_density_circular_mean_wraps_through_north():
+    values = [350.0, 10.0] * 20
+    result = rk.build_rank_density(values, ValueType.CIRCULAR, "circular_mean")
+    assert result["mean"] == pytest.approx(0.0, abs=1e-6) or result["mean"] == pytest.approx(360.0)
+
+
+def test_build_rank_density_unknown_variable_or_empty():
+    assert rk.build_rank_density([1.0, 2.0], None, "mean") is None
+    assert rk.build_rank_density([], ValueType.RATIO, "mean") is None
+
+
+def test_read_rank_density_class_metric_includes_implicit_zeros():
+    fake = _fake_rank_positions({
+        ("100", "SPECIES", "kg2", "class_1"): [
+            {"taxon_key": "200", "value": 0.6, "position": 3, "count": 5, "sampleCount": 50},
+            {"taxon_key": "201", "value": 0.8, "position": 4, "count": 5, "sampleCount": 50},
+        ],
+    })
+    with patch("util.rankings._read_rank_positions", side_effect=fake):
+        result = rk.read_rank_density("100", "SPECIES", "kg2", "class_1", _ALL_LAYERS)
+    assert result["count"] == 5
+    assert result["mean"] == pytest.approx(0.28)
+
+
+def test_read_rank_density_missing_group():
+    with patch("util.rankings._read_rank_positions", return_value=[]):
+        assert rk.read_rank_density("100", "SPECIES", "bio1", "mean", _ALL_LAYERS) is None
+
+
+def test_query_ranked_scoped_density_follows_filters_and_highlights_page():
+    rows = [
+        {"taxon_key": str(200 + i), "value": float(i), "position": i, "count": 4, "sampleCount": 100}
+        for i in range(4)
+    ]
+    fake = _fake_rank_positions({("100", "SPECIES", "bio1", "mean"): rows})
+    with patch("util.rankings._read_rank_positions", side_effect=fake), \
+         patch("util.rankings.get_taxon_by_id", side_effect=lambda k: {**_SPECIES_A, "taxon_key": k}), \
+         patch("util.rankings._apply_stat_filters", return_value=frozenset({"201", "202", "203"})):
+        result = rk._query_ranked_scoped(
+            q=None, within_taxon=_GENUS, descendant_rank="SPECIES",
+            sort_variable="bio1", sort_metric="mean", sort_order="desc",
+            limit=2, offset=0, min_samples=0, include_species_like=False,
+            loc_keys=None, loc_counts={},
+            stat_filters=[rk.StatFilter(variable="bio1", metric="mean", op="gte", value=1.0)],
+            layers=[_RATIO_LAYER],
+        )
+    assert result["density"]["count"] == 3
+    assert result["density"]["mean"] == pytest.approx(2.0)
+    assert result["highlight"] == {"start": 3.0, "end": 2.0}

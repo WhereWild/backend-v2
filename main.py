@@ -1729,9 +1729,25 @@ def get_taxon_env_stats(request: Request, taxon_id: str, unit_system: str | None
 # Legacy compatibility endpoints (frontend still uses these URL patterns)
 # ---------------------------------------------------------------------------
 
-def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
+def _rank_value_for_display(value: float | None, layer: dict | None, unit_system: str | None, metric: str) -> float | None:
+    """A ranked metric value in display units — class_ fractions as
+    percentages, everything else per units' per-metric rules (same as
+    /api/taxa/query's sort values)."""
+    if value is None:
+        return None
+    if metric.startswith("class_"):
+        return value * 100
+    return units.convert_value(value, layer, unit_system, metric=metric) if layer else value
+
+
+def _load_relative_ranks(
+    taxon_key: str, variable_id: str, layer: dict | None = None, unit_system: str | None = None,
+) -> list[dict]:
     """Read this taxon's ranking positions (one row per ancestor context) from
-    the consolidated global positions file."""
+    the consolidated global positions file. Each row carries its context id,
+    rank, and this taxon's own value (display units) — everything the
+    frontend needs to request and mark that context's /api/taxa/rank-density
+    distribution."""
     positions_file = GLOBAL_STATS_DIR / POSITION_FILE
     if not positions_file.exists():
         return []
@@ -1757,6 +1773,10 @@ def _load_relative_ranks(taxon_key: str, variable_id: str) -> list[dict]:
             "sampleCount": row.get("sampleCount"),
             "context_label": row.get("contextLabel"),
             "label": row.get("contextLabel"),
+            "context_taxon_id": row.get("contextTaxonId"),
+            "context_rank": row.get("rank"),
+            "variable": variable_id,
+            "value": _rank_value_for_display(row.get("value"), layer, unit_system, str(row.get("metric") or "")),
         })
     return result
 
@@ -1985,7 +2005,7 @@ def _cached_get_species_environment_base(
             "density_curve": None,
             "categorical_distribution": categorical_distribution,
             "ternary_composition_density": ternary_composition_density,
-            "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id),
+            "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id, layer, unit_system),
         }
 
     if value_type == "circular":
@@ -2015,7 +2035,7 @@ def _cached_get_species_environment_base(
             "summary": summary,
             "density_curve": density_curve,
             "categorical_distribution": None,
-            "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id),
+            "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id, layer, unit_system),
         }
 
     _tk_var = [("taxon_key", "=", str(taxon["taxon_key"])), ("variable", "=", variable_id)]
@@ -2057,7 +2077,7 @@ def _cached_get_species_environment_base(
         "summary": units.convert_summary(raw_summary, layer, unit_system),
         "density_curve": units.convert_density_curve(density_curve, layer, unit_system),
         "categorical_distribution": None,
-        "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id),
+        "relative_ranks": _load_relative_ranks(str(taxon.get("taxon_key", "")), variable_id, layer, unit_system),
     }
 
 
@@ -3015,6 +3035,52 @@ def _cached_list_taxa_ranking_options(within_taxon: str, descendant_rank: str, d
     return {"ancestor_taxon_id": resolved["taxon_key"], "rank": norm_rank, "options": options}
 
 
+def _convert_rank_density(curve: dict | None, layer: dict | None, unit_system: str | None, metric: str) -> dict | None:
+    """Display-unit conversion for a relative-rank distribution — class_
+    fractions display as percentages (same as their sort values), every
+    other metric follows units' per-metric rules."""
+    if curve is None:
+        return None
+    if metric.startswith("class_"):
+        return units.scale_density_curve(curve, 100.0)
+    if layer is None:
+        return curve
+    return units.convert_density_curve(curve, layer, unit_system, metric=metric)
+
+
+@lru_cache(maxsize=4096)
+def _cached_rank_density(
+    context_taxon: str, rank: str, variable: str, metric: str, unit_system: str | None, data_version: str,
+) -> dict:
+    all_layers = tiles.load_layers()
+    variable_id = _resolve_variable_id(variable)
+    layer = next((lyr for lyr in all_layers if lyr["id"] == variable_id), None)
+    density = rankings.read_rank_density(context_taxon, rank.upper(), variable_id, metric, all_layers)
+    return {
+        "context_taxon_id": context_taxon,
+        "rank": rank.upper(),
+        "variable": variable_id,
+        "metric": metric,
+        "density": _convert_rank_density(density, layer, unit_system, metric),
+    }
+
+
+@app.get("/api/taxa/rank-density")
+@limiter.limit(_RATE_LIMIT_DETAIL)
+def get_rank_density(
+    request: Request,
+    context_taxon: str = Query(...),
+    rank: str = Query(...),
+    variable: str = Query(...),
+    metric: str = Query(...),
+    unit_system: str | None = Query(None),
+):
+    """Distribution of one relative-rank group's metric values across its
+    taxa (the population behind a species page's percentile box) — computed
+    on the fly from the rankings file, cached per data version."""
+    return _cached_rank_density(context_taxon, rank, variable, metric, unit_system, _DATA_VERSION)
+
+
 @app.get("/api/taxa/ranking-options")
 @limiter.limit(_RATE_LIMIT_DETAIL)
 def list_taxa_ranking_options(
@@ -3109,6 +3175,13 @@ def _cached_query_taxa(
 
     sort_layer = next((lyr for lyr in all_layers if lyr["id"] == norm_sort_variable), None) if norm_sort_variable else None
     is_class_metric = bool(sort_metric and sort_metric.startswith("class_"))
+
+    def _convert_sort(raw: float | None) -> float | None:
+        if is_class_metric:
+            return raw * 100 if raw is not None else None
+        return units.convert_value(raw, sort_layer, unit_system, metric=sort_metric) if sort_layer else raw
+
+    highlight = result.get("highlight")
     serialized: list[dict] = []
     for item in result["results"]:
         taxon = item["taxon"]
@@ -3121,11 +3194,7 @@ def _cached_query_taxa(
         sci_norm = normalize_name(taxon.get("scientific_name") or "")
         use_match = bool(match_name) and normalize_name(match_name) != sci_norm
         display_name = format_common_name(match_name if use_match else preferred)
-        raw_sort = item.get("sort_value")
-        if is_class_metric:
-            converted_sort = raw_sort * 100 if raw_sort is not None else None
-        else:
-            converted_sort = units.convert_value(raw_sort, sort_layer, unit_system, metric=sort_metric) if sort_layer else raw_sort
+        converted_sort = _convert_sort(item.get("sort_value"))
         serialized.append({
             "taxon_id": taxon["taxon_key"],
             "scientific_name": taxon.get("scientific_name", "").replace("_", " "),
@@ -3168,6 +3237,11 @@ def _cached_query_taxa(
         "limit": limit,
         "offset": offset,
         "results": serialized,
+        "density": _convert_rank_density(result.get("density"), sort_layer, unit_system, sort_metric or ""),
+        "highlight": (
+            {"start": _convert_sort(highlight["start"]), "end": _convert_sort(highlight["end"])}
+            if highlight else None
+        ),
     }
 
 
@@ -3216,6 +3290,7 @@ def _clear_data_versioned_caches() -> None:
     _cached_get_species_occurrences.cache_clear()
     _cached_get_species_locations.cache_clear()
     _cached_list_taxa_ranking_options.cache_clear()
+    _cached_rank_density.cache_clear()
     _cached_query_taxa.cache_clear()
     _cached_list_variables.cache_clear()  # also temporal-tagged, see below
 

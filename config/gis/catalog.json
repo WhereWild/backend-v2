@@ -1282,6 +1282,34 @@
           "add_offset": null,
           "render_min": 2.0,
           "render_max": 20.0
+        },
+        {
+          "id": "terrain_shade",
+          "source": "gedtm30_terrain_light",
+          "display_name": "Terrain Shade Index",
+          "units": "",
+          "value_type": "ratio",
+          "domain": "continuous",
+          "filename": "terrain_shade.tif",
+          "download_url": null,
+          "scale_factor": 0.001,
+          "add_offset": null,
+          "render_min": 0.0,
+          "render_max": 0.3
+        },
+        {
+          "id": "sky_view",
+          "source": "gedtm30_terrain_light",
+          "display_name": "Sky View Factor",
+          "units": "",
+          "value_type": "ratio",
+          "domain": "continuous",
+          "filename": "sky_view.tif",
+          "download_url": null,
+          "scale_factor": 0.004,
+          "add_offset": null,
+          "render_min": 0.6,
+          "render_max": 1.0
         }
       ]
     },

@@ -218,6 +218,60 @@
       }
     ]
   },
+  "gedtm30_terrain_light": {
+    "name": "Terrain shade index and sky view factor from GEDTM30 v1.2",
+    "url": "https://codeberg.org/openlandmap/GEDTM30",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Derived from GEDTM30 v1.2 (Ho et al. 2025): horizon angles and sky view factor after Dozier and Frew (1990); yearly direct-beam energy with the ESRA clear-sky model as implemented in GRASS GIS r.sun (Rigollier et al. 2000; Hofierka and Šúri 2002).",
+    "doi": "https://doi.org/10.1109/36.58986",
+    "references": [
+      {
+        "authors": "Dozier, J. and Frew, J.",
+        "year": 1990,
+        "title": "Rapid calculation of terrain parameters for radiation modeling from digital elevation data",
+        "journal": "IEEE Transactions on Geoscience and Remote Sensing",
+        "volume_issue": "28(5)",
+        "pages": "963–969",
+        "doi": "https://doi.org/10.1109/36.58986"
+      },
+      {
+        "authors": "Rigollier, C., Bauer, O., and Wald, L.",
+        "year": 2000,
+        "title": "On the clear sky model of the ESRA — European Solar Radiation Atlas — with respect to the Heliosat method",
+        "journal": "Solar Energy",
+        "volume_issue": "68(1)",
+        "pages": "33–48",
+        "doi": "https://doi.org/10.1016/S0038-092X(99)00055-9"
+      },
+      {
+        "authors": "Hofierka, J. and Šúri, M.",
+        "year": 2002,
+        "title": "The solar radiation model for Open source GIS: implementation and applications",
+        "journal": "Proceedings of the Open source GIS – GRASS users conference, Trento, Italy",
+        "volume_issue": "",
+        "pages": "1–19"
+      },
+      {
+        "authors": "Steger, C. R., Steger, B., and Schär, C.",
+        "year": 2022,
+        "title": "HORAYZON v1.2: an efficient and flexible ray-tracing algorithm to compute horizon and sky view factor",
+        "journal": "Geoscientific Model Development",
+        "volume_issue": "15",
+        "pages": "6817–6840",
+        "doi": "https://doi.org/10.5194/gmd-15-6817-2022"
+      },
+      {
+        "authors": "Ho, Y.-F., Grohmann, C. H., Lindsay, J., Reuter, H. I., Parente, L., Witjes, M., and Hengl, T.",
+        "year": 2025,
+        "title": "GEDTM30: global ensemble digital terrain model at 30 m and derived multiscale terrain variables",
+        "journal": "PeerJ",
+        "volume_issue": "13",
+        "pages": "e19673",
+        "doi": "https://doi.org/10.7717/peerj.19673"
+      }
+    ]
+  },
   "glc_fcs30d_v2": {
     "name": "GLC_FCS30D v2",
     "url": "https://zenodo.org/records/15063683",

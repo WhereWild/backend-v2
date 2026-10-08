@@ -210,6 +210,12 @@ def _push_stage() -> None:
         "--exclude", "gis/geomorphons_equi7_tiles/**",
         "--exclude", "gis/geomorphons_1deg_tiles/**",
         "--exclude", "gis/geomorphons_scratch/**",
+        # download_dem's raw downloads and fill_twi_gaps' working files.
+        "--exclude", "gis/dem_raw/**",
+        "--exclude", "gis/twi_fill/**",
+        "--exclude", "gis/terrain_light_equi7_tiles/**",
+        "--exclude", "gis/terrain_light_1deg_tiles/**",
+        "--exclude", "gis/terrain_light_scratch/**",
         # pipeline_state.json/temporal_state.json/basemap_state.json are
         # each already kept current on prod via their own dedicated HTTP
         # push endpoints (_push_pipeline_state here, plus main.py's

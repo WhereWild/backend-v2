@@ -18,9 +18,9 @@ lossless, no re-encode. The DTM's own scale tag says 0.1, but its values are
 metres (1300.0 at Salt Lake City, where FABDEM has 1298.3), so the tag is
 cleared: anything honouring it would read heights 10× too low.
 
-The TWI layer stops at 57°S while the DTM reaches 65°S; the land in between
-(South Shetlands/Orkneys/Sandwich, the tip of the Antarctic Peninsula) has
-no published TWI.
+The published TWI stops at 57°S while the DTM reaches 65°S, and skips some
+islands and tile-edge strips; fill_twi_gaps.py computes those with
+GEDTM30's own recipe right after the download.
 
 Full run: aria2c each file into data/gis/dem_raw/, fix it up there, then
 rename it into place. --bbox W S E N clips every layer from the remote COGs
@@ -70,7 +70,7 @@ def _download(url: str, dest: Path) -> None:
             "--min-split-size=64M",
             "--file-allocation=none",
             "--continue=true",
-            "--max-tries=12",
+            "--max-tries=0",          # retry forever: a Wi-Fi or DNS blip only pauses it
             "--retry-wait=15",
             "--connect-timeout=60",
             "--summary-interval=300",
@@ -131,6 +131,13 @@ def main(force: bool = False, bbox: tuple[float, float, float, float] | None = N
         out_path.parent.mkdir(parents=True, exist_ok=True)
         raw.replace(out_path)
         print(f"[download_dem] {key}: wrote {out_path}", flush=True)
+
+    # The published TWI misses some land the DTM has (see fill_twi_gaps.py);
+    # once filled, the gap search finds nothing and this costs ~30 s.
+    if bbox is None and (force or VARS_TO_DOWNLOAD is None or "twi" in VARS_TO_DOWNLOAD) \
+            and (out_dir / "twi.tif").exists() and (out_dir / "elevation.tif").exists():
+        from scripts.gis import fill_twi_gaps
+        fill_twi_gaps.main()
 
 
 if __name__ == "__main__":

@@ -1294,8 +1294,8 @@
           "download_url": null,
           "scale_factor": 0.001,
           "add_offset": null,
-          "render_min": 0.0,
-          "render_max": 0.3
+          "render_min": null,
+          "render_max": null
         },
         {
           "id": "sky_view",
@@ -1308,8 +1308,22 @@
           "download_url": null,
           "scale_factor": 0.004,
           "add_offset": null,
-          "render_min": 0.6,
-          "render_max": 1.0
+          "render_min": null,
+          "render_max": null
+        },
+        {
+          "id": "direct_sun",
+          "source": "gedtm30_terrain_light",
+          "display_name": "Direct Sunlight",
+          "units": "kWh m⁻² yr⁻¹",
+          "value_type": "ratio",
+          "domain": "continuous",
+          "filename": "direct_sun.tif",
+          "download_url": null,
+          "scale_factor": 5.0,
+          "add_offset": null,
+          "render_min": null,
+          "render_max": null
         }
       ]
     },

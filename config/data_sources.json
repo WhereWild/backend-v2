@@ -219,7 +219,7 @@
     ]
   },
   "gedtm30_terrain_light": {
-    "name": "Terrain shade index and sky view factor from GEDTM30 v1.2",
+    "name": "Terrain shade index, sky view factor and direct sunlight from GEDTM30 v1.2",
     "url": "https://codeberg.org/openlandmap/GEDTM30",
     "license": "CC BY 4.0",
     "license_url": "https://creativecommons.org/licenses/by/4.0/",

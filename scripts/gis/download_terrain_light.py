@@ -12,6 +12,10 @@ on the GPU, as two global COGs:
                      is cast shadow only and doesn't overlap heat load. UInt16, ×0.001.
   sky_view.tif       fraction of the sky dome the cell sees (Dozier & Frew 1990), the
                      share of isotropic diffuse light it gets. UInt8, ×0.004.
+  direct_sun.tif     yearly clear-sky direct-beam energy reaching the cell's own slope
+                     after cast shadows, kWh m⁻² yr⁻¹ — self-shading, terrain shadows
+                     and the atmosphere in one number (cloud cover not included).
+                     UInt16, ×5.
 
 Method (both from the same horizons):
   * Horizons (Dozier & Frew 1990) in 64 directions out to MAX_DIST_M, traced per cell
@@ -24,7 +28,8 @@ Method (both from the same horizons):
     (Rigollier et al. 2000; Hofierka & Šúri 2002): Linke turbidity 3, Kasten-Young air
     mass with refraction, Rayleigh optical thickness, pressure from the cell's
     elevation; times its incidence on the cell's own slope (Horn gradient).
-  * Shade = 1 − Σ(energy with the sun above that direction's horizon) / Σ(energy).
+  * Shade = 1 − Σ(energy with the sun above that direction's horizon) / Σ(energy);
+    direct sun = Σ(energy with the sun above the horizon) × solar constant 1367 W m⁻².
   * Equi7 grid north differs from true north; sun azimuths are rotated per cell.
 
 Checked against analytic cases (an unobstructed 30° plane: sky view (1+cos s)/2,
@@ -34,9 +39,10 @@ against r.sun run with and without terrain shadowing (-p) over the year.
 Tiling is download_geomorphons': every Equi7 T6 tile with land in elevation.tif
 (warped exactly, see there), BUFFER_CELLS of padding for the horizons, back to
 elevation.tif's own 1" grid in 1° cells (bilinear), then one COG per layer.
-Resumable like download_geomorphons. Once every 1° cell is written the Equi7
-tiles are deleted (they'd double the disk needed, and the cells are all the
-COGs are built from); a rerun then goes straight to the COGs. Needs an NVIDIA GPU and CuPy; skipped where
+Resumable like download_geomorphons. Each Equi7 zone's tiles become 1° cells
+as soon as the zone is done and are then deleted (keeping every tile and
+every cell at once would double the disk needed; the cells are all the COGs
+are built from). Needs an NVIDIA GPU and CuPy; skipped where
 CuPy isn't installed (the docker image has neither — run it on a GPU machine).
 """
 
@@ -66,10 +72,11 @@ VARS_TO_DOWNLOAD: list[str] | None = [v.strip() for v in _raw_vars.split(",") if
 ELEV_PATH       = geo.ELEV_PATH
 SHADE_PATH      = geo.LAYERS_DIR / "terrain_shade.tif"
 SVF_PATH        = geo.LAYERS_DIR / "sky_view.tif"
+DIRECT_PATH     = geo.LAYERS_DIR / "direct_sun.tif"
 EQUI7_TILES_DIR = Path("data/gis/terrain_light_equi7_tiles")  # <zone>/<tile>_{shade,svf}.tif
 WGS84_TILES_DIR = Path("data/gis/terrain_light_1deg_tiles")   # <N00E000>_{shade,svf}.tif
 SCRATCH_DIR     = Path("data/gis/terrain_light_scratch")
-CELLS_DONE      = WGS84_TILES_DIR / ".complete"   # 1° cells finished; Equi7 tiles no longer needed
+CELLS_DONE      = WGS84_TILES_DIR / ".complete"   # every zone's 1° cells written
 
 RES_M = geo.EQUI7_RES_M
 MAX_DIST_M = 40_000.0       # 20 km vs 40 km changed shade < 0.3 points in the Wasatch; 40 for the big ranges
@@ -90,6 +97,10 @@ WARP_THREADS = int(os.environ.get("TERRAIN_LIGHT_WARP_THREADS", geo.WARP_THREADS
 
 SHADE_SCALE, SHADE_NODATA = 0.001, 65535
 SVF_SCALE, SVF_NODATA = 0.004, 255
+DIRECT_SCALE, DIRECT_NODATA = 5.0, 65535    # kWh m⁻² yr⁻¹
+SOLAR_CONSTANT = 1367.0                     # W m⁻², as r.sun
+# table weights are Earth-Sun distance factors per minute of sun → kWh m⁻² yr⁻¹
+KWH_PER_WEIGHT = SOLAR_CONSTANT * MINUTE_STEP / 60.0 / 1000.0
 
 KERNEL = r"""
 #define KD %(K_DIRS)d
@@ -100,7 +111,7 @@ extern "C" __global__ void shade(
     const float res, const float zmax, const float max_dist, const float step_frac,
     const int* lat_idx, const float* gamma, const int cw, const int coarse,
     const float* tW, const float* tSinE, const float* tCosE, const float* tSinA, const float* tCosA,
-    const float* tM0, const float linke, float* out_shade, float* out_svf, const int r0, const int r1)
+    const float* tM0, const float linke, float* out_shade, float* out_svf, float* out_lit, const int r0, const int r1)
 {
     const int W = pw[0], H = ph[0];
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -108,7 +119,7 @@ extern "C" __global__ void shade(
     if (i >= r1 || i >= H || j >= W) return;
     const long long idx = (long long)i * W + j;
     const float z0 = pyr[idx];
-    if (isnan(z0)) { out_shade[idx] = nanf(""); out_svf[idx] = nanf(""); return; }
+    if (isnan(z0)) { out_shade[idx] = nanf(""); out_svf[idx] = nanf(""); out_lit[idx] = nanf(""); return; }
 
     // Horn gradient, nodata neighbours -> centre
     float nb[9];
@@ -193,6 +204,7 @@ extern "C" __global__ void shade(
         if (se / ce > h) lit += e;
     }
     out_shade[idx] = (tot > 0.0f) ? 1.0f - lit / tot : nanf("");
+    out_lit[idx] = lit;
 }
 """ % dict(K_DIRS=K_DIRS, K_SUN=K_SUN, N_ELEV=N_ELEV)
 
@@ -249,8 +261,9 @@ def _band_tables(band: int) -> dict[str, np.ndarray]:
     return _TABLES[band]
 
 
-def _compute(dem: np.ndarray, tf, crs) -> tuple[np.ndarray, np.ndarray]:
-    """Shade index and sky view factor for a padded Equi7 DEM (NaN = nodata)."""
+def _compute(dem: np.ndarray, tf, crs) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Shade index, sky view factor and direct sun (kWh m⁻² yr⁻¹) for a padded
+    Equi7 DEM (NaN = nodata)."""
     import cupy as cp
     from pyproj import Transformer
 
@@ -274,6 +287,7 @@ def _compute(dem: np.ndarray, tf, crs) -> tuple[np.ndarray, np.ndarray]:
     pyr = cp.asarray(np.concatenate([l.ravel() for l in levels]))
     out_shade = cp.full((H, W), cp.nan, cp.float32)
     out_svf = cp.full((H, W), cp.nan, cp.float32)
+    out_lit = cp.full((H, W), cp.nan, cp.float32)
     kern = cp.RawKernel(KERNEL, "shade", options=("--use_fast_math",))
     args = (
         pyr, cp.asarray(off), cp.asarray(np.array([l.shape[1] for l in levels], np.int32)),
@@ -282,17 +296,17 @@ def _compute(dem: np.ndarray, tf, crs) -> tuple[np.ndarray, np.ndarray]:
         cp.asarray(local.reshape(bands.shape).astype(np.int32).ravel()), cp.asarray(gamma.ravel()),
         np.int32(cw), np.int32(COARSE),
         tab["W"], tab["sE"], tab["cE"], tab["sA"], tab["cA"], tab["M0"], np.float32(LINKE_TL),
-        out_shade, out_svf,
+        out_shade, out_svf, out_lit,
     )
     bs = (16, 16)
     for r0 in range(0, H, STRIP_ROWS):
         grid = ((W + bs[0] - 1) // bs[0], (STRIP_ROWS + bs[1] - 1) // bs[1])
         kern(grid, bs, args + (np.int32(r0), np.int32(min(r0 + STRIP_ROWS, H))))
         cp.cuda.Device().synchronize()
-    shade, svf = out_shade.get(), out_svf.get()
-    del pyr, out_shade, out_svf, tab
+    shade, svf, direct = out_shade.get(), out_svf.get(), out_lit.get() * np.float32(KWH_PER_WEIGHT)
+    del pyr, out_shade, out_svf, out_lit, tab
     cp.get_default_memory_pool().free_all_blocks()
-    return shade, svf
+    return shade, svf, direct
 
 
 def _encode(a: np.ndarray, scale: float, nodata: int, dtype: str, top: int) -> np.ndarray:
@@ -304,19 +318,19 @@ def _encode(a: np.ndarray, scale: float, nodata: int, dtype: str, top: int) -> n
 
 # ── Step 1: Equi7 tiles ───────────────────────────────────────────────────────
 
-def _tile_paths(zone_name: str, tile) -> tuple[Path, Path, Path]:
+def _tile_paths(zone_name: str, tile) -> tuple[list[Path], Path]:
     base = EQUI7_TILES_DIR / zone_name / tile.name
-    return Path(f"{base}_shade.tif"), Path(f"{base}_svf.tif"), Path(f"{base}.empty")
+    return [Path(f"{base}_{key}.tif") for key, _, _ in LAYERS], Path(f"{base}.empty")
 
 
 def _process_equi7_tile(zone_name: str, epsg: int, tile) -> bool:
     """Shade + sky view for one Equi7 tile; False if it has no DEM data."""
-    shade_dest, svf_dest, empty_marker = _tile_paths(zone_name, tile)
-    if geo._is_done(shade_dest) and geo._is_done(svf_dest):
+    dests, empty_marker = _tile_paths(zone_name, tile)
+    if all(geo._is_done(d) for d in dests):
         return True
     if empty_marker.exists():
         return False
-    shade_dest.parent.mkdir(parents=True, exist_ok=True)
+    dests[0].parent.mkdir(parents=True, exist_ok=True)
 
     w, s, e, n = tile.outer_boundary_extent
     buf = BUFFER_CELLS * RES_M
@@ -341,11 +355,12 @@ def _process_equi7_tile(zone_name: str, epsg: int, tile) -> bool:
             empty_marker.touch()
             return False
         dem = np.where(valid, dem, np.nan).astype(np.float32)
-        shade, svf = _compute(dem, tf, crs)
+        shade, svf, direct = _compute(dem, tf, crs)
         core_tf = tf * tf.translation(BUFFER_CELLS, BUFFER_CELLS)
         for arr, dest, scale, nodata, dtype, top in (
-            (shade[core], shade_dest, SHADE_SCALE, SHADE_NODATA, "uint16", 1000),
-            (svf[core], svf_dest, SVF_SCALE, SVF_NODATA, "uint8", 250),
+            (shade[core], dests[0], SHADE_SCALE, SHADE_NODATA, "uint16", 1000),
+            (svf[core], dests[1], SVF_SCALE, SVF_NODATA, "uint8", 250),
+            (direct[core], dests[2], DIRECT_SCALE, DIRECT_NODATA, "uint16", 65534),
         ):
             tmp = dest.with_suffix(".tif.tmp")
             with rasterio.open(tmp, "w", driver="GTiff", width=arr.shape[1], height=arr.shape[0], count=1,
@@ -358,35 +373,39 @@ def _process_equi7_tile(zone_name: str, epsg: int, tile) -> bool:
         dem_path.unlink(missing_ok=True)
 
 
-# ── Step 2: back to WGS84 1° tiles ────────────────────────────────────────────
+# ── Step 2: back to WGS84 1° tiles, one Equi7 zone at a time ─────────────────
+#
+# Each zone's tiles are turned into 1° cells (that zone's footprint only —
+# cells straddling a zone border get one file per zone, which the COG's VRT
+# simply mosaics) as soon as the zone is finished, and then deleted: the peak
+# disk is all cells written so far plus one zone's tiles, instead of every
+# tile and every cell at once.
 
-LAYERS = (("shade", SHADE_NODATA, "uint16"), ("svf", SVF_NODATA, "uint8"))
+LAYERS = (("shade", SHADE_NODATA, "uint16"), ("svf", SVF_NODATA, "uint8"), ("direct", DIRECT_NODATA, "uint16"))
 
 
-def _write_wgs84_cell(lon: int, lat: int, zone_srcs: dict, footprints: dict, elev_tf) -> list[Path]:
-    dests = {k: WGS84_TILES_DIR / f"{geo._cell_name(lon, lat)}_{k}.tif" for k, _, _ in LAYERS}
+def _zone_done_marker(zone_name: str) -> Path:
+    return WGS84_TILES_DIR / f".{zone_name}.complete"
+
+
+def _write_zone_cell(lon: int, lat: int, zone_name: str, srcs: dict, footprint, elev_tf) -> None:
+    dests = {k: WGS84_TILES_DIR / f"{geo._cell_name(lon, lat)}_{zone_name}_{k}.tif" for k, _, _ in LAYERS}
     if all(geo._is_done(p) for p in dests.values()):
-        return list(dests.values())
+        return
     # Same 1" grid as elevation.tif — see download_geomorphons._write_wgs84_cell.
     px = elev_tf.a
     col0 = math.floor((lon - elev_tf.c) / px)
     row0 = math.floor((elev_tf.f - (lat + 1)) / px)
     size = round(1.0 / px)
     dst_tf = from_origin(elev_tf.c + col0 * px, elev_tf.f - row0 * px, px, px)
-    shapes = [(footprints[z], i + 1) for i, z in enumerate(geo.EQUI7_ZONES) if z in zone_srcs]
-    zone_ids = rasterize(shapes, out_shape=(size, size), transform=dst_tf, fill=0, dtype="uint8")
-    written = []
+    inzone = rasterize([(footprint, 1)], out_shape=(size, size), transform=dst_tf, fill=0, dtype="uint8").astype(bool)
+    if not inzone.any():
+        return
     for key, nodata, dtype in LAYERS:
         out = np.full((size, size), nodata, dtype)
-        for i, zone_name in enumerate(geo.EQUI7_ZONES):
-            mask = zone_ids == i + 1
-            if zone_name not in zone_srcs or not mask.any():
-                continue
-            warped = np.full((size, size), nodata, dtype)
-            reproject(source=rasterio.band(zone_srcs[zone_name][key], 1), destination=warped,
-                      src_nodata=nodata, dst_transform=dst_tf, dst_crs="EPSG:4326",
-                      dst_nodata=nodata, resampling=Resampling.bilinear)
-            out[mask] = warped[mask]
+        reproject(source=rasterio.band(srcs[key], 1), destination=out, src_nodata=nodata,
+                  dst_transform=dst_tf, dst_crs="EPSG:4326", dst_nodata=nodata, resampling=Resampling.bilinear)
+        out[~inzone] = nodata
         if not (out != nodata).any():
             continue
         dest = dests[key]
@@ -396,37 +415,33 @@ def _write_wgs84_cell(lon: int, lat: int, zone_srcs: dict, footprints: dict, ele
                            tiled=True, blockxsize=512, blockysize=512) as ds:
             ds.write(out, 1)
         geo._commit(tmp, dest)
-        written.append(dest)
-    return written
 
 
-def _reproject_to_wgs84(done: list[tuple[str, int, tuple]]) -> dict[str, list[Path]]:
+def _finish_zone(zone_name: str, done: list[tuple[str, int, tuple]]) -> None:
+    """1° cells from one zone's tiles, then delete those tiles."""
     footprints = geo._zone_footprints()
-    cells = geo._cells_for_tiles(done, footprints)
     WGS84_TILES_DIR.mkdir(parents=True, exist_ok=True)
     with rasterio.open(ELEV_PATH) as elev:
         elev_tf = elev.transform
-    written: dict[str, list[Path]] = {k: [] for k, _, _ in LAYERS}
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        zone_srcs: dict[str, dict] = {}
-        for zone_name in geo.EQUI7_ZONES:
+    if done:
+        cells = geo._cells_for_tiles(done, footprints)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            srcs = {}
             for key, _, _ in LAYERS:
-                tiles = sorted((EQUI7_TILES_DIR / zone_name).glob(f"*_{key}.tif"))
-                if tiles:
-                    vrt = Path(tmp_dir) / f"{zone_name}_{key}.vrt"
-                    geo._run(["gdalbuildvrt", "-overwrite", "-q", str(vrt), *[str(t) for t in tiles]])
-                    zone_srcs.setdefault(zone_name, {})[key] = rasterio.open(vrt)
-        try:
-            for j, (lon, lat) in enumerate(cells, 1):
-                for p in _write_wgs84_cell(lon, lat, zone_srcs, footprints, elev_tf):
-                    written["shade" if p.stem.endswith("_shade") else "svf"].append(p)
-                if j % 500 == 0 or j == len(cells):
-                    print(f"  [{j}/{len(cells)}] 1° cells", flush=True)
-        finally:
-            for srcs in zone_srcs.values():
+                vrt = Path(tmp_dir) / f"{key}.vrt"
+                geo._run(["gdalbuildvrt", "-overwrite", "-q", str(vrt),
+                          *[str(t) for t in sorted((EQUI7_TILES_DIR / zone_name).glob(f"*_{key}.tif"))]])
+                srcs[key] = rasterio.open(vrt)
+            try:
+                for j, (lon, lat) in enumerate(cells, 1):
+                    _write_zone_cell(lon, lat, zone_name, srcs, footprints[zone_name], elev_tf)
+                    if j % 500 == 0 or j == len(cells):
+                        print(f"  {zone_name}: [{j}/{len(cells)}] 1° cells", flush=True)
+            finally:
                 for ds in srcs.values():
                     ds.close()
-    return written
+    _zone_done_marker(zone_name).touch()
+    shutil.rmtree(EQUI7_TILES_DIR / zone_name, ignore_errors=True)
 
 
 # ── Step 3: global COGs ───────────────────────────────────────────────────────
@@ -450,8 +465,8 @@ def main(force: bool = False) -> None:
     if not force and VARS_TO_DOWNLOAD is not None and "terrain_shade" not in VARS_TO_DOWNLOAD:
         print("[download_terrain_light] skipped (terrain_shade not in VARS_TO_DOWNLOAD)")
         return
-    if SHADE_PATH.exists() and SVF_PATH.exists() and not force:
-        print(f"COGs already exist: {SHADE_PATH}, {SVF_PATH} (use --force to rebuild)")
+    if SHADE_PATH.exists() and SVF_PATH.exists() and DIRECT_PATH.exists() and not force:
+        print(f"COGs already exist: {SHADE_PATH}, {SVF_PATH}, {DIRECT_PATH} (use --force to rebuild)")
         return
     try:
         import cupy  # noqa: F401
@@ -467,38 +482,40 @@ def main(force: bool = False) -> None:
         return
 
     tiles = list(geo._land_tiles())
-    print(f"Terrain shade + sky view for {len(tiles)} Equi7 tiles ({MAX_DIST_M / 1000:.0f} km horizons, "
+    print(f"Terrain shade + sky view + direct sun for {len(tiles)} Equi7 tiles ({MAX_DIST_M / 1000:.0f} km horizons, "
           f"{K_DIRS} directions, sun every day every {MINUTE_STEP} min)...", flush=True)
     shutil.rmtree(SCRATCH_DIR, ignore_errors=True)
     SCRATCH_DIR.mkdir(parents=True)
-    done: list[tuple[str, int, tuple]] = []
     computed, compute_s = 0, 0.0
     try:
-        for i, (zone_name, epsg, tile) in enumerate(tiles, 1):
-            shade_dest, svf_dest, empty_marker = _tile_paths(zone_name, tile)
-            resumed = (geo._is_done(shade_dest) and geo._is_done(svf_dest)) or empty_marker.exists()
-            t0 = time.perf_counter()
-            if _process_equi7_tile(zone_name, epsg, tile):
-                done.append((zone_name, epsg, tile.outer_boundary_extent))
-            if resumed:
+        for zone_name in geo.EQUI7_ZONES:
+            zone_tiles = [(i, e, t) for i, (z, e, t) in enumerate(tiles, 1) if z == zone_name]
+            if _zone_done_marker(zone_name).exists():
                 continue
-            dt = time.perf_counter() - t0
-            computed += 1
-            compute_s += dt
-            eta_h = compute_s / computed * (len(tiles) - i) / 3600
-            geo._log(f"  [{i}/{len(tiles)}] {tile.name}: {dt:.0f}s  (ETA {eta_h:.1f} h)")
+            done: list[tuple[str, int, tuple]] = []
+            for i, epsg, tile in zone_tiles:
+                dests, empty_marker = _tile_paths(zone_name, tile)
+                resumed = all(geo._is_done(d) for d in dests) or empty_marker.exists()
+                t0 = time.perf_counter()
+                if _process_equi7_tile(zone_name, epsg, tile):
+                    done.append((zone_name, epsg, tile.outer_boundary_extent))
+                if resumed:
+                    continue
+                dt = time.perf_counter() - t0
+                computed += 1
+                compute_s += dt
+                eta_h = compute_s / computed * (len(tiles) - i) / 3600
+                geo._log(f"  [{i}/{len(tiles)}] {tile.name}: {dt:.0f}s  (ETA {eta_h:.1f} h)")
+            print(f"{zone_name}: {len(done)} tiles with data → 1° cells", flush=True)
+            _finish_zone(zone_name, done)
     finally:
         shutil.rmtree(SCRATCH_DIR, ignore_errors=True)
-
-    print("\nReprojecting to WGS84 1° tiles...", flush=True)
-    _reproject_to_wgs84(done)
     CELLS_DONE.touch()
-    shutil.rmtree(EQUI7_TILES_DIR, ignore_errors=True)
     _build_cogs()
 
 
 def _build_cogs() -> None:
-    for key, path, scale in (("shade", SHADE_PATH, SHADE_SCALE), ("svf", SVF_PATH, SVF_SCALE)):
+    for key, path, scale in (("shade", SHADE_PATH, SHADE_SCALE), ("svf", SVF_PATH, SVF_SCALE), ("direct", DIRECT_PATH, DIRECT_SCALE)):
         cells = sorted(WGS84_TILES_DIR.glob(f"*_{key}.tif"))
         if cells:
             print(f"\nBuilding {path} from {len(cells)} cells...", flush=True)

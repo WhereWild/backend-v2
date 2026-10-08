@@ -1329,7 +1329,7 @@ def test_rank_metric_value_type(vtype, metric, expected):
 
 def test_build_rank_density_small_group_returns_sorted_values():
     result = rk.build_rank_density([3.0, 1.0, float("nan"), 2.0], ValueType.RATIO, "mean")
-    assert result == {"count": 3, "values": [1.0, 2.0, 3.0]}
+    assert result == {"count": 3, "mean": 2.0, "values": [1.0, 2.0, 3.0]}
 
 
 def test_build_rank_density_large_group_returns_curve():
@@ -1348,6 +1348,12 @@ def test_build_rank_density_circular_bearing_uses_circular_kde():
     assert (result["min"], result["max"]) == (0.0, 360.0)
 
 
+def test_build_rank_density_circular_mean_wraps_through_north():
+    values = [350.0, 10.0] * rk.RANK_DENSITY_MIN_VALUES
+    result = rk.build_rank_density(values, ValueType.CIRCULAR, "circular_mean")
+    assert result["mean"] == pytest.approx(0.0, abs=1e-6) or result["mean"] == pytest.approx(360.0)
+
+
 def test_build_rank_density_unknown_variable_or_empty():
     assert rk.build_rank_density([1.0, 2.0], None, "mean") is None
     assert rk.build_rank_density([], ValueType.RATIO, "mean") is None
@@ -1362,7 +1368,7 @@ def test_read_rank_density_class_metric_includes_implicit_zeros():
     })
     with patch("util.rankings._read_rank_positions", side_effect=fake):
         result = rk.read_rank_density("100", "SPECIES", "kg2", "class_1", _ALL_LAYERS)
-    assert result == {"count": 5, "values": [0.0, 0.0, 0.0, 0.6, 0.8]}
+    assert result == {"count": 5, "mean": pytest.approx(0.28), "values": [0.0, 0.0, 0.0, 0.6, 0.8]}
 
 
 def test_read_rank_density_missing_group():
@@ -1387,5 +1393,5 @@ def test_query_ranked_scoped_density_follows_filters_and_highlights_page():
             stat_filters=[rk.StatFilter(variable="bio1", metric="mean", op="gte", value=1.0)],
             layers=[_RATIO_LAYER],
         )
-    assert result["density"] == {"count": 3, "values": [1.0, 2.0, 3.0]}
+    assert result["density"] == {"count": 3, "mean": 2.0, "values": [1.0, 2.0, 3.0]}
     assert result["highlight"] == {"start": 3.0, "end": 2.0}

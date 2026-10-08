@@ -148,7 +148,7 @@ def convert_summary(
 def scale_density_curve(curve: dict[str, Any], scale: float, shift: float = 0.0) -> dict[str, Any]:
     """Map a density curve through x -> x * scale + shift.
 
-    Positions (points, min, max, mode, raw values) move with the map; the
+    Positions (points, min, max, mode, mean, raw values) move with the map; the
     density is divided by |scale| so the curve still integrates to 1, and the
     bandwidth (a width) only scales."""
     result = dict(curve)
@@ -159,7 +159,7 @@ def scale_density_curve(curve: dict[str, Any], scale: float, shift: float = 0.0)
         result["density"] = [v / abs(scale) for v in result["density"]]
     if isinstance(result.get("bandwidth"), (int, float)):
         result["bandwidth"] = result["bandwidth"] * abs(scale)
-    for key in ("min", "max", "mode"):
+    for key in ("min", "max", "mode", "mean"):
         if isinstance(result.get(key), (int, float)):
             result[key] = result[key] * scale + shift
     return result

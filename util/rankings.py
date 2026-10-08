@@ -1057,9 +1057,10 @@ def rank_metric_value_type(variable_vtype: ValueType, metric: str) -> ValueType:
 def build_rank_density(values, variable_vtype: ValueType | None, metric: str) -> dict | None:
     """Density of one ranking group's metric values across its taxa.
 
-    Returns {"count", "points", "density", "min", "max", "bandwidth", "mode"}
-    for a KDE-sized group, {"count", "values"} (sorted) for a group smaller
-    than RANK_DENSITY_MIN_VALUES, or None when there's nothing to show."""
+    Returns {"count", "mean", "points", "density", "min", "max", "bandwidth",
+    "mode"} for a KDE-sized group, {"count", "mean", "values"} (sorted) for a
+    group smaller than RANK_DENSITY_MIN_VALUES, or None when there's nothing
+    to show. "mean" is the circular mean for a bearing metric."""
     if variable_vtype is None:
         return None
     arr = np.asarray(values, dtype=float)
@@ -1067,12 +1068,18 @@ def build_rank_density(values, variable_vtype: ValueType | None, metric: str) ->
     n = int(arr.size)
     if n == 0:
         return None
+    value_type = rank_metric_value_type(variable_vtype, metric)
+    if value_type == ValueType.CIRCULAR:
+        rad = np.deg2rad(arr)
+        mean = float(np.rad2deg(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean())) % 360.0)
+    else:
+        mean = float(arr.mean())
     if n < RANK_DENSITY_MIN_VALUES:
-        return {"count": n, "values": np.sort(arr).tolist()}
-    curve = build_density_curve(arr, rank_metric_value_type(variable_vtype, metric))
+        return {"count": n, "mean": mean, "values": np.sort(arr).tolist()}
+    curve = build_density_curve(arr, value_type)
     if curve is None:
         return None
-    return {"count": n, **curve}
+    return {"count": n, "mean": mean, **curve}
 
 
 def read_rank_density(

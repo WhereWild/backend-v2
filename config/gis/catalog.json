@@ -1280,8 +1280,8 @@
           "download_url": null,
           "scale_factor": 0.01,
           "add_offset": null,
-          "render_min": 2.0,
-          "render_max": 20.0
+          "render_min": 0.0,
+          "render_max": 30.0
         },
         {
           "id": "terrain_shade",

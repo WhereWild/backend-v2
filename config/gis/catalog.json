@@ -1199,8 +1199,8 @@
           "download_url": null,
           "scale_factor": null,
           "add_offset": null,
-          "render_min": 0.0,
-          "render_max": 1.2
+          "render_min": 0.042123,
+          "render_max": 1.255397
         },
         {
           "id": "convergence",
@@ -1235,8 +1235,8 @@
           "download_url": null,
           "scale_factor": null,
           "add_offset": null,
-          "render_min": -0.01,
-          "render_max": 0.01
+          "render_min": -0.02,
+          "render_max": 0.02
         },
         {
           "id": "profile_curvature",
@@ -1253,8 +1253,8 @@
           "download_url": null,
           "scale_factor": null,
           "add_offset": null,
-          "render_min": -0.01,
-          "render_max": 0.01
+          "render_min": -0.02,
+          "render_max": 0.02
         },
         {
           "id": "geomorphons",

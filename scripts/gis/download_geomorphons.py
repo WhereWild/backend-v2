@@ -341,7 +341,7 @@ def _cells_for_tiles(done: list[tuple[str, int, tuple]], footprints: dict) -> li
         if fp.is_empty:
             continue
         x0, y0, x1, y1 = fp.bounds
-        for lat in range(max(math.floor(y0), -60), min(math.ceil(y1), 80)):
+        for lat in range(max(math.floor(y0), math.floor(DEM_BOUNDS[1])), min(math.ceil(y1), math.ceil(DEM_BOUNDS[3]))):
             for lon in range(max(math.floor(x0), -180), min(math.ceil(x1), 180)):
                 if fp.intersects(box(lon, lat, lon + 1, lat + 1)):
                     cells.add((lon, lat))

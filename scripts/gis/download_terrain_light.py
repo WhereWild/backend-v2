@@ -465,12 +465,15 @@ def main(force: bool = False) -> None:
     if not force and VARS_TO_DOWNLOAD is not None and "terrain_shade" not in VARS_TO_DOWNLOAD:
         print("[download_terrain_light] skipped (terrain_shade not in VARS_TO_DOWNLOAD)")
         return
-    if SHADE_PATH.exists() and SVF_PATH.exists() and DIRECT_PATH.exists() and not force:
+    if all(_covers_dem(p) for p in (SHADE_PATH, SVF_PATH, DIRECT_PATH)) and not force:
         print(f"COGs already exist: {SHADE_PATH}, {SVF_PATH}, {DIRECT_PATH} (use --force to rebuild)")
         return
     try:
-        import cupy  # noqa: F401
-    except ImportError:
+        import cupy
+
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            raise RuntimeError("no CUDA device")
+    except Exception:  # ImportError, or CUDA runtime/driver errors on GPU-less hosts
         print("[download_terrain_light] skipped: needs an NVIDIA GPU with CuPy (see docstring)")
         return
     if not ELEV_PATH.exists():
@@ -478,7 +481,8 @@ def main(force: bool = False) -> None:
 
     if CELLS_DONE.exists():
         print(f"1° cells already complete ({WGS84_TILES_DIR}/), building the COGs", flush=True)
-        _build_cogs()
+        _extend_to_dem_bounds()
+        _build_cogs(force)
         return
 
     tiles = list(geo._land_tiles())
@@ -511,11 +515,61 @@ def main(force: bool = False) -> None:
     finally:
         shutil.rmtree(SCRATCH_DIR, ignore_errors=True)
     CELLS_DONE.touch()
-    _build_cogs()
+    EXTENDED.touch()
+    _build_cogs(force)
 
 
-def _build_cogs() -> None:
+def _covers_dem(path: Path) -> bool:
+    """Whether a COG was built after the 1° cells were extended to the DEM's
+    full latitude range (.extended). The first run clamped the cells to FABDEM's
+    60°S-80°N, so its COGs stop short; a bounds check can't tell, since the
+    DEM's outermost rows are open sea and the finished COGs stop short of them."""
+    return path.exists() and EXTENDED.exists() and path.stat().st_mtime > EXTENDED.stat().st_mtime
+
+
+OLD_LAT_RANGE = (-60, 80)   # cells the first run wrote, before the clamp followed DEM_BOUNDS
+EXTENDED = WGS84_TILES_DIR / ".extended"   # cells outside OLD_LAT_RANGE written
+
+
+def _extend_to_dem_bounds() -> None:
+    """Add the 1° cells north of 80°N and south of 60°S to an already-finished
+    run: recompute only the Equi7 tiles that touch those bands (every other
+    tile's cells exist and are skipped)."""
+    if EXTENDED.exists():
+        return
+    footprints = geo._zone_footprints()
+    wanted: dict[str, list] = {}
+    for zone_name, epsg, tile in geo._land_tiles():
+        extent = tile.outer_boundary_extent
+        cells = geo._cells_for_tiles([(zone_name, epsg, extent)], footprints)
+        if any(lat < OLD_LAT_RANGE[0] or lat >= OLD_LAT_RANGE[1] for _, lat in cells):
+            wanted.setdefault(zone_name, []).append((epsg, tile))
+    n = sum(len(v) for v in wanted.values())
+    print(f"Extending to the DEM's {geo.DEM_BOUNDS[1]:g}..{geo.DEM_BOUNDS[3]:g}° latitude range: "
+          f"{n} Equi7 tiles touch the new bands...", flush=True)
+    shutil.rmtree(SCRATCH_DIR, ignore_errors=True)
+    SCRATCH_DIR.mkdir(parents=True)
+    try:
+        i = 0
+        for zone_name, items in wanted.items():
+            done = []
+            for epsg, tile in items:
+                i += 1
+                t0 = time.perf_counter()
+                if _process_equi7_tile(zone_name, epsg, tile):
+                    done.append((zone_name, epsg, tile.outer_boundary_extent))
+                geo._log(f"  extend [{i}/{n}] {zone_name} {tile.name}: {time.perf_counter() - t0:.0f}s")
+            _finish_zone(zone_name, done)
+    finally:
+        shutil.rmtree(SCRATCH_DIR, ignore_errors=True)
+    EXTENDED.touch()
+
+
+def _build_cogs(force: bool = False) -> None:
     for key, path, scale in (("shade", SHADE_PATH, SHADE_SCALE), ("svf", SVF_PATH, SVF_SCALE), ("direct", DIRECT_PATH, DIRECT_SCALE)):
+        if _covers_dem(path) and not force:
+            print(f"{path} already exists and covers the DEM, skipping (use --force to rebuild)", flush=True)
+            continue
         cells = sorted(WGS84_TILES_DIR.glob(f"*_{key}.tif"))
         if cells:
             print(f"\nBuilding {path} from {len(cells)} cells...", flush=True)

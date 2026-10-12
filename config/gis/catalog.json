@@ -1290,12 +1290,14 @@
           "units": "",
           "value_type": "ratio",
           "domain": "continuous",
+          "group": "shade",
+          "group_label": "Shade",
           "filename": "terrain_shade.tif",
           "download_url": null,
           "scale_factor": 0.001,
           "add_offset": null,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 1.0
         },
         {
           "id": "sky_view",
@@ -1304,12 +1306,14 @@
           "units": "",
           "value_type": "ratio",
           "domain": "continuous",
+          "group": "shade",
+          "group_label": "Shade",
           "filename": "sky_view.tif",
           "download_url": null,
           "scale_factor": 0.004,
           "add_offset": null,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 1.0
         },
         {
           "id": "direct_sun",
@@ -1318,12 +1322,14 @@
           "units": "kWh m⁻² yr⁻¹",
           "value_type": "ratio",
           "domain": "continuous",
+          "group": "shade",
+          "group_label": "Shade",
           "filename": "direct_sun.tif",
           "download_url": null,
           "scale_factor": 5.0,
           "add_offset": null,
-          "render_min": null,
-          "render_max": null
+          "render_min": 0.0,
+          "render_max": 2935.0
         }
       ]
     },

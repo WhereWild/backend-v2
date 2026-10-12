@@ -51,7 +51,6 @@ from __future__ import annotations
 import math
 import os
 import shutil
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -206,7 +205,7 @@ extern "C" __global__ void shade(
     out_shade[idx] = (tot > 0.0f) ? 1.0f - lit / tot : nanf("");
     out_lit[idx] = lit;
 }
-""" % dict(K_DIRS=K_DIRS, K_SUN=K_SUN, N_ELEV=N_ELEV)
+""" % dict(K_DIRS=K_DIRS, K_SUN=K_SUN, N_ELEV=N_ELEV)  # noqa: UP031
 
 
 def mean_pool(a):
@@ -231,7 +230,7 @@ def _band_tables(band: int) -> dict[str, np.ndarray]:
         return _TABLES[band]
     lat = -90 + (band + 0.5) * LAT_BAND
     days = np.arange(1, 366)
-    G = 2 * np.pi * (days - 1) / 365
+    G = 2 * np.pi * (days - 1) / 365  # noqa: N806
     dec = (0.006918 - 0.399912 * np.cos(G) + 0.070257 * np.sin(G) - 0.006758 * np.cos(2 * G)
            + 0.000907 * np.sin(2 * G) - 0.002697 * np.cos(3 * G) + 0.00148 * np.sin(3 * G))
     e0 = 1.00011 + 0.034221 * np.cos(G) + 0.00128 * np.sin(G) + 0.000719 * np.cos(2 * G) + 0.000077 * np.sin(2 * G)
@@ -243,20 +242,22 @@ def _band_tables(band: int) -> dict[str, np.ndarray]:
     up = se > 0
     se, d, om, w = se[up], dec[up], omega[up], w[up]
     ce = np.sqrt(np.maximum(1 - se ** 2, 1e-12))
-    A = np.mod(np.arctan2(-np.cos(d) * np.sin(om) / ce, (np.sin(d) - se * np.sin(phi)) / (ce * np.cos(phi))), 2 * np.pi)
+    A = np.mod(np.arctan2(-np.cos(d) * np.sin(om) / ce, (np.sin(d) - se * np.sin(phi)) / (ce * np.cos(phi))), 2 * np.pi)  # noqa: N806
     h0 = np.arcsin(se)
     href = h0 + 0.061359 * (0.1594 + 1.123 * h0 + 0.065656 * h0 ** 2) / (1 + 28.9344 * h0 + 277.3971 * h0 ** 2)
     m0 = 1.0 / (np.sin(href) + 0.50572 * (np.degrees(href) + 6.07995) ** -1.6364)
     b = (np.mod(np.floor(A / (2 * np.pi / K_SUN) + 0.5), K_SUN).astype(int) * N_ELEV
          + np.minimum(np.floor(np.degrees(h0)), N_ELEV - 1).astype(int))
     n = K_SUN * N_ELEV
-    Wb = np.bincount(b, w, n)
+    Wb = np.bincount(b, w, n)  # noqa: N806
     out = {"W": Wb}
     for key, v in (("sE", se), ("cE", ce), ("sA", np.sin(A)), ("cA", np.cos(A)), ("M0", m0)):
         s = np.bincount(b, w * v, n)
         out[key] = np.divide(s, Wb, out=np.zeros_like(s), where=Wb > 0)
-    norm = np.hypot(out["sA"], out["cA"]); nz = norm > 0
-    out["sA"][nz] /= norm[nz]; out["cA"][nz] /= norm[nz]
+    norm = np.hypot(out["sA"], out["cA"])
+    nz = norm > 0
+    out["sA"][nz] /= norm[nz]
+    out["cA"][nz] /= norm[nz]
     _TABLES[band] = {k: v.astype(np.float32) for k, v in out.items()}
     return _TABLES[band]
 
@@ -267,11 +268,11 @@ def _compute(dem: np.ndarray, tf, crs) -> tuple[np.ndarray, np.ndarray, np.ndarr
     import cupy as cp
     from pyproj import Transformer
 
-    H, W = dem.shape
+    H, W = dem.shape  # noqa: N806
     levels = [dem]
     for _ in range(N_LEVELS - 1):
         levels.append(mean_pool(levels[-1]))
-    off = np.cumsum([0] + [l.size for l in levels[:-1]]).astype(np.int64)
+    off = np.cumsum([0] + [lv.size for lv in levels[:-1]]).astype(np.int64)
 
     cw, ch = (W + COARSE - 1) // COARSE, (H + COARSE - 1) // COARSE
     jj, ii = np.meshgrid(np.arange(cw) * COARSE + COARSE / 2, np.arange(ch) * COARSE + COARSE / 2)
@@ -284,14 +285,14 @@ def _compute(dem: np.ndarray, tf, crs) -> tuple[np.ndarray, np.ndarray, np.ndarr
     tabs = [_band_tables(int(b)) for b in uniq]
     tab = {k: cp.asarray(np.concatenate([t[k] for t in tabs])) for k in ("W", "sE", "cE", "sA", "cA", "M0")}
 
-    pyr = cp.asarray(np.concatenate([l.ravel() for l in levels]))
+    pyr = cp.asarray(np.concatenate([lv.ravel() for lv in levels]))
     out_shade = cp.full((H, W), cp.nan, cp.float32)
     out_svf = cp.full((H, W), cp.nan, cp.float32)
     out_lit = cp.full((H, W), cp.nan, cp.float32)
     kern = cp.RawKernel(KERNEL, "shade", options=("--use_fast_math",))
     args = (
-        pyr, cp.asarray(off), cp.asarray(np.array([l.shape[1] for l in levels], np.int32)),
-        cp.asarray(np.array([l.shape[0] for l in levels], np.int32)), np.int32(N_LEVELS),
+        pyr, cp.asarray(off), cp.asarray(np.array([lv.shape[1] for lv in levels], np.int32)),
+        cp.asarray(np.array([lv.shape[0] for lv in levels], np.int32)), np.int32(N_LEVELS),
         np.float32(RES_M), np.float32(np.nanmax(dem)), np.float32(MAX_DIST_M), np.float32(STEP_FRAC),
         cp.asarray(local.reshape(bands.shape).astype(np.int32).ravel()), cp.asarray(gamma.ravel()),
         np.int32(cw), np.int32(COARSE),
@@ -348,7 +349,7 @@ def _process_equi7_tile(zone_name: str, epsg: int, tile) -> bool:
     try:
         with rasterio.open(dem_path) as ds:
             dem = ds.read(1)
-            tf, crs, prof = ds.transform, ds.crs, ds.profile
+            tf, crs = ds.transform, ds.crs
         valid = dem != geo.DEM_NODATA
         core = (slice(BUFFER_CELLS, dem.shape[0] - BUFFER_CELLS), slice(BUFFER_CELLS, dem.shape[1] - BUFFER_CELLS))
         if not valid[core].any():

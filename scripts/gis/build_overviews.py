@@ -235,7 +235,7 @@ def _derived_elevation_bounds(layer_ids: list[str]) -> dict[str, tuple[float, fl
         saved = json.loads(DERIVED_SCAN_STATE.read_text())
         if saved.get("ids") == state["ids"]:
             state = saved
-    W, H = DERIVED_SCAN_WINDOW, DERIVED_SCAN_HALO
+    W, H = DERIVED_SCAN_WINDOW, DERIVED_SCAN_HALO  # noqa: N806
     with rasterio.open(elev) as ds:
         nodata = ds.nodata
         for r0 in range(state["next_row"], ds.height, W):

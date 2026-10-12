@@ -185,14 +185,18 @@ def _find_gaps():
     """Land gap patches at the elevation overview's ~2 km resolution: the
     (dilated) mask, its transform, and per (zone, tile name) the gap area,
     the gap points' lon/lat and the 1° cells they touch."""
+    from equi7grid import get_standard_equi7grid
     from scipy import ndimage
     from shapely.geometry import Point
-    from equi7grid import get_standard_equi7grid
 
     with rasterio.open(ELEV_PATH, OVERVIEW_LEVEL=DETECT_OVERVIEW_LEVEL) as d:
-        dem = d.read(1); dtf = d.transform; dnd = d.nodata
+        dem = d.read(1)
+        dtf = d.transform
+        dnd = d.nodata
     with rasterio.open(TWI_PATH, OVERVIEW_LEVEL=DETECT_OVERVIEW_LEVEL) as t:
-        twi = t.read(1); ttf = t.transform; tnd = t.nodata
+        twi = t.read(1)
+        ttf = t.transform
+        tnd = t.nodata
 
     lat = dtf.f + (np.arange(dem.shape[0]) + 0.5) * dtf.e
     lon = dtf.c + (np.arange(dem.shape[1]) + 0.5) * dtf.a
@@ -247,7 +251,8 @@ def _write_mask(mask, tf) -> None:
 def _data_window(path: Path, nodata: float, margin: int = 2):
     """Row/col bounds of the valid data in a (mostly empty) raster."""
     with rasterio.open(path) as ds:
-        rows = np.zeros(ds.height, bool); cols = np.zeros(ds.width, bool)
+        rows = np.zeros(ds.height, bool)
+        cols = np.zeros(ds.width, bool)
         for _, win in ds.block_windows(1):
             a = ds.read(1, window=win)
             v = a != nodata
@@ -256,7 +261,8 @@ def _data_window(path: Path, nodata: float, margin: int = 2):
                 cols[win.col_off: win.col_off + win.width] |= v.any(axis=0)
         if not rows.any():
             return None
-        r = np.nonzero(rows)[0]; c = np.nonzero(cols)[0]
+        r = np.nonzero(rows)[0]
+        c = np.nonzero(cols)[0]
         r0, r1 = max(r[0] - margin, 0), min(r[-1] + margin + 1, ds.height)
         c0, c1 = max(c[0] - margin, 0), min(c[-1] + margin + 1, ds.width)
         return c0, r0, c1 - c0, r1 - r0
@@ -270,9 +276,13 @@ def _tile_twi(zone: str, epsg: int, tile, pts, scratch: Path) -> Path | None:
     w, s, e, n = tile.outer_boundary_extent
     xs, ys = Transformer.from_crs(4326, epsg, always_xy=True).transform(*zip(*pts))
     half = 2 * 111_320 / 3600 * 2 ** DETECT_OVERVIEW_LEVEL   # two detection pixels, in metres
-    bw = max(w - BUFFER_M, min(xs) - BUFFER_M - half); bs = max(s - BUFFER_M, min(ys) - BUFFER_M - half)
-    be = min(e + BUFFER_M, max(xs) + BUFFER_M + half); bn = min(n + BUFFER_M, max(ys) + BUFFER_M + half)
-    snap = lambda v, f: f(v / RES_M) * RES_M
+    bw = max(w - BUFFER_M, min(xs) - BUFFER_M - half)
+    bs = max(s - BUFFER_M, min(ys) - BUFFER_M - half)
+    be = min(e + BUFFER_M, max(xs) + BUFFER_M + half)
+    bn = min(n + BUFFER_M, max(ys) + BUFFER_M + half)
+    def snap(v, f):
+        return f(v / RES_M) * RES_M
+
     full = scratch / "dem_full.tif"
     geo._run([
         "gdalwarp", "-overwrite", "-q", "-t_srs", f"EPSG:{epsg}",
@@ -395,7 +405,8 @@ def fill_twi_gaps() -> None:
         print("[fill_twi] no land gaps — nothing to do")
         return
     _write_mask(mask, mask_tf)
-    CELLS_DIR.mkdir(parents=True, exist_ok=True); DONE_DIR.mkdir(parents=True, exist_ok=True)
+    CELLS_DIR.mkdir(parents=True, exist_ok=True)
+    DONE_DIR.mkdir(parents=True, exist_ok=True)
     grid_tf = _publish_grid()
     fps = geo._zone_footprints()
     by_name = {t.name: (z, e, t) for z, e, t in geo._land_tiles()}
@@ -410,7 +421,8 @@ def fill_twi_gaps() -> None:
                 continue
             z, epsg, tile = by_name[name]
             t0 = time.time()
-            shutil.rmtree(SCRATCH_DIR, ignore_errors=True); SCRATCH_DIR.mkdir(parents=True)
+            shutil.rmtree(SCRATCH_DIR, ignore_errors=True)
+            SCRATCH_DIR.mkdir(parents=True)
             try:
                 info = tiles[(zone, name)]
                 twi = _tile_twi(z, epsg, tile, info["pts"], SCRATCH_DIR)

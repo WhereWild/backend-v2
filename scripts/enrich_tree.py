@@ -50,7 +50,11 @@ from util.gis import (
     DERIVED_FROM_ELEVATION,
     DERIVED_FROM_SOIL,
     sample_aspect_batch,
+    sample_convergence_batch,
     sample_elevation_terrain_batch,
+    sample_heat_load_batch,
+    sample_plan_curvature_batch,
+    sample_profile_curvature_batch,
     sample_slope_batch,
     sample_soil_texture_batch,
     sample_vector_batch,
@@ -408,6 +412,14 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> pa.Table | None:
                 return layer_id, np.full(len(lats), np.nan)
             if layer_id == "aspect":
                 raw = sample_aspect_batch(lats[arr], lons[arr])
+            elif layer_id == "heat_load":
+                raw = sample_heat_load_batch(lats[arr], lons[arr])
+            elif layer_id == "convergence":
+                raw = sample_convergence_batch(lats[arr], lons[arr])
+            elif layer_id == "plan_curvature":
+                raw = sample_plan_curvature_batch(lats[arr], lons[arr])
+            elif layer_id == "profile_curvature":
+                raw = sample_profile_curvature_batch(lats[arr], lons[arr])
             else:
                 raw = sample_slope_batch(lats[arr], lons[arr])
             vals = np.array([v if v is not None else np.nan for v in raw], dtype=np.float64)
@@ -463,6 +475,10 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> pa.Table | None:
             want_elevation=elev_layer_id in _terrain_ids,
             want_slope="slope" in _terrain_ids,
             want_aspect="aspect" in _terrain_ids,
+            want_heat_load="heat_load" in _terrain_ids,
+            want_convergence="convergence" in _terrain_ids,
+            want_plan_curvature="plan_curvature" in _terrain_ids,
+            want_profile_curvature="profile_curvature" in _terrain_ids,
         )
         out: list[tuple[str, np.ndarray]] = []
         for lid, raw in combo.items():

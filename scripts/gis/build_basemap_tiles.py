@@ -7,11 +7,16 @@ Build the self-hosted OpenMapTiles-schema vector basemap that replaces the
 Stadia Maps light/dark + Toner background/lines/labels tiles.
 
 Steps:
-  1. Download the OSM planet PBF (aria2c, resumable) to data/tmp/ — never
-     pushed to prod, same treatment as the DEM/landcover raw downloads.
+  1. Get the OSM planet PBF into data/gis/tiles/_src/ (never pushed to prod):
+     a full aria2c download (resumable, ~94GB) the first time or with
+     --force, otherwise an in-place pyosmium-up-to-date catch-up from the
+     osm.org hourly replication diffs — a few GB for a quarter's worth of
+     changes instead of re-pulling the whole planet.
   2. Download (and cache) the planetiler-openmaptiles jar.
   3. Run it to produce a single planet-wide PMTiles archive at
-     data/gis/tiles/basemap.pmtiles. One data file serves every theme —
+     data/gis/tiles/basemap.pmtiles — whenever the PBF is newer than the
+     existing archive (planetiler has no incremental mode, so this is always
+     a full multi-hour rebuild). One data file serves every theme —
      "standard" vs "variable" (background+labels only) is a style-layer
      concern, not a data concern.
   4. Copy the two hand-maintained base styles from config/gis/tile_styles/
@@ -70,6 +75,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -93,6 +99,13 @@ PLANETILER_JAR_SHA256 = os.environ.get(
 # Geofabrik mirrors the official planet file with resumable HTTP, which
 # plays nicer with aria2c's multi-connection split than the OSMF server.
 PLANET_PBF_URL = "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+
+# Max MB of diffs pyosmium-up-to-date holds in memory per pass. Each pass
+# rewrites the whole planet PBF, so bigger = fewer ~94GB rewrites (a quarter
+# of hourly diffs is roughly 10-15GB total); it needs about this much RAM
+# plus ~1GB.
+OSM_UPDATE_SIZE_MB = int(os.environ.get("WW_OSM_UPDATE_SIZE_MB", "4096"))
+OSM_UPDATE_MAX_PASSES = 50
 
 OPENMAPTILES_FONTS_URL = (
     "https://github.com/openmaptiles/fonts/releases/download/v2.0/v2.0.zip"
@@ -257,10 +270,39 @@ def _push_basemap_files() -> None:
 
 def _download_planet(force: bool) -> None:
     if PLANET_PBF.exists() and not force:
-        print(f"  Planet PBF already downloaded: {PLANET_PBF}")
+        _update_planet()
         return
+    # aria2c --continue treats an already-complete file as done, so --force
+    # has to remove it to actually re-download.
+    PLANET_PBF.unlink(missing_ok=True)
     print(f"  Downloading planet PBF from {PLANET_PBF_URL} (this is ~94GB, expect 4-7 hours to build after download)...")
     _aria2_download(PLANET_PBF_URL, PLANET_PBF)
+
+def _update_planet() -> None:
+    """Applies OSM replication diffs to the cached planet PBF in place.
+    pyosmium-up-to-date exits 0 once fully caught up, 1 when it stopped at
+    the --size limit with more diffs still on the server (so run another
+    pass), and >1 on error — in which case it leaves the file untouched.
+    --force-update-of-old-planet because the quarterly cron lands right on
+    its 90-day "download a fresh planet instead" cutoff.
+    """
+    cmd = [
+        str(Path(sys.executable).parent / "pyosmium-up-to-date"),
+        "-v",
+        "--size", str(OSM_UPDATE_SIZE_MB),
+        "--force-update-of-old-planet",
+        str(PLANET_PBF),
+    ]
+    print(f"  Updating {PLANET_PBF} from OSM replication diffs...", flush=True)
+    for n in range(1, OSM_UPDATE_MAX_PASSES + 1):
+        print(f"  pyosmium-up-to-date pass {n}", flush=True)
+        rc = subprocess.run(cmd, check=False).returncode
+        if rc == 0:
+            print(f"  Planet PBF up to date ({PLANET_PBF.stat().st_size / 1024**3:.1f} GB)")
+            return
+        if rc != 1:
+            raise RuntimeError(f"pyosmium-up-to-date failed (exit {rc}) — rerun with --force for a fresh planet download")
+    raise RuntimeError(f"Planet PBF still not caught up after {OSM_UPDATE_MAX_PASSES} pyosmium-up-to-date passes")
 
 
 def _download_planetiler_jar() -> None:
@@ -282,8 +324,10 @@ def _build_pmtiles(force: bool, area: str) -> Path:
     out_path = (TEST_DIR / f"basemap-{area.replace(' ', '_')}.pmtiles") if is_test else PMTILES_OUT
 
     if out_path.exists() and not force:
-        print(f"  PMTiles already built: {out_path} (use --force to rebuild)")
-        return out_path
+        if is_test or PLANET_PBF.stat().st_mtime <= out_path.stat().st_mtime:
+            print(f"  PMTiles already built from the current PBF: {out_path} (use --force to rebuild)")
+            return out_path
+        print(f"  {PLANET_PBF} is newer than {out_path} — rebuilding")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Keep the .pmtiles extension on the tmp path — planetiler infers its
@@ -407,7 +451,9 @@ def main(force: bool = False, skip_download: bool = False, area: str = "planet")
 
         _write_state("running", stage="styles")
         print("--- Styles ---")
-        _build_styles(started_at.date().isoformat())
+        # The PMTiles' own mtime, not today — a run that found nothing new
+        # to build shouldn't restamp the attribution with a fresh date.
+        _build_styles(datetime.fromtimestamp(out_path.stat().st_mtime, UTC).date().isoformat())
 
         _write_state("running", stage="fonts")
         print("--- Fonts ---")

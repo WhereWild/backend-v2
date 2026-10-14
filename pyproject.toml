@@ -25,6 +25,9 @@ dependencies = [
     "matplotlib>=3.8.0",
     "duckdb>=1.5.4",
     "slowapi>=0.1.9",
+    "equi7grid>=1.1.1",
+    "osmium>=4.3.1",
+    "whitebox>=2.3",
 ]
 
 [tool.ruff]

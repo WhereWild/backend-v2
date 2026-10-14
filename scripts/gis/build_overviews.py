@@ -8,7 +8,7 @@ each to a Cloud Optimized GeoTIFF (COG) with appropriate overview levels.
 
 Overview resampling is chosen by value_type:
   interval / ratio → average
-  nominal          → nearest  (preserves discrete class values)
+  nominal/ordinal  → mode     (preserves discrete class values)
 
 Also the one place two config.py-driven corrections actually get applied,
 for the same reason in both cases: acting on every layer in data/gis/layers/
@@ -58,6 +58,11 @@ LAYERS_DIR          = Path("data/gis/layers")
 TARGET_MIN_ZOOM     = 3
 TARGET_TILE_SIZE    = 256
 MAX_OVERVIEW_FACTOR = 2048
+
+# Compression / overview threads for the COG pass. 4, not all cores: all-core
+# vector-heavy GDAL work has panicked this box with a Machine Check (see
+# download_geomorphons.WARP_THREADS).
+COG_THREADS = 4
 
 OVERVIEW_FACTOR_TOLERANCE_RATIO = 0.03
 OVERVIEW_FACTOR_TOLERANCE_MIN   = 2
@@ -167,20 +172,12 @@ def _fill_nodata_with_zero(path: Path) -> bool:
         return changed
 
 
-def _compute_minmax_bounds(path: Path, layer: dict) -> tuple[float, float]:
-    """Return (render_min, render_max) as the true min/max of valid pixel
-    values, in display units (scale_factor/add_offset applied) — same
-    nodata-masking logic as download_chelsa.py's _compute_stats.
-    """
-    scale = layer.get("scale_factor") or 1.0
-    offset = layer.get("add_offset") or 0.0
-    with rasterio.open(path) as ds:
-        dtype_str = ds.dtypes[0]
-        nodata = ds.nodata
-        raw_native = ds.read(1)
+def _valid_block_values(raw_native: np.ndarray, dtype_str: str, nodata) -> np.ndarray:
+    """Float32 copy of a block with nodata as NaN — same masking as
+    download_chelsa.py's _compute_stats (integer layers also drop the top
+    3 values of their range, which some sources use as extra nodata)."""
     if np.issubdtype(np.dtype(dtype_str), np.integer):
-        iinfo = np.iinfo(dtype_str)
-        dtype_max = iinfo.max
+        dtype_max = np.iinfo(dtype_str).max
         nd_int = round(nodata) if nodata is not None else dtype_max
         if nd_int == dtype_max:
             nodata_mask = raw_native >= dtype_max - 3
@@ -192,48 +189,136 @@ def _compute_minmax_bounds(path: Path, layer: dict) -> tuple[float, float]:
         raw = raw_native.astype(np.float32)
         if nodata is not None:
             raw[raw == nodata] = np.nan
-    raw = raw * scale + offset
-    valid = raw[np.isfinite(raw)]
-    if valid.size == 0:
+    return raw
+
+
+def _compute_minmax_bounds(path: Path, layer: dict) -> tuple[float, float]:
+    """Return (render_min, render_max) as the true min/max of valid pixel
+    values, in display units (scale_factor/add_offset applied). Streams the
+    file block by block, so it works for 30 m global layers (a trillion
+    cells) as well as 1 km ones."""
+    scale = layer.get("scale_factor") or 1.0
+    offset = layer.get("add_offset") or 0.0
+    lo, hi = math.inf, -math.inf
+    with rasterio.open(path) as ds:
+        dtype_str, nodata = ds.dtypes[0], ds.nodata
+        for _, window in ds.block_windows(1):
+            raw = _valid_block_values(ds.read(1, window=window), dtype_str, nodata)
+            if np.isfinite(raw).any():
+                lo = min(lo, float(np.nanmin(raw)))
+                hi = max(hi, float(np.nanmax(raw)))
+    if not math.isfinite(lo):
         return 0.0, 1.0
-    lo, hi = float(np.min(valid)), float(np.max(valid))
-    return round(lo, 6), round(hi, 6)
+    a, b = lo * scale + offset, hi * scale + offset
+    return round(min(a, b), 6), round(max(a, b), 6)
+
+
+# ── On-the-fly elevation layers: exact bounds from one full pass ──────────────
+
+DERIVED_SCAN_STATE = Path("data/gis/derived_bounds_scan.json")
+DERIVED_SCAN_WINDOW = 4096
+DERIVED_SCAN_HALO = 2          # convergence uses a 5×5 window
+
+
+def _derived_elevation_bounds(layer_ids: list[str]) -> dict[str, tuple[float, float]]:
+    """True min/max of on-the-fly elevation layers (heat load, curvature, …)
+    over every cell of elevation.tif, computed with the same code the API
+    uses (util.gis). ~18 h on one core for GEDTM30 — checkpointed after each
+    band of rows to DERIVED_SCAN_STATE, so it resumes after a restart; only
+    runs for layers whose catalog bounds are null."""
+    from util import gis as g
+
+    elev = LAYERS_DIR / "elevation.tif"
+    want = set(layer_ids)
+    state = {"ids": sorted(want), "next_row": 0, "bounds": {i: [math.inf, -math.inf] for i in want}}
+    if DERIVED_SCAN_STATE.exists():
+        saved = json.loads(DERIVED_SCAN_STATE.read_text())
+        if saved.get("ids") == state["ids"]:
+            state = saved
+    W, H = DERIVED_SCAN_WINDOW, DERIVED_SCAN_HALO  # noqa: N806
+    with rasterio.open(elev) as ds:
+        nodata = ds.nodata
+        for r0 in range(state["next_row"], ds.height, W):
+            for c0 in range(0, ds.width, W):
+                rr0, cc0 = max(r0 - H, 0), max(c0 - H, 0)
+                rr1, cc1 = min(r0 + W + H, ds.height), min(c0 + W + H, ds.width)
+                win = rasterio.windows.Window(cc0, rr0, cc1 - cc0, rr1 - rr0)
+                dem = ds.read(1, window=win).astype(np.float32)
+                if nodata is not None:
+                    dem[dem == nodata] = np.nan
+                if not np.isfinite(dem).any():
+                    continue
+                tf = ds.window_transform(win)
+                dx, dy = g._array_cell_sizes(dem, tf)
+                dzdx, dzdy = g._horn_gradient(dem, dx, dy)
+                out: dict[str, np.ndarray] = {}
+                if "heat_load" in want:
+                    lat = g._row_latitudes(dem, tf)[:, None]
+                    out["heat_load"] = g._heat_load(g._slope_deg(dzdx, dzdy), g._aspect_deg(dzdx, dzdy), lat)
+                if want & {"plan_curvature", "profile_curvature"}:
+                    out["plan_curvature"], out["profile_curvature"] = g._curvatures(dem, dx, dy, dzdx, dzdy)
+                if "convergence" in want:
+                    out["convergence"] = g._convergence_index(dem, dx, dy)
+                inner = (slice(r0 - rr0, r0 - rr0 + min(W, ds.height - r0)), slice(c0 - cc0, c0 - cc0 + min(W, ds.width - c0)))
+                for layer_id in want:
+                    v = out[layer_id][inner]
+                    if np.isfinite(v).any():
+                        b = state["bounds"][layer_id]
+                        b[0] = min(b[0], float(np.nanmin(v)))
+                        b[1] = max(b[1], float(np.nanmax(v)))
+            state["next_row"] = r0 + W
+            DERIVED_SCAN_STATE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = DERIVED_SCAN_STATE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(state))
+            tmp.replace(DERIVED_SCAN_STATE)
+            print(f"[overview] derived bounds scan: rows {min(r0 + W, ds.height):,}/{ds.height:,}", flush=True)
+    DERIVED_SCAN_STATE.unlink(missing_ok=True)
+    return {i: (round(b[0], 6), round(b[1], 6)) for i, b in state["bounds"].items() if math.isfinite(b[0])}
+
+
+def _derived_layers_missing_bounds() -> list[str]:
+    from util.gis import ELEVATION_DERIVERS
+    with open(CATALOG_PATH) as f:
+        catalog = json.load(f)
+    return [
+        layer["id"]
+        for cat in catalog["categories"] for layer in cat["layers"]
+        if layer.get("derived") and layer["id"] in ELEVATION_DERIVERS
+        and str(layer.get("value_type") or "").lower() not in ("nominal", "ordinal", "circular")
+        and (layer.get("render_min") is None or layer.get("render_max") is None)
+    ]
 
 
 def _build_cog(src_path: Path, dst_path: Path, *, nominal: bool, overview_factors: list[int]) -> None:
-    resampling = "mode" if nominal else "average"
-    base_tif = dst_path.with_suffix(".base.tif")
-    try:
-        subprocess.run(
-            [
-                "gdal_translate",
-                "-of", "GTiff",
-                "-co", "TILED=YES",
-                "-co", "COMPRESS=DEFLATE",
-                "-co", "BIGTIFF=IF_SAFER",
-                str(src_path), str(base_tif),
-            ],
-            check=True,
-        )
-        if overview_factors:
-            subprocess.run(
-                ["gdaladdo", "-r", resampling, str(base_tif), *[str(f) for f in overview_factors]],
-                check=True,
-            )
-        subprocess.run(
-            [
-                "gdal_translate",
-                "-of", "COG",
-                "-co", "COMPRESS=DEFLATE",
-                "-co", "BIGTIFF=IF_SAFER",
-                "-co", "OVERVIEWS=FORCE_USE_EXISTING",
-                "-co", f"OVERVIEW_RESAMPLING={resampling.upper()}",
-                str(base_tif), str(dst_path),
-            ],
-            check=True,
-        )
-    finally:
-        base_tif.unlink(missing_ok=True)
+    """Write src_path as a COG with fresh overviews in one gdal_translate pass.
+
+    The COG driver builds the overviews itself (OVERVIEWS=IGNORE_EXISTING, so
+    any old internal overviews on src are dropped rather than reused) — this
+    used to be gdal_translate to a plain base GeoTIFF, gdaladdo on that, then a
+    second gdal_translate to COG: two extra full-file passes, all on one core
+    (geomorphons.tif's base copy alone took 71 min). overview_factors are
+    always 2, 4, 8, … (see _overview_factors_for_dataset), which is exactly
+    what OVERVIEW_COUNT levels produce.
+    """
+    if overview_factors != [2 ** i for i in range(1, len(overview_factors) + 1)]:
+        raise ValueError(f"expected consecutive power-of-two factors from 2, got {overview_factors}")
+    cmd = [
+        "gdal_translate",
+        "--config", "GDAL_NUM_THREADS", str(COG_THREADS),
+        "-of", "COG",
+        "-co", "COMPRESS=DEFLATE",
+        "-co", "BIGTIFF=IF_SAFER",
+        "-co", f"NUM_THREADS={COG_THREADS}",
+    ]
+    if overview_factors:
+        cmd += [
+            "-co", "OVERVIEWS=IGNORE_EXISTING",
+            "-co", f"OVERVIEW_RESAMPLING={'MODE' if nominal else 'AVERAGE'}",
+            "-co", f"OVERVIEW_COUNT={len(overview_factors)}",
+        ]
+    else:
+        cmd += ["-co", "OVERVIEWS=NONE"]
+    subprocess.run([*cmd, str(src_path), str(dst_path)], check=True)
 
 
 def _vector_layer_filenames(layer_meta: dict[str, dict]) -> set[str]:
@@ -338,6 +423,13 @@ def main(fill: bool = False) -> None:
                 skipped += 1
         except Exception as exc:
             print(f"[overview] failed vector pyramid {path.name}: {exc}")
+
+    missing = _derived_layers_missing_bounds()
+    if missing and (LAYERS_DIR / "elevation.tif").exists():
+        print(f"[overview] full-pass min/max for on-the-fly layers: {', '.join(missing)}", flush=True)
+        for layer_id, bounds in _derived_elevation_bounds(missing).items():
+            print(f"[overview] min/max render bounds -> {layer_id}: {bounds[0]}/{bounds[1]}")
+            catalog_updates[layer_id] = bounds
 
     if catalog_updates:
         # Re-read from disk before writing so external edits made while this

@@ -977,3 +977,13 @@ def test_sample_layer_to_tile_temporal_missing_npy_returns_nan(patch_temporal_re
     dest = tiles._sample_layer_to_tile(layer, z=2, x=2, y=1, tile_size=8)
     assert dest.shape == (8, 8)
     assert np.all(np.isnan(dest))
+
+
+@pytest.mark.parametrize(
+    "layer_id", ["slope", "aspect", "heat_load", "convergence", "plan_curvature", "profile_curvature"],
+)
+def test_sample_layer_to_tile_uses_layers_own_elevation_deriver(layer_id):
+    from util.gis import ELEVATION_DERIVERS
+    with patch.object(tiles, "_sample_elevation_derived_to_tile", return_value="tile") as mock:
+        assert tiles._sample_layer_to_tile({"id": layer_id}, 5, 3, 7, 256) == "tile"
+    assert mock.call_args.args[4] is ELEVATION_DERIVERS[layer_id]

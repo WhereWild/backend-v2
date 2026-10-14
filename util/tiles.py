@@ -1384,7 +1384,7 @@ def _sample_layer_to_tile(
     from ANY layer, primary or chained. Mirrors the dispatch
     render_layer_tile_bytes does for the primary layer, minus colorizing.
     """
-    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, derive_aspect_array, derive_slope_array
+    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, ELEVATION_DERIVERS
 
     layer_id = layer["id"]
     mx0, my0, mx1, my1 = tile_bounds_mercator(z, x, y)
@@ -1400,7 +1400,7 @@ def _sample_layer_to_tile(
             return np.full((tile_size, tile_size), np.nan, dtype=np.float32)
         return _reproject_temporal_array(arr, dst_transform, tile_size, model)
     if layer_id in DERIVED_FROM_ELEVATION:
-        derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
+        derive_fn = ELEVATION_DERIVERS[layer_id]
         return _sample_elevation_derived_to_tile(z, x, y, tile_size, derive_fn, dst_transform)
     if layer_id in DERIVED_FROM_SOIL:
         return _sample_soil_texture_to_tile(z, x, y, tile_size, dst_transform)
@@ -1514,12 +1514,12 @@ def render_layer_tile_bytes(
     chain: list[dict] | None = None,
     render_range: tuple[float, float] | None = None,
 ) -> bytes:
-    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, derive_aspect_array, derive_slope_array
+    from util.gis import DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL, ELEVATION_DERIVERS
     layer = get_layer(layer_id)
     if layer.get("window_hours") is not None:
         rgba = _render_temporal_tile_rgba(layer_id, z, x, y, tile_size, colormap, cb_mode, forecast_suffix, class_filter, value_ranges, render_range)
     elif layer_id in DERIVED_FROM_ELEVATION:
-        derive_fn = derive_aspect_array if layer_id == "aspect" else derive_slope_array
+        derive_fn = ELEVATION_DERIVERS[layer_id]
         rgba = _render_derived_elevation_tile_rgba(layer, z, x, y, tile_size, derive_fn, colormap, value_ranges, render_range)
     elif layer_id in DERIVED_FROM_SOIL:
         rgba = _render_derived_soil_texture_tile_rgba(layer, z, x, y, tile_size, colormap, cb_mode, class_filter)

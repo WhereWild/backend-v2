@@ -27,6 +27,7 @@ RUN apt-get update \
     python3-venv \
     rclone \
     openjdk-21-jre-headless \
+    grass-core \
  && rm -rf /var/lib/apt/lists/*
 
 RUN echo '\nif [ -f /usr/share/bash-completion/bash_completion ]; then\n  . /usr/share/bash-completion/bash_completion\nfi' >> /etc/bash.bashrc \

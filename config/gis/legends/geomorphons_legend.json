@@ -1,0 +1,16 @@
+{
+  "layer_id": "geomorphons",
+  "source": "Jasiewicz, J. & Stepinski, T.F. (2013). Geomorphons — a pattern recognition approach to classification and mapping of landforms. Geomorphology, 182, 147–156. Colors: GRASS GIS r.geomorphon.",
+  "classes": [
+    { "id": 1,  "name": "Flat",       "group": "flat",    "group_label": "Flat",           "traits": { "color": "#DCDCDC" } },
+    { "id": 2,  "name": "Summit",     "group": "crest",   "group_label": "Crests",         "traits": { "color": "#380000" } },
+    { "id": 3,  "name": "Ridge",      "group": "crest",   "group_label": "Crests",         "traits": { "color": "#C80000" } },
+    { "id": 4,  "name": "Shoulder",   "group": "convex",  "group_label": "Convex Slopes",  "traits": { "color": "#FF5014" } },
+    { "id": 5,  "name": "Spur",       "group": "convex",  "group_label": "Convex Slopes",  "traits": { "color": "#FAD23C" } },
+    { "id": 6,  "name": "Slope",      "group": "slope",   "group_label": "Slopes",         "traits": { "color": "#FFFF3C" } },
+    { "id": 7,  "name": "Hollow",     "group": "concave", "group_label": "Concave Slopes", "traits": { "color": "#B4E614" } },
+    { "id": 8,  "name": "Footslope",  "group": "concave", "group_label": "Concave Slopes", "traits": { "color": "#3CFA96" } },
+    { "id": 9,  "name": "Valley",     "group": "low",     "group_label": "Valleys",        "traits": { "color": "#0000FF" } },
+    { "id": 10, "name": "Depression", "group": "low",     "group_label": "Valleys",        "traits": { "color": "#000038" } }
+  ]
+}

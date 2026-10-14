@@ -204,6 +204,18 @@ def _push_stage() -> None:
         # every taxonomy push instead of just leaving them alone.
         "--exclude", "gis/tiles/**",
         "--exclude", "tmp/**",
+        # download_geomorphons' working tiles (tens of GB, kept locally only
+        # so --force can rebuild the COG without days of recompute) — prod
+        # only needs the final gis/layers/geomorphons.tif.
+        "--exclude", "gis/geomorphons_equi7_tiles/**",
+        "--exclude", "gis/geomorphons_1deg_tiles/**",
+        "--exclude", "gis/geomorphons_scratch/**",
+        # download_dem's raw downloads and fill_twi_gaps' working files.
+        "--exclude", "gis/dem_raw/**",
+        "--exclude", "gis/twi_fill/**",
+        "--exclude", "gis/terrain_light_equi7_tiles/**",
+        "--exclude", "gis/terrain_light_1deg_tiles/**",
+        "--exclude", "gis/terrain_light_scratch/**",
         # pipeline_state.json/temporal_state.json/basemap_state.json are
         # each already kept current on prod via their own dedicated HTTP
         # push endpoints (_push_pipeline_state here, plus main.py's
@@ -221,6 +233,9 @@ def _push_stage() -> None:
         "--exclude", "temporal_state.json",
         "--exclude", "basemap_state.json",
         "--transfers", transfers,
+        # rclone logs --stats at INFO by default, below its own default
+        # NOTICE level, so without this the push printed no progress at all.
+        "--stats-log-level", "NOTICE",
         "--stats-one-line", "--stats", "1m",
     ]
     print(f"  rclone sync {DATA_DIR} → {dest}")

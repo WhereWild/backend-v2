@@ -162,22 +162,113 @@
       }
     ]
   },
-  "fabdem": {
-    "name": "FABDEM V1-2",
-    "url": "https://data.bris.ac.uk/data/dataset/s5hqmjcdj8yo2ibzi9b4ew3sn",
-    "license": "CC BY-NC-SA 4.0",
-    "license_url": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
-    "citation": "Hawker, L., Uhe, P., Paulo, L., Sosa, J., Savage, J., Sampson, C., and Neal, J. (2022). A 30 m global map of elevation with forests and buildings removed. Environmental Research Letters, 17(2), 024016.",
-    "doi": "https://doi.org/10.1088/1748-9326/ac4d4f",
+  "gedtm30": {
+    "name": "GEDTM30 v1.2",
+    "url": "https://codeberg.org/openlandmap/GEDTM30",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Ho, Y.-F., Grohmann, C. H., Lindsay, J., Reuter, H. I., Parente, L., Witjes, M., and Hengl, T. (2025). GEDTM30: global ensemble digital terrain model at 30 m and derived multiscale terrain variables. PeerJ, 13, e19673.",
+    "doi": "https://doi.org/10.7717/peerj.19673",
     "references": [
       {
-        "authors": "Hawker, L., Uhe, P., Paulo, L., Sosa, J., Savage, J., Sampson, C., and Neal, J.",
+        "authors": "Ho, Y.-F., Grohmann, C. H., Lindsay, J., Reuter, H. I., Parente, L., Witjes, M., and Hengl, T.",
+        "year": 2025,
+        "title": "GEDTM30: global ensemble digital terrain model at 30 m and derived multiscale terrain variables",
+        "journal": "PeerJ",
+        "volume_issue": "13",
+        "pages": "e19673",
+        "doi": "https://doi.org/10.7717/peerj.19673"
+      }
+    ]
+  },
+  "gedtm30_geomorphons": {
+    "name": "Geomorphons from GEDTM30 v1.2 (Geomorpho90m method at 30 m)",
+    "url": "https://codeberg.org/openlandmap/GEDTM30",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Derived from GEDTM30 v1.2 (Ho et al. 2025) with GRASS GIS r.geomorphon (Jasiewicz and Stepinski 2013), following the Geomorpho90m workflow (Amatulli et al. 2020).",
+    "doi": "https://doi.org/10.1016/j.geomorph.2012.11.005",
+    "references": [
+      {
+        "authors": "Jasiewicz, J. and Stepinski, T.F.",
+        "year": 2013,
+        "title": "Geomorphons — a pattern recognition approach to classification and mapping of landforms",
+        "journal": "Geomorphology",
+        "volume_issue": "182",
+        "pages": "147–156",
+        "doi": "https://doi.org/10.1016/j.geomorph.2012.11.005"
+      },
+      {
+        "authors": "Amatulli, G., McInerney, D., Sethi, T., Strobl, P., and Domisch, S.",
+        "year": 2020,
+        "title": "Geomorpho90m, empirical evaluation and accuracy assessment of global high-resolution geomorphometric layers",
+        "journal": "Scientific Data",
+        "volume_issue": "7",
+        "pages": "162",
+        "doi": "https://doi.org/10.1038/s41597-020-0479-6"
+      },
+      {
+        "authors": "Ho, Y.-F., Grohmann, C. H., Lindsay, J., Reuter, H. I., Parente, L., Witjes, M., and Hengl, T.",
+        "year": 2025,
+        "title": "GEDTM30: global ensemble digital terrain model at 30 m and derived multiscale terrain variables",
+        "journal": "PeerJ",
+        "volume_issue": "13",
+        "pages": "e19673",
+        "doi": "https://doi.org/10.7717/peerj.19673"
+      }
+    ]
+  },
+  "gedtm30_terrain_light": {
+    "name": "Terrain shade index, sky view factor and direct sunlight from GEDTM30 v1.2",
+    "url": "https://codeberg.org/openlandmap/GEDTM30",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "citation": "Derived from GEDTM30 v1.2 (Ho et al. 2025): horizon angles and sky view factor after Dozier and Frew (1990); yearly direct-beam energy with the ESRA clear-sky model as implemented in GRASS GIS r.sun (Rigollier et al. 2000; Hofierka and Šúri 2002).",
+    "doi": "https://doi.org/10.1109/36.58986",
+    "references": [
+      {
+        "authors": "Dozier, J. and Frew, J.",
+        "year": 1990,
+        "title": "Rapid calculation of terrain parameters for radiation modeling from digital elevation data",
+        "journal": "IEEE Transactions on Geoscience and Remote Sensing",
+        "volume_issue": "28(5)",
+        "pages": "963–969",
+        "doi": "https://doi.org/10.1109/36.58986"
+      },
+      {
+        "authors": "Rigollier, C., Bauer, O., and Wald, L.",
+        "year": 2000,
+        "title": "On the clear sky model of the ESRA — European Solar Radiation Atlas — with respect to the Heliosat method",
+        "journal": "Solar Energy",
+        "volume_issue": "68(1)",
+        "pages": "33–48",
+        "doi": "https://doi.org/10.1016/S0038-092X(99)00055-9"
+      },
+      {
+        "authors": "Hofierka, J. and Šúri, M.",
+        "year": 2002,
+        "title": "The solar radiation model for Open source GIS: implementation and applications",
+        "journal": "Proceedings of the Open source GIS – GRASS users conference, Trento, Italy",
+        "volume_issue": "",
+        "pages": "1–19"
+      },
+      {
+        "authors": "Steger, C. R., Steger, B., and Schär, C.",
         "year": 2022,
-        "title": "A 30 m global map of elevation with forests and buildings removed",
-        "journal": "Environmental Research Letters",
-        "volume_issue": "17(2)",
-        "pages": "024016",
-        "doi": "https://doi.org/10.1088/1748-9326/ac4d4f"
+        "title": "HORAYZON v1.2: an efficient and flexible ray-tracing algorithm to compute horizon and sky view factor",
+        "journal": "Geoscientific Model Development",
+        "volume_issue": "15",
+        "pages": "6817–6840",
+        "doi": "https://doi.org/10.5194/gmd-15-6817-2022"
+      },
+      {
+        "authors": "Ho, Y.-F., Grohmann, C. H., Lindsay, J., Reuter, H. I., Parente, L., Witjes, M., and Hengl, T.",
+        "year": 2025,
+        "title": "GEDTM30: global ensemble digital terrain model at 30 m and derived multiscale terrain variables",
+        "journal": "PeerJ",
+        "volume_issue": "13",
+        "pages": "e19673",
+        "doi": "https://doi.org/10.7717/peerj.19673"
       }
     ]
   },

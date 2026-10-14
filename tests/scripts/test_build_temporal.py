@@ -1742,3 +1742,46 @@ def test_main_resumes_if_pid_dead(monkeypatch, tmp_path: Path):
     bt.main()
 
     assert "temperature_2m" in full_build_calls
+
+
+# ---------------------------------------------------------------------------
+# _alert_push_failure — throttled bot ping when a push target is unreachable
+# ---------------------------------------------------------------------------
+
+def test_alert_push_failure_posts_once_then_throttles(monkeypatch, tmp_path):
+    posts = []
+    monkeypatch.setattr(bt, "_NOTIFY_URL", "http://bot/notify")
+    monkeypatch.setattr(bt, "_PUSH_ALERT_STATE", tmp_path / "state.json")
+    monkeypatch.setattr(bt, "_PUSH_ALERT_EVERY_S", 3600.0)
+    monkeypatch.setattr(bt.httpx, "post", lambda url, **kw: posts.append((url, kw["json"])))
+
+    bt._alert_push_failure("temporal raster push", "rclone sync exited 1")
+    bt._alert_push_failure("temporal raster push", "rclone sync exited 1")  # inside the window
+    bt._alert_push_failure("temporal status push", "refused")               # a different kind
+
+    assert [p[1]["kind"] for p in posts] == ["temporal raster push", "temporal status push"]
+    assert posts[0][0] == "http://bot/notify"
+    assert posts[0][1]["event"] == "push_failed"
+
+
+def test_alert_push_failure_noop_without_url(monkeypatch, tmp_path):
+    monkeypatch.setattr(bt, "_NOTIFY_URL", "")
+    monkeypatch.setattr(bt, "_PUSH_ALERT_STATE", tmp_path / "state.json")
+    monkeypatch.setattr(bt.httpx, "post", lambda *a, **kw: pytest.fail("should not post"))
+
+    bt._alert_push_failure("temporal raster push", "x")
+
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_alert_push_failure_swallows_bot_errors(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(bt, "_NOTIFY_URL", "http://bot/notify")
+    monkeypatch.setattr(bt, "_PUSH_ALERT_STATE", tmp_path / "state.json")
+
+    def boom(*a, **kw):
+        raise RuntimeError("bot down")
+
+    monkeypatch.setattr(bt.httpx, "post", boom)
+    bt._alert_push_failure("temporal raster push", "x")
+
+    assert "push alert: failed: bot down" in capsys.readouterr().out

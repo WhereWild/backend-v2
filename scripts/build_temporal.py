@@ -54,6 +54,11 @@ from util.temporal import (
 )
 
 _TEMPORAL_STATUS_PUSH_URL = os.environ.get("WHEREWILD_STATUS_PUSH_URL", "")
+_NOTIFY_URL = os.environ.get("WHEREWILD_NOTIFY_URL", "")
+# A down push target fails every 30-minute tick; ping the bot at most once per
+# this many hours per kind of failure.
+_PUSH_ALERT_EVERY_S = float(os.environ.get("WW_PUSH_ALERT_HOURS", "6")) * 3600
+_PUSH_ALERT_STATE = Path("logs/.push_alert_state.json")
 
 
 def _floor_to_6h(last_modified: datetime) -> float:
@@ -107,6 +112,28 @@ def _gfs_detect_cycle(
     return changed, cycle_init_ts, new_lm
 
 
+def _alert_push_failure(kind: str, detail: str) -> None:
+    """Tell the WhereWild bot (the same /notify listener rebuild.py uses) that a
+    push failed, at most once per _PUSH_ALERT_EVERY_S per kind. Silently drops
+    if WHEREWILD_NOTIFY_URL is unset or the bot can't be reached."""
+    if not _NOTIFY_URL:
+        return
+    try:
+        try:
+            state = json.loads(_PUSH_ALERT_STATE.read_text())
+        except (OSError, ValueError):
+            state = {}
+        now = time.time()
+        if now - float(state.get(kind, 0)) < _PUSH_ALERT_EVERY_S:
+            return
+        httpx.post(_NOTIFY_URL, json={"event": "push_failed", "kind": kind, "detail": detail[:300]}, timeout=5)
+        state[kind] = now
+        _PUSH_ALERT_STATE.parent.mkdir(parents=True, exist_ok=True)
+        _PUSH_ALERT_STATE.write_text(json.dumps(state))
+    except Exception as exc:
+        print(f"push alert: failed: {exc}")
+
+
 def _push_temporal_state(state: dict) -> None:
     if not _TEMPORAL_STATUS_PUSH_URL:
         return
@@ -115,6 +142,7 @@ def _push_temporal_state(state: dict) -> None:
         httpx.post(url, json=state, timeout=5)
     except Exception as exc:
         print(f"temporal status push: failed: {exc}")
+        _alert_push_failure("temporal status push", f"{_TEMPORAL_STATUS_PUSH_URL}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1392,6 +1420,7 @@ def _push_rasters(out_dir: str) -> None:
     ])
     if result.returncode != 0:
         print(f"  rclone sync exited {result.returncode}")
+        _alert_push_failure("temporal raster push", f"rclone sync exited {result.returncode} -> {dest}")
     else:
         print("  upload complete")
 

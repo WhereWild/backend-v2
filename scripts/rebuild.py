@@ -193,7 +193,13 @@ def _push_stage() -> None:
     flags = [
         "--exclude", "taxonomy/cache/**",
         "--exclude", "gis/temporal/**",
+        # The largest layers live on prod's second disk (served from
+        # WHEREWILD_EXTRA_LAYERS_DIRS, /mnt/wherewild-disk2/layers), not under
+        # data/gis/layers on its NVMe — pushed there separately, so they must
+        # stay out of this sync or it would fill the NVMe.
         "--exclude", "gis/layers/elevation.tif",
+        "--exclude", "gis/layers/twi.tif",
+        "--exclude", "gis/layers/direct_sun.tif",
         # The whole basemap tile tree (basemap.pmtiles, styles/, fonts/,
         # _src/, _test/) is pushed by scripts/gis/build_basemap_tiles.py's
         # own _push_basemap_files, on its own cron — entirely separate from

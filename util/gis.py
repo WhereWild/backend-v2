@@ -121,6 +121,18 @@ def sample_point(layer: dict, lat: float, lon: float, forecast_suffix: str = "")
     return _sample_cog_point(layer, lat, lon)
 
 
+def vector_sampling_field(layer: dict) -> str:
+    """Polygon attribute enrichment samples for a vector layer.
+
+    Multi-valued layers (see util/multiclass.py) store the per-polygon class
+    set as a bitmask in `vector_set_field`; `vector_field` stays the single
+    primary class used for tile rendering and the point lookup API.
+    """
+    if layer.get("multi_valued") and layer.get("vector_set_field"):
+        return layer["vector_set_field"]
+    return layer["vector_field"]
+
+
 def _sample_vector_point(layer: dict, lat: float, lon: float) -> float | None:
     """Point-in-polygon lookup for a native vector layer source (e.g. ecoregions/biome).
 

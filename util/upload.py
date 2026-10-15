@@ -50,6 +50,7 @@ from util.gis import (
     sample_slope_batch,
     sample_soil_texture_batch,
     sample_vector_batch,
+    vector_sampling_field,
 )
 from util.rankings import (
     MIN_RANKING_SAMPLES,
@@ -790,7 +791,7 @@ def enrich_with_gis(df: pd.DataFrame) -> pd.DataFrame:
                 vec_path = resolve_layer_path(LAYERS_DIR, layer["filename"])
                 if not vec_path.exists():
                     continue
-                sorted_arr = sample_vector_batch(vec_path, layer["vector_field"], s_lats, s_lons)
+                sorted_arr = sample_vector_batch(vec_path, vector_sampling_field(layer), s_lats, s_lons)
                 result[layer_id] = [None if np.isnan(sorted_arr[i]) else sorted_arr[i] for i in restore]
             else:
                 cog_path = resolve_layer_path(LAYERS_DIR, layer["filename"])

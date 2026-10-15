@@ -47,6 +47,7 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 from config.config import ValueType, load_config
+from util.multiclass import OBS_TOTAL_KEY, mask_counts, split_obs_total
 from util.storage import ParquetStorage, atomic_write_parquet
 from util.taxa import TaxonRecord, get_children, load_catalog
 from util.ternary import build_ternary_density_grid, composition_group_members
@@ -661,7 +662,16 @@ def _filter_to_known_classes(counts: Counter, layer_id: str) -> Counter:
     valid = _valid_class_ids(layer_id)
     if valid is None:
         return counts
-    return Counter({k: v for k, v in counts.items() if k in valid})
+    return Counter({k: v for k, v in counts.items() if k in valid or k == OBS_TOTAL_KEY})
+
+
+def _nominal_counts(values, layer_id: str, layer: dict | None) -> Counter:
+    """Class counts for a nominal column; decodes bitmasks for multi-valued layers
+    (which also carry their observation total — see util/multiclass.py)."""
+    if layer is not None and layer.get("multi_valued"):
+        counts = _filter_to_known_classes(mask_counts(values.to_numpy()), layer_id)
+        return counts if len(counts) > 1 or OBS_TOTAL_KEY not in counts else Counter()
+    return _filter_to_known_classes(Counter(int(float(v)) for v in values), layer_id)
 
 
 def _is_discrete(layer: dict) -> bool:
@@ -790,7 +800,7 @@ def _df_to_acc(df: pd.DataFrame, layer_meta: dict[str, dict]) -> dict:
                 series = df[col].dropna()
                 if series.empty:
                     continue
-                counts_n = _filter_to_known_classes(Counter(int(float(v)) for v in series), col)
+                counts_n = _nominal_counts(series, col, layer_meta[col])
                 if not counts_n:
                     continue
                 acc["nominal"][col] = {"counts": counts_n, "unique": _col_unique(col)}
@@ -1577,12 +1587,19 @@ def _ordinal_stat_entries(layer_id: str, layer: dict, counts: Counter, stats: di
 # ---------------------------------------------------------------------------
 
 def _nominal_stats(counts: Counter, unique_samples: int) -> tuple[dict, list[dict]]:
-    """Nominal summary stats + sorted class distribution."""
-    total = sum(counts.values())
-    if total == 0:
+    """Nominal summary stats + sorted class distribution.
+
+    For multi-valued layers (counts carries OBS_TOTAL_KEY) fractions are the
+    share of observations including each class, so they can sum past 1; the
+    entropy is taken over those shares renormalized to sum to 1.
+    """
+    counts, obs_total = split_obs_total(counts)
+    total = obs_total if obs_total is not None else sum(counts.values())
+    if total == 0 or not counts:
         return {}, []
     fractions = {k: v / total for k, v in counts.items()}
     probs = np.array(list(fractions.values()), dtype=float)
+    probs = probs / probs.sum()
     entropy = float(_scipy_entropy(probs))
     mode_cls = counts.most_common(1)[0][0]
     summary = {
@@ -1606,6 +1623,7 @@ def _nominal_cat_entries(layer_id: str, layer: dict, counts: Counter, summary: d
     # column, always written below) rather than materialized per class —
     # for a high-cardinality legend like ecoregions (847 classes) that keeps
     # nominal_stats.parquet at O(taxa) instead of O(taxa * classes).
+    counts, _ = split_obs_total(counts)
     total = summary["total_samples"]
     entries: list[dict] = [
         {"variable": layer_id, "metric": "unique_samples", "value": float(summary["unique_samples"])},
@@ -2052,7 +2070,7 @@ def _process_leaf_df(target, taxon_key: str, df: pd.DataFrame, layer_meta: dict[
                 if raw.empty:
                     continue
                 unique = _col_unique(raw_full)
-                raw_counts: Counter = _filter_to_known_classes(Counter(int(float(v)) for v in raw), col)
+                raw_counts: Counter = _nominal_counts(raw, col, layer)
                 if not raw_counts:
                     continue
                 summary, _ = _nominal_stats(raw_counts, unique)
@@ -2300,7 +2318,9 @@ def compute_location_filtered_stats(
         series = df[variable_id].dropna()
         if series.empty:
             return None
-        raw_counts: Counter = Counter(int(float(v)) for v in series)
+        raw_counts: Counter = _nominal_counts(series, variable_id, layer)
+        if not raw_counts:
+            return None
         summary, distribution = _nominal_stats(raw_counts, unique)
         result = {"type": "nominal", "observation_count": summary["total_samples"], "summary": summary, "distribution": distribution}
         if layer_meta is not None:

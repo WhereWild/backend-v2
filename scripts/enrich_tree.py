@@ -58,6 +58,7 @@ from util.gis import (
     sample_slope_batch,
     sample_soil_texture_batch,
     sample_vector_batch,
+    vector_sampling_field,
 )
 from util.isolation import run_isolated
 from util.taxa import load_catalog
@@ -431,9 +432,10 @@ def _process_batch(worklist: pa.Table, layers: list[dict]) -> pa.Table | None:
             if not vec_path.exists():
                 print(f"[warn] {vec_path.name} not found; skipping {layer_id}")
                 return layer_id, np.full(len(lats), np.nan)
-            vals = sample_vector_batch(vec_path, layer["vector_field"], lats[arr], lons[arr])
+            vals = sample_vector_batch(vec_path, vector_sampling_field(layer), lats[arr], lons[arr])
             vtype = layer.get("value_type", "")
-            if vtype in ("nominal", "ordinal"):
+            # Multi-valued values are class bitmasks, not class ids.
+            if vtype in ("nominal", "ordinal") and not layer.get("multi_valued"):
                 valid = _valid_class_ids(layer_id)
                 if valid is not None:
                     finite = np.isfinite(vals)

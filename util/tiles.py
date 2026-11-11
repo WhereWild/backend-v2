@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import zlib
 from collections.abc import Collection
 from functools import lru_cache
 from pathlib import Path
@@ -448,6 +449,42 @@ def _colorize_nominal(
     return rgba
 
 
+# Matplotlib colormaps a catalog layer may pin via its `colormap` field,
+# overriding the user-selected global colormap for that layer.
+LAYER_COLORMAPS = frozenset({"coolwarm"})
+
+
+def _layer_colormap(layer: dict, colormap: str) -> str:
+    """Resolve the colormap for a continuous layer: a catalog `colormap`
+    name (see LAYER_COLORMAPS) overrides the user-selected global one."""
+    spec = layer.get("colormap")
+    return spec if spec in LAYER_COLORMAPS else colormap
+
+
+def layer_colormap_bounds(layer: dict) -> tuple[float, float] | None:
+    """Catalog `colormap_bounds` ({"min", "max"}, raw units) — the value range
+    the colormap spans for this layer, in place of render_min/render_max;
+    values outside it clamp to the end colors. None when absent/invalid."""
+    spec = layer.get("colormap_bounds")
+    if not isinstance(spec, dict):
+        return None
+    lo, hi = spec.get("min"), spec.get("max")
+    if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and lo < hi:
+        return (float(lo), float(hi))
+    return None
+
+
+def layer_colormap_override(layer: dict) -> dict | None:
+    """The layer's catalog colormap override as {"name", "stops"} (16 evenly
+    spaced RGB stops, low→high) for API consumers; None when absent."""
+    name = _layer_colormap(layer, "")
+    if not name:
+        return None
+    lut = _get_cmap_lut(name)
+    idx = np.linspace(0, len(lut) - 1, 16).round().astype(int)
+    return {"name": name, "stops": [[int(c) for c in lut[i]] for i in idx]}
+
+
 def _colorize(
     values: np.ndarray,
     vmin: float,
@@ -460,7 +497,9 @@ def _colorize(
     if not np.any(finite):
         return rgba
 
-    lut         = _get_cmap_lut(colormap if colormap in SUPPORTED_COLORMAPS else _DEFAULT_COLORMAP)
+    lut = _get_cmap_lut(
+        colormap if colormap in SUPPORTED_COLORMAPS | LAYER_COLORMAPS else _DEFAULT_COLORMAP
+    )
     span        = max(float(vmax) - float(vmin), 1e-6)
     norm        = np.clip((values - vmin) / span, 0.0, 1.0)
     finite_norm = norm[finite]
@@ -572,12 +611,24 @@ def _mtime(path: Path) -> int:
 
 
 def get_layer_version(layer: dict, forecast_suffix: str = "") -> int:
-    """Return an mtime-derived integer that changes exactly when a layer's source data does.
+    """Return an integer that changes exactly when a layer's rendering inputs do.
 
     Used as a cache-busting token: URLs built with this value can be cached
     indefinitely, since a new version only appears once the underlying file
-    is actually rebuilt.
+    is rebuilt or the layer's catalog colormap override changes (tiles are
+    colorized server-side, so a color change must also yield new URLs).
     """
+    version = _layer_data_version(layer, forecast_suffix)
+    override = _layer_colormap(layer, "")
+    if override:
+        version ^= zlib.crc32(override.encode())
+    bounds = layer_colormap_bounds(layer)
+    if bounds:
+        version ^= zlib.crc32(repr(bounds).encode())
+    return version
+
+
+def _layer_data_version(layer: dict, forecast_suffix: str = "") -> int:
     from util.gis import _SOIL_TEXTURE_INPUT_FILES, DERIVED_FROM_ELEVATION, DERIVED_FROM_SOIL
 
     layer_id = layer["id"]
@@ -1356,6 +1407,9 @@ def _render_static_layer_tile_rgba(
         dest, vmin, vmax = _sample_static_cog_to_tile(layer, z, x, y, tile_size, dst_transform)
     vmin = vmin if vmin is not None else 0.0
     vmax = vmax if vmax is not None else 1.0
+    bounds = layer_colormap_bounds(layer)
+    if bounds is not None:
+        vmin, vmax = bounds
     if render_range is not None:
         vmin, vmax = render_range
 
@@ -1372,7 +1426,7 @@ def _render_static_layer_tile_rgba(
         return _colorize_nominal(dest, nominal_cmap, class_filter) if nominal_cmap else _colorize(dest, vmin, vmax, colormap, value_ranges)
     if value_type == "circular":
         return _colorize_circular(dest, colormap if colormap in SUPPORTED_CIRCULAR_COLORMAPS else _DEFAULT_CIRCULAR_COLORMAP, value_ranges)
-    return _colorize(dest, vmin, vmax, colormap, value_ranges)
+    return _colorize(dest, vmin, vmax, _layer_colormap(layer, colormap), value_ranges)
 
 
 def _sample_layer_to_tile(

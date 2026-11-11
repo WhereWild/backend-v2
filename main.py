@@ -881,6 +881,15 @@ def _cached_list_variables(
             "legend_classes": legend_classes,
             "render_min": units.convert_value(rmin, layer, unit_system),
             "render_max": units.convert_value(rmax, layer, unit_system),
+            "colormap_override": tiles.layer_colormap_override(layer),
+            "colormap_bounds": (
+                {
+                    "min": units.convert_value(_cb[0], layer, unit_system),
+                    "max": units.convert_value(_cb[1], layer, unit_system),
+                }
+                if (_cb := tiles.layer_colormap_bounds(layer))
+                else None
+            ),
             "group": layer.get("group") or None,
             "group_label": layer.get("group_label") or None,
             "agg": layer.get("agg") or None,

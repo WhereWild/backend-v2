@@ -17,6 +17,8 @@
           "add_offset": -273.15,
           "render_min": -53.549988,
           "render_max": 34.75,
+          "colormap": "coolwarm",
+          "colormap_bounds": {"min": -23.3333, "max": 26.6667},
           "domain": "continuous",
           "imperial_unit": "°F"
         },

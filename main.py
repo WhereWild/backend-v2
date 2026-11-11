@@ -3308,6 +3308,40 @@ def _clear_temporal_versioned_caches() -> None:
     _cached_list_variables.cache_clear()
 
 
+_STUDY_DIR = Path(os.environ.get("STUDY_DATA_DIR", "data/study"))
+_STUDY_MAX_BYTES = 16_384
+
+
+@app.post("/study/responses", status_code=201)
+@limiter.limit(_RATE_LIMIT_CHEAP)
+async def study_response(request: Request) -> JSONResponse:
+    """Append one visualization-study response (a JSON object) to a JSONL log.
+
+    The frontend sends it as text/plain (a CORS "simple request" — the app's
+    CORS config only allows GET, so a JSON content-type would be preflighted
+    and blocked); the body is still parsed as JSON here. Payload shape is
+    deliberately free-form while the study's questions are TBD.
+    """
+    raw = await request.body()
+    if len(raw) > _STUDY_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Response too large")
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Body must be JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    record = {"received_at": datetime.now(UTC).isoformat(), **payload}
+
+    def _append() -> None:
+        _STUDY_DIR.mkdir(parents=True, exist_ok=True)
+        with (_STUDY_DIR / "responses.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+    await run_in_threadpool(_append)
+    return JSONResponse({"ok": True}, status_code=201)
+
+
 @app.post("/upload/raw-observations")
 @limiter.limit(_RATE_LIMIT_UPLOAD)
 async def upload_raw_observations(
